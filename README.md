@@ -5,10 +5,10 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 confident, reviewably when it isn't.
 
 > **Status: design complete, pre-alpha.** The architecture decisions, domain
-> language, and development standards are committed; implementation begins
-> with Phase 0 (export → dataset analysis). No installable tooling yet —
-> watch the repo or follow the phase plan in [AGENTS.md](AGENTS.md) to see it
-> land.
+> language, and development standards are committed. The CLI skeleton installs
+> (`uv sync`, then `gmail-labeler --help`), but every command is an honest
+> exit-3 stub until its Phase 0 segment lands — watch the repo or follow the
+> phase plan in [AGENTS.md](AGENTS.md).
 
 ## Why
 

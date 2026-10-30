@@ -5,8 +5,8 @@ fine-tunes a multi-label classifier on the user's own Gmail history and applies
 labels to arriving mail as it lands. Anyone can use it on their own inbox;
 nothing leaves the user's machines; nothing is centralized on the maintainer.
 Docs live where you expect: `GLOSSARY.md`, `CODING-STANDARDS.md`, `docs/adr/`.
-The repo is currently docs-only — the code sections below are the target
-shape, and each gains detail as its phase lands.
+Phase 0 (corpus) has landed; the layout and command sections below mark
+what is wired vs. planned, and each gains detail as its phase lands.
 
 ## Design spine (read the ADRs before questioning these)
 
@@ -17,31 +17,43 @@ shape, and each gains detail as its phase lands.
 - ADR-0003 Gmail History-API polling (default 30s) is the sync spine; Pub/Sub
   push is a deferred trigger, not a redesign.
 - ADR-0004 each user brings their own GCP project + desktop OAuth client
-  (production mode, not testing); wizard-guided.
+  (production mode, not testing); the README Setup section
+  guides today's flow — the interactive `auth` wizard ADR-0004 sketches is not
+  built yet (see its status note).
 - ADR-0005 additive-only writes; Shadow Pass until per-label Graduation;
   human-gated retrain/threshold changes.
 
-## Target layout
+## Layout
 
-- `src/gmail_labeler/` — pure core (`dataset`, `labels`, `thresholds`,
-  `graduation`, `eval`) + adapters (`gmail`, `gyb`, `store`, `model`,
-  `daemon`, `cli`).
-- `train/` — fine-tune recipe (HF `Trainer`), checkpoint output convention.
+- `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
+  `corpus_store`, `mime_extract`, `analyze`, `auth`, `tokens`,
+  `gmail_client`, `gmail_errors`, `fake_gmail`, `export`, `gyb_import`,
+  `cli`. Planned (later phases): model core (`dataset` build,
+  `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.
+- `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
+  convention.
 - `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.
-- CLI surface: `auth`, `dataset {export,import-gyb,analyze}`, `train`, `eval`,
-  `shadow {run,report}`, `apply`, `daemon`, `status` (AGENTS: names frozen by
-  the design conversation — change with cause).
+- CLI surface: `auth` (status) + `auth login` and
+  `dataset {export,import-gyb,analyze}` are wired; `train`, `eval`,
+  `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
+  design conversation, not yet wired — change names with cause.
 
-## Commands (will exist once Phase 0 lands the scaffold)
+## Commands
 
 ```sh
-uv run pytest -q --cov=src --cov-fail-under=80   # tests + coverage gate
+scripts/local-ci.sh    # pre-push gate: uv.lock freshness + all CI gates
+uv run pytest          # -q --cov -m 'not live' come from pyproject addopts
 uv run ruff check . && uv run ruff format --check .
 uv run pyright
 ```
 
-CI parity (GitHub Actions, ubuntu + macos, py 3.12/3.13) is the merge gate
-once the workflow exists; `--live` Gmail tests never run there.
+The coverage gate (`fail_under = 80`, scope `src/gmail_labeler`) and the
+live-test exclusion live in `pyproject.toml`
+(`[tool.pytest.ini_options]`, `[tool.coverage.*]`), so a bare
+`uv run pytest` cannot bypass either.
+
+CI parity (`.github/workflows/ci.yml`: ubuntu + macOS, Python 3.12/3.13)
+is the merge gate; `--live` Gmail tests never run there (invariant #9).
 
 ## Git management — project inputs
 
@@ -151,18 +163,20 @@ contributor machines are configured independently.
 
 ## Known external facts
 
-- Owner's GYB backup is mounted at `.gyb-data/` (gitignored; the importer
-  must never depend on it existing). Verified layout:
-  `<year>/<month>/<day>/<hexid>.eml` where `hexid` **is the Gmail API
-  message id**, plus `msg-db.sqlite` — read-only — with
+- GYB backup shape the importer codes against (verify any refinement against
+  a real backup before tightening; the maintainer keeps a verified probe
+  summary in `AGENTS.local.md` in the maintainer's **primary checkout**
+  (gitignored; structurally absent from worktrees)):
+  `<year>/<month>/<day>/<hexid>.eml` under the backup root where `hexid`
+  **is the Gmail API message id**, plus `msg-db.sqlite` — read-only — with
   `messages(message_num, message_filename, message_internaldate)`,
-  `labels(message_num, label)`, `uids(message_num, uid=hexid)`: the label map
-  joins straight onto Gmail API ids, no .eml header parsing needed.
-  ~394k messages, 2005→2026-10 (snapshot — freshness vs API export must be
-  reconciled at import). 120 raw labels including system noise
-  (`INBOX`, `UNREAD`, `IMPORTANT`, `SENT`, `CATEGORY_*`) to filter, and
-  slash-nested user labels (`Money/Purchases`) to handle as label *paths*.
-  Corpus spans 21 years — `dataset analyze` needs a recency cap/weighting,
-  and temporal splits alone would over-weight 2005-era mail.
-- Owner's runtime box: the homelab host that runs auto-github (CPU inference;
-  the GPU box appears only for `train`).
+  `labels(message_num, label)`, `uids(message_num, uid=hexid)`: the label
+  map joins straight onto Gmail API ids, no .eml header parsing needed.
+  System-label noise (`INBOX`, `UNREAD`, `SENT`, `CATEGORY_*`) must be
+  filtered; slash-nested user labels are label *paths*. Decade-scale corpus
+  spans make `dataset analyze`'s recency gates load-bearing, and temporal
+  splits alone would over-weight the oldest mail.
+- The importer must never depend on any user's backup existing, and backup
+  freshness vs the API export must be reconciled at import time.
+- The maintainer's runtime box is a homelab host (CPU inference; a GPU host
+  appears only for `train`); topology details live in `AGENTS.local.md`.

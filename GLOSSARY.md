@@ -6,8 +6,8 @@ strictly-local model, trained on the owner's own labeling history.
 ## Language
 
 **Managed Label**:
-One of the small set of content labels (a subset of the owner's ~40) that the
-system is permitted to apply. All other labels are untouchable.
+One of the small set of content labels the owner permits the system to apply.
+All other labels are untouchable. All other labels are untouchable.
 _Avoid_: target label, predicted label
 
 **Tier Label**:
@@ -41,8 +41,10 @@ family, ...) — never content labels, never trainable, never touchable.
 _Avoid_: built-in label
 
 **Label Path**:
-A user label's slash-separated hierarchy (`Money/Bills`); analysis and
-graduation reason over paths, where a parent may scope its children.
+A user label's slash-separated hierarchy (`Money/Bills`); graduation is
+planned to reason over paths, where a parent may scope its children. The
+landed `dataset analyze` treats each full name as its own string —
+`Money/Bills` and `Bills` are separate rows there.
 _Avoid_: nested label, label tree
 
 **Filter-Authored Label**:

@@ -1,0 +1,83 @@
+[project]
+name = "gmail-labeler"
+version = "0.0.1"
+description = "Strictly-local Gmail auto-labeling: fine-tune a multi-label classifier on your own inbox history"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.12"
+authors = [{ name = "Jess Morgan" }]
+keywords = ["gmail", "email", "classification", "auto-labeling", "local-first"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+]
+
+dependencies = [
+    "google-api-python-client>=2.201",
+    "google-auth-oauthlib>=1.5",
+    "keyring>=25.7",
+    "pydantic>=2.14",
+    "rich>=15",
+    "typer>=0.27",
+]
+
+[project.urls]
+Repository = "https://github.com/JessMorgan/gmail-labeler"
+Issues = "https://github.com/JessMorgan/gmail-labeler/issues"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest-cov>=7.1",
+    "pytest>=9.2",
+    "ruff>=0.17",
+]
+
+[project.scripts]
+gmail-labeler = "gmail_labeler.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gmail_labeler"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.agents", "/.github"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py312"
+extend-exclude = [".agents"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The gate and the live-test exclusion (invariant #9) live here so a bare
+# `uv run pytest` cannot bypass either; coverage scope/level come from
+# [tool.coverage.*] below (single source of truth). Targeted local runs may
+# pass --no-cov; -m live overrides the exclusion on purpose.
+addopts = "-q --cov -m 'not live'"
+markers = [
+    "live: tests that hit the real Gmail API (never run in CI; opt-in with -m live)",
+]
+
+[tool.coverage.run]
+source = ["src/gmail_labeler"]
+
+[tool.coverage.report]
+fail_under = 80
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+# The pure core is held to strict (CODING-STANDARDS); list grows as modules land,
+# starting with src/gmail_labeler/labels.py.
+strict = []

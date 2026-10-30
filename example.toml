@@ -1,0 +1,33 @@
+# gmail-labeler configuration — copy to config.toml and edit.
+# Every value shown is the DEFAULT; delete sections you don't need.
+# Secrets are paths only — never tokens, never inline values.
+
+[gmail]
+# OAuth client JSON you downloaded from YOUR Google Cloud project
+# (ADR-0004; the `auth` wizard walks you through creating it).
+# Default: none — set it before `auth` can run. Relative paths resolve
+# against this file's directory, ~ is expanded.
+# credentials_path = "~/secrets/gmail-oauth-client.json"
+token_backend = "keyring"          # "keyring" (OS vault) or "file"
+# Used with token_backend = "file"; must be mode 0600:
+token_file = "~/.config/gmail-labeler/token.json"
+history_poll_seconds = 30          # daemon polling cadence (ADR-0003)
+
+[labels]
+# Tier Labels attached to every Application (GLOSSARY.md):
+applied = "ai-applied"             # umbrella: "the AI contributed something"
+high = "ai-high"                   # high-confidence band
+med = "ai-med"                     # review-me band
+# Managed Labels this install may apply — empty until you graduate labels
+# from `dataset analyze` + `eval`, e.g.:
+# managed = ["Shipping", "Money/Bills"]
+managed = []
+
+[corpus]
+# Training/eval corpus directory — TREAT AS SECRET (it is your mail).
+dir = "./corpus"
+
+[gyb]
+# Optional: path to an existing Got Your Back backup (contains
+# msg-db.sqlite) for `dataset import-gyb`.
+# path = "/mnt/backup/gmail"

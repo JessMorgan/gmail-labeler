@@ -79,4 +79,8 @@ include = ["src", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
 # The pure core is held to strict (CODING-STANDARDS); list grows as modules land.
-strict = ["src/gmail_labeler/labels.py", "src/gmail_labeler/corpus_record.py"]
+strict = [
+    "src/gmail_labeler/labels.py",
+    "src/gmail_labeler/corpus_record.py",
+    "src/gmail_labeler/mime_extract.py",
+]

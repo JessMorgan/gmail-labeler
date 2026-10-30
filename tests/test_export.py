@@ -263,6 +263,139 @@ def test_max_messages_zero_is_a_noop(tmp_path: Path) -> None:
     assert stats.scanned == stats.written == stats.skipped_present == 0
 
 
+def test_auth_errors_propagate_typed_not_swallowed(tmp_path: Path) -> None:
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    class Revoked(FakeGmailClient):
+        def get_message(self, message_id: str):  # type: ignore[no-untyped-def]
+            raise GmailAuthError("revoked", status=401)
+
+    fake = Revoked(messages=[FakeMessage(id="aaa", eml=_eml())])
+    with pytest.raises(GmailAuthError):
+        export_corpus(
+            fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
+        )
+
+
+def test_settings_fetch_propagates_auth_too(tmp_path: Path) -> None:
+    from gmail_labeler.export import fetch_settings
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    class DeadAuth(FakeGmailClient):
+        def list_labels(self):  # type: ignore[no-untyped-def]
+            raise GmailAuthError("consent withdrawn", status=403)
+
+    with pytest.raises(GmailAuthError):
+        fetch_settings(DeadAuth(), sleeper=lambda s: None)
+
+
+def test_snapshot_death_leaves_secret_tight_root(tmp_path: Path) -> None:
+    # deepseek MINOR: root created by the snapshot path must be 0700 even
+    # when the run dies before the first put()
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.export import write_filters_snapshot
+
+    store = CorpusStore(tmp_path / "deep" / "corpus")
+    write_filters_snapshot(store, [])
+    assert (tmp_path / "deep" / "corpus").stat().st_mode & 0o777 == 0o700
+
+
+def test_snapshot_fsyncs_directory_after_replace(tmp_path: Path, monkeypatch) -> None:
+    # deepseek MINOR: the rename-durability dir fsync must stay pinned
+    import os as _os
+
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.export import write_filters_snapshot
+
+    synced: list[str] = []
+    real_fsync = _os.fsync
+
+    def spy(fno: int) -> None:
+        synced.append("fsync")
+        real_fsync(fno)
+
+    monkeypatch.setattr(_os, "fsync", spy)
+    write_filters_snapshot(CorpusStore(tmp_path / "c"), [])
+    assert synced.count("fsync") >= 2  # file + directory (tokens.py parity)
+
+
+def test_snapshot_failure_leaves_no_tmp(tmp_path: Path, monkeypatch) -> None:
+    # deepseek NIT: mid-write OSError must unlink the predictable-named tmp
+    import os as _os
+
+    from gmail_labeler.corpus_store import CorpusError, CorpusStore
+    from gmail_labeler.export import write_filters_snapshot
+
+    store = CorpusStore(tmp_path / "c")
+
+    def boom(*a: object, **k: object) -> None:
+        raise OSError("ENOSPC-ish")
+
+    monkeypatch.setattr(_os, "fdopen", boom)
+    import pytest as _pt
+
+    with _pt.raises(CorpusError):
+        write_filters_snapshot(store, [])
+    assert not (store.root / "filters.json.tmp").exists()
+
+
+def test_snapshot_fchmod_failure_cleans_up(tmp_path: Path, monkeypatch) -> None:
+    # deepseek r3 NIT: the fd-ownership finally is probe-only otherwise
+    import os as _os
+
+    import pytest as _pt
+
+    from gmail_labeler.corpus_store import CorpusError, CorpusStore
+    from gmail_labeler.export import write_filters_snapshot
+
+    store = CorpusStore(tmp_path / "c")
+    monkeypatch.setattr(
+        _os, "fchmod", lambda *a, **k: (_ for _ in ()).throw(OSError("EPERM"))
+    )
+    fd_cand = next(
+        (c for c in ("/proc/self/fd", "/dev/fd") if _os.path.isdir(c)), None
+    )  # linux + macos legs both mutation-pin the fd fold (deepseek r4 NIT)
+    fd_before = len(_os.listdir(fd_cand)) if fd_cand else 0
+    with _pt.raises(CorpusError):
+        write_filters_snapshot(store, [])
+    assert not (store.root / "filters.json.tmp").exists()
+    if not fd_cand:
+        pytest.skip("no fd table to count — fd-fold invisible on this host")
+    assert len(_os.listdir(fd_cand)) == fd_before
+
+
+def test_snapshot_replace_failure_leaves_healable_tmp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # deepseek r3 NIT: the documented contract — failed replace keeps the
+    # complete 0600 tmp; readers saw nothing; next run heals it
+    import os as _os
+
+    import pytest as _pt
+
+    from gmail_labeler.corpus_store import CorpusError, CorpusStore
+    from gmail_labeler.export import SIDECAR_FILTERS, write_filters_snapshot
+
+    store = CorpusStore(tmp_path / "c")
+    real_replace = _os.replace
+
+    def boom(a: object, b: object, **k: object) -> None:
+        raise OSError("EXDEV-ish")
+
+    monkeypatch.setattr(_os, "replace", boom)
+    with _pt.raises(CorpusError):
+        write_filters_snapshot(store, [])
+    tmp = store.root / (SIDECAR_FILTERS + ".tmp")
+    assert tmp.is_file() and not (store.root / SIDECAR_FILTERS).exists()
+    assert tmp.stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr(_os, "replace", real_replace)
+    write_filters_snapshot(store, [])  # the next run heals it
+    assert (store.root / SIDECAR_FILTERS).is_file() and not tmp.exists()
+
+
+# ---- deepseek independent-engine-pass pins ----
+
+
 def test_resume_gate_is_case_insensitive(tmp_path: Path) -> None:
     # M1-resistant: dropping .lower() in the resume gate refetches every
     # present id on resume (hundreds of thousands of wasted fetches per

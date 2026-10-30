@@ -10,13 +10,21 @@ yet" from "typo" — and never silently succeed.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import typer
+
+from .export import DEFAULT_QUERY
+
+if TYPE_CHECKING:
+    from .config import Config
+    from .gmail_client import GmailClient
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
     epilog=(
-        "Exit codes: 0 ok · 2 usage error · "
-        "3 command not implemented yet · 4 auth/config unusable"
+        "Exit codes: 0 ok · 2 usage error · 3 not implemented · "
+        "4 auth/config unusable · 5 export failed/incomplete"
     ),
     no_args_is_help=True,
 )
@@ -90,10 +98,89 @@ def _load_config(config: str | None):
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
 
 
+_EXPORT_ERROR_EXIT = 5  # transport/corpus failure or incomplete run
+
+
+def _export_client(config: Config) -> GmailClient:
+    """Client factory seam: tests inject FakeGmailClient here."""
+    from .auth import credentials as build_credentials
+    from .gmail_client import GmailRestClient
+
+    return GmailRestClient(build_credentials(config))
+
+
 @dataset_app.command("export")
-def dataset_export() -> None:
+def dataset_export(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    query: str = typer.Option(
+        DEFAULT_QUERY, "--query", help="Gmail search query (single-sourced)"
+    ),
+    max_messages: int | None = typer.Option(
+        None,
+        "--max-messages",
+        min=1,
+        help="Stop after scanning N messages (smoke runs)",
+    ),
+) -> None:
     """Export labeled mail from the Gmail API into the corpus."""
-    _stub("dataset export")
+    from .auth import AuthError
+    from .corpus_store import CorpusError, CorpusStore
+    from .export import (
+        export_corpus,
+        fetch_settings,
+        write_filters_snapshot,
+        write_labels_snapshot,
+    )
+    from .gmail_errors import GmailAuthError, GmailError
+    from .tokens import TokenStoreError
+
+    cfg = _load_config(config)
+    # Auth gate FIRST: a not-signed-in run must not create or re-mode a
+    # corpus tree (a typo'd corpus.dir especially).
+    try:
+        client = _export_client(cfg)
+        id_to_name, filters, bootstrap = fetch_settings(client)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"export failed: {e}", err=True)
+        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+    store = CorpusStore(cfg.corpus.dir)
+    store.enforce_modes()
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    try:
+        write_filters_snapshot(store, filters)
+        write_labels_snapshot(store, id_to_name)
+        stats = export_corpus(
+            client,
+            store,
+            id_to_name=id_to_name,
+            query=query,
+            max_messages=max_messages,
+        )
+    except GmailAuthError as e:  # revoked token mid-run: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError) as e:
+        typer.echo(f"export failed: {e}", err=True)
+        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+    stats.retried += bootstrap.retried  # settings blips count too
+    typer.echo(
+        f"export: scanned={stats.scanned} written={stats.written} "
+        f"skipped_present={stats.skipped_present} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    if stats.failed:
+        for message_id, reason in stats.failed[:20]:
+            typer.echo(f"  failed {message_id}: {reason}", err=True)
+        if len(stats.failed) > 20:
+            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
 
 
 @dataset_app.command("import-gyb")

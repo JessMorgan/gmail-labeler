@@ -14,6 +14,10 @@ import typer
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
+    epilog=(
+        "Exit codes: 0 ok · 2 usage error · "
+        "3 command not implemented yet · 4 auth/config unusable"
+    ),
     no_args_is_help=True,
 )
 dataset_app = typer.Typer(help="Corpus acquisition and analysis.", no_args_is_help=True)
@@ -30,10 +34,60 @@ def _stub(name: str) -> None:
     raise typer.Exit(code=_NOT_IMPLEMENTED_EXIT)
 
 
-@app.command()
-def auth() -> None:
-    """Set up and check the Gmail OAuth credential (ADR-0004)."""
-    _stub("auth")
+auth_app = typer.Typer(help="Gmail OAuth credential (ADR-0004).", no_args_is_help=False)
+app.add_typer(auth_app, name="auth")
+
+_AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
+# (typer requires concrete annotations: str | None, not Any)
+
+
+@auth_app.callback(invoke_without_command=True)
+def auth_status(
+    ctx: typer.Context,
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+) -> None:
+    """Report credential status; `auth login` runs the consent flow."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from .auth import status as _status
+
+    cfg = _load_config(config)
+    st = _status(cfg)
+    state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
+    typer.echo(f"auth: {state} ({st.backend}) — {st.detail}")
+    if not st.signed_in:
+        raise typer.Exit(code=_AUTH_ERROR_EXIT)
+
+
+@auth_app.command("login")
+def auth_login(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+) -> None:
+    """Run the one-time desktop OAuth consent flow."""
+    from .auth import AuthError
+    from .auth import login as _login
+    from .tokens import TokenStoreError
+
+    cfg = _load_config(config)
+    try:
+        _login(cfg)
+    except (AuthError, TokenStoreError) as e:
+        # Exit-code contract: login failures are 4 (auth-config unusable),
+        # never raw tracebacks that could echo third-party exception text.
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    typer.echo("auth: signed in, refresh token stored")
+
+
+def _load_config(config: str | None):
+    from .config import ConfigError, load_config
+
+    try:
+        return load_config(config)
+    except ConfigError as e:  # load_config raises nothing else (store errors
+        # belong to auth status/login, which catch them where they arise)
+        typer.echo(f"config error: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
 
 
 @dataset_app.command("export")

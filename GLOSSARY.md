@@ -35,6 +35,16 @@ _Avoid_: go-live, enablement
 The per-(message, Managed Label) verdict — high, medium, or none — derived
 from the label's calibrated probability and its threshold.
 
+**System Label**:
+Gmail's own mailbox-state labels (`INBOX`, `UNREAD`, `SENT`, the `CATEGORY_*`
+family, ...) — never content labels, never trainable, never touchable.
+_Avoid_: built-in label
+
+**Label Path**:
+A user label's slash-separated hierarchy (`Money/Bills`); analysis and
+graduation reason over paths, where a parent may scope its children.
+_Avoid_: nested label, label tree
+
 **Filter-Authored Label**:
 A label that an existing Gmail filter applied on arrival rather than the
 owner. Excluded from training signal; the model must earn its keep on labels

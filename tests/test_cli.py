@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from gmail_labeler.cli import app
@@ -23,20 +25,6 @@ def test_dataset_help_lists_subcommands() -> None:
     assert result.exit_code == 0
     for cmd in ("export", "import-gyb", "analyze"):
         assert cmd in result.output
-
-
-@pytest.mark.parametrize(
-    ("argv", "name"),
-    [
-        (["dataset", "analyze"], "dataset analyze"),
-    ],
-)
-def test_every_stub_exits_3_with_marker(argv: list[str], name: str) -> None:
-    """No stub may silently succeed: exit 3 (not the usage-error 2) and the
-    per-command marker on stderr."""
-    result = runner.invoke(app, argv)
-    assert result.exit_code == 3
-    assert f"{name}: not implemented yet" in result.stderr
 
 
 def test_usage_error_stays_exit_2() -> None:
@@ -524,3 +512,398 @@ def test_import_gyb_date_conflict_warning(tmp_path: Path) -> None:
     result = runner.invoke(app, ["dataset", "import-gyb", "--config", str(cfg)])
     assert result.exit_code == 0  # imported with the raw stamp — not silently
     assert "MORE than a day" in result.stderr
+
+
+# ---- dataset analyze ----
+
+
+def _seed_corpus(
+    tmp_path: Path, *, n: int = 60, label: str = "Shipping", sender: str = "shop@x.z"
+) -> Path:
+    from datetime import UTC, datetime, timedelta
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+    from gmail_labeler.corpus_store import CorpusStore
+
+    store = CorpusStore(tmp_path / "corpus")
+    store.enforce_modes()
+    now = datetime.now(UTC)
+    base = sum(1 for _ in store.iter_records())
+    for i in range(n):
+        rec = CorpusRecord(
+            id=f"{base + i:08x}",
+            date=now - timedelta(days=1),
+            subject="hi",
+            sender=sender,
+            recipients=("me@x.y",),
+            labels=(label,),
+            body_hash=body_hash(f"body {base + i}"),
+            source="api",
+        )
+        store.put(rec, f"body {base + i}")
+    return store.root
+
+
+def _analyze_cfg(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[corpus]\ndir = "{tmp_path / "corpus"}"\n', encoding="utf-8")
+    return cfg
+
+
+def test_analyze_no_snapshot_withholds_candidates(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "Shipping" in result.stdout
+    assert "no-filter-snapshot" in result.stdout
+    assert "CANDIDATE" not in result.stdout
+    assert "no filters.json snapshot" in result.stderr
+
+
+def test_analyze_assume_no_filters_opens_gate(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "analyze",
+            "--config",
+            str(_analyze_cfg(tmp_path)),
+            "--assume-no-filters",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "CANDIDATE" in result.stdout
+    assert "Managed-Label candidates: Shipping" in result.stdout
+
+
+def test_analyze_json_shape(tmp_path: Path) -> None:
+    _seed_corpus(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "analyze",
+            "--config",
+            str(_analyze_cfg(tmp_path)),
+            "--assume-no-filters",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["messages"] == 60
+    shipping = next(m for m in payload["labels"] if m["label"] == "Shipping")
+    assert shipping["candidate"] is True
+
+
+def test_analyze_filter_covered_blocks(tmp_path: Path) -> None:
+    root = _seed_corpus(tmp_path)
+    import os
+
+    for name, payload in (
+        (
+            "filters.json",
+            '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["L1"]}}]',
+        ),
+        ("labels.json", '{"L1": "Shipping"}'),
+    ):
+        f = root / name
+        f.write_text(payload, encoding="utf-8")
+        os.chmod(f, 0o600)
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "filter-covered" in result.stdout
+    assert "CANDIDATE" not in result.stdout
+
+
+def test_analyze_corrupt_snapshot_exits_5(tmp_path: Path) -> None:
+    root = _seed_corpus(tmp_path)
+    (root / "filters.json").write_text("not json", encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "snapshot unreadable" in result.stderr
+
+
+def test_analyze_empty_corpus_is_friendly(tmp_path: Path) -> None:
+    (tmp_path / "corpus").mkdir()  # present but empty = friendly guidance
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "corpus is empty" in result.stdout
+
+
+def test_analyze_missing_corpus_dir_exits_5(tmp_path: Path) -> None:
+    # deepseek MINOR: a config typo must NOT read as an empty mailbox
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "missing or not a directory" in result.stderr
+
+
+def test_analyze_corpus_dir_is_a_file_exits_5(tmp_path: Path) -> None:
+    (tmp_path / "corpus").write_text("not a dir", encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+
+
+def test_analyze_records_undecodable_exits_5(tmp_path: Path) -> None:
+    root = _seed_corpus(tmp_path, n=2)
+    with (root / "records.jsonl").open("ab") as fh:
+        fh.write(b"\xff\xfe bad bytes\n")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_analyze_missing_bridge_withholds_candidates(tmp_path: Path) -> None:
+    # deepseek CRITICAL: filters.json without the labels.json bridge must
+    # NEVER surface filter-authored labels as CANDIDATE
+    root = _seed_corpus(tmp_path)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["L1"]}}]',
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "CANDIDATE" not in result.stdout
+    assert "bridge" in result.stderr
+
+
+def test_analyze_stale_bridge_withholds_too(tmp_path: Path) -> None:
+    root = _seed_corpus(tmp_path)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["GONE"]}}]',
+        encoding="utf-8",
+    )
+    (root / "labels.json").write_text('{"L1": "Shipping"}', encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "CANDIDATE" not in result.stdout and "bridge" in result.stderr
+
+
+def test_analyze_wrong_shape_sidecars_exit_5(tmp_path: Path) -> None:
+    # deepseek MAJOR: parseable-but-wrong-shape is exit 5, not a traceback
+    for payload in ("[42]", '{"not": "a list"}'):
+        root = _seed_corpus(tmp_path, n=2)
+        (root / "filters.json").write_text(payload, encoding="utf-8")
+        result = runner.invoke(
+            app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+        )
+        assert result.exit_code == 5 and "snapshot unreadable" in result.stderr
+        (root / "filters.json").unlink(missing_ok=True)
+        (root / "labels.json").unlink(missing_ok=True)
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text("[]", encoding="utf-8")
+    (root / "labels.json").write_text('["L1"]', encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5  # labels map wrong-shape raises too
+
+
+def test_analyze_contradictory_attestation_is_ignored_loudly(tmp_path: Path) -> None:
+    # deepseek MAJOR: evidence beats attestation, and the ignore is visible
+    root = _seed_corpus(tmp_path)
+    (root / "filters.json").write_text("[]", encoding="utf-8")
+    (root / "labels.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "analyze",
+            "--config",
+            str(_analyze_cfg(tmp_path)),
+            "--assume-no-filters",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "ignored" in result.stderr and "evidence beats attestation" in result.stderr
+
+
+def test_analyze_json_carries_posture_and_iso_dates(tmp_path: Path) -> None:
+    # deepseek MINOR: machine consumers must see WHY and parseable timestamps
+    root = _seed_corpus(tmp_path)
+    (root / "filters.json").write_text("[]", encoding="utf-8")
+    (root / "labels.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path)), "--json"],
+    )
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["filters_posture"] == "snapshot"
+    assert "T" in payload["summary"]["first_date"]  # ISO-8601
+
+
+def test_analyze_long_labels_are_not_truncated(tmp_path: Path) -> None:
+    # deepseek MINOR: distinct long names must not collide on screen
+    long_a = "A" * 40 + "-one"
+    long_b = "A" * 40 + "-two"
+    for name in (long_a, long_b):
+        _seed_corpus(tmp_path, n=3, label=name)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "analyze",
+            "--config",
+            str(_analyze_cfg(tmp_path)),
+            "--assume-no-filters",
+            "--min-total",
+            "1",
+            "--min-recent",
+            "1",
+        ],
+    )
+    assert long_a in result.stdout and long_b in result.stdout
+
+
+def test_stub_helper_keeps_the_reserved_exit_3() -> None:
+    # deepseek MINOR: the exit-3 contract stays unit-pinned even with an
+    # empty stub surface (train/eval land on it in Phase 1)
+    import gmail_labeler.cli as cli
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._stub("train")
+    assert exc.value.exit_code == 3
+
+
+def test_help_surface_is_clean() -> None:
+    for argv in (["--help"], ["dataset", "--help"]):
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 0
+
+
+def test_analyze_corrupt_records_exit_5(tmp_path: Path) -> None:
+    root = _seed_corpus(tmp_path, n=2)
+    with (root / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write("{{{ corrupt mid-line\n")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+
+
+def test_analyze_nonstring_label_ids_rejected(tmp_path: Path) -> None:
+    # deepseek MINOR: [42]-as-id must not bypass the bridge check
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": [42]}}]',
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "must be strings" in result.stderr
+
+
+def test_analyze_attested_posture_is_visible_in_text_mode(tmp_path: Path) -> None:
+    # deepseek MINOR: --assume-no-filters rests the gate on the attestation,
+    # and the human report must say so
+    _seed_corpus(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "analyze",
+            "--config",
+            str(_analyze_cfg(tmp_path)),
+            "--assume-no-filters",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "filters: attested-none" in result.stdout
+
+
+def test_analyze_bridge_incomplete_reason_not_misnamed(tmp_path: Path) -> None:
+    # deepseek NIT: with a snapshot present, the flag must name the BRIDGE
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["GONE"]}}]',
+        encoding="utf-8",
+    )
+    (root / "labels.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert "no-filter-snapshot" not in result.stdout
+    assert "bridge-incomplete" in result.stdout
+
+
+def test_analyze_json_keeps_engine_reasons_alongside_posture(tmp_path: Path) -> None:
+    # qwen MINOR1: the asymmetry is INTENTIONAL — engine vocabulary in
+    # reasons, real cause in filters_posture; pinning keeps it a decision,
+    # not an accident
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["GONE"]}}]',
+        encoding="utf-8",
+    )
+    (root / "labels.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path)), "--json"]
+    )
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["filters_posture"] == "bridge-incomplete"
+    assert all("no-filter-snapshot" in m["reasons"] for m in payload["labels"])
+    assert all("bridge-incomplete" not in m["reasons"] for m in payload["labels"])
+    assert "stale bridge" in result.stderr  # the NOTE names the real cause
+
+
+def test_analyze_nonlist_addlabelids_rejected(tmp_path: Path) -> None:
+    # qwen MINOR2: a dict-instead-of-list ids field must not attribute nothing
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": {"x": 1}}}]',
+        encoding="utf-8",
+    )
+    (root / "labels.json").write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "addLabelIds must be a list" in result.stderr
+
+
+def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
+    # deepseek NIT: the empty-corpus advice is the friendly line, not
+    # 'run dataset export to capture filters'
+    (tmp_path / "corpus").mkdir()
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert "no filters.json snapshot" not in result.stderr
+    assert "corpus is empty" in result.stdout
+
+
+def test_analyze_nonobject_action_rejected(tmp_path: Path) -> None:
+    # deepseek r4 MINOR: a filter whose action is unreadable must not
+    # contribute zero needed-ids and let the posture claim 'snapshot'
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "filters.json").write_text(
+        '[{"criteria": {"from": "shop@x.z"}, "action": "nope"}]',
+        encoding="utf-8",
+    )
+    result = runner.invoke(
+        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "action must be an object" in result.stderr

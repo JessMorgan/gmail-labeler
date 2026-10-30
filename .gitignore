@@ -1,0 +1,30 @@
+# Mail data — NEVER commit (the entire point of the privacy stance)
+.gyb-data/
+corpus/
+*.eml
+
+# Local configuration and state
+config.toml
+credentials.json
+*.sqlite
+*.sqlite3
+*.db
+state/
+
+# Python
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+site/
+uv-run-venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -6,6 +6,7 @@ corpus/
 # Local configuration and state
 config.toml
 credentials.json
+token.json
 *.sqlite
 *.sqlite3
 *.db

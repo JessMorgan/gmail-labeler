@@ -29,3 +29,5 @@ uv-run-venv/
 .vscode/
 .idea/
 .DS_Store
+# maintainer-private verified facts (never published)
+AGENTS.local.md

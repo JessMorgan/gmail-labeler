@@ -78,6 +78,5 @@ fail_under = 80
 include = ["src", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
-# The pure core is held to strict (CODING-STANDARDS); list grows as modules land,
-# starting with src/gmail_labeler/labels.py.
-strict = []
+# The pure core is held to strict (CODING-STANDARDS); list grows as modules land.
+strict = ["src/gmail_labeler/labels.py", "src/gmail_labeler/corpus_record.py"]

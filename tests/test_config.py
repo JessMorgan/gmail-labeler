@@ -354,6 +354,32 @@ def test_bands_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
             load_config(str(p))
 
 
+def test_bands_empty_raw_per_label_table_refused(tmp_path: Path) -> None:
+    # per_label = {} (an EMPTY dict) is refused like every other raw
+    # form: all() over an empty mapping is vacuously true, so the typed
+    # check alone would accept it (the inherited #21-surface bug)
+    p = _write(tmp_path, "[bands]\nper_label = {}\n")
+    with pytest.raises(ConfigError, match="reserved field name"):
+        load_config(str(p))
+
+
+def test_bands_handler_failure_still_collects_all_problems(
+    tmp_path: Path,
+) -> None:
+    # aggregation completeness: a handler/coercion failure must not skip
+    # the collection — the range problem on the OTHER default is
+    # collected in the same error (the raw scan runs before the handler)
+    p = _write(
+        tmp_path,
+        "[bands]\nmin_high_precision = 1.5\nmin_med_precision = [0.7]\n",
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "must be in [0.0, 1.0]" in msg  # the range problem (raw scan)
+    assert "got list" in msg  # the raw-type problem
+
+
 def test_bands_programmatic_per_label_gets_the_same_checks() -> None:
     # defense in depth: the declared per_label field (the programmatic
     # API — typed BandOverride values) gets the SAME tenth-grid, range,
@@ -404,10 +430,22 @@ def test_bands_label_key_stripped_and_bounded(tmp_path: Path) -> None:
     p = _write(tmp_path, '[bands."   "]\nmin_high_precision = 0.9\n')
     with pytest.raises(ConfigError, match="non-empty after stripping"):
         load_config(str(p))
-    long_key = "B" * 41
+    long_key = "B" * 257
     p = _write(tmp_path, f'[bands."{long_key}"]\nmin_high_precision = 0.9\n')
     with pytest.raises(ConfigError, match="longer than"):
         load_config(str(p))
+
+
+def test_bands_long_slash_nested_label_path_is_accepted(tmp_path: Path) -> None:
+    # the label ACCEPTANCE bound (256) is separate from the error-ECHO
+    # bound (40): GYB corpora carry deeply slash-nested Label Paths,
+    # and a valid 60-char path must be ACCEPTED and gated, not refused
+    long_path = "Money/Purchases/Online/Subscriptions/Streaming/Services"
+    assert len(long_path) == 55
+    p = _write(tmp_path, f'[bands."{long_path}"]\nmin_high_precision = 0.9\n')
+    cfg = load_config(str(p))
+    assert set(cfg.bands.per_label) == {long_path}
+    assert cfg.bands.per_label[long_path].min_high_precision == 0.9
 
 
 def test_bands_bool_target_rejected(tmp_path: Path) -> None:
@@ -609,6 +647,32 @@ def test_graduation_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
             load_config(str(p))
 
 
+def test_graduation_empty_raw_per_label_table_refused(tmp_path: Path) -> None:
+    # per_label = {} (an EMPTY dict) is refused like every other raw
+    # form: all() over an empty mapping is vacuously true, so the typed
+    # check alone would accept it (the inherited #21-surface bug)
+    p = _write(tmp_path, "[graduation]\nper_label = {}\n")
+    with pytest.raises(ConfigError, match="reserved field name"):
+        load_config(str(p))
+
+
+def test_graduation_handler_failure_still_collects_all_problems(
+    tmp_path: Path,
+) -> None:
+    # aggregation completeness: a handler/coercion failure must not skip
+    # the collection — the range problem on the OTHER default is
+    # collected in the same error (the raw scan runs before the handler)
+    p = _write(
+        tmp_path,
+        "[graduation]\nmin_examples = -1\nmin_precision = [0.9]\n",
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "must be >=" in msg  # the range problem (raw scan)
+    assert "got list" in msg  # the raw-type problem
+
+
 def test_graduation_programmatic_per_label_gets_the_same_checks() -> None:
     # defense in depth: the declared per_label field (the programmatic
     # API — typed GateOverride values) gets the SAME range and
@@ -659,10 +723,22 @@ def test_graduation_label_key_stripped_and_bounded(tmp_path: Path) -> None:
     p = _write(tmp_path, '[graduation."   "]\nmin_examples = 5\n')
     with pytest.raises(ConfigError, match="non-empty after stripping"):
         load_config(str(p))
-    long_key = "B" * 41
+    long_key = "B" * 257
     p = _write(tmp_path, f'[graduation."{long_key}"]\nmin_examples = 5\n')
     with pytest.raises(ConfigError, match="longer than"):
         load_config(str(p))
+
+
+def test_graduation_long_slash_nested_label_path_is_accepted(tmp_path: Path) -> None:
+    # the label ACCEPTANCE bound (256) is separate from the error-ECHO
+    # bound (40): GYB corpora carry deeply slash-nested Label Paths,
+    # and a valid 60-char path must be ACCEPTED and gated, not refused
+    long_path = "Money/Purchases/Online/Subscriptions/Streaming/Services"
+    assert len(long_path) == 55
+    p = _write(tmp_path, f'[graduation."{long_path}"]\nmin_examples = 5\n')
+    cfg = load_config(str(p))
+    assert set(cfg.graduation.per_label) == {long_path}
+    assert cfg.graduation.per_label[long_path].min_examples == 5
 
 
 def test_graduation_scalar_override_rejected(tmp_path: Path) -> None:

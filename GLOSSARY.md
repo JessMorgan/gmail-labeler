@@ -28,7 +28,15 @@ captured as training signal but never acted on retroactively.
 
 **Graduation**:
 A Managed Label's promotion from Shadow Pass to live application, earned by
-meeting its per-label evaluation gate on the temporal test split.
+meeting its per-label gates on the temporal test split (the future
+window): minimum examples AND minimum measured precision at the label's
+calibrated high band (a value EXACTLY at a gate passes — analyze's
+strict-gt precedent; a label whose band has no high threshold cannot
+graduate, and the med band never graduates anything by itself; unearned
+labels carry named reasons — `below-min-examples`, `precision-below-gate`,
+`no-high-band`). The gates are recomputed by `eval --graduation` and land
+as a human-confirm diff (old → new per label) before anything live
+changes (ADR-0005); the confirmed result is the Graduation Table.
 _Avoid_: go-live, enablement
 
 **Threshold Band**:
@@ -193,6 +201,23 @@ disagreements named). The config's per-label band targets
 (`[bands]`) ride in its per-label effective targets (provenance). The
 shadow pass and the daemon (later phases) read it.
 _Avoid_: bands file, threshold config
+
+**Graduation Table**:
+The versioned JSON artifact `eval --graduation --confirm-graduation`
+writes (opt-in — a bare `eval`, and `eval --graduation` without the
+confirm flag, never write it; the recompute posture: `train`/`eval` are
+the only recomputers, and only the confirm path writes the table). It
+carries the per-label gate results — examples, precision at the
+calibrated high band, the high/med thresholds, the effective gate
+targets, the graduated verdict, and the named reasons for unearned
+labels — bound to the checkpoint identity (vocabulary hash, corpus
+fingerprint, split manifest hash, encoder id: the Checkpoint Sidecar's
+fields, mirrored), the eval identity (split date, test example count),
+and the content hash of the Bands Artifact it was computed from; its
+content hash covers every field (the SplitManifest discipline), and a
+consumer verifying it against a disagreeing checkpoint/eval/bands
+REFUSES it (every field checked independently, all disagreements named).
+_Avoid_: graduation file, gate report
 
 **Model (seam)**:
 The `Model` Protocol — batch predict → per-label sigmoid scores over the

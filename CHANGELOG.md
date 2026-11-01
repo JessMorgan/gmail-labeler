@@ -107,6 +107,103 @@ does not ship releases yet.
   (fail loud). The config carries no path (the artifact path is
   the CLI's `--bands` argument), so the config-file relative-path rule
   has nothing to anchor here. GLOSSARY gains the Bands Artifact term.
+- Per-label Graduation gates (ticket #22): the pure core
+  (`graduation.py`, pyright strict) applies the gates to the measured
+  Eval Table against the calibrated Bands Artifact: a Managed Label
+  graduates when `examples >= min_examples` AND the measured precision
+  AT ITS CALIBRATED HIGH BAND THRESHOLD `>= min_precision`. The gate
+  operators MIRROR `analyze.py` exactly (the strict-gt precedent:
+  `total < min_total` / `dup_rate > max_dup_rate` — a value EXACTLY at
+  a gate passes, pinned by golden boundary tests). Unearned labels
+  carry named reasons (`below-min-examples`, `precision-below-gate`,
+  `no-high-band`); a label whose band has no high threshold cannot
+  graduate, and the med band never graduates anything by itself.
+  Gate targets are NOT tenth-grid (documented asymmetry with `[bands]`):
+  a band target must match the candidate grid (looked up in it), a gate
+  precision target is compared against measured values (any rational
+  tp/(tp+fp)) — range + bool refusals do apply. Deterministic total
+  order (label-sorted entries — same eval → byte-identical table, AC5).
+- Graduation Table (`graduation.py`): the versioned JSON artifact
+  (format version + content hash over every field — the
+  `dataset_build.SplitManifest` discipline: canonical dump, UTC
+  datetimes, `validate()` from BOTH entry paths) binding the gate
+  results to the checkpoint identity (vocabulary hash, corpus
+  fingerprint, split manifest hash, encoder id — the Checkpoint
+  Sidecar's fields, mirrored), the eval identity (split date, test
+  example count), and the `bands_content_hash` of the Bands Artifact
+  it was computed from (AC3). `verify_graduation` REFUSES a table that
+  disagrees with the checkpoint/eval/bands it is served against — every
+  field checked independently, all disagreements named in one
+  `GraduationRefusedError` (the sidecar doctrine). Same eval →
+  byte-identical table (AC5, pinned across re-runs).
+- `eval --graduation PATH` + `--confirm-graduation` (ticket #22): the
+  deliberate act that recomputes the Graduation Table and prints the
+  human-confirm diff (old → new per label, on stderr — the report/
+  `--out` byte-identity stays literally true; with `--json` the
+  proposal rides in the payload under the `graduation` key and stdout
+  stays exactly one parseable JSON object). Nothing applies itself:
+  without `--confirm-graduation` the run writes NOTHING (ADR-0005 —
+  no pipeline run ever mutates what is live by itself); the write is
+  the CLI-gated confirm act (0600 from creation, staging + atomic
+  replace, replacing an existing file announced on stderr, post-write
+  readback compared by content hash). The "existing" side of the diff
+  is read + parsed from the target file (absent/garbage target =
+  everything-vs-nothing baseline); an existing table bound to a
+  DIFFERENT identity is named in the diff (the disagreeing fields) and
+  refuses the confirm. The run must have bands available (the
+  precision-at-high comes from the run's calibration — computed
+  in-memory, written only with `--bands`), and a degraded corpus
+  (test records with missing body shards) refuses `--graduation` too —
+  the same serving-gate posture as `--bands`, sharing the guard.
+  Usage refusals up front (exit 2): `--confirm-graduation` without
+  `--graduation`; an empty path; `--graduation` and `--out` naming the
+  same file; `--bands` and `--graduation` naming the same file;
+  `--graduation` naming an existing directory; `--graduation` naming
+  the config file; and ANY `--graduation` target whose resolved path
+  lies inside the checkpoint dir (manifest, sidecar, weights) or the
+  corpus store (records index, labels/filters sidecars, bodies) — the
+  table must not live beside identity files (by resolved path — a link
+  named inside pointing outside is allowed and replaces the link).
+  Run-time refusals (exit 5, the report preserved on stdout): a
+  degraded corpus; a band calibration refusal (an unknown band
+  override label, a lying identity); a gate evaluation refusal (an
+  empty/duplicate Managed Label list, a Managed Label the vocabulary
+  does not carry — named, an unknown gate override label, a lying
+  bands/table identity); confirming over an existing table whose
+  identity fields disagree with the current run (refused BEFORE any
+  staging, the previous bytes intact); a write failure; a post-write
+  readback fault — the on-disk bytes do not parse back to a valid
+  table (a torn/corrupt write); or a readback mismatch — a valid table
+  whose content hash differs from the minted one, a concurrent
+  writer's signature. Config error → exit 4 (an out-of-range gate
+  value, a raw bool/string). The recompute posture is pinned:
+  `train`/`eval` are the only recomputers, and ONLY the confirm path
+  writes the table — a structural source-scan tripwire against named
+  mints (a tripwire, not a sandbox: getattr-construction and a
+  hand-rolled dict evade any string scan) + the behavioral pins (AC4).
+- Config `[graduation]` (ticket #22): the run's default gate values
+  (`min_examples` 10 / `min_precision` 0.9) + per-label overrides as
+  `[graduation."<label>"]` subtables (label names may carry slashes —
+  quoted TOML keys). The hardened config doctrine (the `[bands]`
+  precedent, reused): a single raw-seeing wrap validator collects
+  EVERY problem, refuses TOML bools AND strings on the raw value
+  (pydantic's lax coercion would silently turn `true` into 1 / 1.0 and
+  `"10"` into 10 — named, never coerced), out-of-range values
+  (`min_examples` >= 0, `min_precision` in [0.0, 1.0]), scalars under
+  a label name (named as unknown/typo'd keys), empty tables (a no-op
+  override is refused, not dropped), a raw `per_label` key (a reserved
+  field name — the label-path spelling is the only per-label form; the
+  declared field is the typed programmatic API and gets the same value
+  checks), blank/over-length label keys (keys are stripped — a padded
+  key must not survive to the gate evaluation), and the same label
+  named more than once (refused, not silently shadowed). `min_precision`
+  is NOT tenth-grid (the documented asymmetry with `[bands]` — a gate
+  target is compared against measured values, never looked up in the
+  candidate grid). The config carries no path (the table path is the
+  CLI's `--graduation` argument). GLOSSARY gains the Graduation Table
+  term and the Graduation entry carries the earned-by-gates +
+  identity-binding wording.
+
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):
   export stamps server `internalDate` vs MIME `Date`-header fallback
   distinctly, GYB import stamps its own source; pre-existing lines lacking

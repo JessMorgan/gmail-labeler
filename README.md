@@ -204,9 +204,10 @@ atomic replace, post-write readback compared by content hash).
 Refusals: up front (exit 2) `--confirm-graduation` without
 `--graduation`, an empty `--out`/`--bands`/`--graduation` path, a path
 equal to `--out` or `--bands`, an existing directory, the config file
-(for `--bands`, `--graduation`, or `--out`), and any target inside the
-checkpoint dir or the corpus store (by resolved path — the table must
-not live beside identity files); at run
+(for `--bands`, `--graduation`, or `--out`), and ANY target
+(`--out`, `--bands`, or `--graduation`) inside the checkpoint dir or
+the corpus store (by resolved path — the target must not live beside
+identity files); at run
 time (exit 5, the report preserved) a degraded corpus (test records
 missing body shards — the table feeds the serving gate, same posture
 as `--bands`), a band calibration refusal, a gate evaluation refusal
@@ -222,8 +223,10 @@ effect when the `--bands` artifact was already written this run); a
 post-write readback fault — the on-disk bytes do not parse back to a
 valid table (a torn/corrupt write); and a readback mismatch — a valid
 table whose content hash differs (a concurrent writer published a
-different table). Config error → exit 4 (an out-of-range gate value,
-a raw bool/string). With `--json` the proposal rides in the payload
+different table). The readback fault/mismatch messages say the write
+failed AFTER the target was replaced (the previous file may be gone;
+re-run to repair) — not "cannot write". Config error → exit 4 (an
+out-of-range gate value, a raw bool/string). With `--json` the proposal rides in the payload
 under the `graduation` key (stdout stays exactly one parseable JSON
 object); on a post-report refusal the base payload (the report,
 without the proposal) is emitted first — the report is never lost on

@@ -157,6 +157,16 @@ class BandsTargetRefusedError(Exception):
     serving-gate hardening — a clobber by a drifted run is a lie)."""
 
 
+class ArtifactReadbackError(OSError):
+    """The post-replace readback failed — the replace ALREADY happened
+    (the on-disk bytes do not parse back, or parse to a different
+    content hash). Distinct from a staging failure, where the previous
+    file is intact: the CLI's message must not say "cannot write" when
+    the target was in fact replaced (the previous file may be gone).
+    Subclasses ``OSError`` so the existing write-failure mapping still
+    catches it (exit 5)."""
+
+
 def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> None:
     """Write the Bands Artifact (ticket #21): 0600 from creation,
     EXCLUSIVE staging + atomic replace — a failure leaves any PREVIOUS
@@ -264,7 +274,7 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
         try:
             readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
-            raise OSError(
+            raise ArtifactReadbackError(
                 f"artifact readback fault: {path} does not parse back "
                 f"to a valid artifact ({type(e).__name__})"
             ) from e
@@ -272,7 +282,7 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
             # it DID parse — a valid artifact whose content hash
             # differs: a concurrent writer published a different
             # artifact (the fault branch above is the torn-write one)
-            raise OSError(
+            raise ArtifactReadbackError(
                 f"artifact readback mismatch: {path} is a valid "
                 "artifact whose content hash differs from the minted "
                 "one (a concurrent writer published a different "
@@ -384,7 +394,7 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
         try:
             readback = GraduationTable.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
-            raise OSError(
+            raise ArtifactReadbackError(
                 f"table readback fault: {path} does not parse back "
                 f"to a valid table ({type(e).__name__})"
             ) from e
@@ -392,7 +402,7 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
             # it DID parse — a valid table whose content hash
             # differs: a concurrent writer published a different
             # table (the fault branch above is the torn-write one)
-            raise OSError(
+            raise ArtifactReadbackError(
                 f"table readback mismatch: {path} is a valid "
                 "table whose content hash differs from the minted "
                 "one (a concurrent writer published a different "
@@ -1300,10 +1310,21 @@ def eval(
             err=True,
         )
         raise typer.Exit(code=2) from None
-    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+    # the config path is bound ONCE for the refusal checks below
+    # (find_config is called up to 4x per run otherwise)
+    config_path = find_config(config).resolve()
+    for flag, target in (
+        ("--out", out),
+        ("--bands", bands),
+        ("--graduation", graduation),
+    ):
         if target is None:
             continue
-        if out is not None and Path(target).resolve() == Path(out).resolve():
+        if (
+            flag != "--out"
+            and out is not None
+            and (Path(target).resolve() == Path(out).resolve())
+        ):
             typer.echo(
                 f"eval failed: {flag} and --out must name different files",
                 err=True,
@@ -1316,15 +1337,16 @@ def eval(
             # front, like the other usage refusals
             typer.echo(
                 f"eval failed: {flag} {target!r} names an existing "
-                f"directory ({target_path}) \u2014 the artifact is a file",
+                f"directory ({target_path}) \u2014 the target is a file",
                 err=True,
             )
             raise typer.Exit(code=2) from None
-        # the artifact must not live beside identity files: ANY target
-        # inside the checkpoint dir or the corpus store is refused
-        # (both sides RESOLVED — a symlink whose name sits outside but
-        # points inside is caught). The canonical artifact location
-        # lands with the daemon phase; until then, any other path.
+        # the target must not live beside identity files: ANY target
+        # (report OR artifact) inside the checkpoint dir or the corpus
+        # store is refused (both sides RESOLVED — a symlink whose name
+        # sits outside but points inside is caught). The canonical
+        # artifact location lands with the daemon phase; until then,
+        # any other path.
         for root, what in (
             (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
             (Path(cfg.corpus.dir).resolve(), "the corpus store"),
@@ -1332,30 +1354,18 @@ def eval(
             if target_path == root or root in target_path.parents:
                 typer.echo(
                     f"eval failed: {flag} {target!r} lives inside {what} "
-                    f"({root}) \u2014 the artifact must not live beside "
+                    f"({root}) \u2014 the target must not live beside "
                     "identity files; use any other path",
                     err=True,
                 )
                 raise typer.Exit(code=2) from None
-        if target_path == find_config(config).resolve():
+        if target_path == config_path:
             typer.echo(
                 f"eval failed: {flag} {target!r} names the config file "
-                f"({find_config(config).resolve()}) \u2014 refusing to "
-                "destroy it",
+                f"({config_path}) \u2014 refusing to destroy it",
                 err=True,
             )
             raise typer.Exit(code=2) from None
-    # --out naming the config file would destroy the identity material
-    # this very run just read (the same exact-path refusal as the
-    # artifact targets — the report write is no exception)
-    if out is not None and Path(out).resolve() == find_config(config).resolve():
-        typer.echo(
-            f"eval failed: --out {out!r} names the config file "
-            f"({find_config(config).resolve()}) \u2014 refusing to "
-            "destroy it",
-            err=True,
-        )
-        raise typer.Exit(code=2) from None
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         typer.echo(
@@ -1801,6 +1811,18 @@ def eval(
                 if as_json:
                     _emit_json_payload()  # the report is never lost
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+            except ArtifactReadbackError as e:
+                # the replace ALREADY happened — "cannot write" would
+                # be a lie; the previous file may be gone
+                typer.echo(
+                    f"eval failed: --bands write failed AFTER the target "
+                    f"was replaced: {e}; the previous file may be gone; "
+                    "re-run to repair",
+                    err=True,
+                )
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
+                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             except OSError as e:
                 # the helper already cleaned up its (mkstemp-named)
                 # staging; the refusal reason prints BEFORE the json
@@ -1836,18 +1858,24 @@ def eval(
             graduation_path = Path(graduation)
             existing: GraduationTable | None = None
             unparseable_existing = False
+            unreadable_existing = False
             if graduation_path.is_file():
+                # the file EXISTS: the diff says what is wrong with it
+                # (honesty about what is on disk) — an UNREADABLE file
+                # (I/O failure) is named differently from an
+                # UNPARSEABLE one (parse failure); "no existing table"
+                # is reserved for the absent target
                 try:
-                    existing = GraduationTable.from_json(
-                        graduation_path.read_text(encoding="utf-8")
-                    )
-                except (ValueError, OSError):
-                    # a garbage target is the baseline — but the file
-                    # EXISTS: the diff says "does not parse", not
-                    # "no existing table" (honesty about what is on
-                    # disk)
+                    text = graduation_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
                     existing = None
-                    unparseable_existing = True
+                    unreadable_existing = True
+                else:
+                    try:
+                        existing = GraduationTable.from_json(text)
+                    except ValueError:
+                        existing = None
+                        unparseable_existing = True
             disagreeing: tuple[str, ...] = ()
             if existing is not None:
                 # the identity fields are named in ONE place
@@ -1861,6 +1889,7 @@ def eval(
                     path=str(graduation),
                     disagreeing_fields=disagreeing,
                     unparseable_existing=unparseable_existing,
+                    unreadable_existing=unreadable_existing,
                 ),
                 err=True,
                 nl=False,
@@ -1880,6 +1909,25 @@ def eval(
                     # artifact was already written this run
                     typer.echo(
                         f"eval failed: --graduation refused: {e}"
+                        + (
+                            f" (the --bands artifact was already written at {bands})"
+                            if bands is not None
+                            else ""
+                        ),
+                        err=True,
+                    )
+                    if as_json:
+                        # the report is never lost — and the proposal
+                        # rides (the computation succeeded)
+                        _emit_json_payload(proposal)
+                    raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+                except ArtifactReadbackError as e:
+                    # the replace ALREADY happened — "cannot write"
+                    # would be a lie; the previous file may be gone
+                    typer.echo(
+                        f"eval failed: --graduation write failed AFTER "
+                        f"the target was replaced: {e}; the previous "
+                        "file may be gone; re-run to repair"
                         + (
                             f" (the --bands artifact was already written at {bands})"
                             if bands is not None

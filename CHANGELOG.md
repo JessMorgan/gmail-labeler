@@ -97,10 +97,12 @@ does not ship releases yet.
   override is refused, not dropped), a raw `per_label` key (a
   reserved field name — the label-path spelling is the only
   per-label form; an EMPTY raw table is the typed default and is
-  accepted — the model_dump round-trip produces exactly that
-  form — while a non-empty raw table stays refused; the
-  declared field is the typed programmatic API and gets the same
-  value checks), blank/over-length label keys
+  accepted — configs WITHOUT per-label overrides round-trip
+  through model_dump() -> model_validate, while a non-empty raw
+  table stays refused and a populated dump is refused by design
+  (the typed construction — BandOverride values — is the
+  programmatic API); the declared field gets the same value
+  checks), blank/over-length label keys
   (keys are stripped — a padded key must not survive to
   calibration), and the same label named more than once (refused,
   not silently shadowed); every problem is reported together (a
@@ -170,8 +172,10 @@ does not ship releases yet.
   readback compared by content hash). The "existing" side of the diff
   is read + parsed from the target file (absent target = the
   everything-vs-nothing baseline; an existing file that does not
-  parse as a Graduation Table is named as such, not "no existing
-  table"); an existing table bound to a DIFFERENT identity is named
+  parse as a Graduation Table is named as such, and an UNREADABLE
+  existing file (I/O failure) is named as unreadable — not
+  "no existing table", and not misdiagnosed as a parse failure); an
+  existing table bound to a DIFFERENT identity is named
   in the diff (the disagreeing fields) and refuses the confirm. The
   diff lines carry the EFFECTIVE gate targets + the measured values
   (examples, precision@high) — a gate change (min_examples 10 →
@@ -190,10 +194,10 @@ does not ship releases yet.
   `--graduation` and `--out` naming the
   same file; `--bands` and `--graduation` naming the same file;
   `--graduation` naming an existing directory; `--graduation` naming
-  the config file; `--out` naming the config file (the report write
-  is no exception to the exact-path refusal); and ANY
-  `--graduation` target whose resolved path lies inside the checkpoint
-  dir (manifest, sidecar, weights) or the
+  the config file (for `--bands`, `--graduation`, or `--out`); and
+  ANY target (`--out`, `--bands`, or `--graduation`) whose resolved
+  path lies inside the checkpoint dir (manifest, sidecar, weights) or
+  the
   corpus store (records index, labels/filters sidecars, bodies) — the
   table must not live beside identity files (by resolved path — a link
   named inside pointing outside is allowed and replaces the link).
@@ -214,7 +218,10 @@ does not ship releases yet.
   run); a post-write readback fault — the on-disk bytes do not parse
   back to a valid table (a torn/corrupt write); or a readback
   mismatch — a valid table whose content hash differs from the
-  minted one, a concurrent writer's signature. Config error → exit
+  minted one, a concurrent writer's signature. The readback
+  fault/mismatch messages say the write failed AFTER the target was
+  replaced (the replace already happened — the previous file may be
+  gone; re-run to repair), not "cannot write". Config error → exit
   4 (an out-of-range gate value, a raw bool/string). The recompute
   posture is pinned:
   `train`/`eval` are the only recomputers, and ONLY the confirm path
@@ -233,11 +240,12 @@ does not ship releases yet.
   a label name (named as unknown/typo'd keys), empty tables (a no-op
   override is refused, not dropped), a raw `per_label` key (a reserved
   field name — the label-path spelling is the only per-label form; an
-  EMPTY raw table is the typed default and is accepted — the
-  model_dump round-trip produces exactly that form — while a
-  non-empty raw table stays refused; the declared field is the typed
-  programmatic API and gets the same value checks), blank/over-length
-  label keys (keys are stripped — a padded
+  EMPTY raw table is the typed default and is accepted — configs
+  WITHOUT per-label overrides round-trip through model_dump() ->
+  model_validate, while a non-empty raw table stays refused and a
+  populated dump is refused by design (the typed construction —
+  GateOverride values — is the programmatic API); the declared field
+  gets the same value checks), blank/over-length label keys (keys are stripped — a padded
   key must not survive to the gate evaluation), and the same label
   named more than once (refused, not silently shadowed). `min_precision`
   is NOT tenth-grid (the documented asymmetry with `[bands]` — a gate

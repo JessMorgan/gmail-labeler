@@ -136,6 +136,9 @@ does not ship releases yet.
 - Design: ADR-0007 (the Corpus is a revision log) and ADR-0008 (the Sync
   Cursor is sync's ledger) for spec #64 (Label Sync), with glossary terms
   Backfill, Label Sync, Sync Cursor, Revision, Resolved view, and Compaction.
+- `docs/ROADMAP.md` — the phase plan of record (Phase 0 remnants →
+  Phase 1 → Phase 2 → explicitly-parked Phase 3); the README's
+  phase-plan pointer now links there (#15).
 
 ### Changed
 

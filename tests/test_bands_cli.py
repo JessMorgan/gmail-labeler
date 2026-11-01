@@ -8,6 +8,7 @@ spine, invariant #9).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -540,18 +541,16 @@ def test_eval_bands_readback_fault_exits_5(
     # on-disk bytes — a torn/corrupt write) is a named exit-5
     # operation failure, never an uncaught ValueError traceback (exit
     # 1), and the report is preserved
-    from gmail_labeler.thresholds import BandsArtifact
-
     _seed_corpus(tmp_path)
     assert _run_train(tmp_path, monkeypatch).exit_code == 0
+
+    def _boom(cls, text: str) -> BandsArtifact:
+        raise ValueError("bands field invalid: simulated torn write")
+
     monkeypatch.setattr(
         BandsArtifact,
         "from_json",
-        classmethod(
-            lambda cls, text: (_ for _ in ()).throw(
-                ValueError("bands field invalid: simulated torn write")
-            )
-        ),
+        classmethod(_boom),
     )
     out = tmp_path / "bands.json"
     result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
@@ -566,10 +565,6 @@ def test_eval_bands_readback_mismatch_exits_5(
 ) -> None:
     # the true mismatch: the readback parses but its content_hash
     # differs from the minted artifact — exit 5, named
-    import dataclasses
-
-    from gmail_labeler.thresholds import BandsArtifact
-
     _seed_corpus(tmp_path)
     assert _run_train(tmp_path, monkeypatch).exit_code == 0
     # any parseable artifact with a DIFFERENT stored hash

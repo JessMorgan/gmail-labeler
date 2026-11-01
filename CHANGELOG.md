@@ -152,10 +152,14 @@ does not ship releases yet.
   stays exactly one parseable JSON object — on a post-report refusal
   the BASE payload (the report, without the proposal) is emitted
   first, so the report is never lost on stdout; on a graduation write
-  failure the proposal rides, since the computation succeeded). The
-  `--out` file lands BEFORE the serving-gate acts, so a run that later
-  refuses still replaces a previous report file (the refusal is about
-  the artifacts, not the report). Nothing applies itself:
+  failure AND a foreign-bound confirm refusal the proposal rides,
+  since the computation succeeded; the stderr refusal reason prints
+  BEFORE the json emit, so an emit failure cannot swallow the cause).
+  The `--out` file lands BEFORE the serving-gate acts in TEXT mode
+  and at the payload emit (after the acts) in `--json` mode — in
+  both, a run that later refuses still replaces a previous report
+  file (the refusal is about the artifacts, not the report). Nothing
+  applies itself:
   without `--confirm-graduation` the run writes NOTHING (ADR-0005 —
   no pipeline run ever mutates what is live by itself); the write is
   the CLI-gated confirm act (0600 from creation, staging + atomic
@@ -170,7 +174,8 @@ does not ship releases yet.
   (test records with missing body shards) refuses `--graduation` too —
   the same serving-gate posture as `--bands`, sharing the guard.
   Usage refusals up front (exit 2): `--confirm-graduation` without
-  `--graduation`; an empty path; `--graduation` and `--out` naming the
+  `--graduation`; an empty `--out`/`--bands`/`--graduation` path;
+  `--graduation` and `--out` naming the
   same file; `--bands` and `--graduation` naming the same file;
   `--graduation` naming an existing directory; `--graduation` naming
   the config file; and ANY `--graduation` target whose resolved path
@@ -184,14 +189,20 @@ does not ship releases yet.
   empty/duplicate Managed Label list, a Managed Label the vocabulary
   does not carry — named, an unknown gate override label, a lying
   bands/table identity, a bands artifact whose high band has no
-  measured predictions on the table); confirming over an existing table whose
+  measured predictions on the table); an existing target that parses
+  as the SIBLING artifact (a Bands Artifact for `--graduation`, a
+  Graduation Table for `--bands` — refused naming the confusion,
+  before any staging; garbage that parses as NOTHING keeps the
+  NOTICE-replace posture); confirming over an existing table whose
   identity fields disagree with the current run (refused BEFORE any
-  staging, the previous bytes intact); a write failure; a post-write
-  readback fault — the on-disk bytes do not parse back to a valid
-  table (a torn/corrupt write); or a readback mismatch — a valid table
-  whose content hash differs from the minted one, a concurrent
-  writer's signature. Config error → exit 4 (an out-of-range gate
-  value, a raw bool/string). The recompute posture is pinned:
+  staging, the previous bytes intact); a write failure (naming the
+  partial effect when the `--bands` artifact was already written this
+  run); a post-write readback fault — the on-disk bytes do not parse
+  back to a valid table (a torn/corrupt write); or a readback
+  mismatch — a valid table whose content hash differs from the
+  minted one, a concurrent writer's signature. Config error → exit
+  4 (an out-of-range gate value, a raw bool/string). The recompute
+  posture is pinned:
   `train`/`eval` are the only recomputers, and ONLY the confirm path
   writes the table — a structural source-scan tripwire against named
   mints (a tripwire, not a sandbox: getattr-construction and a

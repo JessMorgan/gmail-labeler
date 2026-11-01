@@ -676,6 +676,163 @@ def test_eval_graduation_json_refused_confirm_preserves_report_with_proposal(
     assert "--graduation refused" in result.stderr
 
 
+def test_eval_out_empty_path_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # an empty --out would resolve to the cwd (and write a stray
+    # staging file there) — a usage error (exit 2) up front, before
+    # any corpus work
+    import os
+
+    cwd_files = set(os.listdir(Path.cwd()))
+    result, _factory = _run_eval(tmp_path, "--out", " ", monkeypatch=monkeypatch)
+    assert result.exit_code == 2
+    assert "non-empty" in result.stderr
+    assert "test examples=6" not in result.stdout  # pre-report refusal
+    assert set(os.listdir(Path.cwd())) == cwd_files  # no stray file in cwd
+
+
+def test_eval_graduation_sibling_bands_target_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # type-confusion honesty: a target that parses as the SIBLING
+    # artifact (a Bands Artifact) is a KNOWN artifact, not garbage —
+    # deleting it behind the NOTICE would destroy identity material;
+    # the write refuses, naming the confusion (exit 5, pre-staging)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    target = tmp_path / "artifact.json"
+    r1, _f1 = _run_eval(
+        tmp_path, "--bands", str(target), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert r1.exit_code == 0, r1.stderr
+    bytes_a = target.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(target),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    assert "is a Bands Artifact, not a Graduation Table" in result.stderr
+    assert "refusing to delete it" in result.stderr
+    assert target.read_bytes() == bytes_a  # the bands artifact intact
+
+
+def test_eval_bands_sibling_graduation_target_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the symmetric case: a target that parses as a Graduation Table
+    # is refused by the --bands write, naming the confusion
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    target = tmp_path / "artifact.json"
+    r1, _f1 = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(target),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert r1.exit_code == 0, r1.stderr
+    bytes_a = target.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(target), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert result.exit_code == 5
+    assert "is a Graduation Table, not a Bands Artifact" in result.stderr
+    assert "refusing to delete it" in result.stderr
+    assert target.read_bytes() == bytes_a  # the table intact
+
+
+def test_eval_graduation_refusal_names_partial_bands_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # partial-effect honesty: when --confirm-graduation refuses AFTER a
+    # successful --bands write, the exit-5 message names the partial
+    # effect. The scenario: a [bands] override changes the bands
+    # CONTENT (the bands_content_hash identity field) while the six
+    # eval identity fields stay the same — the bands write succeeds
+    # (NOTICE replace), the graduation table is foreign-bound
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg1 = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    bands_out = tmp_path / "bands.json"
+    grad_out = tmp_path / "graduation.json"
+    r1, _f1 = _run_eval(
+        tmp_path,
+        "--bands",
+        str(bands_out),
+        "--graduation",
+        str(grad_out),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg1,
+    )
+    assert r1.exit_code == 0, r1.stderr
+    cfg2 = _eval_cfg(
+        tmp_path,
+        graduation="min_examples = 3\n",
+        bands='[bands."Shipping"]\nmin_high_precision = 0.5\n',
+    )
+    r2, _f2 = _run_eval(
+        tmp_path,
+        "--bands",
+        str(bands_out),
+        "--graduation",
+        str(grad_out),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg2,
+    )
+    assert r2.exit_code == 5
+    assert "--graduation refused" in r2.stderr
+    assert "bands_content_hash" in r2.stderr  # the named disagreeing field
+    assert "the --bands artifact was already written" in r2.stderr  # the partial effect
+
+
+def test_eval_graduation_json_out_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --json + --out + refusal: the --out file lands at the payload
+    # emit (AFTER the serving-gate acts, in json mode); on a write
+    # failure the proposal rides in the payload (the computation
+    # succeeded); stdout is exactly one parseable JSON object; exit
+    # 5; no staging residue
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    report = tmp_path / "report.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--out",
+        str(report),
+        "--graduation",
+        str(tmp_path / "no" / "such" / "dir" / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    assert "cannot write --graduation" in result.stderr
+    payload = json.loads(result.stdout)  # one parseable JSON object
+    assert payload["test_examples"] == 6
+    # on a WRITE failure the proposal rides (the computation
+    # succeeded) — the same proposal in the --out file
+    assert payload["graduation"]["test_examples"] == 6
+    assert report.is_file()  # the --out file landed at the emit
+    file_payload = json.loads(report.read_text(encoding="utf-8"))
+    assert file_payload["test_examples"] == 6
+    assert file_payload["graduation"]["test_examples"] == 6
+    assert list(tmp_path.glob("report.json.*")) == []  # no staging residue
+
+
 def test_eval_graduation_out_file_lands_before_refusal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -63,7 +63,7 @@ does not ship releases yet.
     Label name collision (the BARE ValueError per the Protocol
     contract) refuses with exit 4 NAMING the offending `[labels]`
     key. SIGTERM/SIGINT shut the loop down gracefully (the current
-    page completes to its commit point, exit 0; mid-sleep exits
+    delta completes to its commit point, exit 0; mid-sleep exits
     immediately, cursor untouched); `[gmail]
     history_poll_seconds` drives the interruptible sleep. Exit-code
     contract 0/2/3/4/5 per the project surface (4 = auth/config
@@ -104,8 +104,9 @@ does not ship releases yet.
     total order); skip-present earns no row and no Tier Labels (empty
     plan → no API call — invariant #2, crash-retry idempotent); a
     DATA-PATH compose error means no write for that message plus a
-    counted warning carrying the message id, label, and score (body-free
-    by construction) — caller bugs and internal-contradiction
+    counted warning naming the message id and the plan detail (label and
+    score where the failure shape carries them; body-free by
+    construction) — caller bugs and internal-contradiction
     guards RAISE instead (the three-class model; the no-write holds
     for all three, invariant #1); every resolved id is screened
     through `is_system_label_id` (the composition-level guard on top

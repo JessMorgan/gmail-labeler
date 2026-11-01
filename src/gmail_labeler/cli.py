@@ -3488,13 +3488,15 @@ def daemon(
     # removes it (a daemon run must not leak handlers, the signal
     # precedent above). caplog pins keep working: propagation to the
     # root is untouched.
+    store_db = AppDB(db_path)
     daemon_log = logging.getLogger("gmail_labeler.daemon")
     log_handler = logging.StreamHandler(sys.stderr)
     log_handler.setLevel(logging.INFO)
     previous_log_level = daemon_log.level
+    # propagation stays ON (the caplog pins ride it); today no root
+    # handler exists, so nothing double-prints (verified in review)
     daemon_log.setLevel(logging.INFO)
     daemon_log.addHandler(log_handler)
-    store_db = AppDB(db_path)
     try:
         store_db.open()
         daemon_loop(

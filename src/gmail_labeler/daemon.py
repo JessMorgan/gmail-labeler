@@ -331,6 +331,13 @@ def _run_tick(
     # checkpoint)
     try:
         score_rows = model.predict([text for _, _, text in fetched])
+        # the CONTAINER check precedes the count check (F2 round-2):
+        # len() on a generator would itself raise TypeError
+        if not isinstance(score_rows, Sized):
+            raise _PredictionShapeError(
+                "the model returned an unsized score-row container "
+                "(not a sequence) — checkpoint/recipe defect"
+            )
         if len(score_rows) != len(fetched):
             raise _PredictionShapeError(
                 f"the model returned {len(score_rows)} score rows for "
@@ -342,11 +349,21 @@ def _run_tick(
         # kill the loop. Divergence from shadow's one-shot posture (cli.py
         # treats a width defect as exit-1 'a bug'): the daemon is a
         # long-lived service — hold, warn, keep the cursor.
-        # Sized checks FIRST (F2 MINOR 1): a flat vector served as the
-        # whole batch (len == texts but rows are floats) would raise
-        # TypeError from len(row) — outside the caught tuple, exit 1.
-        # Every shape defect must land in _PredictionShapeError territory.
-        vocab_len = len(model.vocabulary)
+        # Sized checks FIRST (F2 MINOR 1 + round-2): a flat vector
+        # served as the whole batch (len == texts but rows are floats)
+        # raised TypeError from len(row), and an unsized CONTAINER or a
+        # non-iterable vocabulary from their len/tuple calls — all
+        # outside the caught tuple, exit 1. Every shape defect lands in
+        # _PredictionShapeError territory: the checks are TOTAL.
+        try:
+            vocab = tuple(model.vocabulary)  # materialized ONCE (the
+            # compose zip below rides this, never the live attribute)
+        except TypeError as e:
+            raise _PredictionShapeError(
+                f"the model vocabulary is not iterable ({type(e).__name__}) "
+                f"— checkpoint/recipe defect"
+            ) from e
+        vocab_len = len(vocab)
         if any(
             not isinstance(row, Sized) or len(row) != vocab_len for row in score_rows
         ):
@@ -385,7 +402,7 @@ def _run_tick(
     for (message_id, present, _text), score_row in zip(
         fetched, score_rows, strict=True
     ):
-        scores = dict(zip(model.vocabulary, score_row, strict=True))
+        scores = dict(zip(vocab, score_row, strict=True))
         plan = plan_message_write(
             message_id,
             scores=scores,

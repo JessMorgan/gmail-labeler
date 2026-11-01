@@ -1018,6 +1018,37 @@ def test_prediction_non_iterable_vocabulary_holds(
     db.close()
 
 
+def test_prediction_sized_but_uniterable_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 review NIT (round 2): a row with __len__ but no __iter__ passes
+    # the Sized+width checks and raises TypeError from the compose zip
+    # — the Iterable term closes it into the shape arm
+    caplog.set_level(logging.WARNING)
+
+    class _LenOnly:
+        def __len__(self) -> int:
+            return 2
+
+    class _OddRows(FakeModel):
+        def predict(self, texts):  # (lying wire shape)
+            self.calls.append(tuple(texts))
+            return tuple(_LenOnly() for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_OddRows(VOCAB, scores={})) == 0
+    assert db.get_history_cursor() == 777  # held, loop alive
+    assert "does not align" in caplog.text
+    db.close()
+
+
 def test_stop_flag_during_write_capture_drains_and_commits(tmp_path: Path) -> None:
     # F2 NIT (ds probe: correct behavior, no node): the stop is
     # observed after the message's capture (the per-message check) and

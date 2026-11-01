@@ -10,6 +10,7 @@ no command is stubbed; scripts can branch on 0/2/4/5 today.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -152,7 +153,11 @@ def _write_out_report(out: str, file_text: str) -> None:
             os.fsync(fh.fileno())
         os.replace(staging, str(target))  # atomic on POSIX
     except OSError:
-        staging.unlink(missing_ok=True)  # best-effort staging cleanup
+        # the cleanup is best-effort: an unlink failure must not
+        # REPLACE the primary error (it would surface as a new
+        # "cannot write" cause that masks the real one)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
 
 
@@ -274,8 +279,11 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
         # from_json refuses a corrupt/torn file FIRST (ValueError —
         # self-inconsistent bytes never reach the hash comparison);
         # that refusal is the same named operation failure, not a
-        # traceback. The OSError branch below is the I/O guard
-        # (concurrent writer, disk error) — not the torn-write guard.
+        # traceback. The OUTER `except OSError` (staging cleanup +
+        # re-raise) is the I/O guard (concurrent writer, disk error)
+        # — not the torn-write guard; the readback's own
+        # `except OSError` (inside the try) is the post-replace
+        # read-failure guard, wrapped into ArtifactReadbackError.
         try:
             readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
@@ -305,7 +313,11 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
                 "artifact)"
             )
     except OSError:
-        staging.unlink(missing_ok=True)  # best-effort staging cleanup
+        # the cleanup is best-effort: an unlink failure must not
+        # REPLACE the primary error (it would surface as a new
+        # "cannot write" cause that masks the real one)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
 
 
@@ -405,8 +417,11 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
         # from_json refuses a corrupt/torn file FIRST (ValueError —
         # self-inconsistent bytes never reach the hash comparison);
         # that refusal is the same named operation failure, not a
-        # traceback. The OSError branch below is the I/O guard
-        # (concurrent writer, disk error) — not the torn-write guard.
+        # traceback. The OUTER `except OSError` (staging cleanup +
+        # re-raise) is the I/O guard (concurrent writer, disk error)
+        # — not the torn-write guard; the readback's own
+        # `except OSError` (inside the try) is the post-replace
+        # read-failure guard, wrapped into ArtifactReadbackError.
         try:
             readback = GraduationTable.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
@@ -435,7 +450,11 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
                 "table)"
             )
     except OSError:
-        staging.unlink(missing_ok=True)  # best-effort staging cleanup
+        # the cleanup is best-effort: an unlink failure must not
+        # REPLACE the primary error (it would surface as a new
+        # "cannot write" cause that masks the real one)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
 
 

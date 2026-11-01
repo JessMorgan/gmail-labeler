@@ -553,6 +553,20 @@ def build_artifact(
     if split_date.tzinfo is None:
         raise ValueError("split_date must be timezone-aware")
     split_date = split_date.astimezone(UTC)  # canonical instant in the artifact
+    for label_bands, (target_label, _effective) in zip(
+        bands.labels, bands.targets, strict=True
+    ):
+        if label_bands.label != target_label:
+            # the entries zip labels and targets POSITIONALLY — a
+            # swapped/misaligned targets tuple would mint per-label
+            # targets for the WRONG labels, and validate() cannot see
+            # it (the entry's targets are never re-checked against the
+            # label) — refuse the lying alignment
+            raise ValueError(
+                f"bands.targets for {target_label!r} do not align with "
+                f"bands.labels' {label_bands.label!r} — refusing to mint "
+                "per-label targets for the wrong labels"
+            )
     entries = tuple(
         BandsLabelEntry(
             label=label_bands.label,

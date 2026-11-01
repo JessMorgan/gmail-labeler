@@ -414,11 +414,123 @@ def test_eval_bands_same_path_as_sidecar_is_a_usage_error(
         tmp_path, "--bands", str(sidecar), monkeypatch=monkeypatch
     )
     assert result.exit_code == 2
-    assert "checkpoint sidecar" in result.stderr
+    assert "checkpoint directory" in result.stderr
     # the sidecar is intact (still the checkpoint's identity, not an
     # artifact)
     sidecar_json = json.loads(sidecar.read_text(encoding="utf-8"))
     assert "vocabulary_hash" in sidecar_json
+
+
+def test_eval_bands_inside_checkpoint_dir_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the generalized identity-file guard: ANY target inside the
+    # checkpoint dir is refused — the split manifest is identity
+    # material the garbage-tolerance NOTICE branch cannot see (the
+    # reviewer repro: eval --bands <ckpt>/manifest.json used to exit
+    # 0 and destroy it)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    manifest = tmp_path / "ckpt" / "manifest.json"
+    bytes_before = manifest.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(manifest), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "checkpoint" in result.stderr
+    assert "test examples=6" not in result.stdout  # pre-report refusal
+    assert manifest.read_bytes() == bytes_before  # bytes intact
+
+
+def test_eval_bands_inside_corpus_store_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the store's identity files (labels.json, filters.json,
+    # records.jsonl, bodies) are equally destroyable — refused
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    labels = tmp_path / "corpus" / "labels.json"
+    bytes_before = labels.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(labels), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "corpus store" in result.stderr
+    assert labels.read_bytes() == bytes_before  # bytes intact
+
+
+def test_eval_bands_symlink_into_checkpoint_dir_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a symlink whose NAME sits outside the checkpoint dir but POINTS
+    # inside it: both sides are resolved, so the guard catches it (an
+    # unresolved check would let the clobber through)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    sidecar = tmp_path / "ckpt" / "sidecar.json"
+    bytes_before = sidecar.read_bytes()
+    link = tmp_path / "bands-link.json"
+    os.symlink(sidecar, link)
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(link), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "checkpoint" in result.stderr
+    assert sidecar.read_bytes() == bytes_before  # the target intact
+
+
+def test_eval_bands_readback_is_hash_based(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # readback equality is by CONTENT HASH, not dataclass equality:
+    # the canonical payload serializes reasons sorted, so a
+    # reasons-order difference is the same meaning — a dataclass
+    # comparison would exit 5 after a perfectly good artifact landed
+    # (reachable in one reason rename)
+    import dataclasses
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.dataset_build import TrainingExample
+    from gmail_labeler.eval import eval_metrics
+    from gmail_labeler.thresholds import BandsArtifact, build_artifact, calibrate_bands
+
+    examples = [
+        TrainingExample(
+            id=f"{i:016x}",
+            date=datetime.now(UTC),
+            labels=(),
+            weight=1.0,
+            date_provenance="internal_date",
+        )
+        for i in range(2)
+    ]
+    scores = {f"{i:016x}": (0.0, 0.0) for i in range(2)}
+    table = eval_metrics(examples, scores, vocabulary=("Bills", "Shipping"))
+    bands = calibrate_bands(table)  # no-band state → reasons
+    artifact = build_artifact(
+        bands,
+        vocabulary=("Bills", "Shipping"),
+        corpus_fingerprint="f" * 64,
+        split_manifest_hash="0" * 64,
+        encoder_id="tiny-encoder",
+        split_date=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert all(entry.reasons for entry in artifact.labels)
+    reversed_entries = tuple(
+        dataclasses.replace(entry, reasons=entry.reasons[::-1])
+        for entry in artifact.labels
+    )
+    readback = dataclasses.replace(artifact, labels=reversed_entries)
+    assert readback.content_hash == artifact.content_hash  # canonical
+    assert readback != artifact  # dataclass equality is order-sensitive
+    monkeypatch.setattr(
+        BandsArtifact,
+        "from_json",
+        classmethod(lambda cls, text: readback),
+    )
+    out = tmp_path / "bands.json"
+    cli._write_bands_artifact(out, artifact, artifact.to_json())  # no refusal
+    assert out.is_file()
 
 
 def test_eval_bands_same_path_as_config_is_a_usage_error(

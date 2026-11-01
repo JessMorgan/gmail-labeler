@@ -199,7 +199,11 @@ class BandsConfig(BaseModel):
     the label-path spelling shown: the declared field is the
     validator's collection target and the CLI's read surface, not an
     input surface (typed programmatic construction with BandOverride
-    values is the API, and gets the same value checks). The config
+    values is the API, and gets the same VALUE checks — range,
+    tenth-grid, empty-override; not the raw-type checks, which the
+    wrap validator applies to raw input: a bool passed into
+    BandOverride is coerced by pydantic before the validator sees it).
+    The config
     carries NO path: the artifact path is the CLI's ``eval --bands``
     argument, so the config-file relative-path rule has nothing to
     anchor here."""
@@ -269,9 +273,11 @@ class BandsConfig(BaseModel):
                 )
                 continue
             if not isinstance(sub, dict):
+                # a scalar under a label name is a typo'd/unknown key,
+                # not a half-written table — name it as such
                 problems.append(
-                    f"bands.{key}: a per-label override must be a table "
-                    'of targets ([bands."Some/Label"])'
+                    f"bands.{key}: unknown/typo'd key \u2014 a per-label "
+                    f'override is a subtable of targets ([bands."{key}"])'
                 )
                 continue
             nested = cast("dict[str, object]", sub)
@@ -322,6 +328,15 @@ class BandsConfig(BaseModel):
                     f"bands.{key}: a label key may not be a reserved field name"
                 )
                 continue
+            if key in per_label:
+                # a padded key stripping onto an existing one (the
+                # LabelsConfig uniqueness precedent, post-clean)
+                problems.append(
+                    f"bands.{key}: duplicate per-label override — the "
+                    "same label is named more than once; refusing to "
+                    "silently shadow"
+                )
+                continue
             problems.extend(_override_value_problems(key, override))
             per_label[key] = override
         for label, sub in (self.__pydantic_extra__ or {}).items():
@@ -341,6 +356,17 @@ class BandsConfig(BaseModel):
                 problems.extend(
                     f"bands.{key}.{_shorten_loc(err['loc'])}: {err['msg']}"
                     for err in e.errors()
+                )
+                continue
+            if key in per_label:
+                # the same label named more than once: a typed
+                # per_label entry AND a [bands."<key>"] subtable, or
+                # padded keys that strip to one — silent shadowing
+                # violates refuse-never-drop
+                problems.append(
+                    f"bands.{key}: duplicate per-label override — the "
+                    "same label is named more than once; refusing to "
+                    "silently shadow"
                 )
                 continue
             skip = frozenset(

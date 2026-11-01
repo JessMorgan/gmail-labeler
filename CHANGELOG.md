@@ -8,6 +8,76 @@ does not ship releases yet.
 
 ### Added
 
+- Per-label threshold calibration (ticket #21): the pure core
+  (`thresholds.py`, pyright strict) turns the eval metric table into
+  per-label Threshold Bands — "confident" becomes a measured per-label
+  claim, never a global constant. The band-selection rule (pinned by
+  golden tests): `high` = the HIGHEST candidate threshold whose
+  measured precision is defined (tp+fp > 0) and meets the label's
+  min-precision target (`>=` — a cell exactly at the target earns the
+  band); `med` = the highest qualifier STRICTLY below `high` when high
+  is earned (an empty/inverted med band is meaningless; unconstrained
+  when high is not earned); a band that is not earned is an explicit
+  `none` with a named reason, never a silent zero (the strict-below-
+  high constraint gets its own reason name — a reason must not lie).
+  The run's AND every per-label target get the same validation
+  (out-of-range, bool, and non-tenth targets refuse). Calibration reads
+  tp/fp/fn and derives the ratio itself — a zero-denominator cell
+  (tp=0 AND fp=0, no predictions) has UNDEFINED precision and never
+  meets any target, not even 0.0 (the eval's 0.0 rendering is not a
+  measurement). Refusals: non-canonical vocabulary, a candidate grid
+  that is empty/out-of-range/non-ascending/non-tenth (the eval stance
+  inherited), misaligned rows/cells, a target outside [0, 1] (a bool
+  is not a target), a non-tenth target (the tenth-grid stance, #20),
+  and an override for a label the table does not carry (named).
+  Deterministic total order (same table → same bands; input-order
+  invariant).
+- Bands Artifact (`thresholds.py`): the versioned JSON artifact
+  (format version + content hash over every field — the
+  `dataset_build.SplitManifest` discipline: canonical dump, UTC
+  datetimes, `validate()` from BOTH entry paths) binding the
+  calibrated bands to the checkpoint identity (vocabulary hash, corpus
+  fingerprint, split manifest hash, encoder id — the Checkpoint
+  Sidecar's fields, mirrored) and the eval identity (split date, test
+  example count), carrying the candidate grid + default targets + the
+  per-label effective targets (provenance — an override is visible).
+  `verify_bands` REFUSES an artifact that disagrees with the
+  checkpoint/eval it is served against — every field checked
+  independently, all disagreements named in one `BandsRefusedError`
+  (the sidecar doctrine, AC2). Same eval → byte-identical artifact
+  (AC5, pinned across re-runs and a reordered record index).
+- `eval --bands PATH` (ticket #21): the deliberate act that calibrates
+  the per-label Threshold Bands from the measured table and writes the
+  artifact — opt-in (human-gated, ADR-0005: writing/updating the
+  serving bands is a decision, never a side effect of a report run; a
+  bare `eval` writes nothing), 0600 from creation, staging + atomic
+  replace, replacing an existing artifact announced on stderr (the
+  #20 `--out` NOTICE), the report rendered before calibration and the
+  write (never lost — even a calibration refusal leaves the report on
+  stdout), and a one-line human summary on stdout in text mode. Usage
+  refusals up front (an empty path, `--bands` and `--out` naming the
+  same file — the artifact write would destroy the report) → 2. The
+  recompute posture is pinned: ONLY the eval command writes the
+  artifact (structural source-scan + behavioral tests — no other
+  import surface can mint or write the file, AC4). Exit-code contract
+  preserved (config error → 4; a calibration refusal — an unknown
+  override label, a lying identity — and a write failure → 5).
+- Config `[bands]` (ticket #21): the run's default min-precision
+  targets (`min_high_precision` 0.9 / `min_med_precision` 0.7) +
+  per-label overrides as `[bands."<label>"]` subtables (label names
+  may carry slashes — quoted TOML keys). The minimal posture: only
+  min-precision TARGETS are overridable — an explicit band threshold
+  would let the operator set a threshold no measured cell meets, and
+  "confident" would stop being a measured claim; the operator changes
+  what "confident" means, the measured table picks the threshold.
+  Overrides REFUSE unknown keys, scalars, out-of-range values,
+  non-tenth values (the tenth-grid stance, #20), TOML bools (pydantic's
+  lax float coercion would silently turn `true` into 1.0 — refused on
+  the raw value), and empty tables (a no-op override is refused, not
+  dropped); an override for a label the checkpoint's vocabulary does
+  not carry refuses the run, named (fail loud). The config carries no path (the artifact path is
+  the CLI's `--bands` argument), so the config-file relative-path rule
+  has nothing to anchor here. GLOSSARY gains the Bands Artifact term.
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):
   export stamps server `internalDate` vs MIME `Date`-header fallback
   distinctly, GYB import stamps its own source; pre-existing lines lacking

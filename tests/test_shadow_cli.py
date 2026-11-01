@@ -399,13 +399,15 @@ def test_shadow_run_zero_gmail_writes(
     assert "list_labels" in methods
 
 
-def test_shadow_run_default_query_is_inbox_after_epoch(
+def test_shadow_run_since_query_is_inbox_after_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # S4: the default Backlog query is in:inbox after:<epoch-seconds> —
+    # S4: the --since Backlog query is in:inbox after:<epoch-seconds> —
     # the EPOCH form (unambiguous; calendar dates in API queries are
     # interpreted as MIDNIGHT PST, and newer_than: is relative-duration
     # only). --since 2026-10-01 → UTC midnight of that date → epoch.
+    # (The REAL default-window pin is
+    # test_shadow_run_default_window_cli_pin — fold-4 item 2.)
     from datetime import UTC, datetime
 
     _prepare(tmp_path, monkeypatch)
@@ -866,7 +868,16 @@ def test_shadow_run_json_single_object(
 ) -> None:
     # the --json contract: stdout is EXACTLY one parseable JSON object
     # (the human summary is suppressed — on stderr)
+    import re
+    from datetime import UTC, datetime
+
+    import gmail_labeler.cli as cli
+
     _prepare(tmp_path, monkeypatch)
+    # fold-4 item 2/3 pins: a fixed injectable clock so the payload's
+    # run_ts and cutoff are assertable against the SAME clock read
+    fixed_now = datetime(2026, 11, 1, 12, 30, 0, tzinfo=UTC)
+    monkeypatch.setattr(cli, "_now", lambda: fixed_now)
     result, _fake = _run_shadow(tmp_path, "--json", monkeypatch=monkeypatch)
     assert result.exit_code == 0, result.stderr
     payload = json.loads(result.stdout)  # the whole stdout is one object
@@ -887,6 +898,19 @@ def test_shadow_run_json_single_object(
     # in --json mode the payload IS the output — the human summary is
     # suppressed (stdout stays exactly one parseable JSON object)
     assert "shadow run: run=" not in result.stdout
+    # fold-4 item 3 pin: the payload's cutoff is derived from the SAME
+    # cutoff_dt that built the query — the payload window == the query
+    # window (a mutant binding the payload to run_ts survives no suite
+    # that asserts this)
+    m = re.search(r"after:(\d+)$", payload["query"])
+    assert m is not None
+    query_epoch = int(m.group(1))
+    assert payload["cutoff_epoch"] == query_epoch
+    assert payload["cutoff"] == datetime.fromtimestamp(query_epoch, tz=UTC).isoformat()
+    # fold-4 item 2 pin: run_ts goes through the SAME injectable clock
+    # read (a mutant restoring datetime.now(UTC) for run_ts survives no
+    # suite that asserts this)
+    assert payload["run_ts"] == fixed_now.isoformat()
 
 
 def test_shadow_run_zero_graduated_labels_exits_5(
@@ -1092,6 +1116,47 @@ def test_shadow_run_graduated_system_label_is_refused(
     assert "INBOX" in result.stderr
 
 
+def test_shadow_run_default_window_cli_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fold-4 item 2: the CLI-level pin for the REAL shipped default —
+    # monkeypatch cli._now to a fixed aware datetime, run shadow run
+    # WITHOUT --since, and assert the FakeGmailClient-recorded
+    # list_messages q is EXACTLY in:inbox after:<int((fixed-90d).
+    # timestamp())>. This kills the fold-2 rewire mutant (the dead-
+    # branch bug where the default passed a non-None since_date, so the
+    # cutoff was UTC-midnight(today-90d) instead of now-90d time-kept).
+    from datetime import UTC, datetime
+
+    import gmail_labeler.cli as cli
+
+    _prepare(tmp_path, monkeypatch)
+    fixed_now = datetime(2026, 11, 1, 12, 30, 0, tzinfo=UTC)
+    monkeypatch.setattr(cli, "_now", lambda: fixed_now)
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_shadow_labels())
+    monkeypatch.setattr(cli, "_shadow_client", lambda cfg_: fake)
+    monkeypatch.setattr(
+        cli, "_shadow_model_factory", _shadow_factory(_backlog_scores())
+    )
+    result = runner.invoke(
+        app,
+        [
+            "shadow",
+            "run",
+            "--config",
+            str(_shadow_cfg(tmp_path)),
+            "--bands",
+            str(tmp_path / "bands.json"),
+            "--graduation",
+            str(tmp_path / "graduation.json"),
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    expected_epoch = int((fixed_now - timedelta(days=90)).timestamp())
+    list_calls = [c for c in fake.calls if c.startswith("list_messages")]
+    assert list_calls[0] == f"list_messages:in:inbox after:{expected_epoch}:"
+
+
 def test_shadow_run_fail_fast_db_before_network(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1146,6 +1211,36 @@ def test_shadow_run_db_flag_overrides_store_path(
     assert _db_has_rows(custom_db)
     # the config default was NOT written
     assert not (tmp_path / "gmail-labeler.db").exists()
+
+
+def test_shadow_run_db_flag_trailing_space_is_stripped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fold-4 item 4: --db "<path>.db " (trailing space) → the DB lands at
+    # the CLEAN stripped path (no space-suffixed file) — proves the strip
+    _prepare(tmp_path, monkeypatch)
+    clean_db = tmp_path / "state.db"
+    result, _fake = _run_shadow(
+        tmp_path, "--db", str(clean_db) + " ", monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 0, result.stderr
+    assert clean_db.is_file()
+    assert _db_has_rows(clean_db)
+    # no space-suffixed file
+    assert not (tmp_path / "state.db ").exists()
+
+
+def test_shadow_run_db_flag_expanduser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fold-4 item 4: --db '~/state.db' with HOME=tmp_path → lands under
+    # tmp (the ~ is expanded, matching the config path fields)
+    _prepare(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    result, _fake = _run_shadow(tmp_path, "--db", "~/state.db", monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    assert (tmp_path / "state.db").is_file()
+    assert _db_has_rows(tmp_path / "state.db")
 
 
 def test_shadow_run_db_flag_containment_exits_2(

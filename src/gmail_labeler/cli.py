@@ -12,6 +12,7 @@ stubbed; scripts can branch on 0/2/4/5 today.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import tempfile
@@ -2125,6 +2126,15 @@ def _validate_store_db(db_path: Path) -> None:
         db.close()
 
 
+def _now() -> datetime:
+    """The injectable clock seam (fold-4 item 2): the single
+    ``datetime.now(UTC)`` read per command. ``shadow run``'s window math
+    and run_ts go through it, so a test can monkeypatch it to a fixed
+    aware datetime and pin the EXACT shipped default (now - 90d, time
+    kept) at the CLI level (the recorded ``list_messages`` query)."""
+    return datetime.now(UTC)
+
+
 def _backlog_cutoff(since_date: date | None, now: datetime) -> datetime:
     """The UTC-aware cutoff datetime for the Backlog query (S4): a
     --since date → UTC MIDNIGHT of that date — the named day is
@@ -2212,8 +2222,6 @@ def shadow_run(
     posture choice vs ``eval``'s whole-run refusal: shadow is a
     read-only survey, not a serving-gate artifact mint.
     """
-    from datetime import UTC, datetime, timedelta
-
     from .appdb import AppDB, AppDBError, ShadowRow
     from .auth import AuthError
     from .corpus_record import corpus_fingerprint, preprocess_text
@@ -2246,11 +2254,11 @@ def shadow_run(
     if query is not None and not query.strip():
         typer.echo("shadow run failed: --query must be non-empty", err=True)
         raise typer.Exit(code=2) from None
-    # ONE datetime.now(UTC) read per run (disposition 1): the default
+    # ONE injectable clock read per run (fold-4 item 2): the default
     # window is now - 90 days WITH the time kept (the documented intent);
     # --since → UTC midnight of the named day (the day is INCLUDED —
     # `after:` is strictly-newer than that midnight)
-    now = datetime.now(UTC)
+    now = _now()
     if since is not None:
         # strict ISO (YYYY-MM-DD) — strptime, not date.fromisoformat
         # (3.11+ fromisoformat is lenient and would accept "20261001")
@@ -2264,7 +2272,6 @@ def shadow_run(
             raise typer.Exit(code=2) from None
         cutoff_dt = _backlog_cutoff(since_date, now)  # UTC midnight of that day
     else:
-        since_date = now.date() - timedelta(days=90)  # for the --json payload
         cutoff_dt = _backlog_cutoff(None, now)  # now - 90d, time kept
 
     cfg = _load_config(config)
@@ -2609,7 +2616,7 @@ def shadow_run(
     # graduated labels only, skip-present, System Labels never targeted
     bands_map = {entry.label: (entry.high, entry.med) for entry in artifact.labels}
     graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
-    run_ts = datetime.now(UTC)
+    run_ts = now  # the SAME injectable clock read (fold-4 item 2 — ONE read)
     run_id = uuid.uuid4().hex
     all_rows: list[ShadowRow] = []
     json_rows: list[dict[str, object]] = []
@@ -2690,11 +2697,16 @@ def shadow_run(
         store_db.close()
 
     if as_json:
+        # fold-4 item 3: the window in the payload is derived from the
+        # SAME cutoff_dt that built the query (the epoch the query uses +
+        # its ISO datetime) — the date-only `since` is retired (it
+        # diverged from the shipped default, which keeps the time)
         payload = {
             "run_id": run_id,
             "run_ts": run_ts.isoformat(),
             "query": q,
-            "since": since_date.isoformat(),
+            "cutoff_epoch": int(cutoff_dt.timestamp()),
+            "cutoff": cutoff_dt.isoformat(),
             "limit": limit,
             "scored": len(fetched),
             "skipped": skipped,
@@ -2977,8 +2989,6 @@ def shadow_report(
         # now in LOCKSTEP with the ReportRow dataclass (a field added to
         # the dataclass is automatically in the payload, not a silent
         # drift)
-        import dataclasses
-
         payload = {
             "run_id": run_id,
             "run_ts": run_ts.isoformat(),

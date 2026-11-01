@@ -2,8 +2,15 @@
 
 The SQLite file behind ``[store] db_path``: the shadow_results table
 (the Shadow Pass's recorded would-apply verdicts) and, with the daemon
-phase, the applications table (#24 — same file, same versioning story;
-the seam is the schema_version row + the comment below).
+phase, the applications table (#24 — same file; the seam is the
+schema_version row + the comment below).
+
+UPGRADE STORY (stated honestly, fold-4 item 6): ``SCHEMA_VERSION`` stays
+1 this ticket. The v1→v2 restamp/migration path (adding the applications
+table) is DELIBERATELY UNSOLVED pending #24's schema design — no sentence
+here implies the versioning story is complete. Meanwhile the HARD version
+gate (the ownership check refuses a foreign/future schema_version, named)
+is what protects cross-version reads: a v2 DB is not consumed by a v1 tool.
 
 Invariants:
 
@@ -40,8 +47,10 @@ __all__ = [
 ]
 
 #: The schema version (bump on any change to the tables' field set or
-#: semantics — the #24 applications table lands under the SAME
-#: versioning story).
+#: semantics). The #24 applications table lands under a v2 restamp —
+#: the v1→v2 restamp/migration path is UNSOLVED pending #24's schema
+#: design (see the module docstring's UPGRADE STORY); the HARD version
+#: gate below is what protects cross-version reads meanwhile.
 SCHEMA_VERSION = 1
 
 # Gmail message ids are hex (the CorpusRecord._ID_RE precedent): a
@@ -103,9 +112,11 @@ CREATE TABLE IF NOT EXISTS shadow_results (
     run_ts TEXT NOT NULL,
     PRIMARY KEY (run_id, message_id, label)
 );
--- Seam (ticket #24): the applications table lands in THIS file, under
--- this schema_version — the same versioning story. No write surface
--- exists here until #24/#25 (the Shadow Pass is read-only).
+-- Seam (ticket #24): the applications table lands in THIS file under a
+-- v2 restamp — the v1->v2 restamp/migration is UNSOLVED pending #24's
+-- schema design (the HARD version gate protects cross-version reads
+-- meanwhile). No write surface exists here until #24/#25 (the Shadow
+-- Pass is read-only).
 """
 
 
@@ -204,11 +215,9 @@ class AppDB:
             ) from e
 
     def _check_ownership(self) -> None:
-        # the ownership gate (disposition 2): ownership is by SHAPE, not
-        # by table NAME. A DB is "ours" iff it carries a VALID
-        # shadow_results (our exact column set) OR a VALID
-        # schema_version (single-column `version`, stamped with EXACTLY
-        # our version). Everything is read BEFORE any write (the
+        # the ownership gate (disposition 2 + fold-4 item 1): ownership
+        # is by SHAPE, not by table NAME, and the version is a HARD gate
+        # (not advisory). Everything is read BEFORE any write (the
         # "verified before any write" claim is literally true — a
         # foreign DB is not adopted, and a versioned-foreign DB does not
         # gain a shadow_results table pre-refusal):
@@ -217,12 +226,16 @@ class AppDB:
         #   ours (a same-named wrong-shape table is refused, named);
         # - schema_version present → it must be the single-column
         #   `version` table (a generic same-named table is NOT ours —
-        #   the adoption hole ds reproduced), and if populated its rows
-        #   must be EXACTLY {SCHEMA_VERSION} (a foreign version, or an
-        #   empty generic table, is NOT ours);
-        # - a DB with a valid ours-table PLUS foreign extra tables
+        #   the adoption hole ds reproduced), and the version HARD gate
+        #   applies: the version set must EQUAL {SCHEMA_VERSION} — a
+        #   foreign version ({99}), a polluted set ({1,99}), or an
+        #   our-shape-but-EMPTY table is refused, named (the version is
+        #   NOT advisory: a v2 DB is not consumed by a v1 tool);
+        # - a DB with a valid ours-table PLUS UNKNOWN extra tables
         #   COEXISTS (documented decision — our tables are the
-        #   authority; the extras are left alone);
+        #   authority; the unknowns are left alone). Coexist is for
+        #   UNKNOWN TABLES only — a version disagreement NEVER
+        #   coexists (it is refused above);
         # - a DB with tables but NONE valid-ours is FOREIGN — refused,
         #   named (the foreign table names are listed);
         # - an empty file (no tables) is fresh.
@@ -235,7 +248,7 @@ class AppDB:
             ).fetchall()
         }
         shadow_results_valid = False
-        schema_version_valid = False
+        schema_version_present = False
         if "shadow_results" in tables:
             cols = self._column_set("shadow_results")
             if cols != _SHADOW_RESULTS_COLUMNS:
@@ -246,6 +259,7 @@ class AppDB:
                 )
             shadow_results_valid = True
         if "schema_version" in tables:
+            schema_version_present = True
             cols = self._column_set("schema_version")
             if cols != _SCHEMA_VERSION_COLUMNS:
                 # a generic same-named table (not our single-column
@@ -256,18 +270,38 @@ class AppDB:
                     f"— a generic table, not a gmail-labeler state DB: "
                     f"{self.path}"
                 )
+            # the version HARD gate (fold-4 item 1): our-shape
+            # schema_version must be stamped with EXACTLY our version —
+            # the version is NOT advisory (a v2 DB is not consumed by a
+            # v1 tool; the parent's _verify_version refused exactly this)
             versions = {
                 row[0]
                 for row in self._conn.execute(
                     "SELECT DISTINCT version FROM schema_version"
                 ).fetchall()
             }
-            # a valid schema_version is stamped with EXACTLY our version
-            # (an empty generic table, or a foreign version, is NOT ours)
-            if versions == {SCHEMA_VERSION}:
-                schema_version_valid = True
-        if shadow_results_valid or schema_version_valid:
-            return  # ours (coexist with any foreign extra tables)
+            if versions != {SCHEMA_VERSION}:
+                # key=repr: a hostile mixed-affinity table must not raise
+                # a raw TypeError out of open() (the shape check does not
+                # constrain column types)
+                if not versions:
+                    # our-shape but EMPTY (no version row) — corrupt, named
+                    raise AppDBError(
+                        f"state DB schema_version is empty (our shape, no "
+                        f"version row) — corrupt: {self.path}"
+                    )
+                # a foreign version ({99}) or a polluted set ({1,99}) —
+                # the version cause is named (restored from the parent's
+                # _verify_version)
+                raise AppDBError(
+                    f"state DB schema_version {sorted(versions, key=repr)} != "
+                    f"{SCHEMA_VERSION}: {self.path} — a newer tool wrote "
+                    f"this DB"
+                )
+        if shadow_results_valid:
+            return  # ours (coexist with any UNKNOWN extra tables)
+        if schema_version_present:
+            return  # ours (our-shape schema_version stamped with our version)
         if tables:
             raise AppDBError(
                 f"state DB is not a gmail-labeler state DB (foreign "

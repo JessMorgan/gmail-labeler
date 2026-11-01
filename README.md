@@ -255,8 +255,10 @@ consumers of the `verify_bands`/`verify_graduation` gates; a
 foreign-bound artifact refuses with exit 5, naming every disagreeing
 field). The Backlog query defaults to `in:inbox after:<epoch-seconds>`
 (the EPOCH form — calendar dates in API queries are interpreted as
-MIDNIGHT PST; `--since` ISO date → UTC midnight of that date → epoch,
-default 90 days ago; the default window includes recent arrivals as
+MIDNIGHT PST; `--since` ISO date → UTC midnight of that date → epoch —
+the named day is INCLUDED (mail from that day onward); default 90 days
+ago with the time kept (now − 90d, not midnight); the default window
+includes recent arrivals as
 well as the older history — GLOSSARY: Backlog; `--limit` max messages,
 default 100; `--query` replaces the default wholesale; `--db PATH`
 overrides `[store] db_path` — `~` is expanded, and a relative `--db`

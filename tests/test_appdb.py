@@ -1046,16 +1046,19 @@ def test_fresh_db_crash_mid_transition_leaves_clean_fresh(
 def test_v1_migration_crash_mid_transition_leaves_clean_v1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # F1 MAJOR pin (2): kill mid-migration, PAST the restamp UPDATE —
-    # the applications DDL and indexes have already been attempted when
-    # the marker statement fires, so this is the window where a
-    # non-transactional transition could land the file in
-    # {1}+applications (dead-end refusal) or {2}-without-tables. ONE
-    # transaction: the file stays CLEAN v1 and the retry migrates
-    # successfully — shadow history survives, no delete-recovery, no
-    # manual stamp. (Marker position matters: on the applications CREATE
-    # itself the test stays green under the split-transaction mutant —
-    # the UPDATE has not run yet at that point — F1 review MAJOR.)
+    # F1 MAJOR pin (2): kill mid-migration, on the applications INDEX —
+    # AFTER the applications CREATE TABLE has been attempted but BEFORE
+    # the restamp UPDATE, so a non-transactional transition has already
+    # committed the table here -> {1}+applications (dead-end refusal).
+    # A leaked/early-committed restamp (the pre-F1 shape) shows up in
+    # the VERSION assertion below instead. ONE transaction: the file
+    # stays CLEAN v1 and the retry migrates successfully — shadow
+    # history survives, no delete-recovery, no manual stamp. (Marker
+    # position matters: on the applications CREATE itself the test
+    # stays green under the split-transaction mutant — the table has
+    # not been attempted yet at that point — F1 review MAJOR; a COMMIT
+    # marker misses the leaked-restamp shape — the index placement
+    # discriminates both, per the round-2 probes.)
     _arm_crash_on(monkeypatch, "CREATE INDEX IF NOT EXISTS idx_applications_message_id")
     db_path = tmp_path / "state.db"
     _v1_db(db_path)

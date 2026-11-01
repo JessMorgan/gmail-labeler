@@ -176,3 +176,17 @@ load-bearing for correctness (ADR-0007): the last-wins fold is the truth,
 so compaction changes only the fold's cost, never the resolved state.
 _Avoid_: garbage collection, log rotation (both imply the history itself is
 what's managed; the fold already resolves it)
+**Date Provenance**:
+Where a Corpus record's date came from: the server `internalDate`
+(`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB
+backup's internal-date stamp (`gyb_internaldate`), or `unknown` when not
+stamped by a writer (pre-existing lines, explicit nulls). Part of the
+record contract, never derived — temporal-split consumers filter on
+it, so a forged or future `Date` header can no longer silently move a
+record across the split. Trust grouping: `internal_date` and
+`gyb_internaldate` are the SAME trust class — both
+server-authoritative (the GYB stamp is Gmail's own timestamp as
+written by the backup) — while `mime_date` is sender-claimed and
+`unknown` is legacy; the two server forms must not be
+treated as different trust classes by a split-builder.
+_Avoid_: date source, timestamp origin

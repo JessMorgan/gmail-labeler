@@ -97,6 +97,41 @@ def test_example_toml_bands_example_uncomments_to_a_valid_override(
     }
 
 
+def test_example_toml_graduation_example_uncomments_to_a_valid_override(
+    tmp_path: Path,
+) -> None:
+    # the commented per-label example in example.toml must be
+    # UNCOMMENTABLE: uncommenting the documented subtable lines yields
+    # valid TOML that loads with the documented override (the example
+    # sits BELOW the two defaults — a layout above them would
+    # duplicate the keys and parse-fail)
+    from gmail_labeler.config import GateOverride
+
+    text = (REPO_ROOT / "example.toml").read_text(encoding="utf-8")
+    out: list[str] = []
+    in_graduation = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_graduation = stripped == "[graduation]"
+        if in_graduation and (
+            stripped.startswith("# [graduation.")
+            or stripped.startswith("# min_examples = ")
+            or stripped.startswith("# min_precision = ")
+        ):
+            out.append(line.removeprefix("# "))
+        else:
+            out.append(line)
+    p = tmp_path / "config.toml"
+    p.write_text("".join(out), encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.graduation.min_examples == 10
+    assert cfg.graduation.min_precision == 0.9
+    assert cfg.graduation.per_label == {
+        "Money/Bills": GateOverride(min_examples=20, min_precision=0.95)
+    }
+
+
 def test_full_config_parses(tmp_path: Path) -> None:
     p = _write(
         tmp_path,
@@ -163,6 +198,11 @@ def test_all_section_defaults_are_literal_pinned() -> None:
     assert Config().bands.model_dump() == {
         "min_high_precision": 0.9,
         "min_med_precision": 0.7,
+        "per_label": {},
+    }
+    assert Config().graduation.model_dump() == {
+        "min_examples": 10,
+        "min_precision": 0.9,
         "per_label": {},
     }
 
@@ -438,6 +478,246 @@ def test_bands_scalar_override_rejected(tmp_path: Path) -> None:
     p = _write(tmp_path, '[bands]\n"Bills" = 0.9\n')
     with pytest.raises(ConfigError, match="Bills"):
         load_config(str(p))
+
+
+# ---- [graduation] (ticket #22: per-label graduation gates) ----
+
+
+def test_graduation_defaults_are_literal_pinned() -> None:
+    # the defaults ride the named constants — pin the literal values so
+    # a changed default goes red HERE (and in example.toml's match test)
+    from gmail_labeler.graduation import (
+        DEFAULT_MIN_EXAMPLES,
+        DEFAULT_MIN_PRECISION,
+    )
+
+    grad = Config().graduation
+    assert grad.min_examples == DEFAULT_MIN_EXAMPLES == 10
+    assert grad.min_precision == DEFAULT_MIN_PRECISION == 0.9
+    assert grad.per_label == {}
+
+
+def test_graduation_per_label_override_parses(tmp_path: Path) -> None:
+    # a per-label subtable (label names may carry slashes — quoted TOML
+    # keys); only the stated gate is overridden, the other stays None
+    p = _write(
+        tmp_path,
+        "[graduation]\nmin_examples = 5\n\n"
+        '[graduation."Money/Bills"]\nmin_precision = 0.95\n',
+    )
+    cfg = load_config(str(p))
+    assert cfg.graduation.min_examples == 5
+    assert cfg.graduation.min_precision == 0.9
+    assert set(cfg.graduation.per_label) == {"Money/Bills"}
+    override = cfg.graduation.per_label["Money/Bills"]
+    assert override.min_examples is None
+    assert override.min_precision == 0.95
+
+
+def test_graduation_non_tenth_precision_is_allowed(tmp_path: Path) -> None:
+    # the documented asymmetry with [bands]: a gate precision target is
+    # COMPARED against measured values (any rational tp/(tp+fp)), never
+    # looked up in the candidate grid — a non-tenth like 0.93 is a
+    # legitimate gate (the tenth-grid stance does NOT apply here)
+    p = _write(
+        tmp_path,
+        "[graduation]\nmin_precision = 0.93\n"
+        '[graduation."Bills"]\nmin_precision = 0.875\n',
+    )
+    cfg = load_config(str(p))
+    assert cfg.graduation.min_precision == 0.93
+    assert cfg.graduation.per_label["Bills"].min_precision == 0.875
+
+
+def test_graduation_override_unknown_key_rejected(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        '[graduation."Money/Bills"]\nmin_example = 10\n',
+    )
+    with pytest.raises(ConfigError, match="min_example"):
+        load_config(str(p))
+
+
+def test_graduation_out_of_range_rejected(tmp_path: Path) -> None:
+    for section in (
+        "[graduation]\nmin_precision = 1.5\n",
+        "[graduation]\nmin_precision = -0.1\n",
+        "[graduation]\nmin_examples = -1\n",
+        '[graduation."Bills"]\nmin_precision = 1.1\n',
+        '[graduation."Bills"]\nmin_examples = -3\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match=r"must be in|must be >="):
+            load_config(str(p))
+
+
+def test_graduation_string_value_rejected(tmp_path: Path) -> None:
+    # a string is not a gate value: pydantic's lax int/float coercion
+    # would turn "10" into 10 / "0.9" into 0.9 — refused on the RAW
+    # value, named, never silently coerced
+    for section in (
+        '[graduation]\nmin_examples = "10"\n',
+        '[graduation]\nmin_precision = "0.9"\n',
+        '[graduation]\nmin_precision = "abc"\n',
+        '[graduation."Bills"]\nmin_examples = "10"\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="not a string"):
+            load_config(str(p))
+
+
+def test_graduation_bool_value_rejected(tmp_path: Path) -> None:
+    # a TOML bool is not a gate value: pydantic's lax coercion would
+    # turn true into 1 / 1.0 — refused on the RAW value, never silently
+    # coerced (the core's "a bool is not a count/target")
+    for section in (
+        "[graduation]\nmin_examples = true\n",
+        "[graduation]\nmin_precision = false\n",
+        '[graduation."Bills"]\nmin_precision = true\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="not a bool"):
+            load_config(str(p))
+
+
+def test_graduation_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
+    # the per_label back door: a raw per_label table in the [graduation]
+    # table bypassed every custom refusal (bool→1, negative, empty
+    # table, silent discard against the label-path form). It is a
+    # reserved field name — refused with the label-path spelling shown
+    for section in (
+        '[graduation]\nper_label = { "Bills" = { min_examples = true } }\n',
+        '[graduation]\nper_label = { "Bills" = { min_precision = 1.5 } }\n',
+        '[graduation]\nper_label = { "Bills" = {} }\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="reserved field name"):
+            load_config(str(p))
+        p = _write(
+            tmp_path,
+            '[graduation]\nper_label = { "Bills" = { min_examples = 5 } }\n'
+            '[graduation."Bills"]\nmin_precision = 0.95\n',
+        )
+        with pytest.raises(ConfigError, match="reserved field name"):
+            load_config(str(p))
+        # the guidance shows the label-path spelling
+        p = _write(
+            tmp_path,
+            '[graduation]\nper_label = { "Bills" = { min_examples = 5 } }\n',
+        )
+        with pytest.raises(ConfigError, match=r'graduation\."Some/Label"'):
+            load_config(str(p))
+
+
+def test_graduation_programmatic_per_label_gets_the_same_checks() -> None:
+    # defense in depth: the declared per_label field (the programmatic
+    # API — typed GateOverride values) gets the SAME range and
+    # empty-override checks as the label-path form
+    from gmail_labeler.config import GateOverride, GraduationConfig
+
+    good = GraduationConfig(per_label={"Bills": GateOverride(min_examples=5)})
+    assert good.per_label["Bills"].min_examples == 5
+    for bad in (
+        GateOverride(min_precision=1.5),  # out of range
+        GateOverride(min_examples=-1),  # negative
+        GateOverride(),  # empty override
+    ):
+        with pytest.raises(ValueError, match=r"graduation\.Bills"):
+            GraduationConfig(per_label={"Bills": bad})
+
+
+def test_graduation_same_label_named_twice_refused(tmp_path: Path) -> None:
+    # the same label named more than once — a typed per_label entry AND
+    # a [graduation."<key>"] subtable, or padded keys that strip to one
+    # — is refused, not silently shadowed (the LabelsConfig uniqueness
+    # precedent, post-clean)
+    from gmail_labeler.config import GateOverride, GraduationConfig
+
+    with pytest.raises(ValueError, match="duplicate"):
+        GraduationConfig.model_validate(
+            {
+                "per_label": {"Bills": GateOverride(min_examples=5)},
+                "Bills": {"min_examples": 10},
+            }
+        )
+    p = _write(
+        tmp_path,
+        '[graduation."Foo"]\nmin_examples = 5\n'
+        '[graduation."Foo "]\nmin_precision = 0.95\n',
+    )
+    with pytest.raises(ConfigError, match="duplicate"):
+        load_config(str(p))
+
+
+def test_graduation_label_key_stripped_and_bounded(tmp_path: Path) -> None:
+    # a whitespace-padded key is stored stripped (the LabelsConfig
+    # stripping precedent — a padded key must not survive to the gate
+    # evaluation); blank-after-strip and over-length keys refuse
+    p = _write(tmp_path, '[graduation."  Bills  "]\nmin_examples = 5\n')
+    cfg = load_config(str(p))
+    assert set(cfg.graduation.per_label) == {"Bills"}
+    p = _write(tmp_path, '[graduation."   "]\nmin_examples = 5\n')
+    with pytest.raises(ConfigError, match="non-empty after stripping"):
+        load_config(str(p))
+    long_key = "B" * 41
+    p = _write(tmp_path, f'[graduation."{long_key}"]\nmin_examples = 5\n')
+    with pytest.raises(ConfigError, match="longer than"):
+        load_config(str(p))
+
+
+def test_graduation_scalar_override_rejected(tmp_path: Path) -> None:
+    # a per-label override must be a TABLE of gates — a scalar under a
+    # label name is a typo, refused (not silently dropped)
+    p = _write(tmp_path, '[graduation]\n"Bills" = 10\n')
+    with pytest.raises(ConfigError, match="Bills"):
+        load_config(str(p))
+
+
+def test_graduation_empty_override_table_rejected(tmp_path: Path) -> None:
+    # an empty [graduation."<label>"] table sets nothing — a no-op that
+    # would silently gate with the defaults; refused, not dropped
+    p = _write(tmp_path, '[graduation."Bills"]\n')
+    with pytest.raises(ConfigError, match="at least one gate"):
+        load_config(str(p))
+
+
+def test_all_graduation_problems_reported_together(tmp_path: Path) -> None:
+    # aggregation, not first-fail (the LabelsConfig doctrine): a bad
+    # default + two bad per-label tables are ALL named in one error
+    p = _write(
+        tmp_path,
+        "[graduation]\nmin_precision = 1.5\n"
+        '[graduation."Bills"]\nmin_examples = -1\n'
+        '[graduation."Shipping"]\nmin_example = 10\n',
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "must be in [0.0, 1.0]" in msg  # the bad default
+    assert "Bills" in msg and "must be >=" in msg  # the negative override
+    assert "Shipping" in msg and "min_example" in msg  # the unknown key
+
+
+def test_all_graduation_problems_reported_together_including_bool(
+    tmp_path: Path,
+) -> None:
+    # the aggregation mutation pin: a RAW bool used to fire a separate
+    # pre-scan (which raised before the collection ran) — now bool +
+    # out-of-range + unknown key are ALL named in one error by the
+    # single raw-seeing validator
+    p = _write(
+        tmp_path,
+        "[graduation]\nmin_examples = true\nmin_precision = 1.5\n"
+        '[graduation."Bills"]\nmin_examples = -1\n'
+        '[graduation."Shipping"]\nmin_example = 10\n',
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "not a bool" in msg  # the raw bool
+    assert "must be in [0.0, 1.0]" in msg  # the out-of-range default
+    assert "Bills" in msg and "must be >=" in msg  # the negative override
+    assert "Shipping" in msg and "min_example" in msg  # the unknown key
 
 
 def test_duplicate_tier_names_rejected(tmp_path: Path) -> None:

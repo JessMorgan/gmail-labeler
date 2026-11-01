@@ -8,13 +8,17 @@ one language.
 Space contract: matching is EXACT-CASE (Gmail's system namespace is; a
 lowercase look-alike is user content, and case-normalizing here would
 manufacture false negatives). The API path uses label IDS; the GYB path was
-verified over a 21-year corpus to store system labels as exactly the uppercase
-tokens below. Do NOT assume display NAMES equal these tokens (UI strings like
-"Category Promotions", and GYB additionally ships a 478-entry (73-locale)
-labellang map of LOCALIZED system names — INKASSIE, GELÄNLÄR, ...): the GYB
-reader MUST canonicalize localized system names via that map (or an
-equivalent) before this filter runs, or non-English mailboxes leak system
-labels into training signal.
+verified over a real corpus to store system labels as exactly the uppercase
+tokens below — the backup DB's label column carries those canonical ids
+(GYB's reader-side `labelIdsToLabels` mapping; its labellang map is
+restore-path-only; research recorded in issue #10), so a backup DB
+carries no localized system names and no canonicalization step is needed.
+Do NOT assume display NAMES equal these tokens for OTHER export sources
+(UI strings like "Category Promotions"; hand-edited or derived exports can
+carry localized system names — GYB's 73-locale labellang map, INKASSIE,
+GELÄNLÄR, ...): such tokens are excluded via `--system-labels`
+(`system_labels_extra`, a token list you maintain), not by this module
+guessing.
 
 Known limitation: a user label may literally be named ``id:Something`` or
 ``CATEGORY_x`` and would then be mistaken for the canonical forms above
@@ -31,7 +35,7 @@ from collections.abc import Mapping, Sequence
 #: Provenance by group: the first block is Google's guide table; CHAT/SNOOZE/
 #: UNDO per community enumerations (GAM/lieer — not in the guide table);
 #: the starred family is complete per the ^ss_* superstar mapping, YELLOW_STAR
-#: additionally observed in the owner's GYB corpus. PINK_STAR deliberately
+#: additionally observed in a real GYB corpus. PINK_STAR deliberately
 #: absent: no Gmail star format or ^ss_* mapping enumerates a pink star
 #: (six colors only) — re-add ONLY with a source, not by symmetry-hunch.
 #: Over-inclusion trade-off: in the ID space user labels are `Label_*`-prefixed

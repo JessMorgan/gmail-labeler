@@ -25,6 +25,10 @@ jobs:
       # uv fetches its own standalone CPython per UV_PYTHON; the interpreter
       # step below asserts it matches the matrix cell.
       UV_PYTHON: ${{ matrix.python-version }}
+      # Make local runs match CI's tz-db-less environment (nonexistent
+      # path); scripts/local-ci.sh mirrors this, and tests/test_tzenv.py
+      # pins the declaration itself.
+      PYTHONTZPATH: /nonexistent/tzdb
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 

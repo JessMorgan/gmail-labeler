@@ -481,6 +481,7 @@ class AppDB:
                 # key=repr: a hostile mixed-affinity table must not raise
                 # a raw TypeError out of open() (the shape check does not
                 # constrain column types)
+                single = next(iter(versions), None) if len(versions) == 1 else None
                 if not versions:
                     # our-shape but EMPTY (no version row) — corrupt,
                     # named. UNREACHABLE by crash since the atomic
@@ -561,10 +562,10 @@ class AppDB:
                         f"(shadow and application history is lost)"
                     )
                 elif (
-                    len(versions) == 1
-                    and isinstance(only := next(iter(versions)), int)
-                    and not isinstance(only, bool)
-                    and only > SCHEMA_VERSION
+                    single is not None
+                    and isinstance(single, int)
+                    and not isinstance(single, bool)
+                    and single > SCHEMA_VERSION
                 ):
                     # a SINGLE future INT stamp: the only state where "a
                     # newer tool wrote this DB" is honest (the sealed [99]
@@ -719,9 +720,7 @@ class AppDB:
         batch here is a caller bug), a row failing validation (the id
         shape, the score range, the band/tier/source vocabularies, a
         naive applied_at), or a duplicate (message_id, label) WITHIN one
-        batch, or MORE THAN ONE distinct applied_at stamp in the batch (the
-        #24 homogeneity contract as a store invariant, F1) (one
-        Application carries one row per label — the same
+        batch (one Application carries one row per label — the same
         (message_id, label) across SEPARATE batches is legitimate
         re-application history, so there is no PK). Returns the row
         count."""
@@ -816,7 +815,9 @@ class AppDB:
         move; record_applications' empty-batch refusal is deliberately
         NOT inherited here). Refusals raise BEFORE the transaction: a
         row failing validation, a within-batch (message_id, label)
-        duplicate, or a non-cursor value. A crash before the COMMIT
+        duplicate, MORE THAN ONE distinct applied_at stamp across the
+        batch (the #24 homogeneity contract as a store invariant, F1),
+        or a non-cursor value. A crash before the COMMIT
         replays the page; skip-present makes the replay idempotent —
         the safety proof is the daemon loop's write-first ordering
         (daemon.py, the pinned comment there). Returns the row count."""

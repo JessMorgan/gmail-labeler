@@ -54,12 +54,15 @@ does not ship releases yet.
   replace, replacing an existing artifact announced on stderr (the
   #20 `--out` NOTICE), the report rendered before calibration and the
   write (never lost — even a calibration refusal leaves the report on
-  stdout), and a one-line human summary on stdout in text mode. Usage
-  refusals up front (an empty path, `--bands` and `--out` naming the
-  same file — the artifact write would destroy the report) → 2. The
-  recompute posture is pinned: ONLY the eval command writes the
-  artifact (structural source-scan + behavioral tests — no other
-  import surface can mint or write the file, AC4). Exit-code contract
+  stdout), and a one-line human summary on stderr in text mode (the
+  `--out` file stays the same bytes as stdout). Usage refusals up
+  front (an empty path, `--bands` and `--out` naming the same file —
+  the artifact write would destroy the report) → 2. The recompute
+  posture is pinned: eval remains the only command that writes the
+  artifact — a structural source-scan tripwire against named mints
+  (a tripwire, not a sandbox: getattr-construction and a hand-rolled
+  dict evade any string scan) + the behavioral pins (AC4).
+  Exit-code contract
   preserved (config error → 4; a calibration refusal — an unknown
   override label, a lying identity — and a write failure → 5).
 - Config `[bands]` (ticket #21): the run's default min-precision

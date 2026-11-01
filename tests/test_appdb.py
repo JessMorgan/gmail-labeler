@@ -177,7 +177,9 @@ def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="schema_version \\[99\\]"):
+    # a foreign-version schema_version (99) is NOT valid-ours (rows !=
+    # {1}) → refused as a foreign DB (the shape gate, disposition 2)
+    with pytest.raises(AppDBError, match="foreign tables"):
         db.open()
     conn = sqlite3.connect(str(db_path))
     try:
@@ -200,6 +202,105 @@ def test_polluted_schema_version_is_refused(tmp_path: Path) -> None:
     db = AppDB(db_path)
     with pytest.raises(AppDBError, match="schema_version"):
         db.open()
+
+
+def test_generic_schema_version_is_not_ours(tmp_path: Path) -> None:
+    # disposition 2 (the adoption hole ds reproduced): a foreign DB with
+    # ONLY a generic single-column `version` table (empty — not stamped
+    # by us) is NOT ours → named refusal, not silently adopted
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="foreign tables"):
+        db.open()
+    # NOT adopted: no shadow_results table was created on the foreign DB
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "shadow_results" not in tables
+        assert "schema_version" in tables  # the foreign table, untouched
+    finally:
+        conn.close()
+
+
+def test_wrong_shape_shadow_results_is_refused(tmp_path: Path) -> None:
+    # disposition 2: a same-named shadow_results with the WRONG column
+    # set is refused, named (shape, not name) — BEFORE any write
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE shadow_results (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="shadow_results has the wrong shape"):
+        db.open()
+
+
+def test_wrong_shape_schema_version_is_refused(tmp_path: Path) -> None:
+    # disposition 2: a same-named schema_version that is NOT the
+    # single-column `version` table (e.g. two columns) is refused, named
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER, note TEXT)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="schema_version has the wrong shape"):
+        db.open()
+
+
+def test_valid_ours_coeexists_with_foreign_tables(tmp_path: Path) -> None:
+    # disposition 2 (documented decision): a valid ours-DB (our
+    # shadow_results) PLUS foreign extra tables COEXISTS — our tables are
+    # the authority, the extras are left alone
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.record_run("run-1", TS, [_row("aa", "Shipping", 0.9, "high")])
+    db.close()
+    # add a foreign extra table
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE other_app_data (id INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO other_app_data (id) VALUES (1)")
+    conn.commit()
+    conn.close()
+    # re-open: coexists (no refusal)
+    db2 = AppDB(db_path)
+    db2.open()
+    _run_ts, rows = db2.load_run("run-1")
+    assert len(rows) == 1
+    db2.close()
+
+
+def test_versioned_foreign_db_gains_no_table_pre_refusal(tmp_path: Path) -> None:
+    # disposition 2 (ds-C5 probe): a versioned-foreign DB (our
+    # schema_version shape + a foreign version) is refused BEFORE
+    # executescript — it does NOT gain a shadow_results table pre-refusal
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (99)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="foreign tables"):
+        db.open()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "shadow_results" not in tables  # NOT created pre-refusal
+        assert tables == {"schema_version"}
+    finally:
+        conn.close()
 
 
 def test_schema_version_row_is_stable_across_opens(tmp_path: Path) -> None:

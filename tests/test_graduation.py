@@ -838,6 +838,22 @@ def test_validate_refuses_bool_format_version() -> None:
         lying.validate()
 
 
+def test_validate_refuses_float_examples() -> None:
+    # the 5.0 residue: a float examples count passes a bare
+    # `isinstance(bool) or < 0` check, mints a hash, and from_json
+    # then refuses it (the hash-sealed-unroundtrippable class) —
+    # validate() gets the same type() is int policing
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    bills, shipping = table.labels
+    lying = _mutated_table(
+        table, labels=(dataclasses.replace(bills, examples=5.0), shipping)
+    )  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="examples"):
+        lying.validate()
+
+
 def test_validate_refuses_float_test_examples() -> None:
     # 18.0 passes a bare `< 0` check; from_json's _need_int refuses a
     # float, so validate() must too (the symmetry)
@@ -1022,13 +1038,13 @@ def test_diff_baseline_empty_when_no_existing_table() -> None:
     # old side; the lines carry the effective gate targets + measured
     # values (the human-confirm surface shows what is being confirmed)
     assert (
-        "Bills: (absent) -> graduated (examples=10, precision@high=0.90, "
-        "min_examples=10, min_precision=0.9)" in diff
+        "Bills: (absent) -> graduated (examples=10, precision@high=0.9000, "
+        "min_examples=10, min_precision=0.9000)" in diff
     )
     assert (
         "Shipping: (absent) -> not graduated (below-min-examples, "
-        "no-high-band) (examples=5, precision@high=none, min_examples=10, "
-        "min_precision=0.9)" in diff
+        "no-high-band; examples=5, precision@high=none, min_examples=10, "
+        "min_precision=0.9000)" in diff
     )
 
 
@@ -1053,16 +1069,16 @@ def test_diff_shows_old_to_new_per_label() -> None:
     old = dataclasses.replace(old, content_hash=old.compute_hash())
     diff = render_graduation_diff(old, table, path="grad.json")
     assert (
-        "Bills: not graduated (below-min-examples) "
-        "(examples=10, precision@high=0.90, min_examples=10, "
-        "min_precision=0.9) -> graduated (examples=10, "
-        "precision@high=0.90, min_examples=10, min_precision=0.9)" in diff
+        "Bills: not graduated (below-min-examples; examples=10, "
+        "precision@high=0.9000, min_examples=10, min_precision=0.9000) "
+        "-> graduated (examples=10, precision@high=0.9000, "
+        "min_examples=10, min_precision=0.9000)" in diff
     )
     assert (
         "Shipping: graduated (examples=5, precision@high=none, "
-        "min_examples=10, min_precision=0.9) -> not graduated "
-        "(below-min-examples, no-high-band) (examples=5, "
-        "precision@high=none, min_examples=10, min_precision=0.9)" in diff
+        "min_examples=10, min_precision=0.9000) -> not graduated "
+        "(below-min-examples, no-high-band; examples=5, "
+        "precision@high=none, min_examples=10, min_precision=0.9000)" in diff
     )
 
 
@@ -1080,9 +1096,9 @@ def test_diff_names_absent_labels() -> None:
     old = dataclasses.replace(old, content_hash=old.compute_hash())
     diff = render_graduation_diff(old, table, path="grad.json")
     assert (
-        "(absent) -> not graduated (below-min-examples, no-high-band) "
-        "(examples=5, precision@high=none, min_examples=10, "
-        "min_precision=0.9)" in diff
+        "(absent) -> not graduated (below-min-examples, no-high-band; "
+        "examples=5, precision@high=none, min_examples=10, "
+        "min_precision=0.9000)" in diff
     )
 
 
@@ -1119,9 +1135,10 @@ def test_diff_shows_gate_changes() -> None:
     )
     diff = render_graduation_diff(old, new, path="grad.json")
     assert (
-        "Bills: graduated (examples=10, precision@high=0.90, min_examples=10, "
-        "min_precision=0.9) -> graduated (examples=10, precision@high=0.90, "
-        "min_examples=5, min_precision=0.9)" in diff
+        "Bills: graduated (examples=10, precision@high=0.9000, "
+        "min_examples=10, min_precision=0.9000) -> graduated "
+        "(examples=10, precision@high=0.9000, min_examples=5, "
+        "min_precision=0.9000)" in diff
     )
 
 

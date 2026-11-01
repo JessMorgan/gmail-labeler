@@ -539,6 +539,7 @@ def _seed_corpus(
             labels=(label,),
             body_hash=body_hash(f"body {base + i}"),
             source="api",
+            date_provenance="internal_date",
         )
         store.put(rec, f"body {base + i}")
     return store.root

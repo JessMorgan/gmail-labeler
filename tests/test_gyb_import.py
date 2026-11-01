@@ -83,6 +83,9 @@ def test_import_writes_normalized_records(gyb: Path, tmp_path: Path) -> None:
     assert store.get_body("aaaa") == "body aaaa"
     assert all(r.source == "gyb" for r in recs.values())
     assert all(r.thread_id == "" for r in recs.values())  # never guessed
+    # GYB stamps its own source on the record contract (the folder-
+    # corrected internal-date) — distinct from the two API provenances
+    assert all(r.date_provenance == "gyb_internaldate" for r in recs.values())
 
 
 def test_system_labels_extra_localizes_the_filter(gyb: Path, tmp_path: Path) -> None:

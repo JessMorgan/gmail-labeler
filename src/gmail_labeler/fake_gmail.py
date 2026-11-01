@@ -281,8 +281,9 @@ class FakeGmailClient:
 
     def ensure_label(self, name: str) -> str:
         """Get-or-create a USER label by exact name (idempotent when
-        present — no create recorded). A System Label name-sake is
-        REFUSED, named (the REST mirror, F1). The fake performs the
+        present — exact-case match, no create recorded). A System
+        Label name-sake (casefolded) is REFUSED, named (the REST
+        mirror, F1/F2). The fake performs the
         same WIRE calls as the adapter — list_labels first (recorded in
         the call log; a READ, so the shadow zero-write pin is
         unaffected), create only when the name is absent — so #25's
@@ -296,11 +297,13 @@ class FakeGmailClient:
         self._maybe_fail("ensure_label")
         labels = self.list_labels()  # the wire call the adapter makes
         wanted = name.casefold()
-        for label in labels:
+        for label in labels:  # pass 1: the exact-case get-or-create hit
             if label.name == name and label.type == "user":
                 return label.id
+        for label in labels:  # pass 2: the casefolded collision guard
+            # AFTER the user-hit pass (deterministic precedence, F2
+            # review) — the guard only prevents MINTING a look-alike
             if label.type == "system" and label.name.casefold() == wanted:
-                # the casefolded collision guard, mirrored (F2)
                 raise ValueError(
                     f"ensure_label: {name!r} collides with a System Label "
                     "name in the mailbox — rename [labels] applied/high/med "

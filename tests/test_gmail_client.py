@@ -880,6 +880,39 @@ def test_ensure_label_casefold_catches_lowercase_collision() -> None:
     assert service.create_calls == []
 
 
+def test_ensure_label_user_hit_wins_regardless_of_list_order() -> None:
+    # F2 review MINOR: deterministic precedence — the exact-case user
+    # hit is pass 1, the casefolded collision guard is pass 2. The old
+    # single loop RAISED when the system entry preceded the user entry
+    # in labels.list (same mailbox, order-dependent outcome); an
+    # EXISTING exact-case user label is always reused — the guard only
+    # prevents MINTING a look-alike
+    client, service = _write_rest(
+        labels={
+            "labels": [
+                {"id": "INBOX", "name": "INBOX", "type": "system"},
+                {"id": "Label_user", "name": "inbox", "type": "user"},
+            ]
+        }
+    )
+    assert client.ensure_label("inbox") == "Label_user"
+    assert service.create_calls == []
+
+
+def test_ensure_label_case_variant_of_a_user_label_creates_not_refuses() -> None:
+    # F2 review NIT: the guard's negative direction — a case variant of
+    # a USER label (no system collision) must proceed to create, not
+    # refuse: the refusal is for System-Label look-alikes only (what
+    # Gmail's own uniqueness rule then answers on the wire is the 409
+    # self-heal's story, not the guard's)
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    created = fake.ensure_label("AI-HIGH")
+    assert created != "Label_9"
+    assert fake.writes == [{"method": "ensure_label", "body": {"name": "AI-HIGH"}}]
+
+
 def test_ensure_label_409_race_self_heals_by_relisting() -> None:
     # F1 (qwen MINOR): a concurrent create (another client won the name
     # between our list and our create — Gmail answers 409) is NOT a hard

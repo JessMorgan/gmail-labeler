@@ -955,6 +955,33 @@ def test_shadow_run_empty_backlog_exits_5(
     assert "no messages to score" in result.stderr
 
 
+def test_shadow_run_db_flag_overrides_store_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D3: the --db flag is a usage-level override of [store] db_path —
+    # the rows land at the --db path, not the config default
+    _prepare(tmp_path, monkeypatch)
+    custom_db = tmp_path / "custom" / "state.db"
+    result, _fake = _run_shadow(
+        tmp_path, "--db", str(custom_db), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 0, result.stderr
+    assert custom_db.is_file()
+    assert _db_has_rows(custom_db)
+    # the config default was NOT written
+    assert not (tmp_path / "gmail-labeler.db").exists()
+
+
+def test_shadow_run_db_flag_empty_is_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # an empty --db is a usage refusal (exit 2)
+    _prepare(tmp_path, monkeypatch)
+    result, _fake = _run_shadow(tmp_path, "--db", "  ", monkeypatch=monkeypatch)
+    assert result.exit_code == 2
+    assert "--db PATH must be non-empty" in result.stderr
+
+
 def test_shadow_run_store_db_path_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -969,70 +996,105 @@ def test_shadow_run_store_db_path_config(
 
 
 @pytest.mark.live
+@pytest.mark.smoke
 def test_live_shadow_run_real_checkpoint(tmp_path: Path) -> None:
-    """The Phase 1 exit demo (opt-in, NEVER run in CI): a real-checkpoint
-    shadow run against the live mailbox.
+    """The Phase 1 exit demo (opt-in, NEVER run in CI): a READ-ONLY
+    real-checkpoint shadow run against the live mailbox.
 
-    Runs the full Phase 1 exit path with a REAL encoder (the ``train``
-    extra — torch) and the REAL Gmail API: train a checkpoint, calibrate
-    the bands, graduate the labels, then ``shadow run`` over a small
-    Backlog window and ``shadow report``. This is the human go/no-go
-    review before anything goes live (ADR-0005).
+    This test NEVER trains and NEVER confirms a Graduation Table (those
+    stay README-documented HUMAN actions — a test must not run
+    ``train --force`` against the operator's real checkpoint, nor pass
+    ``--confirm-graduation``). It requires the operator to have ALREADY
+    done the human steps (train, ``eval --bands``, ``eval --graduation
+    --confirm-graduation``) and then runs ``shadow run`` + ``shadow
+    report`` against the EXISTING checkpoint + artifacts.
+
+    It is READ-ONLY against Gmail (list_labels / list_messages /
+    get_message only — no write), costs API quota, and writes ONLY the
+    tmp-redirected state DB (``--db <tmp>``). It skips (with a reason)
+    when the config / corpus / checkpoint / bands / graduation artifacts
+    are absent — it never fails for "not set up".
 
     Opt-in:
 
-        uv run pytest -m live \\
+        uv run pytest -m "live and smoke" \\
             tests/test_shadow_cli.py::test_live_shadow_run_real_checkpoint
 
-    (needs the ``train`` extra, a signed-in Gmail account, and a corpus).
+    (needs the ``train`` extra for the real encoder, a signed-in Gmail
+    account, a corpus, and the human-step artifacts in the cwd).
     """
-    # no monkeypatching: the REAL model factory + REAL Gmail client. The
-    # config is discovered the normal way (./config.toml or
-    # ~/.config/gmail-labeler/config.toml) — the operator's real install.
-    import gmail_labeler.cli as cli
+    from pathlib import Path
 
-    # the real seams (no monkeypatch — the real recipe + real client)
-    assert cli._shadow_model_factory is not None  # the real factory
-    bands = tmp_path / "bands.json"
-    graduation = tmp_path / "graduation.json"
-    # train a real checkpoint (CPU)
-    train = runner.invoke(
-        app,
-        [
-            "train",
-            "--split-date",
-            "2026-01-01",
-            "--force",
-            "--device",
-            "cpu",
-        ],
-    )
-    assert train.exit_code == 0, train.stderr
-    # calibrate the bands + graduate the labels
-    bands_run = runner.invoke(app, ["eval", "--bands", str(bands)])
-    assert bands_run.exit_code == 0, bands_run.stderr
-    grad_run = runner.invoke(
-        app,
-        ["eval", "--graduation", str(graduation), "--confirm-graduation"],
-    )
-    assert grad_run.exit_code == 0, grad_run.stderr
+    from gmail_labeler.config import ConfigError, find_config, load_config
+    from gmail_labeler.model import MANIFEST_FILENAME
+
+    # the config must be discoverable (the operator's real install)
+    try:
+        config_path = find_config()
+    except ConfigError as e:
+        pytest.skip(f"no config.toml discoverable: {e}")
+    try:
+        cfg = load_config(str(config_path))
+    except ConfigError as e:
+        pytest.skip(f"config invalid: {e}")
+    # the corpus must exist and have records
+    corpus_root = Path(cfg.corpus.dir)
+    if not (corpus_root / "records.jsonl").is_file():
+        pytest.skip(f"corpus dir {corpus_root} has no records.jsonl")
+    # the checkpoint manifest must exist (the human train step was done)
+    manifest = Path(cfg.model.checkpoint_dir) / MANIFEST_FILENAME
+    if not manifest.is_file():
+        pytest.skip(f"checkpoint manifest {manifest} absent (run train first)")
+    # the bands + graduation artifacts must exist (the human eval steps)
+    cwd = Path.cwd()
+    bands = cwd / "bands.json"
+    graduation = cwd / "graduation.json"
+    if not bands.is_file() or not graduation.is_file():
+        pytest.skip(
+            "bands.json / graduation.json absent in cwd (run the human "
+            "eval --bands / eval --graduation --confirm-graduation steps)"
+        )
+    # the state DB is redirected to a tmp path (the test writes ONLY here)
+    db = tmp_path / "state.db"
     # the shadow run over a SMALL Backlog window (the demo — not a full
-    # mailbox scan)
+    # mailbox scan). READ-ONLY against Gmail; the real encoder loads the
+    # existing checkpoint (no train).
     run = runner.invoke(
         app,
         [
             "shadow",
             "run",
+            "--config",
+            str(config_path),
             "--bands",
             str(bands),
             "--graduation",
             str(graduation),
+            "--db",
+            str(db),
             "--limit",
-            "10",
+            "5",
         ],
     )
     assert run.exit_code == 0, run.stderr
-    # the report (the Phase 1 exit review)
-    report = runner.invoke(app, ["shadow", "report"])
+    assert db.is_file()  # the tmp DB was written (the only write)
+    # the report (the Phase 1 exit review) — READ-ONLY
+    report = runner.invoke(
+        app,
+        [
+            "shadow",
+            "report",
+            "--config",
+            str(config_path),
+            "--db",
+            str(db),
+        ],
+    )
     assert report.exit_code == 0, report.stderr
+    # no vacuous assert: the report must have real content (a header +
+    # at least one outcome line or the per-label block)
     assert "shadow report: run=" in report.stdout
+    assert any(
+        token in report.stdout
+        for token in ("ADDED", "ALREADY-PRESENT", "NOT-APPLIED", "per-label:")
+    )

@@ -309,6 +309,36 @@ def test_shadow_report_auth_gate_exits_4(
     assert "auth:" in result.stderr
 
 
+def test_shadow_report_uses_configured_tier_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D2: the [labels] high/med config drives the report's tier names —
+    # a custom spelling is honored, not silently ignored (refuse-never-
+    # drop). tiers.py keeps the DEFAULT spellings as the pure-core
+    # constants; the CLI maps band→configured name.
+    _prepare(tmp_path, monkeypatch)
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    # custom [labels] tier names
+    cfg = _shadow_cfg(
+        tmp_path,
+        labels=(
+            'managed = ["Money/Bills", "Shipping"]\nhigh = "confident"\nmed = "review"'
+        ),
+    )
+    report, _f2 = _run_report(tmp_path, monkeypatch=monkeypatch, cfg=cfg)
+    assert report.exit_code == 0, report.stderr
+    # m2's Money/Bills is ADDED (high band) → renders the configured
+    # "confident" name, not the default "ai-high"
+    aa22_block = report.stdout.split("aa22:")[1].split("aa33:")[0]
+    assert "confident" in aa22_block
+    assert "ai-high" not in aa22_block
+    # m4's Shipping is ADDED (med band) → renders "review", not "ai-med"
+    aa44_block = report.stdout.split("aa44:")[1]
+    assert "review" in aa44_block
+    assert "ai-med" not in aa44_block
+
+
 def test_shadow_report_all_skipped_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

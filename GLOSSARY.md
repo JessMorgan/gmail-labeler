@@ -13,13 +13,21 @@ _Avoid_: target label, predicted label
 **Tier Label**:
 A label attached alongside the content labels marking the confidence band under
 which they were applied, so every AI application is visible and reviewable.
+Three spellings (the `tiers.py` defaults, mirrored by the `[labels]` config
+keys `applied` / `high` / `med`): the `ai-applied` umbrella ("the AI
+contributed something"), `ai-high` (the high-confidence band), and `ai-med`
+(the review-me band). The operator's configured `[labels]` names drive the
+shadow report's tier names; the daemon resolves them to Gmail label ids before
+any live Application.
 _Avoid_: confidence label, meta label
 
 **Application**:
 A single act of applying one or more Managed Labels plus one Tier Label to one
 message, performed only when at least one predicted Managed Label is genuinely
 absent from the message (present labels are never re-applied). The unit that
-corrections and audits are counted against.
+corrections and audits are counted against. The per-message Tier Label is the
+BEST band among the applied labels (high beats med); a skip-present label
+earns no Tier Label (it is not applied), so it never raises the tier.
 _Avoid_: auto-label (the event, not the label)
 
 **Additive-only**:
@@ -41,7 +49,10 @@ _Avoid_: go-live, enablement
 
 **Threshold Band**:
 The per-(message, Managed Label) verdict — high, medium, or none — derived
-from the label's calibrated probability and its threshold.
+from the label's calibrated probability and its threshold. The persisted
+verdict values are `high` / `med` / `none` (the `tiers.py` `BAND_HIGH` /
+`BAND_MED` constants; "none" is the explicit no-band state).
+_Avoid_: medium (the persisted value is `med`)
 
 **System Label**:
 Gmail's own mailbox-state labels (`INBOX`, `UNREAD`, `SENT`, the `CATEGORY_*`
@@ -83,8 +94,37 @@ Running predictions on messages and recording them locally without any Gmail
 write, used for backlog evaluation before any label goes live.
 _Avoid_: dry run (reserved for the CLI flag)
 
+**Shadow Run**:
+One `shadow run` invocation: it scores the recent Backlog through the
+sidecar-validated checkpoint, the Graduation Table, and the Threshold Bands
+and records the would-apply verdicts in the state DB (one transaction per run)
+— applying NOTHING. Each run is identified by a run id; the verdicts are bound
+to the bands/graduation artifacts as of the run (the report discloses this
+basis and does not re-verify it).
+_Avoid_: shadow evaluation, dry run
+
+**Shadow Report**:
+The `shadow report` output: the diff of a Shadow Run's stored would-apply
+verdicts against the mailbox's ACTUAL labels (re-fetched via the read path) —
+the Phase 1 exit go/no-go artifact a human reviews before choosing the
+graduates. It shows per-message ADDED / ALREADY-PRESENT / NOT-APPLIED outcomes
+(ids + labels + scores + tiers only — no subjects, no bodies) and a per-label
+summary with the would-be tier mix.
+_Avoid_: shadow summary, evaluation report
+
+**state DB**:
+The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`)
+holding the `shadow_results` table (run id, message id, label, probability,
+band, run timestamp) and, with the daemon phase, the `applications` table. It
+carries ids, probabilities, labels, and timestamps ONLY — never bodies
+(invariant #5) — so it is publicly attachable. One transaction per run (a crash
+mid-run leaves no half rows); a foreign schema_version is refused.
+_Avoid_: shadow DB, label DB
+
 **Backlog**:
-The pre-existing mailbox history, as opposed to newly-arriving mail.
+The pre-existing mailbox history, as opposed to newly-arriving mail. The
+default `shadow run` window (90 days) includes recent arrivals as well as the
+older history — it is "recent mailbox", not strictly "pre-existing".
 
 **Corpus**:
 A user's labeled mail, assembled for training. Sourced either from a live

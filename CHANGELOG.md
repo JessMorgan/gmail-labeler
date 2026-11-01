@@ -65,6 +65,28 @@ does not ship releases yet.
   order and unreferenced label entries) so a drifted snapshot refuses the
   rebuild. The filter-shape rule is shared with `dataset analyze`
   (`filter_label_ids` / `filter_label_ids_strict`).
+- Checkpoint identity + loader refusal (`model.py`,
+  `corpus_record.py`): a checkpoint is a plain HF-style directory
+  (gitignored) plus a JSON Checkpoint Sidecar — label-vocabulary
+  hash, thresholds source (`none` until calibration exists; #21's
+  artifact slots in without a format change), Corpus fingerprint
+  (new `corpus_fingerprint`: sha256 of the canonical record lines of
+  the TRAIN-SPLIT slice only, order-invariant — append-only corpus
+  growth cannot invalidate a serving checkpoint, #25's lifeline),
+  train-split manifest hash, encoder identifier. Hash-shaped fields
+  are 64-hex validated at parse (empty strings refused).
+  `load_model` REFUSES any checkpoint whose sidecar disagrees with the
+  Corpus/config it is asked to serve against — each field refused
+  independently, all disagreements named in one
+  `CheckpointRefusedError` (a `ValueError`); the format version is
+  checked FIRST with its own `sidecar-version` code (not conflated
+  with `sidecar-corrupt`); the materialized `manifest.json` is
+  verified against the sidecar (`manifest-missing` /
+  `manifest-corrupt` / `split-manifest-mismatch` — a tampered
+  manifest refuses). `corpus_record.preprocess_text` states its
+  contract literally (`subject + "\n" + body`; an empty body ends
+  with a trailing newline). Pinned offline with `tmp_path` fixtures +
+  `FakeModel` (AC#3), incl. the append-only-growth serving test.
 - Dataset builder recency weighting: each Training Example carries a
   recency weight (1.0 at/after the cutoff, `old_weight` before) mirroring
   analyze's `months_ago` window shape; the cutoff (UTC-normalized) and

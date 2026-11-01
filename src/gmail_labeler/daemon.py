@@ -305,11 +305,16 @@ def _run_tick(
                 f"{len(fetched)} texts — checkpoint/recipe defect"
             )
     except (ValueError, OSError, RuntimeError) as e:
+        # invariant #5 at THIS surface: a model error may quote the
+        # scored TEXT (FakeModel's unprogrammed-text refusal does — and
+        # the text carries the body) — the log names the exception
+        # CLASS only, never the message. The held cursor is the
+        # operator-visible fact.
         log.warning(
             "daemon: delta failed at cursor %d — cursor held, retry next "
-            "tick: prediction failed: %s",
+            "tick: prediction failed (%s)",
             cursor,
-            e,
+            type(e).__name__,
         )
         return "held", stop
 

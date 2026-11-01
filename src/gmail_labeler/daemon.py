@@ -85,6 +85,16 @@ __all__ = ["BOOTSTRAP_QUERY", "ServingContext", "bootstrap_cursor", "daemon_loop
 
 log = logging.getLogger("gmail_labeler.daemon")
 
+
+class _PredictionShapeError(ValueError):
+    # SELF-AUTHORED prediction-shape defects (row count / row width):
+    # the message is built from COUNTS only — structurally body-free —
+    # so it is safe to log verbatim. Model-raised errors stay class-only
+    # in the log (a model error may quote the scored text, which carries
+    # the body — invariant #5).
+    pass
+
+
 #: The bootstrap list query: UNFILTERED — the sync guide's full-sync
 #: step 1 lists the mailbox and the FIRST stub is the most recent
 #: message (the guide's own claim); its historyId is the cursor seed.
@@ -267,7 +277,7 @@ def _run_tick(
                 return "held", stop
             try:
                 data = decode_gmail_raw(raw.raw_b64url)
-            except (ValueError, UnicodeEncodeError) as e:
+            except ValueError as e:  # UnicodeEncodeError IS a ValueError
                 # decode_gmail_raw is intentionally loud on corrupt raw
                 # (the export doctrine): per-message fail-safe
                 skipped += 1
@@ -300,10 +310,30 @@ def _run_tick(
     try:
         score_rows = model.predict([text for _, _, text in fetched])
         if len(score_rows) != len(fetched):
-            raise ValueError(
+            raise _PredictionShapeError(
                 f"the model returned {len(score_rows)} score rows for "
                 f"{len(fetched)} texts — checkpoint/recipe defect"
             )
+        # the row WIDTH check lives HERE (inside the guarded arm): a
+        # lying checkpoint with the right count but a misaligned row
+        # would otherwise raise from the compose zip OUTSIDE the net and
+        # kill the loop. Divergence from shadow's one-shot posture (cli.py
+        # treats a width defect as exit-1 'a bug'): the daemon is a
+        # long-lived service — hold, warn, keep the cursor.
+        vocab_len = len(model.vocabulary)
+        if any(len(row) != vocab_len for row in score_rows):
+            raise _PredictionShapeError(
+                f"a score row does not align to the {vocab_len}-label "
+                f"vocabulary — checkpoint/recipe defect"
+            )
+    except _PredictionShapeError as e:
+        # self-authored, counts-only message: safe to log verbatim
+        log.warning(
+            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
+            cursor,
+            e,
+        )
+        return "held", stop
     except (ValueError, OSError, RuntimeError) as e:
         # invariant #5 at THIS surface: a model error may quote the
         # scored TEXT (FakeModel's unprogrammed-text refusal does — and
@@ -384,7 +414,10 @@ def _run_tick(
     # THE durable-handling commit point: rows AND cursor in ONE
     # transaction — COMMIT = handled (invariant #3; the store-side
     # all-or-nothing is pinned in test_appdb)
-    assert new_cursor is not None  # every served page set it (loop invariant)
+    if new_cursor is None:  # unreachable: every served page set it
+        # (the repo rule: a raise, not an assert — python -O strips
+        # asserts; the applications.py internal-contradiction precedent)
+        raise AssertionError("delta drained without a cursor value")
     try:
         db.commit_page(page_rows, new_cursor)
     except AppDBError as e:

@@ -34,9 +34,9 @@ you would.
 - **Your mail never leaves your machines.** Training, inference, and storage
   are 100% local. No telemetry, no hosted training, no API keys to us.
 - **It only ever adds labels.** `gmail-labeler` will not remove anything,
-  and every application (once the write phase lands) carries an `ai-applied`
+  and every application carries an `ai-applied`
   umbrella plus one band Tier Label (`ai-high` / `ai-med`) so you can audit
-  every decision it ever made.
+  every decision it ever made (the daemon's write path landed with #25).
 - **Nothing goes live unproven.** Each label is trained, scored on a recent
   held-out slice of *your* mail, and shadow-scored before it is ever applied
   silently. Labels that don't earn it stay in review.

@@ -326,9 +326,12 @@ def test_daemon_midrun_auth_error_exit_4(
         current_history_id=900,
     )
     fake.fail("history", GmailAuthError("token revoked"))
-    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
+    install: list[tuple[int, object]] = []
+    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake, install_capture=install)
     assert result.exit_code == 4
     assert "auth:" in result.stderr
+    # handlers restored on the exit-4 path too (the finally covers it)
+    assert len(install) == 4  # 2 installs + 2 restores
 
 
 def test_daemon_collision_refusal_exit_4_names_the_labels_key(
@@ -347,6 +350,44 @@ def test_daemon_collision_refusal_exit_4_names_the_labels_key(
     assert result.exit_code == 4
     assert "[labels] high" in result.stderr
     assert "collides with a System Label" in result.stderr
+
+
+def test_daemon_ensure_label_auth_error_exit_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the review round's BLOCKER (both families, executed probes):
+    # ensure_label's own list/create round-trips raise the gmail_errors
+    # family; a token revoked between the auth gate and startup
+    # resolution must land on 4 (human-gated), never exit-1 traceback
+    _prepare(tmp_path, monkeypatch)
+    fake = FakeGmailClient(
+        messages=_backlog_messages(),
+        labels=_shadow_labels(),
+        current_history_id=900,
+    )
+    fake.fail("ensure_label", GmailAuthError("token revoked"))
+    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+
+
+def test_daemon_ensure_label_transient_exit_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a rate-limit blip during the 3-6 startup wire calls of a
+    # long-running service: operation failure (5), named, no traceback
+    _prepare(tmp_path, monkeypatch)
+    from gmail_labeler.gmail_errors import GmailTransientError
+
+    fake = FakeGmailClient(
+        messages=_backlog_messages(),
+        labels=_shadow_labels(),
+        current_history_id=900,
+    )
+    fake.fail("ensure_label", GmailTransientError("blip"))
+    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
+    assert result.exit_code == 5
+    assert "tier label resolution failed" in result.stderr
 
 
 def test_daemon_state_db_fail_fast_exit_5(
@@ -376,9 +417,13 @@ def test_daemon_tampered_cursor_exit_5_not_traceback(
     conn.execute("UPDATE daemon_state SET history_cursor = 0")
     conn.commit()
     conn.close()
-    result, _ = _run_daemon(tmp_path, monkeypatch, preset_cursor=None)
+    install: list[tuple[int, object]] = []
+    result, _ = _run_daemon(
+        tmp_path, monkeypatch, preset_cursor=None, install_capture=install
+    )
     assert result.exit_code == 5
     assert "state DB" in result.stderr
+    assert len(install) == 4  # restored on the exit-5 path as well
 
 
 def test_daemon_tampered_bands_artifact_exit_5(
@@ -449,6 +494,9 @@ def test_daemon_bodies_absent_cli_layer(
     monkeypatch.setattr(cli, "_daemon_model_factory", _shadow_factory(scores))
     result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
     assert result.exit_code == 0, result.stderr
+    # non-vacuity: the leak path (the predict-failure warning quoting
+    # the unprogrammed text) MUST have executed this run
+    assert "prediction failed" in caplog.text
     assert marker not in result.stdout
     assert marker not in result.stderr
     assert marker not in caplog.text

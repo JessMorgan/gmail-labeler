@@ -1202,6 +1202,42 @@ def test_daemon_state_tampered_cursor_is_refused_on_read(tmp_path: Path) -> None
     db2.close()
 
 
+def test_set_history_cursor_ceiling_refused(tmp_path: Path) -> None:
+    # the wire type (uint64) is wider than SQLite's signed INTEGER: an
+    # unbounded value would escape as a raw OverflowError at bind time,
+    # past every named-error wrapper (review finding) — refused here
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="SQLite INTEGER range"):
+        db.set_history_cursor(2**63)
+    assert db.get_history_cursor() is None
+    # the top of the supported range still lands
+    db.set_history_cursor(2**63 - 1)
+    assert db.get_history_cursor() == 2**63 - 1
+    db.close()
+
+
+def test_daemon_state_off_rowid_tamper_is_refused_on_read(tmp_path: Path) -> None:
+    # the single-row model's rowid gate: the writer only ever touches
+    # rowid 1, so a lone row elsewhere is hand-made (and the next
+    # legitimate write would make the table two rows) — refused,
+    # named, recovery given (review finding)
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    conn.execute("CREATE TABLE daemon_state (history_cursor INTEGER NOT NULL)")
+    conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (7, 42)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    with pytest.raises(AppDBError, match="rowid 7") as exc:
+        db.get_history_cursor()
+    assert "DELETE FROM daemon_state WHERE rowid != 1" in str(exc.value)
+    db.close()
+
+
 def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:
     # the durable-handling commit point (#25, invariant #3): ONE
     # transaction carries the page's Application rows AND the cursor

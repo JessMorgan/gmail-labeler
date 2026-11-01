@@ -522,6 +522,35 @@ def test_fake_history_idle_never_regresses_cursor() -> None:
     assert idle.history_id is not None and idle.history_id >= 98765
 
 
+def test_fake_history_rewalk_replays_and_the_token_guard_survives() -> None:
+    # #25 review round: the RE-WALK rule (a token-less call from the
+    # held cursor re-serves the scripted window) must not mask a
+    # genuine skip — the TOKEN guard has to survive it
+    pages = [
+        HistoryPage(
+            history_id=None,
+            next_page_token="p1",
+            records=({"messages": [{"id": "a1"}]},),
+        ),
+        HistoryPage(history_id=None, next_page_token=None, records=()),
+    ]
+    fake = FakeGmailClient(history_pages=pages, current_history_id=50)
+    first = fake.history(10)
+    assert first.next_page_token == "p1"
+    # re-walk: token-less, SAME start id, mid-chain → replays from the
+    # walk's first page (the held-cursor replay the daemon relies on)
+    replay = fake.history(10)
+    assert replay.next_page_token == "p1"
+    # a wrong token mid-chain still trips the typed 400 (the skip catch)
+    with pytest.raises(GmailPermanentError, match="skip/replay misuse"):
+        fake.history(10, "bogus")
+    # a token-less call under a DIFFERENT start id is a fresh poll from
+    # a different cursor (the re-bootstrap flow): a new walk, the script
+    # continues from its current position (page 2)
+    fresh = fake.history(20)
+    assert fresh.next_page_token is None
+
+
 @pytest.mark.parametrize(
     "bad",
     [True, -1],

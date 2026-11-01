@@ -146,6 +146,10 @@ does not ship releases yet.
   latest (3.15) runs on ubuntu and macOS. Drops the macOS 3.12 cell (runner
   queue pressure) and replaces 3.13 with 3.15 as the tested latest; 3.13 and
   3.14 remain allowed by `requires-python >=3.12`, just untested.
+- CI and the local CI script pin a tz-db-less environment
+  (`PYTHONTZPATH=/nonexistent/tzdb`) so runner-dependent timezone behavior
+  surfaces locally; the declaration is self-pinned by `tests/test_tzenv.py`
+  (issue #16).
 - Renamed `dataset export` to `dataset import-gmail` (ticket #68, ADR-0006):
   the acquisition commands speak from the Corpus's side, symmetric with
   `import-gyb`. Hard cut — no compat alias (pre-1.0); the old name exits 2

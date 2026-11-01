@@ -7,7 +7,7 @@ the same property that makes crash-retry harmless — invariant #2's corpus
 twin), so the import can die at any moment and simply be re-run. Retry policy
 is driven by the typed taxonomy only (transient→backoff-retry,
 rate_limited→honored backoff, permanent→record-and-continue: one unreadable
-message must never abort a 394k-message import). Messages whose timestamp
+message must never abort the whole import). Messages whose timestamp
 cannot be established from either source (API internalDate or Date header) are
 FAILED, not fabricated — the temporal split (invariant #7) starts honest.
 """
@@ -170,7 +170,7 @@ def _birth_cursor(
     non-positive seed is a wire lie the ledger refuses. When no usable seed
     exists the import degrades LOUDLY but not fatally: the cursor is
     additive, the corpus stays birth-eligible, and failing a healthy
-    394k-message import over one bootstrap read would regress the
+    full-corpus import over one bootstrap read would regress the
     acquisition contract. A write failure (CorpusError) propagates like any
     structural store fault — typed exit 5."""
     if store.read_cursor() is not None:
@@ -251,7 +251,7 @@ def _import_one(
         )
     except ValueError as e:
         # a wire value violating the record contract fails THIS message
-        # only — one impossible id must not abort a 394k import
+        # only — one impossible id must not abort the whole import
         stats.failed.append((message_id, f"record shape: {e}"))
         return "failed"
     # Structural store failures (CorpusError) PROPAGATE and stop the run

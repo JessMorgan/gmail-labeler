@@ -32,6 +32,7 @@ AttributionPosture = Literal[
 if TYPE_CHECKING:
     from .config import Config
     from .gmail_client import GmailClient
+    from .thresholds import BandsArtifact
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -105,7 +106,13 @@ def _write_secret_tight(path: Path, text: str) -> None:
         fh.write(text)
 
 
-def _write_bands_artifact(path: Path, text: str) -> None:
+class BandsTargetRefusedError(Exception):
+    """The existing --bands target is a verifiably-different Bands
+    Artifact: replacing it would destroy identity material (the
+    serving-gate hardening — a clobber by a drifted run is a lie)."""
+
+
+def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> None:
     """Write the Bands Artifact (ticket #21): 0600 from creation,
     EXCLUSIVE staging + atomic replace — a failure leaves any PREVIOUS
     artifact intact, and no fd can leak. The staging file is
@@ -114,13 +121,50 @@ def _write_bands_artifact(path: Path, text: str) -> None:
     --bands`` runs on the same path can never interleave on a shared
     staging name and rename each other's partial bytes into place; the
     final ``os.replace`` is atomic, so each run publishes its own
-    complete bytes. Replacing an EXISTING artifact is announced on
+    complete bytes.
+
+    Before replacing an EXISTING artifact, its identity is checked
+    against the current run (the serving-gate hardening): a parsed
+    artifact whose identity fields disagree is refused
+    (``BandsTargetRefusedError`` — exit 5, BEFORE any staging); an
+    unreadable/garbage target is NOT identity material — the replace
+    NOTICE proceeds (the artifact is regenerable by design, the
+    recompute posture). Replacing an existing artifact is announced on
     stderr (the #20 ``--out`` NOTICE — a silent clobber of a typo'd
-    path would be a lie). The ONLY writer of the artifact in the
-    package (recompute posture, AC4 — pinned by
+    path would be a lie). After the replace, the on-disk bytes are read
+    back through ``BandsArtifact.from_json`` (train's sidecar readback
+    symmetry): a torn write is an operation failure, never a silently
+    corrupt artifact. The ONLY writer of the artifact in the package
+    (recompute posture, AC4 — pinned by
     ``test_only_eval_writes_the_bands_artifact``)."""
-    if path.exists():
-        typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+    from .thresholds import BandsArtifact
+
+    if path.is_file():
+        try:
+            existing = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            # an unreadable/garbage target is not identity material —
+            # the replace NOTICE proceeds (regenerable by design)
+            typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+        else:
+            disagreeing = [
+                field
+                for field in (
+                    "vocabulary_hash",
+                    "corpus_fingerprint",
+                    "split_manifest_hash",
+                    "encoder_id",
+                    "split_date",
+                    "test_examples",
+                )
+                if getattr(existing, field) != getattr(artifact, field)
+            ]
+            if disagreeing:
+                raise BandsTargetRefusedError(
+                    f"existing artifact at {path} is bound to "
+                    f"{', '.join(disagreeing)} — not this checkpoint"
+                )
+            typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
     fd, staging_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
     staging = Path(staging_name)
     try:
@@ -129,6 +173,14 @@ def _write_bands_artifact(path: Path, text: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(staging, str(path))  # atomic on POSIX
+        # readback symmetry (train's sidecar pattern): the on-disk
+        # bytes must parse back to the minted artifact — a torn write
+        # is an operation failure, never a silently corrupt artifact
+        if BandsArtifact.from_json(path.read_text(encoding="utf-8")) != artifact:
+            raise OSError(
+                f"artifact readback mismatch: {path} does not parse "
+                "back to the minted artifact"
+            )
     except OSError:
         staging.unlink(missing_ok=True)  # best-effort staging cleanup
         raise
@@ -984,6 +1036,16 @@ def eval(
             )
             raise typer.Exit(code=2) from None
         bands_path = Path(bands).resolve()
+        if bands_path.is_dir():
+            # an existing directory at the target would fail at
+            # os.replace (EISDIR) AFTER the report — a usage error up
+            # front, like the other usage refusals
+            typer.echo(
+                f"eval failed: --bands {bands!r} names an existing "
+                f"directory ({bands_path}) \u2014 the artifact is a file",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
         from .config import find_config
 
         for protected, what in (
@@ -1325,14 +1387,23 @@ def eval(
             typer.echo(f"eval failed: band calibration refused: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         try:
-            _write_bands_artifact(Path(bands), artifact.to_json())
+            _write_bands_artifact(Path(bands), artifact, artifact.to_json())
+        except BandsTargetRefusedError as e:
+            # the serving-gate hardening: the existing target is a
+            # verifiably-different artifact — exit 5, before any
+            # staging, the previous bytes intact
+            typer.echo(f"eval failed: --bands refused: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         except OSError as e:
             # the helper already cleaned up its (mkstemp-named) staging
             typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         # the human-readable summary (the text-report mode only — the
         # --json payload is the machine-readable output, and the
-        # artifact file is the machine-readable bands)
+        # artifact file is the machine-readable bands). On STDERR, so
+        # the --out file stays "the same bytes as stdout" (the
+        # documented --out contract — the summary is status, not
+        # report content)
         if not as_json:
             typer.echo(
                 "bands: "
@@ -1341,7 +1412,8 @@ def eval(
                     f"med={lb.med if lb.med is not None else 'none'}"
                     + (f" ({', '.join(lb.reasons)})" if lb.reasons else "")
                     for lb in calibrated.labels
-                )
+                ),
+                err=True,
             )
 
 

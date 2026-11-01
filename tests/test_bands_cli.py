@@ -105,14 +105,26 @@ def _eval_factory(
     return factory
 
 
-def _run_train(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Result:
+def _run_train(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    split_date: str = SPLIT,
+    force: bool = False,
+) -> Result:
     import gmail_labeler.cli as cli
 
     monkeypatch.setattr(cli, "_model_factory", _train_factory())
-    return runner.invoke(
-        app,
-        ["train", "--config", str(_eval_cfg(tmp_path)), "--split-date", SPLIT],
-    )
+    args = [
+        "train",
+        "--config",
+        str(_eval_cfg(tmp_path)),
+        "--split-date",
+        split_date,
+    ]
+    if force:
+        args.append("--force")
+    return runner.invoke(app, args)
 
 
 def _test_side_scores() -> dict[str, tuple[float, ...]]:
@@ -224,11 +236,13 @@ def test_eval_bands_writes_bound_artifact(
     assert entries["Shipping"].high == 0.9
     assert entries["Shipping"].med == 0.8
     assert entries["Shipping"].reasons == ()
-    # the summary line is on stdout (the report is not lost)
+    # the report is on stdout; the bands summary is on STDERR (the
+    # --out "same bytes as stdout" contract — the summary is status,
+    # not report content)
     assert "test examples=6" in result.stdout
     assert (
         "bands: Money/Bills high=0.8 med=0.7; Shipping high=0.9 med=0.8"
-        in result.stdout
+        in result.stderr
     )
 
 
@@ -506,6 +520,74 @@ def test_eval_bands_with_distinct_out_writes_both(
     assert [e.label for e in artifact.labels] == ["Money/Bills", "Shipping"]
 
 
+def test_eval_bands_refuses_identity_drift_on_existing_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the serving-gate hardening: an eval of checkpoint B over a target
+    # holding checkpoint A's artifact must REFUSE (exit 5, before any
+    # staging) — a NOTICE-only clobber would destroy a verifiably-A
+    # artifact. A's bytes stay byte-identical.
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0  # checkpoint A
+    out = tmp_path / "bands.json"
+    r1, _f1 = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
+    assert r1.exit_code == 0, r1.stderr
+    bytes_a = out.read_bytes()
+    # checkpoint B: same corpus, a LATER split date — the manifest's
+    # split identity (and the artifact's split_date) differs
+    assert (
+        _run_train(tmp_path, monkeypatch, split_date="2026-02-01", force=True).exit_code
+        == 0
+    )
+    r2, _f2 = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
+    assert r2.exit_code == 5
+    assert "--bands refused" in r2.stderr
+    assert "split_date" in r2.stderr  # the named disagreeing field
+    assert out.read_bytes() == bytes_a  # A's bytes byte-identical
+
+
+def test_eval_bands_out_file_is_the_same_bytes_as_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --out byte contract with --bands: the file is EXACTLY the
+    # stdout bytes (the bands summary is status, routed to stderr —
+    # the documented "same bytes" promise holds)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    out = tmp_path / "report.txt"
+    bands = tmp_path / "bands.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--out",
+        str(out),
+        "--bands",
+        str(bands),
+        monkeypatch=monkeypatch,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert out.read_text(encoding="utf-8") == result.stdout
+    assert "bands: " not in result.stdout
+    assert "bands: " in result.stderr
+    assert bands.is_file()
+
+
+def test_eval_bands_existing_directory_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --bands naming an existing directory: refused UP FRONT as a usage
+    # error (exit 2, pre-report — the old path printed the replace
+    # NOTICE and then died at os.replace EISDIR, exit 5)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    d = tmp_path / "bands-dir"
+    d.mkdir()
+    result, _factory = _run_eval(tmp_path, "--bands", str(d), monkeypatch=monkeypatch)
+    assert result.exit_code == 2
+    assert "directory" in result.stderr
+    assert "test examples=6" not in result.stdout  # pre-report refusal
+    assert not any(d.iterdir())  # nothing written
+
+
 def test_eval_bands_override_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -590,33 +672,34 @@ def test_eval_bands_bodies_never_in_artifact(
 
 
 def test_only_eval_writes_the_bands_artifact() -> None:
-    # structural pin (the test_no_random_in_module_namespace doctrine):
-    # the Bands Artifact class is REFERENCED in exactly two modules —
-    # thresholds.py (its definition) and cli.py (the eval command's
-    # --bands write). No other module in the package can name the
-    # artifact, so none can produce it (train/eval are the only
-    # recomputers; train does not calibrate). The behavioural weight
-    # sits in test_eval_without_bands_writes_nothing.
+    # NAMED-MINT TRIPWIRE (not a sandbox — honesty pass): a string
+    # scan cannot prove absence; getattr-construction and a
+    # hand-rolled dict json.dump evade any source scan. What this pin
+    # DOES: name the sanctioned mint/write symbols and fail if a
+    # SECOND module in the package (any depth — the AGENTS target
+    # layout grows subpackages such as daemon/) starts naming them.
+    # The behavioural weight sits in
+    # test_eval_without_bands_writes_nothing.
     import pathlib
 
     import gmail_labeler
 
     package_dir = pathlib.Path(gmail_labeler.__file__).parent
-    # the artifact can only be MINTED through build_artifact: exactly
-    # two modules name it — thresholds.py (the definition) and cli.py
-    # (the eval command's call). No other module can mint it.
+    # the artifact is MINTED through build_artifact: exactly two
+    # modules name it — thresholds.py (the definition) and cli.py
+    # (the eval command's call)
     minters = [
         py.name
-        for py in sorted(package_dir.glob("*.py"))
+        for py in sorted(package_dir.rglob("*.py"))
         if "build_artifact" in py.read_text(encoding="utf-8")
     ]
     assert minters == ["cli.py", "thresholds.py"]
     # and no module other than thresholds.py CONSTRUCTS the class
-    # directly (a mint that bypasses build_artifact would skip its
+    # directly (a mint that bypassed build_artifact would skip its
     # validation)
     constructors = [
         py.name
-        for py in sorted(package_dir.glob("*.py"))
+        for py in sorted(package_dir.rglob("*.py"))
         if "BandsArtifact(" in py.read_text(encoding="utf-8")
     ]
     assert constructors == ["thresholds.py"]
@@ -625,7 +708,7 @@ def test_only_eval_writes_the_bands_artifact() -> None:
     # report --out and train's manifest/sidecar writes share it)
     writers = [
         py.name
-        for py in sorted(package_dir.glob("*.py"))
+        for py in sorted(package_dir.rglob("*.py"))
         if "_write_secret_tight" in py.read_text(encoding="utf-8")
     ]
     assert writers == ["cli.py"]
@@ -635,7 +718,7 @@ def test_only_eval_writes_the_bands_artifact() -> None:
     # helper would be a second writer, and this scan would name it)
     band_writers = [
         py.name
-        for py in sorted(package_dir.glob("*.py"))
+        for py in sorted(package_dir.rglob("*.py"))
         if "_write_bands_artifact" in py.read_text(encoding="utf-8")
     ]
     assert band_writers == ["cli.py"]

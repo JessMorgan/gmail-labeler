@@ -352,11 +352,10 @@ class GmailRestClient:
             if label.type == "system" and label.name.casefold() == wanted:
                 # CASEFOLDED (F2): the Gmail REST reference documents the
                 # 409 duplicate-name refusal but not a case rule, and CI
-                # cannot ask the live API — a user label named "inbox"
-                # beside the system INBOX is the same visual trap the
-                # guard exists to refuse, so the comparison does not
-                # depend on Gmail's answer (the get-or-create HIT above
-                # stays exact-case: the labels.py space contract)
+                # cannot ask the live API — belt-and-braces: the visual
+                # trap is the same whichever way Gmail's rule falls (the
+                # hit/refuse contract, incl. the exact-case HIT, is the
+                # method docstring — no restatement here)
                 raise ValueError(
                     f"ensure_label: {name!r} collides with a System Label "
                     "name in the mailbox — rename [labels] applied/high/med "

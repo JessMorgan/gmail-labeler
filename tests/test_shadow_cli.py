@@ -913,6 +913,33 @@ def test_shadow_run_json_single_object(
     assert payload["run_ts"] == fixed_now.isoformat()
 
 
+def test_shadow_run_json_query_override_omits_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fold-5 A1: when --query overrides the default window wholesale, the
+    # --json payload must NOT emit cutoff_epoch/cutoff (they would
+    # describe a window the query never used — no phantom window). The
+    # default case (test_shadow_run_json_single_object) pins their
+    # PRESENCE; this pin their ABSENCE under the override.
+    # Mutant: payload emits cutoff_epoch/cutoff despite the query
+    # override -> this test goes red.
+    _prepare(tmp_path, monkeypatch)
+    result, _fake = _run_shadow(
+        tmp_path,
+        "--json",
+        "--query",
+        "in:inbox from:example.com",
+        monkeypatch=monkeypatch,
+    )
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # the override query is what was used
+    assert payload["query"] == "in:inbox from:example.com"
+    # the window fields are ABSENT (the query replaced the window)
+    assert "cutoff_epoch" not in payload
+    assert "cutoff" not in payload
+
+
 def test_shadow_run_zero_graduated_labels_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1132,7 +1159,16 @@ def test_shadow_run_default_window_cli_pin(
 
     _prepare(tmp_path, monkeypatch)
     fixed_now = datetime(2026, 11, 1, 12, 30, 0, tzinfo=UTC)
-    monkeypatch.setattr(cli, "_now", lambda: fixed_now)
+    # fold-5 A4: counting pin for the ONE-read claim — cli._now is called
+    # EXACTLY once per shadow run (window math + run_ts share the read)
+    now_calls = 0
+
+    def _counting_now() -> datetime:
+        nonlocal now_calls
+        now_calls += 1
+        return fixed_now
+
+    monkeypatch.setattr(cli, "_now", _counting_now)
     fake = FakeGmailClient(messages=_backlog_messages(), labels=_shadow_labels())
     monkeypatch.setattr(cli, "_shadow_client", lambda cfg_: fake)
     monkeypatch.setattr(
@@ -1155,6 +1191,9 @@ def test_shadow_run_default_window_cli_pin(
     expected_epoch = int((fixed_now - timedelta(days=90)).timestamp())
     list_calls = [c for c in fake.calls if c.startswith("list_messages")]
     assert list_calls[0] == f"list_messages:in:inbox after:{expected_epoch}:"
+    # fold-5 A4: the ONE-read claim — cli._now is called EXACTLY once
+    # (a mutant reading the clock twice, e.g. run_ts = _now(), goes red)
+    assert now_calls == 1
 
 
 def test_shadow_run_fail_fast_db_before_network(

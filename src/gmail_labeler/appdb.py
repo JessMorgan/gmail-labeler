@@ -285,7 +285,12 @@ class AppDB:
                 # a raw TypeError out of open() (the shape check does not
                 # constrain column types)
                 if not versions:
-                    # our-shape but EMPTY (no version row) — corrupt, named
+                    # our-shape but EMPTY (no version row) — corrupt, named.
+                    # This state is also REACHABLE by a crash between
+                    # executescript (table created) and the version stamp
+                    # (row never inserted): the fail-safe direction is
+                    # correct (refuse, not adopt) and it is recoverable by
+                    # re-running (a fresh open re-stamps the version).
                     raise AppDBError(
                         f"state DB schema_version is empty (our shape, no "
                         f"version row) — corrupt: {self.path}"

@@ -173,7 +173,17 @@ for the same eval; its consumers (the daemon's shadow path, later
 phases) will refuse it on any identity disagreement once they land.
 It is opt-in: a bare `eval` never writes it
 (human-gated, ADR-0005), and it is the only writer — `train`/`eval`
-remain the only recomputers.
+remain the only recomputers. Refusals: up front (exit 2) an empty
+path, a path equal to `--out`, an existing directory, the config
+file, and any target inside the checkpoint dir or the corpus store
+(the artifact must not live beside identity files — the canonical
+location lands with the daemon phase); at run time (exit 5, the
+report preserved) a degraded corpus (test records missing body
+shards — the artifact feeds the daemon's serving gate), a
+calibration refusal (an unknown override label, a lying identity),
+an existing artifact bound to a different identity (refused before
+any staging — the previous bytes stay intact), and a write failure
+or readback mismatch (a torn write).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.

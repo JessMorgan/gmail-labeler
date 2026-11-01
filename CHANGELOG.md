@@ -56,15 +56,26 @@ does not ship releases yet.
   write (never lost — even a calibration refusal leaves the report on
   stdout), and a one-line human summary on stderr in text mode (the
   `--out` file stays the same bytes as stdout). Usage refusals up
-  front (an empty path, `--bands` and `--out` naming the same file —
-  the artifact write would destroy the report) → 2. The recompute
-  posture is pinned: eval remains the only command that writes the
-  artifact — a structural source-scan tripwire against named mints
-  (a tripwire, not a sandbox: getattr-construction and a hand-rolled
-  dict evade any string scan) + the behavioral pins (AC4).
-  Exit-code contract
-  preserved (config error → 4; a calibration refusal — an unknown
-  override label, a lying identity — and a write failure → 5).
+  front (exit 2): an empty path; `--bands` and `--out` naming the same
+  file (the artifact write would destroy the report); `--bands`
+  naming an existing directory; `--bands` naming the config file; and
+  ANY `--bands` target whose resolved path lies inside the checkpoint
+  dir (manifest, sidecar, weights) or the corpus store (records
+  index, labels/filters sidecars, bodies) — the artifact must not
+  live beside identity files; the canonical location lands with the
+  daemon phase, any other path works. The recompute posture is
+  pinned: eval remains the only command that writes the artifact — a
+  structural source-scan tripwire against named mints (a tripwire,
+  not a sandbox: getattr-construction and a hand-rolled dict evade
+  any string scan) + the behavioral pins (AC4). Exit-code contract
+  preserved (config error → 4; run-time refusals → 5, the report
+  preserved on stdout: a degraded corpus — test records with missing
+  body shards, scored subject-only — because the artifact feeds the
+  daemon's serving gate; a calibration refusal — an unknown override
+  label, a lying identity; replacing an existing artifact whose
+  identity fields disagree with the current run — refused BEFORE any
+  staging, the previous bytes intact; a write failure or a
+  post-write readback mismatch, i.e. a torn write).
 - Config `[bands]` (ticket #21): the run's default min-precision
   targets (`min_high_precision` 0.9 / `min_med_precision` 0.7) +
   per-label overrides as `[bands."<label>"]` subtables (label names
@@ -73,12 +84,22 @@ does not ship releases yet.
   would let the operator set a threshold no measured cell meets, and
   "confident" would stop being a measured claim; the operator changes
   what "confident" means, the measured table picks the threshold.
-  Overrides REFUSE unknown keys, scalars, out-of-range values,
-  non-tenth values (the tenth-grid stance, #20), TOML bools (pydantic's
-  lax float coercion would silently turn `true` into 1.0 — refused on
-  the raw value), and empty tables (a no-op override is refused, not
-  dropped); an override for a label the checkpoint's vocabulary does
-  not carry refuses the run, named (fail loud). The config carries no path (the artifact path is
+  Overrides REFUSE unknown keys, scalars under a label name (named as
+  unknown/typo'd keys), out-of-range values, non-tenth values (the
+  tenth-grid stance, #20), TOML bools AND strings (pydantic's lax
+  float coercion would silently turn `true` into 1.0 / `"0.9"` into
+  0.9 — refused on the raw value, named), empty tables (a no-op
+  override is refused, not dropped), a raw `per_label` key (a
+  reserved field name — the label-path spelling is the only
+  per-label form; the declared field is the typed programmatic API
+  and gets the same value checks), blank/over-length label keys
+  (keys are stripped — a padded key must not survive to
+  calibration), and the same label named more than once (refused,
+  not silently shadowed); every problem is reported together (a
+  single raw-seeing validator — a field-constraint failure can no
+  longer skip the collection); an override for a label the
+  checkpoint's vocabulary does not carry refuses the run, named
+  (fail loud). The config carries no path (the artifact path is
   the CLI's `--bands` argument), so the config-file relative-path rule
   has nothing to anchor here. GLOSSARY gains the Bands Artifact term.
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):

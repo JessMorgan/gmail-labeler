@@ -286,6 +286,17 @@ def test_shadow_report_usage_empty_run_exits_2(
     assert "non-empty" in report.stderr
 
 
+def test_shadow_report_usage_empty_db_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # an empty --db is a usage error (exit 2) — DIRECT pin (the shared
+    # resolver was only transitively covered via shadow run until now)
+    _prepare(tmp_path, monkeypatch)
+    report, _fake = _run_report(tmp_path, "--db", "", monkeypatch=monkeypatch)
+    assert report.exit_code == 2
+    assert "--db PATH must be non-empty" in report.stderr
+
+
 def test_shadow_report_auth_gate_exits_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

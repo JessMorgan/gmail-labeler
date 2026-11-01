@@ -445,6 +445,11 @@ def _token(obj: dict[str, object]) -> str | None:
     raise GmailPermanentError(f"malformed nextPageToken ({type(value).__name__})")
 
 
+#: The wire's unsigned-64-bit ceiling (F1: the 20-digit regex admits
+#: values ABOVE uint64 — "99999999999999999999" parsed clean through
+#: the parser in review). The STORE's bound is SQLite's SIGNED max
+#: (appdb._MAX_SQLITE_INTEGER) — different values, each named once.
+UINT64_MAX = 2**64 - 1
 _UINT_RE = re.compile(r"[0-9]{1,20}")
 
 
@@ -461,14 +466,27 @@ def _opt_int64(obj: dict[str, object], key: str) -> int | None:
     if isinstance(value, int):  # tolerate servers that send real ints
         if value < 0:
             raise GmailPermanentError(f"response field {key!r} not an unsigned integer")
+        if value > UINT64_MAX:  # the F1 range cap (see UINT64_MAX)
+            raise GmailPermanentError(
+                f"response field {key!r} outside the uint64 wire range "
+                f"(0..{UINT64_MAX})"
+            )
         return value
     if isinstance(value, str):
         # STRICT unsigned decimal only: " 42 ", "+42", "-42" are corrupt
         # cursor values (a negative historyId must never silently advance
-        # anything), not parseable-but-weird inputs.
+        # anything), not parseable-but-weird inputs. The regex's 20-digit
+        # width is NOT a range check: the parsed value must fit uint64
+        # (F1 — a lying value beyond it is refused, never truncated).
         if not _UINT_RE.fullmatch(value):
             raise GmailPermanentError(f"response field {key!r} not an unsigned integer")
-        return int(value)
+        parsed = int(value)
+        if parsed > UINT64_MAX:
+            raise GmailPermanentError(
+                f"response field {key!r} outside the uint64 wire range "
+                f"(0..{UINT64_MAX})"
+            )
+        return parsed
     raise GmailPermanentError(f"response field {key!r} not an integer")
 
 

@@ -1178,8 +1178,10 @@ def test_daemon_state_multi_row_tamper_is_refused_on_read(tmp_path: Path) -> Non
     conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (2, 20)")
     conn.commit()
     conn.close()
-    with pytest.raises(AppDBError, match="single-row"):
+    with pytest.raises(AppDBError, match="single-row") as exc:
         db.get_history_cursor()
+    # F1 MINOR 3: the module doctrine is recovery in every refusal
+    assert "DELETE FROM daemon_state" in str(exc.value)
     db.close()
 
 
@@ -1236,6 +1238,77 @@ def test_daemon_state_off_rowid_tamper_is_refused_on_read(tmp_path: Path) -> Non
         db.get_history_cursor()
     assert "DELETE FROM daemon_state WHERE rowid != 1" in str(exc.value)
     db.close()
+
+
+def test_commit_page_refuses_mixed_applied_at(tmp_path: Path) -> None:
+    # F1 MINOR 2 (both families): the #24 batch-homogeneity contract is
+    # now a STORE invariant — a commit_page batch carrying >1 distinct
+    # applied_at is refused NAMED before the transaction, so #26's
+    # future caller inherits the guard instead of rediscovering it
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.set_history_cursor(10)
+    rows = [
+        _app_row(message_id="a1", applied_at=TS),
+        _app_row(
+            message_id="b2",
+            label="Other",
+            applied_at=datetime(2026, 11, 1, 12, 0, 1, tzinfo=UTC),
+        ),
+    ]
+    with pytest.raises(AppDBError, match="distinct applied_at") as exc:
+        db.commit_page(rows, 20)
+    assert "ONE clock reading" in str(exc.value)
+    assert db.get_history_cursor() == 10  # refused BEFORE the transaction
+    assert db.applications_for_message("a1") == ()
+    db.close()
+
+
+def test_read_path_cursor_tamper_names_recovery(tmp_path: Path) -> None:
+    # F1 MINOR 3: a hand-set invalid cursor value surfacing on the READ
+    # is the operator's to repair — the refusal names the recovery (the
+    # write-path refusals carry none: there the value came from the
+    # caller, not from state damage)
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    conn.execute("CREATE TABLE daemon_state (history_cursor INTEGER NOT NULL)")
+    conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (1, 0)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    with pytest.raises(AppDBError, match="not a valid cursor") as exc:
+        db.get_history_cursor()
+    assert "recovery" in str(exc.value)
+    db.close()
+
+
+def test_unknown_stamp_set_refusal_names_the_honest_diagnosis(tmp_path: Path) -> None:
+    # F1 MINOR 3: the blanket "a newer tool wrote this DB" diagnosed
+    # states NO tool can write as if a tool had. A single FUTURE stamp
+    # keeps the newer-tool wording (the sealed [99] pins hold); an
+    # unwriteable set gets the honest diagnosis + recovery
+    def _stamped(name: str, stamps: list[int]) -> Path:
+        path = tmp_path / name
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.executemany(
+            "INSERT INTO schema_version (version) VALUES (?)", [(v,) for v in stamps]
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    for stamps in ([2, 3], [0], [-1]):
+        db = AppDB(_stamped("db-" + "-".join(map(str, stamps)) + ".db", stamps))
+        with pytest.raises(AppDBError, match="unknown stamp set"):
+            db.open()
+    db = AppDB(_stamped("db-future.db", [99]))
+    with pytest.raises(AppDBError, match="a newer tool wrote") as exc:
+        db.open()
+    assert "upgrade this tool" in str(exc.value)
 
 
 def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:

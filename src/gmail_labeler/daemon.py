@@ -19,11 +19,12 @@ PRESENT labels, and every already-written label now reads present →
 skip-present (invariant #2) → an EMPTY plan → NO second write and no
 row. Zero double-writes, zero duplicate rows — that pin IS the safety
 proof (pinned by the crash matrix in tests/test_daemon.py, including a
-real ``os._exit`` kill). The documented face of the same design: a
-crash after a write but before the commit leaves that write's audit
-ROW uncommitted (the Gmail truth stands; the row is not re-added). The
-audit truth is the Applications table plus the mailbox, not a
-guaranteed 1:1.
+real ``os._exit`` kill). The documented face of the same design: ANY
+delta that fails to commit — a crash, or a mid-delta write error that
+holds the cursor (the F1 widening: that loss is ROUTINE, not only
+crash-scoped) — leaves its landed writes' audit ROWS uncommitted (the
+Gmail truth stands; the rows are not re-added). The audit truth is the
+Applications table plus the mailbox, not a guaranteed 1:1.
 
 The cursor takes the id from the delta's FINAL response, never the
 request's — every page's historyId is the mailbox's CURRENT id (the
@@ -123,7 +124,18 @@ def bootstrap_cursor(client: GmailClient) -> int | None:
     """The export prior-art cursor seed (module docstring). GmailError
     propagates (the caller maps the arms); ``None`` = cannot establish
     (empty mailbox, or the newest message's historyId absent — the
-    tolerance branch)."""
+    tolerance branch).
+
+    The FIRST stub is the newest message BY DOCUMENTED CONTRACT: the
+    List Gmail messages guide states "The returned ``messages`` objects
+    are listed in reverse chronological order (newest first)"
+    (https://developers.google.com/workspace/gmail/api/guides/list-messages)
+    and the sync guide's full-sync step stores the historyId of "the most
+    recent message (the first message in the ``list`` response)"
+    (https://developers.google.com/workspace/gmail/api/guides/sync). The
+    fake models that order (``documented_order=True``) and the bootstrap
+    pins exercise a reversed insertion order so a first-stub regression
+    changes the seed value."""
     page = client.list_messages(BOOTSTRAP_QUERY)
     if not page.stubs:
         return None
@@ -155,9 +167,10 @@ def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
     return ids
 
 
-def _bootstrap_tick(client: GmailClient, db: AppDB) -> tuple[str, bool]:
+def _bootstrap_tick(client: GmailClient, db: AppDB) -> bool:
     """Establish the cursor via the prior-art path (no planning, no
-    writes — the next tick polls). Returns (status, stop_requested)."""
+    writes — the next tick polls). Returns stop_requested (always
+    False: a bootstrap never drains a delta, so never observes a stop)."""
     try:
         cursor = bootstrap_cursor(client)
     except GmailAuthError:
@@ -168,20 +181,20 @@ def _bootstrap_tick(client: GmailClient, db: AppDB) -> tuple[str, bool]:
             "%s) — retry next tick",
             e,
         )
-        return "bootstrap-held", False
+        return False
     if cursor is None:
         log.warning(
             "daemon: cannot establish history cursor (no message to read a "
             "historyId from — empty mailbox or the field absent) — retry "
             "next tick"
         )
-        return "bootstrap-held", False
+        return False
     db.set_history_cursor(cursor)
     log.info("daemon: history cursor established at %d", cursor)
-    return "bootstrapped", False
+    return False
 
 
-def _resync_tick(client: GmailClient, db: AppDB, dead_cursor: int) -> tuple[str, bool]:
+def _resync_tick(client: GmailClient, db: AppDB, dead_cursor: int) -> bool:
     """The 404 arm: the cursor fell outside the retained window (the
     sync guide's documented expiry). Re-bootstrap via the prior-art
     path; the DEAD cursor stays durable until a fresh one is ESTABLISHED
@@ -203,9 +216,12 @@ def _run_tick(
     ctx: ServingContext,
     clock: Callable[[], datetime],
     should_stop: Callable[[], bool],
-) -> tuple[str, bool]:
+) -> bool:
     """One poll: drain the delta, write, commit. Returns
-    (status, stop_requested); GmailAuthError propagates (exit-4 arm)."""
+    stop_requested; GmailAuthError propagates (exit-4 arm). Every
+    outcome is already operator-visible on the log (a warning at each
+    hold, an info line at the commit) — the F1 round deleted the
+    parallel status string that no caller consumed."""
     cursor = db.get_history_cursor()
     if cursor is None:
         return _bootstrap_tick(client, db)
@@ -235,7 +251,7 @@ def _run_tick(
                 cursor,
                 e,
             )
-            return "held", stop
+            return stop
         if page.history_id is None:
             # the wire owes the mailbox's CURRENT id on every response;
             # without it the advance cannot be established — hold
@@ -244,7 +260,7 @@ def _run_tick(
                 "next tick: history response carried no historyId",
                 cursor,
             )
-            return "held", stop
+            return stop
         new_cursor = page.history_id  # the PAGE's id, never the request's
         try:
             message_ids = _message_ids(page.records)
@@ -254,7 +270,7 @@ def _run_tick(
                 cursor,
                 e,
             )
-            return "held", stop
+            return stop
         for message_id in message_ids:
             try:
                 raw = client.get_message(message_id)
@@ -274,7 +290,7 @@ def _run_tick(
                     cursor,
                     e,
                 )
-                return "held", stop
+                return stop
             try:
                 data = decode_gmail_raw(raw.raw_b64url)
             except ValueError as e:  # UnicodeEncodeError IS a ValueError
@@ -333,7 +349,7 @@ def _run_tick(
             cursor,
             e,
         )
-        return "held", stop
+        return stop
     except (ValueError, OSError, RuntimeError) as e:
         # invariant #5 at THIS surface: a model error may quote the
         # scored TEXT (FakeModel's unprogrammed-text refusal does — and
@@ -346,7 +362,7 @@ def _run_tick(
             cursor,
             type(e).__name__,
         )
-        return "held", stop
+        return stop
 
     # per message: compose (the plan's fail-safe is the net), then the
     # Gmail write FIRST — see the module docstring's safety proof
@@ -389,8 +405,9 @@ def _run_tick(
             if isinstance(e, GmailPermanentError) and e.status == 404:
                 # the message vanished between fetch and write: no
                 # write happened → no rows (rows record Applications
-                # that DID land); skip counted
-                warnings += 1
+                # that DID land); counted SKIPPED only — the F1 round's
+                # nit: a ghost message is the skip arm, not a warning
+                # (double-counting it inflated both counters)
                 skipped += 1
                 log.warning(
                     "daemon: skipped message %s: apply refused (%s)",
@@ -407,7 +424,7 @@ def _run_tick(
                 cursor,
                 e,
             )
-            return "held", stop
+            return stop
         written += 1
         page_rows.extend(plan.rows)
 
@@ -427,7 +444,7 @@ def _run_tick(
             cursor,
             e,
         )
-        return "held", stop
+        return stop
     log.info(
         "daemon: delta handled cursor=%d messages=%d written=%d skipped=%d warnings=%d",
         new_cursor,
@@ -436,7 +453,7 @@ def _run_tick(
         skipped,
         warnings,
     )
-    return "committed", stop
+    return stop
 
 
 def daemon_loop(
@@ -457,7 +474,7 @@ def daemon_loop(
     while True:
         if should_stop():
             return 0
-        _status, stop_requested = _run_tick(client, db, model, ctx, clock, should_stop)
+        stop_requested = _run_tick(client, db, model, ctx, clock, should_stop)
         if stop_requested or should_stop():
             return 0
         sleep(poll_seconds)

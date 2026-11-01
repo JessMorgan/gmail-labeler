@@ -513,6 +513,39 @@ def test_reason_falls_back_to_own_reason_when_errors_lacks_one() -> None:
     assert _error_reason(err) == "userRateLimitExceeded"  # type: ignore[union-attr]
 
 
+def test_opt_int64_caps_at_the_uint64_wire_range() -> None:
+    # F1 MINOR 4: the 20-digit regex admitted "99999999999999999999"
+    # (ABOVE uint64) clean through the parser in review. The parsed
+    # value must fit uint64 (wire semantics); the STORE's SQLite signed
+    # bound is a DIFFERENT named constant (appdb._MAX_SQLITE_INTEGER)
+    from gmail_labeler.gmail_client import UINT64_MAX, _opt_int64
+
+    assert _opt_int64({"h": str(UINT64_MAX)}, "h") == UINT64_MAX
+    with pytest.raises(GmailPermanentError, match="uint64 wire range"):
+        _opt_int64({"h": "99999999999999999999"}, "h")
+    with pytest.raises(GmailPermanentError, match="uint64 wire range"):
+        _opt_int64({"h": UINT64_MAX + 1}, "h")  # the real-int branch too
+
+
+def test_fake_history_404s_both_expiry_directions() -> None:
+    # F1 MINOR 5: the fake models BOTH window failures — a cursor
+    # AHEAD of the mailbox (pre-existing) and, the REAL production
+    # direction, a cursor BEHIND the retention floor: the history.list
+    # reference documents the 404 for a startHistoryId "invalid or out
+    # of date" (the daemon-side arm test rides the floor)
+    fake = FakeGmailClient(current_history_id=900, retention_floor=850)
+    with pytest.raises(GmailPermanentError, match="outside the retained"):
+        fake.history(901)
+    with pytest.raises(GmailPermanentError, match="invalid or out of date"):
+        fake.history(400)
+    # floor unset (the default): no new refusal — sealed fixtures intact
+    plain = FakeGmailClient(
+        history_pages=[HistoryPage(history_id=None, next_page_token=None, records=())],
+        current_history_id=900,
+    )
+    plain.history(1)
+
+
 def test_fake_history_idle_never_regresses_cursor() -> None:
     fake = FakeGmailClient(
         history_pages=[HistoryPage(history_id=98765, next_page_token=None, records=())]

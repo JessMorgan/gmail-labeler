@@ -157,7 +157,10 @@ class FakeGmailClient:
     def list_filters(self) -> list[FilterInfo]:
         self.calls.append("list_filters")
         self._maybe_fail("list_filters")
-        return self.filters_list
+        # a COPY too (F3 review): the read surfaces stay symmetric —
+        # the REST adapter builds fresh FilterInfo per call; #25/#26
+        # ride this fake
+        return list(self.filters_list)
 
     def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:
         self.calls.append(f"list_messages:{query}:{page_token or ''}")
@@ -293,9 +296,9 @@ class FakeGmailClient:
         mirror, F1/F2) — unless a USER label of exactly that name
         already exists: it is used as-is (the refusal guards minting
         only). The fake performs the same WIRE calls as the adapter —
-        list_labels first (recorded in
-        the call log; a READ, so the shadow zero-write pin is
-        unaffected), create only when the name is absent — so #25's
+        list_labels first (recorded in the call log; a READ, so the
+        shadow zero-write pin is unaffected), create only when the name
+        is absent — so #25's
         exact-call tests read one sequence, not two. (The
         ``ensure_label:<name>`` entry itself is this fake's own
         convention — the adapter logs nothing; the fidelity claim is

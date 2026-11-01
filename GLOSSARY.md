@@ -26,9 +26,9 @@ umbrella plus the best band tier to every write, and
 (get-or-create: an existing USER label of exactly that name is used
 as-is; a casefolded System Label name-sake is refused named — the
 refusal guards minting a look-alike only; the daemon / `apply` startup
-of #25/#26 calls it once per configured name). The live write itself lands with
-the daemon / `apply` CLI (#25/#26); the shadow report still attaches no
-labels.
+of #25/#26 calls it once per configured name). The live write itself
+lands with the daemon / `apply` CLI (#25/#26); the shadow report still
+attaches no labels.
 _Avoid_: confidence label, meta label
 
 **Application**:

@@ -389,6 +389,54 @@ def test_bool_min_precision_refused() -> None:
         )
 
 
+def test_bands_high_band_without_predictions_on_table_refused() -> None:
+    # the bands artifact is a SEPARATE input: if it was calibrated on a
+    # DIFFERENT eval table (same vocabulary + grid), the cell at the
+    # high band may have NO predictions on this table (tp=fp=0,
+    # undefined precision) — refused with ValueError (the refusal
+    # family), never a ZeroDivisionError traceback
+    table_a = eval_metrics(
+        [_ex(0, ("Bills",))],
+        {"0000000000000000": (0.95,)},
+        vocabulary=("Bills",),
+    )
+    bands = build_artifact(
+        calibrate_bands(table_a),
+        vocabulary=("Bills",),
+        corpus_fingerprint=CORPUS_FP,
+        split_manifest_hash=MANIFEST_HASH,
+        encoder_id=ENCODER,
+        split_date=SPLIT_DATE,
+    )
+    assert bands.labels[0].high == 0.9
+    # table B: the positive scores below the high band, no predictions
+    # at 0.9 (tp=fp=0)
+    table_b = eval_metrics(
+        [_ex(0, ("Bills",)), _ex(1, ())],
+        {
+            "0000000000000000": (0.5,),
+            "0000000000000001": (0.4,),
+        },
+        vocabulary=("Bills",),
+    )
+    with pytest.raises(ValueError, match="no measured predictions"):
+        evaluate_graduation(table_b, bands, managed_labels=["Bills"])
+
+
+def test_float_min_examples_refused() -> None:
+    # min_examples is a COUNT: a float (even an integral one) is not an
+    # integer — the two-entry-path symmetry (validate vs from_json)
+    # requires the mint to refuse what the parse refuses
+    for value in (10.5, 10.0):
+        with pytest.raises(ValueError, match="min_examples"):
+            evaluate_graduation(
+                _golden_table(),
+                _golden_bands(),
+                min_examples=value,  # type: ignore[arg-type]
+                managed_labels=VOCAB,
+            )
+
+
 def test_override_target_refused() -> None:
     # the override targets get the SAME validation as the run's — an
     # out-of-range per-label target would miscalibrate silently

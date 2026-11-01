@@ -450,6 +450,93 @@ def test_eval_graduation_degraded_corpus_is_refused(
     assert not list(tmp_path.glob("graduation.json*"))  # no staging residue
 
 
+def test_eval_graduation_json_refusal_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine: a post-report refusal
+    # (here: the degraded corpus) exits 5 with the report payload on
+    # stdout — exactly one parseable JSON object, the proposal simply
+    # absent (the computation never ran)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    # orphan one TEST-side body shard (i=6 → id 0000000000000006)
+    shard = tmp_path / "corpus" / "bodies" / "00" / "0000000000000006.txt"
+    assert shard.is_file()
+    shard.unlink()
+    scores = dict(_test_side_scores())
+    scores["subject 6\n"] = scores.pop("subject 6\nbody 6")
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(out),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        scores=scores,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert "graduation" not in payload  # the proposal is absent
+    assert "--graduation refused" in result.stderr
+    assert not out.exists()
+
+
+def test_eval_graduation_json_write_failure_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a WRITE failure: the
+    # payload (with the proposal — the computation succeeded) is on
+    # stdout, exit 5
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(tmp_path / "no" / "such" / "dir" / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert payload["graduation"]["test_examples"] == 6  # the proposal rides
+    assert "cannot write --graduation" in result.stderr
+
+
+def test_eval_graduation_out_file_lands_before_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --out ordering doctrine: the report file lands BEFORE the
+    # serving-gate acts — a refusal exits 5 with the --out file in
+    # place (the "same bytes as stdout" promise holds even when an
+    # artifact act refuses)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    report = tmp_path / "report.txt"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--out",
+        str(report),
+        "--graduation",
+        str(tmp_path / "no" / "such" / "dir" / "graduation.json"),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    assert "cannot write --graduation" in result.stderr
+    assert report.is_file()  # the report file is in place
+    assert report.read_text(encoding="utf-8") == result.stdout
+
+
 def test_eval_graduation_with_json_stdout_is_single_json_object(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -577,6 +664,21 @@ def test_eval_graduation_same_path_as_bands_is_a_usage_error(
     assert result.exit_code == 2
     assert "different files" in result.stderr
     assert not same.exists()
+
+
+def test_eval_graduation_empty_path_beats_equal_path_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # an empty target resolves to the cwd — the empty checks run
+    # BEFORE the equal-path checks, so the message is "non-empty", not
+    # a spurious "different files" collision
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    result, _factory = _run_eval(
+        tmp_path, "--bands", " ", "--graduation", " ", monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "non-empty" in result.stderr
 
 
 def test_eval_graduation_inside_checkpoint_dir_is_a_usage_error(

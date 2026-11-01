@@ -556,6 +556,114 @@ def test_get_message_transient_holds_page_and_rewalks(
     db.close()
 
 
+def test_label_only_records_pass_through_and_delta_commits(tmp_path: Path) -> None:
+    # F1 round 2: a history record carrying ONLY label changes (no
+    # messages key) is the COMMON real wire shape — it passes through
+    # the event extraction and the delta commits normally
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[
+            _page({"id": 7, "labels": {"labels": [{"id": "L1", "added": ["INBOX"]}]}})
+        ],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 900  # handled: nothing to fetch, cursor moves
+    assert fake.writes == []
+    db.close()
+
+
+def test_malformed_messages_not_a_list_holds_cursor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F1 round 2: the sibling malformed shape — messages present but
+    # not a list of objects — is the same lying-wire hold arm
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page({"id": 1, "messages": "not-a-list"})],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777
+    assert "delta failed" in caplog.text
+    db.close()
+
+
+def test_bootstrap_auth_error_propagates(tmp_path: Path) -> None:
+    # F1 round 2 (the same dead-line class): auth during bootstrap must
+    # reach the CLI's exit 4, never hold-retry forever on revoked creds
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    fake.fail("list_messages", GmailAuthError("token revoked"))
+    db = _db(tmp_path)  # no cursor: bootstrap tick
+    with pytest.raises(GmailAuthError):
+        _run(tmp_path, fake, db=db)
+    assert db.get_history_cursor() is None
+    db.close()
+
+
+def test_bootstrap_transient_holds_and_retries_next_tick(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F1 round 2: a transient bootstrap read is the NAMED hold (retry
+    # next tick), not a crash and not a fake cursor
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    fake.fail("list_messages", GmailTransientError("503 blip"))
+    db = _db(tmp_path)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() is None  # never a fake value
+    assert "cannot establish history cursor" in caplog.text
+    db.close()
+
+
+def test_shutdown_mid_delta_still_drains_to_commit_point(tmp_path: Path) -> None:
+    # F1 round 2: the BETWEEN-PAGES stop check — consulted after a
+    # page with a continuation token — records the stop and the delta
+    # still drains to its commit point (no half-committed state)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[
+            _page(_record("aa11"), token="p1"),
+            _page(_record("aa22"), token=None),
+        ],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    seen = {"n": 0}
+
+    def should_stop() -> bool:
+        # 1st call: loop-top (False, tick runs); 2nd: after page 1
+        # (True — recorded, drain continues); later: stay True
+        seen["n"] += 1
+        return seen["n"] > 2
+
+    driver = _LoopRun()
+    rc = daemon_loop(
+        client=fake,
+        db=db,
+        model=FakeModel(VOCAB, scores=_scores()),
+        ctx=_ctx(),
+        poll_seconds=30,
+        clock=lambda: TS,
+        sleep=driver.sleep,
+        should_stop=should_stop,
+    )
+    assert rc == 0
+    assert driver.sleeps == []  # stopped before any sleep: straight out
+    assert db.get_history_cursor() == 900  # drained to the commit point
+    assert [w["message_id"] for w in fake.writes] == ["aa22"]
+    db.close()
+
+
 def test_apply_transient_holds_cursor_and_retries_next_tick(tmp_path: Path) -> None:
     # F1 MAJOR (the manager's mutant T2): a transient failure on the
     # WRITE must not let the cursor advance past the failed message.

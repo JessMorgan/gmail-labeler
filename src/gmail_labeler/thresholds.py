@@ -44,7 +44,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
 from typing import cast
 
@@ -118,13 +118,18 @@ class LabelBands:
 @dataclass(frozen=True, slots=True)
 class Bands:
     """The calibration result: per-label bands in vocabulary order
-    (a total order), the candidate grid they were chosen from, and the
-    per-label EFFECTIVE targets (defaults + overrides — provenance)."""
+    (a total order), the candidate grid they were chosen from, the
+    per-label EFFECTIVE targets (defaults + overrides — provenance),
+    and the measured window's provenance (test_examples, the run's
+    default targets — DERIVED from the calibration inputs and carried
+    here so build_artifact cannot be told a lying identity)."""
 
     vocabulary: tuple[str, ...]
     candidate_thresholds: tuple[float, ...]
     labels: tuple[LabelBands, ...]
     targets: tuple[tuple[str, BandTargets], ...]
+    test_examples: int
+    default_targets: BandTargets
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,11 +176,12 @@ def _check_thresholds(thresholds: tuple[float, ...]) -> None:
 
 
 def _precision(cell: ThresholdCell) -> float | None:
-    """The cell's measured precision, read from tp/fp/fn — NOT the
+    """The cell's measured precision, read from tp/fp — NOT the
     table's rendered ratio: a zero denominator (tp=0 AND fp=0, no
     predictions at all) is UNDEFINED, never 0.0. The eval convention
     renders it 0.0, but calibration must not treat "no predictions" as
-    a measured zero (it would meet a 0.0 target)."""
+    a measured zero (it would meet a 0.0 target). (fn is not read —
+    recall's numerator; precision is tp over tp+fp.)"""
     if cell.tp + cell.fp == 0:
         return None
     return cell.tp / (cell.tp + cell.fp)
@@ -285,6 +291,11 @@ def calibrate_bands(
         candidate_thresholds=table.thresholds,
         labels=tuple(labels),
         targets=tuple(targets),
+        test_examples=table.test_examples,
+        default_targets=BandTargets(
+            min_high_precision=min_high_precision,
+            min_med_precision=min_med_precision,
+        ),
     )
 
 
@@ -338,7 +349,12 @@ class BandsArtifact:
                     "med": entry.med,
                     "min_high_precision": entry.min_high_precision,
                     "min_med_precision": entry.min_med_precision,
-                    "reasons": list(entry.reasons),
+                    # CANONICAL order (sorted): validate() compares
+                    # reasons sorted — the hash must serialize the same
+                    # meaning the same way, or one meaning would have
+                    # two identities (a reversed-reasons artifact would
+                    # validate with a different hash)
+                    "reasons": sorted(entry.reasons),
                 }
                 for entry in self.labels
             ],
@@ -432,6 +448,11 @@ class BandsArtifact:
                 "bands test_examples must be a non-negative integer, got "
                 f"{self.test_examples!r}"
             )
+        if not self.encoder_id.strip():
+            # an empty/blank encoder_id would verify against an
+            # equally empty expectation — refuse at parse/validate,
+            # not "verify" (the hash-field doctrine)
+            raise ValueError("bands encoder_id must be non-empty")
         _check_thresholds(self.candidate_thresholds)
         _check_target(
             "default_targets.min_high_precision",
@@ -447,6 +468,8 @@ class BandsArtifact:
             raise ValueError("bands labels must be sorted and unique")
         grid = set(self.candidate_thresholds)
         for entry in self.labels:
+            if not entry.label.strip():
+                raise ValueError("bands label keys must be non-empty")
             _check_target(f"{entry.label}.min_high_precision", entry.min_high_precision)
             _check_target(f"{entry.label}.min_med_precision", entry.min_med_precision)
             if entry.high is not None and entry.high not in grid:
@@ -511,15 +534,16 @@ def build_artifact(
     split_manifest_hash: str,
     encoder_id: str,
     split_date: datetime,
-    test_examples: int,
-    default_targets: BandTargets,
 ) -> BandsArtifact:
     """Mint the Bands Artifact from a calibration run: the bands + the
     checkpoint identity (the sidecar's fields) + the eval identity
-    (the measured window) + the run's default targets. Refusals: a
-    vocabulary that does not match the bands' (a lying identity) and a
-    naive split_date raise ValueError. The minted artifact passes its
-    own invariants (the manifest symmetry)."""
+    (the measured window). The eval identity (test_examples) and the
+    run's default targets are DERIVED from the bands' provenance —
+    never trusted from the caller (a caller-told identity is a lying
+    identity). Refusals: a vocabulary that does not match the bands'
+    (a lying identity) and a naive split_date raise ValueError. The
+    minted artifact passes its own invariants (the manifest
+    symmetry)."""
     if tuple(vocabulary) != bands.vocabulary:
         raise ValueError(
             f"the artifact's vocabulary {tuple(vocabulary)} does not "
@@ -549,9 +573,9 @@ def build_artifact(
         split_manifest_hash=split_manifest_hash,
         encoder_id=encoder_id,
         split_date=split_date,
-        test_examples=test_examples,
+        test_examples=bands.test_examples,
         candidate_thresholds=bands.candidate_thresholds,
-        default_targets=default_targets,
+        default_targets=bands.default_targets,
         labels=entries,
         content_hash="",
     )
@@ -567,7 +591,7 @@ def verify_bands(
     corpus_fingerprint: str,
     split_manifest_hash: str,
     encoder_id: str,
-    split_date: datetime,
+    split_date: datetime | date,
     test_examples: int,
 ) -> None:
     """Every identity field, checked INDEPENDENTLY; ALL disagreements
@@ -575,7 +599,18 @@ def verify_bands(
     single-field drift is refused on its own — no cross-field
     coupling). The vocabulary check compares the artifact's hash
     against the hash of the expected vocabulary (the manifest is the
-    authority, the artifact must agree with it — the sidecar rule)."""
+    authority, the artifact must agree with it — the sidecar rule).
+
+    A naive-dated ``split_date`` is a CALLER bug, not identity drift:
+    it is refused with a plain ValueError naming it (build_artifact's
+    naive refusal, mirrored) — a BandsRefusedError with the "re-run
+    eval --bands" remedy would misdiagnose a type error as a drifted
+    checkpoint."""
+    if not isinstance(split_date, datetime) or split_date.tzinfo is None:
+        raise ValueError(
+            "verify_bands: split_date must be a timezone-aware datetime — "
+            "a date/naive datetime is a caller bug, not identity drift"
+        )
     mismatches: list[str] = []
     if artifact.vocabulary_hash != vocabulary_hash(vocabulary):
         mismatches.append("vocabulary")
@@ -654,9 +689,12 @@ def _need_label_entries(payload: dict[str, object]) -> tuple[BandsLabelEntry, ..
             raise ValueError(f"labels[{i}] must be an object")
         entry = cast("dict[str, object]", item)
         try:
+            label = _need_str(entry, "label")
+            if not label.strip():
+                raise ValueError("field 'label' must be non-empty")
             entries.append(
                 BandsLabelEntry(
-                    label=_need_str(entry, "label"),
+                    label=label,
                     high=_need_band(entry, "high"),
                     med=_need_band(entry, "med"),
                     min_high_precision=_need_number(entry, "min_high_precision"),

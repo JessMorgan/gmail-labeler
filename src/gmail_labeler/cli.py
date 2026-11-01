@@ -1370,6 +1370,9 @@ def eval(
                 min_med_precision=cfg.bands.min_med_precision,
                 overrides=overrides or None,
             )
+            # the eval identity (test_examples) and the default
+            # targets are DERIVED from the calibration's provenance —
+            # build_artifact no longer takes caller-told values
             artifact = build_artifact(
                 calibrated,
                 vocabulary=manifest.vocabulary,
@@ -1377,11 +1380,6 @@ def eval(
                 split_manifest_hash=manifest.content_hash,
                 encoder_id=cfg.model.encoder,
                 split_date=manifest.split_date,
-                test_examples=table.test_examples,
-                default_targets=BandTargets(
-                    min_high_precision=cfg.bands.min_high_precision,
-                    min_med_precision=cfg.bands.min_med_precision,
-                ),
             )
         except (ValueError, OSError) as e:
             typer.echo(f"eval failed: band calibration refused: {e}", err=True)

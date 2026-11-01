@@ -114,7 +114,9 @@ class FakeGmailClient:
                 m.id
                 for m in sorted(
                     messages or [],
-                    key=lambda m: m.internal_date_ms or 0,
+                    key=lambda m: (
+                        m.internal_date_ms if m.internal_date_ms is not None else 0
+                    ),  # None refused above; explicit guard, not truthiness
                     reverse=True,
                 )
             ]

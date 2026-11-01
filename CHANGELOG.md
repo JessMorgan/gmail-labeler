@@ -15,8 +15,9 @@ does not ship releases yet.
     History-API delta (token chain; the cursor takes the FINAL
     response's id — every page carries the mailbox CURRENT id), fetch
     and score each message (ONE batched predict, vocab zip like
-    shadow; ONE clock read per delta — the batch-homogeneity contract
-    pinned at the call site), compose through `plan_message_write`
+    shadow; ONE clock read per delta — the batch-homogeneity contract,
+    enforced in the store since the review round: `commit_page` refuses
+    a mixed-stamp batch), compose through `plan_message_write`
     (called, never re-derived), and per nonempty plan `apply_labels`
     FIRST, then ONE `commit_page` transaction carrying the page's
     Application rows AND the cursor advance — COMMIT = handled

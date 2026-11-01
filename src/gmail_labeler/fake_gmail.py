@@ -245,7 +245,14 @@ class FakeGmailClient:
         same shape the REST adapter composes; a removal is not even a
         representable argument here. An unknown message id is the typed
         404 the real API answers (the attempt stays visible in the call
-        log; nothing lands, so no write is recorded)."""
+        log; nothing lands, so no write is recorded). The bare-str guard
+        mirrors the REST adapter (a caller bug raises BEFORE even the
+        call-log entry — no wire call happened)."""
+        if isinstance(add_label_ids, (str, bytes)):
+            raise ValueError(
+                "apply_labels: add_label_ids must be a sequence of label "
+                f"ids, not a bare string (got {add_label_ids!r})"
+            )
         self.calls.append(f"apply_labels:{message_id}")
         self._maybe_fail("apply_labels")
         try:
@@ -256,10 +263,16 @@ class FakeGmailClient:
             ) from e
         adds = list(add_label_ids)
         # the real API stores a label SET: re-adding a present id is a
-        # no-op, not a duplicate (the fake must not lie about it)
-        message.label_ids = message.label_ids + tuple(
-            label_id for label_id in adds if label_id not in message.label_ids
-        )
+        # no-op, not a duplicate — ACROSS calls AND WITHIN one call (the
+        # fake must not lie about it). The body SNAPSHOT keeps the raw
+        # caller input: wire evidence (a composition bug that sends
+        # duplicates stays visible, like the modify body the wire saw)
+        present = set(message.label_ids)
+        deduped: list[str] = []
+        for label_id in adds:
+            if label_id not in present and label_id not in deduped:
+                deduped.append(label_id)
+        message.label_ids = message.label_ids + tuple(deduped)
         self.writes.append(
             {
                 "method": "apply_labels",
@@ -270,14 +283,25 @@ class FakeGmailClient:
 
     def ensure_label(self, name: str) -> str:
         """Get-or-create a USER label by exact name (idempotent when
-        present — no create recorded). A System Label name-sake is not a
-        hit (the user-type filter mirrors the REST adapter: a tier name
-        never resolves its write at a System Label id)."""
+        present — no create recorded). A System Label name-sake is
+        REFUSED, named (the REST mirror, F1). The list_labels wire call
+        the REST adapter makes is recorded too (F1 call-log fidelity —
+        #25's exact-call tests see one sequence, not two); it is a READ,
+        so the shadow zero-write pin is unaffected. The 409 concurrent-
+        create self-heal is REST-only: the fake's single-threaded
+        list+create has no race window (documented divergence)."""
         self.calls.append(f"ensure_label:{name}")
         self._maybe_fail("ensure_label")
-        for label in self.labels_list:
-            if label.name == name and label.type == "user":
-                return label.id
+        labels = self.list_labels()  # the wire call the adapter makes
+        for label in labels:
+            if label.name == name:
+                if label.type == "user":
+                    return label.id
+                raise ValueError(
+                    f"ensure_label: {name!r} collides with a System Label "
+                    "name in the mailbox — rename [labels] applied/high/med "
+                    "(System Labels are never write targets)"
+                )
         self._created_label_count += 1
         new_id = f"Label_fake_{self._created_label_count}"
         self.labels_list.append(LabelInfo(id=new_id, name=name, type="user"))

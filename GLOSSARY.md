@@ -39,8 +39,12 @@ med; a skip-present label earns no band tier, it is not applied). That
 composition (umbrella + one band tier) SHIPS at the library level
 (ticket #24): `applications.plan_message_write` composes it from the
 tiers core and the startup-resolved Gmail label ids; the daemon /
-`apply` CLI (#25/#26) rides that plan for the live write. The shadow
-report is a PREVIEW, not an Application: it renders
+`apply` CLI (#25/#26) rides that plan for the live write. Band tiers
+ACCUMULATE across Applications (accepted v1 policy): a later med-band
+Application on a message already carrying `ai-high` adds `ai-med` —
+additive-only forbids correcting the old one, so the audit truth is the
+Applications table, not the tier labels. The shadow report is a PREVIEW,
+not an Application: it renders
 the band tier NAME for would-be rows and attaches no labels (no umbrella, no
 band tier on the wire).
 _Avoid_: auto-label (the event, not the label)

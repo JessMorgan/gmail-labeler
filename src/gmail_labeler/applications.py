@@ -75,16 +75,17 @@ class ApplicationRow:
     direction: the adapter imports the row shape from the core, never
     the reverse); ``appdb`` validates and stores it.
 
-    Band-tier ACCUMULATION semantics (pinned here, decided by #25): the
-    GLOSSARY's "exactly one band Tier Label" is per-Application — a
-    later Application on a message that already carries an earlier band
-    tier adds ITS OWN best band tier (additive-only forbids correcting
-    the old one). NOTE for #25: putting Tier Label names in ``present``
-    changes NOTHING — tiers consults ``present`` only for the graduated
-    content labels, and the tier ids are composed unconditionally here.
-    A skip-present-tier policy (do not add a band tier when one is
-    already on the message) must be implemented IN THIS MODULE (the
-    caller has no lever); the manager's #25 brief should say so."""
+    Band-tier ACCUMULATION is the ACCEPTED v1 policy (manager ruling,
+    F1; operator-visible in GLOSSARY: Application): the GLOSSARY's
+    "exactly one band Tier Label" is PER-APPLICATION — a later
+    Application on a message that already carries an earlier band tier
+    adds ITS OWN best band tier (additive-only forbids correcting the
+    old one; the audit truth is the Applications table, not the tier
+    labels). NOTE: putting Tier Label names in ``present`` changes
+    NOTHING — tiers consults ``present`` only for the graduated content
+    labels, and the tier ids are composed unconditionally here. A
+    skip-present-tier policy would have to be implemented IN THIS
+    MODULE (the caller has no lever)."""
 
     message_id: str
     label: str
@@ -200,6 +201,15 @@ def plan_message_write(
         rows = tuple(sorted(row_items, key=lambda r: (r.message_id, r.label)))
         adds = tuple(sorted(set(managed_ids) | set(tier_ids)))
         return WritePlan(message_id=message_id, adds=adds, rows=rows, warning=None)
+    except AssertionError:
+        # the internal-regression asymmetry (F1, deepseek C3 MINOR):
+        # the unreachable-by-construction guards below raise
+        # AssertionError — an internal contradiction must surface LOUDLY
+        # (exit-1 territory), never degrade to a per-message warning
+        # that turns a systematic break into silent label starvation.
+        # Data-path failures keep the fail-safe net; caller bugs keep
+        # the pre-compose raises
+        raise
     except Exception as e:  # the fail-safe net IS the point (invariant #1)
         # invariant #1: ANY application-path error means NO write for
         # that message. The warning names the id (counted, logged by

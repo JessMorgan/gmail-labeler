@@ -252,14 +252,16 @@ def test_our_shape_shadow_results_with_foreign_version_is_refused(
 def test_our_shape_empty_schema_version_is_corrupt(tmp_path: Path) -> None:
     # fold-4 item 1 + fold-7 item 1: an our-shape schema_version that is
     # EMPTY (no version row) is named corrupt — NOT silently adopted —
-    # and this is the EXECUTABLE proof of the appdb "corrupt" comment's
-    # claims: the exact crash state (executescript done, both tables,
-    # version row never inserted) keeps REFUSING on every re-open (the
-    # ownership gate raises before open()'s re-stamp branch), and
-    # recovery is NOT re-running: delete the file (a fresh open
-    # re-creates + stamps) or stamp the row manually.
+    # and this is the EXECUTABLE proof of the tamper guard: the state
+    # (both tables, version row never inserted) is TAMPER-ONLY since the
+    # F1 atomic transition (a crash cannot leave it; only hand-editing
+    # or a pre-F1 residue file can) and it keeps REFUSING on every
+    # re-open (the ownership gate raises before _apply_schema), with the
+    # recovery NAMED IN THE MESSAGE: stamp the row manually or delete
+    # the file (a fresh open re-creates + stamps).
     def _build_crash_state(path: Path) -> None:
-        # what a crash between executescript and the stamp commit leaves
+        # the tamper state (pre-F1, this was the crash state between
+        # executescript and the stamp commit — now unreachable by crash)
         conn = sqlite3.connect(str(path))
         conn.executescript(_SCHEMA)
         conn.commit()
@@ -705,10 +707,10 @@ def test_v1_stamp_with_applications_table_is_refused(tmp_path: Path) -> None:
 
 
 def test_v2_stamp_without_applications_self_heals(tmp_path: Path) -> None:
-    # the crash-window direction that IS safe: {2} stamped but the
-    # applications table never created (crash between the UPDATE and the
-    # schema script) — the next open re-runs create-all-if-missing and
-    # heals, no refusal
+    # {2} stamped but the applications table never created: unreachable
+    # by crash since the F1 atomic transition (a tamper or pre-F1
+    # residue) — the next open re-runs the create-all-if-missing
+    # transition and HEALS, no refusal (the self-heal is kept on purpose)
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -958,3 +960,152 @@ def test_applications_tampered_applied_at_is_corrupt(tmp_path: Path) -> None:
     with pytest.raises(AppDBError, match="not-a-date"):
         db2.applications_for_message("aa")
     db2.close()
+
+
+# -- F1: atomic schema transitions (the crash windows closed) ---------------
+
+
+class _CrashOn:
+    """Delegating proxy: the execute()/executescript() whose SQL carries
+    `marker` raises (a simulated process death mid-transaction — the
+    journal, not a ROLLBACK, is what a real crash leaves behind; the
+    close-without-commit below reproduces the same file state)."""
+
+    def __init__(self, real: sqlite3.Connection, marker: str) -> None:
+        self._real = real
+        self._marker = marker
+
+    def execute(self, sql: str, *a: object) -> object:
+        if self._marker in sql:
+            raise sqlite3.OperationalError("simulated crash mid-transaction")
+        return self._real.execute(sql, *a)  # pyright: ignore[reportArgumentType]
+
+    def executescript(self, script: str) -> object:
+        if self._marker in script:
+            raise sqlite3.OperationalError("simulated crash mid-transaction")
+        return self._real.executescript(script)
+
+    def __enter__(self) -> object:
+        return self._real.__enter__()
+
+    def __exit__(self, *exc: object) -> object:
+        return self._real.__exit__(*exc)  # type: ignore[arg-type,no-any-return]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def _arm_crash_on(monkeypatch: pytest.MonkeyPatch, marker: str) -> None:
+    # the seam: arm the proxy right after the ownership gate (the last
+    # point before the schema transition begins writing)
+    real_check = AppDB._check_ownership
+
+    def check_then_arm(self: AppDB) -> bool:
+        needs = real_check(self)
+        assert self._conn is not None
+        self._conn = _CrashOn(self._conn, marker)  # type: ignore[assignment]
+        return needs
+
+    monkeypatch.setattr(AppDB, "_check_ownership", check_then_arm)
+
+
+def _table_set(db_path: Path) -> set[str]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+
+def test_fresh_db_crash_mid_transition_leaves_clean_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1 MAJOR pin (1): kill anywhere inside the fresh transition (here:
+    # the stamp INSERT after the table DDL) — ONE transaction means the
+    # file is fully PRIOR-STATE (no tables), never the empty-version
+    # corrupt trap the old executescript-then-stamp order shipped. The
+    # next open succeeds CLEANLY as fresh: no deletion, no refusal.
+    _arm_crash_on(monkeypatch, "INSERT INTO schema_version")
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="simulated crash"):
+        db.open()
+    assert _table_set(db_path) == set()  # fully prior-state
+    monkeypatch.undo()  # the crash seam is dead — the retry opens for real
+    db2 = AppDB(db_path)
+    db2.open()  # clean fresh — the crash left nothing to recover from
+    db2.record_run("run-1", TS, [_row()])  # and it is fully usable
+    db2.close()
+
+
+def test_v1_migration_crash_mid_transition_leaves_clean_v1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1 MAJOR pin (2): kill mid-migration (here: the applications DDL —
+    # the old order had already COMMITTED the restamp by this point, so
+    # the file could land in {2}-without-applications; and any ordering
+    # that commits the DDL separately could land in the
+    # {1}+applications dead-end). ONE transaction: the file stays CLEAN
+    # v1 and the retry migrates successfully — shadow history survives,
+    # no delete-recovery, no manual stamp.
+    _arm_crash_on(monkeypatch, "CREATE TABLE IF NOT EXISTS applications")
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="simulated crash"):
+        db.open()
+    assert _versions(db_path) == [1]  # fully prior-state: the restamp rolled back
+    assert "applications" not in _table_set(db_path)
+    monkeypatch.undo()  # the crash seam is dead — the retry opens for real
+    db2 = AppDB(db_path)
+    db2.open()  # the retry sees clean v1 and migrates
+    assert _versions(db_path) == [2]
+    _run_ts, rows = db2.load_run("run-1")  # shadow history SURVIVES
+    assert len(rows) == 1
+    db2.record_applications([_app_row()])  # fully usable v2
+    db2.close()
+
+
+def test_connection_isolation_mode_is_pinned(tmp_path: Path) -> None:
+    # the atomic transition depends on the connect DEFAULT (legacy
+    # isolation mode: implicit BEGIN before DML only — DDL is NEVER
+    # auto-wrapped, which is exactly why _apply_schema issues an
+    # explicit BEGIN and why executescript (implicit COMMIT first) is
+    # banned from it). If a future edit flips isolation/autocommit,
+    # this pin reddens before the crash tests silently stop meaning
+    # what they say.
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    assert db._conn is not None
+    assert db._conn.isolation_level == ""
+    db.close()
+
+
+def test_tamper_refusals_name_their_recovery(tmp_path: Path) -> None:
+    # F1 (qwen MINOR): the two guards that STAY are tamper guards (no
+    # crash reaches them once the transitions are atomic) — and each
+    # message names the recovery operator-visibly, not just the module
+    # docstring.
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_SCHEMA)
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="schema_version is empty") as exc:
+        AppDB(db_path).open()
+    assert "recovery" in str(exc.value)  # the message itself says how out
+    db_path.unlink()
+    _v1_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE applications (message_id TEXT, label TEXT, label_id TEXT, "
+        "score REAL, band TEXT, tier TEXT, applied_at TEXT, source TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match=r"schema_version \[1\]") as exc:
+        AppDB(db_path).open()
+    assert "recovery" in str(exc.value)

@@ -199,6 +199,33 @@ def test_missing_managed_id_is_fail_safe() -> None:
     assert plan.warning is not None
 
 
+def test_internal_guard_assertion_raises_not_warned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F1 (deepseek C3 MINOR): the unreachable-by-construction guards sit
+    # INSIDE the fail-safe net — an internal regression (best_tier
+    # contradicting the applied decisions) must surface LOUDLY, never
+    # degrade to a per-message warning that turns a systematic break
+    # into silent label starvation. Data-path failures stay fail-safe;
+    # internal contradictions raise
+    import gmail_labeler.applications as applications_module
+
+    monkeypatch.setattr(applications_module, "best_tier", lambda decisions: None)
+    with pytest.raises(AssertionError):
+        applications_module.plan_message_write(
+            "aa",
+            scores=_scores("t", [0.5, 0.95]),
+            bands={label: (0.9, 0.7) for label in VOCAB},
+            graduated=frozenset(VOCAB),
+            present=frozenset(),
+            system_labels=frozenset(),
+            managed_label_ids=MANAGED_IDS,
+            tier_label_ids=TIER_IDS,
+            applied_at=TS,
+            source="daemon",
+        )
+
+
 def test_caller_bugs_raise_not_warn() -> None:
     # the pre-compose guards are CALLER bugs (exit-1 territory), not
     # per-message data errors: a bad source literal or a naive clock

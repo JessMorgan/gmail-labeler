@@ -587,6 +587,15 @@ def sorted_unique(values: tuple[str, ...]) -> bool:
     return all(a < b for a, b in pairwise(values))
 
 
+def is_tenth(value: float) -> bool:
+    """The tenth-grid DECISION, named in exactly one place (shared by
+    eval's threshold grid, thresholds' band targets, and config's
+    [bands] validation): the eval report labels its columns to one
+    decimal, so a non-tenth value would render mislabeled — fail loud
+    instead (the #20 stance)."""
+    return abs(value * 10 - round(value * 10)) <= 1e-9
+
+
 def _need_str_list(payload: dict[str, object], key: str) -> tuple[str, ...]:
     value = payload.get(key)
     if not isinstance(value, list):

@@ -138,7 +138,9 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     be order-insensitive too (a reasons-order difference is the same
     meaning, not a torn write). A corrupt/torn file is refused by
     ``from_json`` ITSELF (ValueError — mapped to the same named
-    operation failure, never a traceback); the OSError branch guards
+    operation failure, never a traceback); the hash-mismatch branch
+    is the concurrent-writer signature (a valid artifact whose
+    content hash differs — it DID parse); the OSError branch guards
     I/O failures around the publish (a concurrent writer, a disk
     error) — it is NOT the torn-write guard. The ONLY writer of the
     artifact in the package
@@ -202,9 +204,14 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
                 f"to a valid artifact ({type(e).__name__})"
             ) from e
         if readback.content_hash != artifact.content_hash:
+            # it DID parse — a valid artifact whose content hash
+            # differs: a concurrent writer published a different
+            # artifact (the fault branch above is the torn-write one)
             raise OSError(
-                f"artifact readback mismatch: {path} does not parse "
-                "back to the minted artifact"
+                f"artifact readback mismatch: {path} is a valid "
+                "artifact whose content hash differs from the minted "
+                "one (a concurrent writer published a different "
+                "artifact)"
             )
     except OSError:
         staging.unlink(missing_ok=True)  # best-effort staging cleanup

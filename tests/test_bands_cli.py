@@ -488,12 +488,10 @@ def test_eval_bands_readback_is_hash_based(
     # reasons-order difference is the same meaning — a dataclass
     # comparison would exit 5 after a perfectly good artifact landed
     # (reachable in one reason rename)
-    import dataclasses
-
     import gmail_labeler.cli as cli
     from gmail_labeler.dataset_build import TrainingExample
     from gmail_labeler.eval import eval_metrics
-    from gmail_labeler.thresholds import BandsArtifact, build_artifact, calibrate_bands
+    from gmail_labeler.thresholds import build_artifact, calibrate_bands
 
     examples = [
         TrainingExample(
@@ -606,6 +604,8 @@ def test_eval_bands_readback_mismatch_exits_5(
     assert result.exit_code == 5
     assert "cannot write --bands" in result.stderr
     assert "readback mismatch" in result.stderr
+    # the message names the real semantics: it DID parse
+    assert "content hash differs" in result.stderr
     assert "test examples=6" in result.stdout  # the report is not lost
 
 

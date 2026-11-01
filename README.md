@@ -183,10 +183,10 @@ time (exit 5, the report preserved) a degraded corpus (test records
 missing body shards — the artifact feeds the daemon's serving gate),
 a calibration refusal (an unknown override label, a lying identity),
 an existing artifact bound to a different identity (refused before
-any staging — the previous bytes stay intact), a write failure, and
-a post-write readback fault — the on-disk bytes do not parse back to
-a valid artifact (a torn/corrupt write) — or a readback mismatch, a
-valid artifact whose content hash differs (a concurrent writer
+any staging — the previous bytes stay intact), a write failure; a
+post-write readback fault — the on-disk bytes do not parse back to
+a valid artifact (a torn/corrupt write); and a readback mismatch —
+a valid artifact whose content hash differs (a concurrent writer
 published a different artifact).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`

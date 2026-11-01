@@ -167,9 +167,11 @@ payload; message bodies never enter it. `eval --bands PATH` is the
 deliberate act that calibrates the per-label Threshold Bands from the
 measured table (high/med per label, per-label min-precision targets
 from the config's `[bands]` section) and writes the versioned Bands
-Artifact — bound to the checkpoint + eval identity, byte-identical
-for the same eval, and refused by its consumers on any identity
-disagreement. It is opt-in: a bare `eval` never writes it
+Artifact — bound to the checkpoint + eval identity (verifiable
+against the checkpoint sidecar's identity fields), byte-identical
+for the same eval; its consumers (the daemon's shadow path, later
+phases) will refuse it on any identity disagreement once they land.
+It is opt-in: a bare `eval` never writes it
 (human-gated, ADR-0005), and it is the only writer — `train`/`eval`
 remain the only recomputers.
 

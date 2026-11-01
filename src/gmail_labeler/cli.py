@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -106,17 +107,31 @@ def _write_secret_tight(path: Path, text: str) -> None:
 
 def _write_bands_artifact(path: Path, text: str) -> None:
     """Write the Bands Artifact (ticket #21): 0600 from creation,
-    staging + atomic replace (train's pattern) — a failure leaves any
-    PREVIOUS artifact intact, and no fd can leak. Replacing an
-    EXISTING artifact is announced on stderr (the #20 ``--out`` NOTICE
-    — a silent clobber of a typo'd path would be a lie). The ONLY
-    writer of the artifact in the package (recompute posture, AC4 —
-    pinned by ``test_only_eval_writes_the_bands_artifact``)."""
+    EXCLUSIVE staging + atomic replace — a failure leaves any PREVIOUS
+    artifact intact, and no fd can leak. The staging file is
+    ``tempfile.mkstemp``'d (a unique name per process, 0600 from
+    creation, fsync'd before publish), so two concurrent ``eval
+    --bands`` runs on the same path can never interleave on a shared
+    staging name and rename each other's partial bytes into place; the
+    final ``os.replace`` is atomic, so each run publishes its own
+    complete bytes. Replacing an EXISTING artifact is announced on
+    stderr (the #20 ``--out`` NOTICE — a silent clobber of a typo'd
+    path would be a lie). The ONLY writer of the artifact in the
+    package (recompute posture, AC4 — pinned by
+    ``test_only_eval_writes_the_bands_artifact``)."""
     if path.exists():
         typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
-    staging = Path(str(path) + ".tmp")
-    _write_secret_tight(staging, text)
-    os.replace(staging, str(path))  # atomic on POSIX
+    fd, staging_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    staging = Path(staging_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:  # owns fd
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staging, str(path))  # atomic on POSIX
+    except OSError:
+        staging.unlink(missing_ok=True)  # best-effort staging cleanup
+        raise
 
 
 def _load_config(config: str | None):
@@ -943,6 +958,7 @@ def eval(
     from .eval import eval_metrics, render_report
     from .model import (
         MANIFEST_FILENAME,
+        SIDECAR_FILENAME,
         THRESHOLDS_SOURCE_NONE,
         CheckpointRefusedError,
         ExpectedIdentity,
@@ -953,7 +969,10 @@ def eval(
     # usage refusals up front (exit 2, before any corpus-scale work):
     # an empty --bands would degenerate to Path("") and fail awkwardly
     # mid-run; --bands and --out naming the same file would let the
-    # artifact write silently destroy the report
+    # artifact write silently destroy the report; --bands naming the
+    # checkpoint's sidecar or the config file would destroy identity
+    # material this very run just read (a destructive collision, not a
+    # regenerable-report NOTICE)
     if bands is not None:
         if not bands.strip():
             typer.echo("eval failed: --bands PATH must be non-empty", err=True)
@@ -964,6 +983,20 @@ def eval(
                 err=True,
             )
             raise typer.Exit(code=2) from None
+        bands_path = Path(bands).resolve()
+        from .config import find_config
+
+        for protected, what in (
+            (cfg.model.checkpoint_dir / SIDECAR_FILENAME, "the checkpoint sidecar"),
+            (find_config(config).resolve(), "the config file"),
+        ):
+            if bands_path == protected:
+                typer.echo(
+                    f"eval failed: --bands {bands!r} names {what} "
+                    f"({protected}) \u2014 refusing to destroy it",
+                    err=True,
+                )
+                raise typer.Exit(code=2) from None
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         typer.echo(
@@ -1228,6 +1261,25 @@ def eval(
     # report already on stdout); the write is the ONLY artifact writer
     # in the package (recompute posture, AC4).
     if bands is not None:
+        # serving-gate hardening: the artifact feeds the daemon's
+        # shadow path, so it must never be minted from degraded data —
+        # a corpus with missing body shards was scored on subject +
+        # trailing newline only (the WARNING above), and those scores
+        # are not the scores the bands would serve with. Refuse with
+        # exit 5 — the operation-failure convention every other
+        # post-report eval refusal uses (the calibration refusal below,
+        # the write failure); the report is already on stdout and is
+        # preserved, mirroring that posture.
+        if missing_bodies:
+            typer.echo(
+                f"eval failed: --bands refused: {missing_bodies} test "
+                "record(s) had no body shard \u2014 the scores are degraded "
+                "(subject + trailing newline only) and the Bands Artifact "
+                "feeds the daemon's serving gate; re-export to repair, "
+                "then re-run",
+                err=True,
+            )
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         from .thresholds import (
             BandTargets,
             build_artifact,
@@ -1275,8 +1327,7 @@ def eval(
         try:
             _write_bands_artifact(Path(bands), artifact.to_json())
         except OSError as e:
-            with contextlib.suppress(OSError):
-                Path(str(bands) + ".tmp").unlink()  # best-effort staging cleanup
+            # the helper already cleaned up its (mkstemp-named) staging
             typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         # the human-readable summary (the text-report mode only — the

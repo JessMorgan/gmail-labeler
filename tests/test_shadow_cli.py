@@ -760,3 +760,73 @@ def test_shadow_run_store_db_path_config(
     assert result.exit_code == 0, result.stderr
     assert (tmp_path / "state" / "custom.db").is_file()
     assert not (tmp_path / "gmail-labeler.db").exists()
+
+
+@pytest.mark.live
+def test_live_shadow_run_real_checkpoint(tmp_path: Path) -> None:
+    """The Phase 1 exit demo (opt-in, NEVER run in CI): a real-checkpoint
+    shadow run against the live mailbox.
+
+    Runs the full Phase 1 exit path with a REAL encoder (the ``train``
+    extra — torch) and the REAL Gmail API: train a checkpoint, calibrate
+    the bands, graduate the labels, then ``shadow run`` over a small
+    Backlog window and ``shadow report``. This is the human go/no-go
+    review before anything goes live (ADR-0005).
+
+    Opt-in:
+
+        uv run pytest -m live \\
+            tests/test_shadow_cli.py::test_live_shadow_run_real_checkpoint
+
+    (needs the ``train`` extra, a signed-in Gmail account, and a corpus).
+    """
+    # no monkeypatching: the REAL model factory + REAL Gmail client. The
+    # config is discovered the normal way (./config.toml or
+    # ~/.config/gmail-labeler/config.toml) — the operator's real install.
+    import gmail_labeler.cli as cli
+
+    # the real seams (no monkeypatch — the real recipe + real client)
+    assert cli._shadow_model_factory is not None  # the real factory
+    bands = tmp_path / "bands.json"
+    graduation = tmp_path / "graduation.json"
+    # train a real checkpoint (CPU)
+    train = runner.invoke(
+        app,
+        [
+            "train",
+            "--split-date",
+            "2026-01-01",
+            "--force",
+            "--device",
+            "cpu",
+        ],
+    )
+    assert train.exit_code == 0, train.stderr
+    # calibrate the bands + graduate the labels
+    bands_run = runner.invoke(app, ["eval", "--bands", str(bands)])
+    assert bands_run.exit_code == 0, bands_run.stderr
+    grad_run = runner.invoke(
+        app,
+        ["eval", "--graduation", str(graduation), "--confirm-graduation"],
+    )
+    assert grad_run.exit_code == 0, grad_run.stderr
+    # the shadow run over a SMALL Backlog window (the demo — not a full
+    # mailbox scan)
+    run = runner.invoke(
+        app,
+        [
+            "shadow",
+            "run",
+            "--bands",
+            str(bands),
+            "--graduation",
+            str(graduation),
+            "--limit",
+            "10",
+        ],
+    )
+    assert run.exit_code == 0, run.stderr
+    # the report (the Phase 1 exit review)
+    report = runner.invoke(app, ["shadow", "report"])
+    assert report.exit_code == 0, report.stderr
+    assert "shadow report: run=" in report.stdout

@@ -1305,10 +1305,34 @@ def test_unknown_stamp_set_refusal_names_the_honest_diagnosis(tmp_path: Path) ->
         db = AppDB(_stamped("db-" + "-".join(map(str, stamps)) + ".db", stamps))
         with pytest.raises(AppDBError, match="unknown stamp set"):
             db.open()
+
+    # the F1 round-2 MAJOR pin: the shape check does not constrain column
+    # TYPES (hostile-affinity doctrine) — a TEXT or NULL stamp must
+    # reach the NAMED refusal, never a raw TypeError out of open() (the
+    # first split compared the stamp to an int and escaped the CLI's
+    # exit-5 mapping)
     db = AppDB(_stamped("db-future.db", [99]))
     with pytest.raises(AppDBError, match="a newer tool wrote") as exc:
         db.open()
     assert "upgrade this tool" in str(exc.value)
+
+    # non-integer single stamps: honest named refusal, NOT a TypeError
+    path = tmp_path / "db-text.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE schema_version (version)")
+    conn.execute("INSERT INTO schema_version (version) VALUES ('abc')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="unknown stamp set"):
+        AppDB(path).open()
+    path = tmp_path / "db-null.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE schema_version (version)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (NULL)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="unknown stamp set"):
+        AppDB(path).open()
 
 
 def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:

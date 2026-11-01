@@ -560,10 +560,20 @@ class AppDB:
                         f"= {SCHEMA_VERSION} manually, or delete the file "
                         f"(shadow and application history is lost)"
                     )
-                elif len(versions) == 1 and next(iter(versions)) > SCHEMA_VERSION:
-                    # a SINGLE future stamp: the only state where "a newer
-                    # tool wrote this DB" is honest (the sealed [99] pins
-                    # keep their prefix)
+                elif (
+                    len(versions) == 1
+                    and isinstance(only := next(iter(versions)), int)
+                    and not isinstance(only, bool)
+                    and only > SCHEMA_VERSION
+                ):
+                    # a SINGLE future INT stamp: the only state where "a
+                    # newer tool wrote this DB" is honest (the sealed [99]
+                    # pins keep their prefix). The type guard is the F1
+                    # round-2 fix: the shape check does not constrain
+                    # column TYPES (hostile-affinity doctrine above), so a
+                    # TEXT/NULL stamp must route to the unknown-set branch
+                    # — comparing it here escaped open() as a raw
+                    # TypeError, past the CLI's exit-5 mapping
                     raise AppDBError(
                         f"state DB schema_version {sorted(versions, key=repr)} != "
                         f"{SCHEMA_VERSION}: {self.path} — a newer tool wrote "
@@ -709,7 +719,9 @@ class AppDB:
         batch here is a caller bug), a row failing validation (the id
         shape, the score range, the band/tier/source vocabularies, a
         naive applied_at), or a duplicate (message_id, label) WITHIN one
-        batch (one Application carries one row per label — the same
+        batch, or MORE THAN ONE distinct applied_at stamp in the batch (the
+        #24 homogeneity contract as a store invariant, F1) (one
+        Application carries one row per label — the same
         (message_id, label) across SEPARATE batches is legitimate
         re-application history, so there is no PK). Returns the row
         count."""
@@ -1112,7 +1124,7 @@ def _check_cursor_value(value: object, recovery: str | None = None) -> int:
         # an unbounded value would escape as a raw sqlite3 OverflowError
         # at bind time (past the DatabaseError wrapper, past the CLI's
         # exit-5 mapping) — refused NAMED here instead (review finding)
-        raise AppDBError(
+        refuse(
             f"history_cursor {value} exceeds the SQLite INTEGER range "
             f"({_MAX_SQLITE_INTEGER}) — no real historyId reaches this bound; "
             f"refusing"

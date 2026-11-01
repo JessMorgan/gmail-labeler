@@ -4,12 +4,14 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 **your own** mailbox, then let it label arriving mail — quietly when it's
 confident, reviewably when it isn't.
 
-> **Status: pre-alpha — Phase 0 (corpus acquisition) has landed.** The
-> architecture decisions, domain language, and development standards are
-> committed; the CLI installs (`uv sync`, then `gmail-labeler --help`) with a
-> working OAuth flow and `dataset export` / `import-gyb` / `analyze`.
-> Training, graduation, and the daemon arrive in later phases — follow the
-> phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: pre-alpha — Phase 0 (corpus acquisition) and Phase 1's
+> `train` have landed.** The architecture decisions, domain language,
+> and development standards are committed; the CLI installs
+> (`uv sync`, then `gmail-labeler --help`) with a working OAuth flow,
+> `dataset export` / `import-gyb` / `analyze`, and `train` (fine-tune
+> on your own machine, checkpoint + identity sidecar). Graduation,
+> `eval`, the shadow pass, and the daemon arrive in later phases —
+> follow the phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -81,6 +83,7 @@ gmail-labeler auth login              # one-time desktop OAuth consent flow
 gmail-labeler dataset export          # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
+gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -121,12 +124,33 @@ withholds candidates instead of guessing (invariant #6), and
 vocabulary; the posture names the real cause); timestamps are ISO-8601.
 Candidates are a shortlist for later graduation,
 never a config change (ADR-0005 keeps retraining and applying
-human-gated).
+human-gated). `train --split-date YYYY-MM-DD` fine-tunes the encoder
+on your corpus — fully local: the corpus comes from disk, the encoder
+weights from a LOCAL path (`[model] encoder_path` in the config;
+nothing is ever downloaded, and the `train` extra installs torch +
+transformers + accelerate — on a CPU box install the smaller
+CPU-only torch with `uv sync --extra train --torch-backend=cpu`).
+It mints the temporal Split Manifest, rebuilds the examples through
+it, trains only the train split (recency-weighted), and writes a
+checkpoint dir with a JSON sidecar pinning its identity
+(label-vocabulary hash, thresholds source, train-split corpus
+fingerprint, split-manifest hash, encoder id) — the loader refuses
+any checkpoint whose sidecar disagrees with the Corpus/config it is
+asked to serve against, and refuses a tampered `manifest.json`. A
+missing or incomplete filters/labels bridge refuses the build
+(invariant #6; `--assume-no-filters` attests a filterless mailbox),
+and an existing checkpoint dir refuses the run until `--force` is
+explicit — retraining is human-gated (ADR-0005). `--force` replaces
+staging-based (build in `<dir>.tmp`, verify the sidecar by readback,
+swap in): a crash leaves the old checkpoint intact, an empty dir, or
+the new one — each refusal-safe. `--device cpu|cuda` selects the
+device (single-device contract: a multi-GPU host is refused — set
+`CUDA_VISIBLE_DEVICES` to one).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`train`, `eval`, `shadow`, `apply`, `daemon`, and `status` are frozen
-command names that arrive in later phases (not wired yet) — until they are,
+`eval`, `shadow`, `apply`, `daemon`, and `status` are frozen command
+names that arrive in later phases (not wired yet) — until they are,
 they exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
 commands and currently unreachable. Scripts can branch on 0/2/4/5
 today; a `1` means an unhandled crash — that's a bug, please report it.

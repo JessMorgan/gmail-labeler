@@ -62,7 +62,9 @@ jobs:
         run: uv run --frozen pyright
 
       - name: Tests (coverage gate + live exclusion from pyproject addopts)
-        run: uv run --frozen pytest -m "not live"
+        # -m overrides addopts' marker expression, so the live/smoke/gpu
+        # exclusions are stated here too (the matrix is torch-free).
+        run: uv run --frozen pytest -m "not live and not smoke and not gpu"
 
       - name: uv.lock untouched by the gates
         run: git diff --exit-code uv.lock

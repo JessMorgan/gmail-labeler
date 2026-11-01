@@ -10,7 +10,6 @@ no command is stubbed; scripts can branch on 0/2/4/5 today.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import tempfile
@@ -109,28 +108,46 @@ def _write_secret_tight(path: Path, text: str) -> None:
 
 
 def _write_out_report(out: str, file_text: str) -> None:
-    """The eval ``--out`` write: 0600 from creation, staging + atomic
-    replace (train's staging pattern) — a failure leaves any PREVIOUS
-    report at the path intact, and no fd can leak. Replacing an
+    """The eval ``--out`` write: 0600 from creation, EXCLUSIVE staging
+    + atomic replace — a failure leaves any PREVIOUS report at the
+    path intact, and no fd can leak. The staging file is
+    ``tempfile.mkstemp``'d (a unique name per process, 0600 from
+    creation, fsync'd before publish), so two concurrent ``eval`` runs
+    on the same path can never interleave on a shared staging name and
+    rename each other's partial bytes into place (the inherited
+    #20-era fixed ``<out>.tmp`` name had exactly that hazard — the
+    artifact writers got the mkstemp treatment in #21; this is the
+    class fix for the report write). The final ``os.replace`` is
+    atomic, so each run publishes its own complete bytes. Replacing an
     EXISTING file is announced on stderr — a silent clobber of a
     typo'd path would be a lie (train refuses overwrites; --force is
     overkill for a regenerable report). The report file lands BEFORE
-    the serving-gate acts (bands/graduation), so a run that later
-    refuses (a degraded corpus, a calibration refusal, a write
-    failure) still REPLACES a previous report file — the report is
-    the run's output, and the refusal is about the artifacts, not the
-    report. Raises OSError on failure (the caller maps it to exit
-    5)."""
+    the serving-gate acts (bands/graduation) in TEXT mode, so a run
+    that later refuses (a degraded corpus, a calibration refusal, a
+    write failure) still REPLACES a previous report file — the report
+    is the run's output, and the refusal is about the artifacts, not
+    the report (in --json mode the file lands at the payload emit,
+    which is after the acts — the bytes are the same). Raises OSError
+    on failure (the caller maps it to exit 5)."""
     target = Path(out)
     if target.exists():
         typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
-    staging = Path(str(out) + ".tmp")
+    fd, staging_name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
+    staging = Path(staging_name)
     try:
-        _write_secret_tight(staging, file_text)
-        os.replace(staging, out)  # atomic on POSIX
+        fh = os.fdopen(fd, "w", encoding="utf-8")  # owns fd from here
     except OSError:
-        with contextlib.suppress(OSError):
-            staging.unlink()  # best-effort staging cleanup
+        os.close(fd)  # fdopen failed — the fd is ours to close
+        staging.unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(file_text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staging, str(target))  # atomic on POSIX
+    except OSError:
+        staging.unlink(missing_ok=True)  # best-effort staging cleanup
         raise
 
 
@@ -154,10 +171,14 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     Before replacing an EXISTING artifact, its identity is checked
     against the current run (the serving-gate hardening): a parsed
     artifact whose identity fields disagree is refused
-    (``BandsTargetRefusedError`` — exit 5, BEFORE any staging); an
-    unreadable/garbage target is NOT identity material — the replace
-    NOTICE proceeds (the artifact is regenerable by design, the
-    recompute posture). Replacing an existing artifact is announced on
+    (``BandsTargetRefusedError`` — exit 5, BEFORE any staging); a
+    target that parses as the SIBLING artifact (a Graduation Table) is
+    a KNOWN artifact, not garbage — deleting it behind the NOTICE
+    would destroy identity material, so it is refused naming the
+    confusion; an unreadable/garbage target (parses as NOTHING) is NOT
+    identity material — the replace NOTICE proceeds (the artifact is
+    regenerable by design, the recompute posture). Replacing an
+    existing artifact is announced on
     stderr (the #20 ``--out`` NOTICE — a silent clobber of a typo'd
     path would be a lie). After the replace, the on-disk bytes are read
     back through ``BandsArtifact.from_json`` (train's sidecar readback
@@ -180,9 +201,25 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
         try:
             existing = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
-            # an unreadable/garbage target is not identity material —
-            # the replace NOTICE proceeds (regenerable by design)
-            typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+            # a target that parses as the SIBLING artifact (a
+            # Graduation Table) is a KNOWN artifact, not garbage —
+            # deleting it behind the NOTICE would destroy identity
+            # material; refuse, naming the confusion
+            from .graduation import GraduationTable
+
+            try:
+                GraduationTable.from_json(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                # an unreadable/garbage target (parses as NOTHING) is
+                # not identity material — the replace NOTICE proceeds
+                # (regenerable by design)
+                typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+            else:
+                raise BandsTargetRefusedError(
+                    f"existing file at {path} is a Graduation Table, not a "
+                    "Bands Artifact \u2014 refusing to delete it (use a "
+                    "different path for --bands)"
+                )
         else:
             disagreeing = [
                 field
@@ -266,10 +303,14 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
     Before replacing an EXISTING table, its identity is checked against
     the current run (the serving-gate hardening): a parsed table whose
     identity fields disagree is refused
-    (``GraduationTargetRefusedError`` — exit 5, BEFORE any staging); an
-    unreadable/garbage target is NOT identity material — the replace
-    NOTICE proceeds (the table is regenerable by design, the recompute
-    posture). Replacing an existing table is announced on stderr (the
+    (``GraduationTargetRefusedError`` — exit 5, BEFORE any staging); a
+    target that parses as the SIBLING artifact (a Bands Artifact) is a
+    KNOWN artifact, not garbage — deleting it behind the NOTICE would
+    destroy identity material, so it is refused naming the confusion;
+    an unreadable/garbage target (parses as NOTHING) is NOT identity
+    material — the replace NOTICE proceeds (the table is regenerable by
+    design, the recompute posture). Replacing an existing table is
+    announced on stderr (the
     #20 ``--out`` NOTICE — a silent clobber of a typo'd path would be a
     lie). After the replace, the on-disk bytes are read back through
     ``GraduationTable.from_json`` (train's sidecar readback symmetry)
@@ -291,9 +332,25 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
         try:
             existing = GraduationTable.from_json(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
-            # an unreadable/garbage target is not identity material —
-            # the replace NOTICE proceeds (regenerable by design)
-            typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+            # a target that parses as the SIBLING artifact (a Bands
+            # Artifact) is a KNOWN artifact, not garbage — deleting it
+            # behind the NOTICE would destroy identity material;
+            # refuse, naming the confusion
+            from .thresholds import BandsArtifact
+
+            try:
+                BandsArtifact.from_json(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                # an unreadable/garbage target (parses as NOTHING) is
+                # not identity material — the replace NOTICE proceeds
+                # (regenerable by design)
+                typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+            else:
+                raise GraduationTargetRefusedError(
+                    f"existing file at {path} is a Bands Artifact, not a "
+                    "Graduation Table \u2014 refusing to delete it (use a "
+                    "different path for --graduation)"
+                )
         else:
             disagreeing = identity_disagreement(existing, table)
             if disagreeing:
@@ -1219,9 +1276,14 @@ def eval(
         )
         raise typer.Exit(code=2) from None
     # the empty checks run BEFORE the equal-path checks: an empty
-    # target would resolve to the cwd and report a spurious
-    # "different files" collision instead of "non-empty"
-    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+    # target would resolve to the cwd (and --out would write a stray
+    # staging file there) and report a spurious "different files"
+    # collision instead of "non-empty"
+    for flag, target in (
+        ("--out", out),
+        ("--bands", bands),
+        ("--graduation", graduation),
+    ):
         if target is not None and not target.strip():
             typer.echo(f"eval failed: {flag} PATH must be non-empty", err=True)
             raise typer.Exit(code=2) from None
@@ -1506,7 +1568,12 @@ def eval(
     # JSON object; the diff lines are on stderr, never stdout). The
     # payload is built LAZILY inside the emitter (called at most once
     # per run) — a text run never pays for the row/cell tree.
-    def _emit_json_payload(proposal: dict[str, object] | None = None) -> None:
+    def _emit_json_payload(
+        graduation_payload: dict[str, object] | None = None,
+    ) -> None:
+        # the parameter is named graduation_payload (not "proposal") —
+        # it must not shadow the block-level `proposal` variable the
+        # success/write-failure emits pass in
         nonlocal file_text
         payload: dict[str, object] = {
             "trust": trust,
@@ -1535,10 +1602,10 @@ def eval(
                 for row in table.rows
             ],
         }
-        if proposal is not None:
+        if graduation_payload is not None:
             # the proposal rides in the payload (the machine-readable
             # diff surface — the diff lines stay on stderr)
-            payload["graduation"] = proposal
+            payload["graduation"] = graduation_payload
         output = json.dumps(payload, sort_keys=True)
         typer.echo(output)
         file_text = output + "\n"
@@ -1558,6 +1625,11 @@ def eval(
     # the writes are the ONLY artifact writers in the package
     # (recompute posture, AC4).
     if bands is not None or graduation is not None:
+        # the graduation proposal (the machine-readable diff surface) —
+        # pre-initialized so the success emit's `proposal if
+        # graduation is not None else None` reads one variable, never
+        # an unbound name
+        proposal: dict[str, object] | None = None
         # serving-gate hardening: the artifacts feed the daemon's
         # serving gate, so they must never be minted from degraded data
         # — a corpus with missing body shards was scored on subject +
@@ -1576,8 +1648,9 @@ def eval(
                 )
                 if given
             )
-            if as_json:
-                _emit_json_payload()  # the report is never lost
+            # the refusal reason prints BEFORE the json emit — an emit
+            # failure (the --out write inside the emitter) must not
+            # swallow the cause
             typer.echo(
                 f"eval failed: {degraded_flags} refused: {missing_bodies} "
                 "test record(s) had no body shard \u2014 the scores are "
@@ -1586,6 +1659,8 @@ def eval(
                 "re-export to repair, then re-run",
                 err=True,
             )
+            if as_json:
+                _emit_json_payload()  # the report is never lost
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         from .thresholds import (
             BandTargets,
@@ -1630,9 +1705,12 @@ def eval(
                 split_date=manifest.split_date,
             )
         except (ValueError, OSError) as e:
+            # the refusal reason prints BEFORE the json emit — an emit
+            # failure (the --out write inside the emitter) must not
+            # swallow the cause
+            typer.echo(f"eval failed: band calibration refused: {e}", err=True)
             if as_json:
                 _emit_json_payload()  # the report is never lost
-            typer.echo(f"eval failed: band calibration refused: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         if bands is not None:
             try:
@@ -1640,17 +1718,20 @@ def eval(
             except BandsTargetRefusedError as e:
                 # the serving-gate hardening: the existing target is a
                 # verifiably-different artifact — exit 5, before any
-                # staging, the previous bytes intact
+                # staging, the previous bytes intact; the refusal
+                # reason prints BEFORE the json emit (an emit failure
+                # must not swallow the cause)
+                typer.echo(f"eval failed: --bands refused: {e}", err=True)
                 if as_json:
                     _emit_json_payload()  # the report is never lost
-                typer.echo(f"eval failed: --bands refused: {e}", err=True)
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             except OSError as e:
                 # the helper already cleaned up its (mkstemp-named)
-                # staging
+                # staging; the refusal reason prints BEFORE the json
+                # emit (an emit failure must not swallow the cause)
+                typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
                 if as_json:
                     _emit_json_payload()  # the report is never lost
-                typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             # the human-readable summary (the text-report mode only —
             # the --json payload is the machine-readable output, and
@@ -1714,12 +1795,15 @@ def eval(
                     split_date=manifest.split_date,
                 )
             except (ValueError, OSError) as e:
-                if as_json:
-                    _emit_json_payload()  # the report is never lost
+                # the refusal reason prints BEFORE the json emit — an
+                # emit failure (the --out write inside the emitter)
+                # must not swallow the cause
                 typer.echo(
                     f"eval failed: graduation gate evaluation refused: {e}",
                     err=True,
                 )
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             # the proposal (the machine-readable diff surface) — parsed
             # ONCE, shared by the success emit and the write-failure
@@ -1765,20 +1849,43 @@ def eval(
                 try:
                     _write_graduation_table(Path(graduation), new_table, table_text)
                 except GraduationTargetRefusedError as e:
+                    # the refusal reason prints BEFORE the json emit
+                    # (an emit failure must not swallow the cause); the
+                    # message names the partial effect when the --bands
+                    # artifact was already written this run
+                    typer.echo(
+                        f"eval failed: --graduation refused: {e}"
+                        + (
+                            f" (the --bands artifact was already written at {bands})"
+                            if bands is not None
+                            else ""
+                        ),
+                        err=True,
+                    )
                     if as_json:
                         # the report is never lost — and the proposal
                         # rides (the computation succeeded)
                         _emit_json_payload(proposal)
-                    typer.echo(f"eval failed: --graduation refused: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
                 except OSError as e:
                     # the helper already cleaned up its (mkstemp-named)
-                    # staging
+                    # staging; the refusal reason prints BEFORE the
+                    # json emit (an emit failure must not swallow the
+                    # cause), naming the partial effect when the
+                    # --bands artifact was already written this run
+                    typer.echo(
+                        f"eval failed: cannot write --graduation: {e}"
+                        + (
+                            f" (the --bands artifact was already written at {bands})"
+                            if bands is not None
+                            else ""
+                        ),
+                        err=True,
+                    )
                     if as_json:
                         # the report is never lost — and the proposal
                         # rides (the computation succeeded)
                         _emit_json_payload(proposal)
-                    typer.echo(f"eval failed: cannot write --graduation: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         if as_json:
             # the success path: the payload carries the proposal when

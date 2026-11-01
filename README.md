@@ -199,17 +199,22 @@ checkpoint + eval identity + the Bands Artifact's content hash
 write is the CLI-gated confirm act (0600 from creation, staging +
 atomic replace, post-write readback compared by content hash).
 Refusals: up front (exit 2) `--confirm-graduation` without
-`--graduation`, an empty path, a path equal to `--out` or `--bands`,
-an existing directory, the config file, and any target inside the
-checkpoint dir or the corpus store (by resolved path — the table must
-not live beside identity files); at run time (exit 5, the report
-preserved) a degraded corpus (test records missing body shards — the
-table feeds the serving gate, same posture as `--bands`), a band
-calibration refusal, a gate evaluation refusal (an empty/duplicate
-Managed Label list, a Managed Label the vocabulary does not carry, an
-unknown gate override label, a lying identity), confirming over an
-existing table bound to a different identity (refused before any
-staging — the previous bytes stay intact), a write failure; a
+`--graduation`, an empty `--out`/`--bands`/`--graduation` path, a path
+equal to `--out` or `--bands`, an existing directory, the config file,
+and any target inside the checkpoint dir or the corpus store (by
+resolved path — the table must not live beside identity files); at run
+time (exit 5, the report preserved) a degraded corpus (test records
+missing body shards — the table feeds the serving gate, same posture
+as `--bands`), a band calibration refusal, a gate evaluation refusal
+(an empty/duplicate Managed Label list, a Managed Label the vocabulary
+does not carry, an unknown gate override label, a lying identity), an
+existing target that parses as the SIBLING artifact (a Bands Artifact
+for `--graduation`, a Graduation Table for `--bands` — refused naming
+the confusion, before any staging; garbage that parses as NOTHING
+keeps the NOTICE-replace posture), confirming over an existing table
+bound to a different identity (refused before any staging — the
+previous bytes stay intact), a write failure (naming the partial
+effect when the `--bands` artifact was already written this run); a
 post-write readback fault — the on-disk bytes do not parse back to a
 valid table (a torn/corrupt write); and a readback mismatch — a valid
 table whose content hash differs (a concurrent writer published a
@@ -218,8 +223,11 @@ a raw bool/string). With `--json` the proposal rides in the payload
 under the `graduation` key (stdout stays exactly one parseable JSON
 object); on a post-report refusal the base payload (the report,
 without the proposal) is emitted first — the report is never lost on
-stdout. The `--out` file lands before the serving-gate acts, so a run
-that later refuses still replaces a previous report file.
+stdout — and on a graduation write failure AND a foreign-bound confirm
+refusal the proposal rides (the computation succeeded). The `--out`
+file lands before the serving-gate acts in TEXT mode and at the
+payload emit (after the acts) in `--json` mode — in both, a run that
+later refuses still replaces a previous report file.
 `train`/`eval` remain the only recomputers, and
 only the confirm path writes the table.
 

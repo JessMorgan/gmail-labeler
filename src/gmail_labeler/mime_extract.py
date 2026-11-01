@@ -9,7 +9,7 @@ impossible here because there is no second code path.
 Pure core: stdlib ``email`` only, no I/O, DETERMINISTIC, and panic-free on
 malformed input — any failure (broken headers, pathological nesting, bad
 charsets) degrades to best-effort fields and a content-free log warning; a
-crash here would abort a 394k-message import over a 20-byte garbage header.
+crash here would abort the whole import over a 20-byte garbage header.
 
 The ``date`` is the MESSAGE's Date header or None — never "now": this module
 is deterministic, and both callers hold an authoritative timestamp (Gmail

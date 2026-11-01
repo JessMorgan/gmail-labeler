@@ -40,7 +40,7 @@ def test_category_family_is_system(label_id: str) -> None:
     ["CHAT", "SNOOZE", "UNDO", "YELLOW_STAR", "PURPLE_STAR"],
 )
 def test_extended_state_labels_are_system(label_id: str) -> None:
-    # YELLOW_STAR observed in the owner's GYB corpus; CHAT/SNOOZE/UNDO per
+    # YELLOW_STAR observed in a real GYB corpus; CHAT/SNOOZE/UNDO per
     # community enumerations (GAM/lieer), NOT Google's guide table.
     assert is_system_label_id(label_id)
 
@@ -60,13 +60,13 @@ def test_extended_state_labels_are_system(label_id: str) -> None:
 )
 def test_superstar_format_variants_are_system(label_id: str) -> None:
     # Non-star members of Gmail's star-format namespace: users with other
-    # star presets surface these ids (YELLOW_STAR was observed in the owner's
+    # star presets surface these ids (YELLOW_STAR was observed in a real
     # corpus; the family is closed per the ^ss_* mapping).
     assert is_system_label_id(label_id)
 
 
 def test_corpus_observed_system_tokens_all_filtered() -> None:
-    # Evidence tie: every system token dumped from the owner's 21-year GYB
+    # Evidence tie: every system token dumped from a real GYB
     # msg-db (public Gmail tokens; user labels excluded) must be filtered.
     observed = [
         "CATEGORY_FORUMS",

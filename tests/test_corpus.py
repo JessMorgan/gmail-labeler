@@ -70,9 +70,12 @@ def test_record_rejects_bad_source_and_dates() -> None:
 
 def test_utc_datetime_coercion() -> None:
     assert utc_datetime(datetime(2026, 1, 1)).tzinfo is UTC
-    # fixed -05:00 == US/Eastern on 2026-01-01 (EST); runners lack a tz db
+    # fixed -05:00 == US/Eastern on 2026-01-01 (EST); needs no tz database
     eastern = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=-5)))
-    assert utc_datetime(eastern).utcoffset() == timedelta(0)
+    # the exact instant, not just the offset: an astimezone→replace
+    # mutation (a 5 h wrong instant) must fail this pin
+    assert utc_datetime(eastern) == datetime(2026, 1, 1, 5, tzinfo=UTC)
+    assert utc_datetime(eastern).tzinfo is UTC
 
 
 def test_from_json_line_rejects_naive_date_and_bad_shapes() -> None:

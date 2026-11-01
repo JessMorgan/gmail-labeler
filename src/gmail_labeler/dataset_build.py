@@ -32,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING, cast
 
-from .analyze import filter_label_ids_strict, simulates_filter
+from .analyze import filter_label_ids_strict, months_ago, simulates_filter
 from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES, DateProvenance
 from .labels import label_path, path_is_at_or_under
 
@@ -40,9 +40,9 @@ if TYPE_CHECKING:
     from .corpus_record import CorpusRecord
 
 #: Split Manifest format version (GLOSSARY: Split Manifest). Bump on any
-#: change to the manifest's field set or semantics. v2 adds bridge_hash
-#: (the pinned filters/labels bridge input).
-FORMAT_VERSION = 2
+#: change to the manifest's field set or semantics. v3 adds the recency-
+#: weighting fields (recent_months, old_weight, weight_cutoff).
+FORMAT_VERSION = 3
 
 
 class BuildAbortedError(ValueError):
@@ -96,6 +96,14 @@ class SplitManifest:
     server_authoritative_only: bool  # split-boundary trust filter (invariant #7)
     bridge_hash: str  # sha256 of the canonical form of the effective bridge:
     # pinned so a drifted filters/labels snapshot refuses the rebuild loudly
+    recent_months: int  # recency-weighting window (analyze's months_ago shape)
+    old_weight: float  # weight outside the window (named, never ad-hoc)
+    weight_cutoff: datetime  # months_ago(now, recent_months) at build time,
+    # UTC-normalized: the weighting anchor — manifest-input mode rebuilds
+    # weights from it, so the rebuild is reproducible from the artifact
+    # alone. Scoped to fixed-offset/UTC-normalized inputs (a DST-zone
+    # offset change would shift the wall-clock cutoff; callers should pass
+    # `now` already in UTC for cross-host stability).
     content_hash: str
 
     def _canonical_payload(self) -> dict[str, object]:
@@ -107,6 +115,9 @@ class SplitManifest:
             "test_ids": list(self.test_ids),
             "server_authoritative_only": self.server_authoritative_only,
             "bridge_hash": self.bridge_hash,
+            "recent_months": self.recent_months,
+            "old_weight": self.old_weight,
+            "weight_cutoff": self.weight_cutoff.isoformat(),
         }
 
     def compute_hash(self) -> str:
@@ -152,6 +163,11 @@ class SplitManifest:
                     payload, "server_authoritative_only"
                 ),
                 bridge_hash=_need_str(payload, "bridge_hash"),
+                recent_months=_need_int(payload, "recent_months"),
+                old_weight=_need_float(payload, "old_weight"),
+                weight_cutoff=datetime.fromisoformat(
+                    _need_str(payload, "weight_cutoff")
+                ),
                 content_hash=_need_str(payload, "content_hash"),
             )
         except ValueError as e:
@@ -175,6 +191,16 @@ class SplitManifest:
             0
         ):
             raise ValueError("manifest split_date must be timezone-aware UTC")
+        if self.weight_cutoff.tzinfo is None or (
+            self.weight_cutoff.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("manifest weight_cutoff must be timezone-aware UTC")
+        if self.recent_months < 0:
+            raise ValueError("manifest recent_months must be >= 0")
+        if not 0.0 <= self.old_weight <= 1.0:
+            raise ValueError(
+                f"manifest old_weight must be in [0.0, 1.0], got {self.old_weight}"
+            )
         if not _sorted_unique(self.vocabulary):
             raise ValueError("manifest vocabulary must be sorted and unique")
         if not _sorted_unique(self.train_ids):
@@ -234,6 +260,16 @@ class BuildResult:
         )
 
 
+def example_weight(date: datetime, *, cutoff: datetime, old_weight: float) -> float:
+    """Recency weight (GLOSSARY: Recency Weight): 1.0 at or after the
+    recency cutoff, ``old_weight`` before it. The cutoff is analyze's
+    exact calendar-month shape (``months_ago(now, recent_months)``) — no
+    new decay curve — and it rides in the Split Manifest, so a 21-year
+    corpus cannot be dominated by its oldest mail and a manifest-input
+    rebuild is reproducible from the artifact alone."""
+    return 1.0 if date >= cutoff else old_weight
+
+
 def build_dataset(
     records: Sequence[CorpusRecord],
     *,
@@ -243,6 +279,8 @@ def build_dataset(
     split_date: datetime,
     manifest: SplitManifest | None = None,
     server_authoritative_only: bool = False,
+    recent_months: int = 24,
+    old_weight: float = 0.1,
 ) -> BuildResult:
     """Turn CorpusRecords + the filters/labels bridge into training
     examples + a versioned split manifest.
@@ -272,13 +310,19 @@ def build_dataset(
     (``mime_date``/``unknown`` Date Provenance) out of the split before
     it; the default stamps them on their examples so eval can filter.
 
+    Recency weighting: each example carries ``example_weight`` — 1.0 at
+    or after the cutoff (``months_ago(now, recent_months)``, UTC-
+    normalized), ``old_weight`` before it; the cutoff rides in the
+    manifest. Whether an eval applies the weight is the consumer's choice
+    (the example carries it; the split identity does not depend on it).
+
     Determinism: examples sorted by id with sorted labels; manifest id
-    sets and vocabulary sorted; identical inputs give byte-identical
-    manifests (``split_date`` is stored UTC-normalized). ``now`` and
-    ``split_date`` are required: the core never reads the clock.
-    ``now`` is unused until the recency weighting lands (it anchors the
-    cutoff) — required now for the analyze discipline. Duplicate record
-    ids are rejected up front (the store guarantees uniqueness).
+    sets, vocabulary, and the weighting cutoff (``weight_cutoff``)
+    sorted/UTC-normalized; identical inputs give byte-identical manifests
+    (``split_date`` is stored UTC-normalized). ``now`` and ``split_date``
+    are required: the core never reads the clock (``now`` anchors the
+    weighting cutoff). Duplicate record ids are rejected up front (the
+    store guarantees uniqueness).
     """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
@@ -326,8 +370,31 @@ def build_dataset(
                 "the manifest"
             )
         # the manifest's parameters are authoritative — same records +
-        # manifest → same examples, no re-split, no re-trust-filtering
+        # manifest → same examples, no re-split, no re-trust-filtering,
+        # no re-weighting (``now``/``recent_months``/``old_weight`` are
+        # ignored here: the manifest's weight_cutoff is the anchor)
         server_authoritative_only = manifest.server_authoritative_only
+        old_weight = manifest.old_weight
+        cutoff = manifest.weight_cutoff
+    else:
+        # mint path: bounds-check the caller's weighting args (manifest
+        # mode does NOT re-check — it uses the manifest's validated values)
+        if isinstance(old_weight, bool):
+            # True would pass 0.0 <= x <= 1.0 (True == 1.0) and mint weight
+            # 1.0 — a bool is not a weight, reject it explicitly
+            raise ValueError(
+                f"old_weight must be a float in [0.0, 1.0], got {old_weight!r}"
+            )
+        if not 0.0 <= old_weight <= 1.0:
+            raise ValueError(f"old_weight must be in [0.0, 1.0], got {old_weight}")
+        if recent_months < 0:
+            raise ValueError(f"recent_months must be >= 0, got {recent_months}")
+        # coerce at mint so int-vs-float (old_weight=1 vs 1.0) and
+        # int recent_months hash identically and round-trip through
+        # from_json (which requires a float old_weight)
+        old_weight = float(old_weight)
+        recent_months = int(recent_months)
+        cutoff = months_ago(now, recent_months).astimezone(UTC)
 
     seen: set[str] = set()
     for record in records:
@@ -407,7 +474,7 @@ def build_dataset(
                     and not (name in covered and record.id in covered[name])
                 )
             ),
-            weight=1.0,
+            weight=example_weight(record.date, cutoff=cutoff, old_weight=old_weight),
             date_provenance=record.date_provenance,
         )
         for record in sorted(records, key=lambda record: record.id)
@@ -447,6 +514,9 @@ def build_dataset(
             test_ids=test_ids,
             server_authoritative_only=server_authoritative_only,
             bridge_hash=bridge_hash,
+            recent_months=recent_months,
+            old_weight=old_weight,
+            weight_cutoff=cutoff,
             content_hash="",
         )
         manifest = replace(manifest, content_hash=manifest.compute_hash())
@@ -496,6 +566,13 @@ def _need_int(payload: dict[str, object], key: str) -> int:
     value = payload.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"field {key!r} must be an integer")
+    return value
+
+
+def _need_float(payload: dict[str, object], key: str) -> float:
+    value = payload.get(key)
+    if not isinstance(value, float):
+        raise ValueError(f"field {key!r} must be a float")
     return value
 
 

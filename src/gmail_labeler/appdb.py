@@ -279,8 +279,10 @@ class AppDB:
         migrations stranded half-restamped). Legacy isolation mode does
         NOT auto-wrap DDL in the implicit transaction and executescript
         commits any pending transaction first — hence the explicit
-        BEGIN/COMMIT over individual execute() calls (both the mode and
-        the ban are pinned by test). The rowcount guard keeps the
+        BEGIN/COMMIT over individual execute() calls (the mode is
+        pinned by test_connection_isolation_mode_is_pinned; the ban by
+        test_executescript_is_banned_from_appdb_production_source — the
+        DIRECT assertion, F2). The rowcount guard keeps the
         single-row model honest INSIDE the transaction: a disagreement
         rolls the whole transition back."""
         if self._conn is None:
@@ -442,9 +444,9 @@ class AppDB:
                     raise AppDBError(
                         f"state DB schema_version is empty (our shape, no "
                         f"version row) — corrupt: {self.path} — recovery: "
-                        f"stamp the row manually (INSERT version "
-                        f"{SCHEMA_VERSION}) or delete the file (recorded "
-                        f"runs are lost)"
+                        f"run INSERT INTO schema_version (version) VALUES "
+                        f"({SCHEMA_VERSION}) manually, or delete the file "
+                        f"(recorded runs are lost)"
                     )
                 if (
                     versions == {1}
@@ -466,9 +468,9 @@ class AppDB:
                         f"state DB schema_version [1] is stamped v1 but "
                         f"carries an applications table (a v1 tool never "
                         f"wrote one) — inconsistent, refusing: {self.path} "
-                        f"— recovery: UPDATE the row to {SCHEMA_VERSION} "
-                        f"manually or delete the file (shadow history is "
-                        f"lost)"
+                        f"— recovery: run UPDATE schema_version SET version "
+                        f"= {SCHEMA_VERSION} manually, or delete the file "
+                        f"(shadow history is lost)"
                     )
                 else:
                     # a foreign version ({99}), a polluted set ({1,99}),

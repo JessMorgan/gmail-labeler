@@ -15,8 +15,10 @@ does not ship releases yet.
     `apply_labels` — the wire body is a literal with the ONE key
     `addLabelIds`, structurally incapable of carrying a removal
     (invariant #1); `ensure_label` — get-or-create for the configured
-    Tier Label names (startup-only; a System Label name-sake is never
-    a hit). FakeGmailClient records successful writes with full body
+    Tier Label names (startup-only; System Label name-sakes are
+    REFUSED, named — casefolded, F2 — never silently minted as
+    duplicate user labels). FakeGmailClient records successful writes
+    with full body
     snapshots (the shadow zero-write pin catches a read-path write by
     name).
   - `appdb` schema v2: the `applications` table (message id, label,
@@ -34,9 +36,11 @@ does not ship releases yet.
     composition on the tiers core (imported, never re-derived): adds =
     would-apply Managed Label ids + umbrella + best band tier (sorted
     total order); skip-present earns no row and no Tier Labels (empty
-    plan → no API call — invariant #2, crash-retry idempotent); ANY
-    compose error means no write for that message plus a counted
-    id-only warning (invariant #1); every resolved id is screened
+    plan → no API call — invariant #2, crash-retry idempotent); a
+    DATA-PATH compose error means no write for that message plus a
+    counted id-only warning — caller bugs and internal-contradiction
+    guards RAISE instead (the three-class model; the no-write holds
+    for all three, invariant #1); every resolved id is screened
     through `is_system_label_id` (the composition-level guard on top
     of tiers' name guard).
 - Shadow Pass (ticket #23): the Phase 1 exit — `shadow run` scores the

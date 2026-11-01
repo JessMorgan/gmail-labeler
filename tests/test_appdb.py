@@ -1077,6 +1077,18 @@ def test_v1_migration_crash_mid_transition_leaves_clean_v1(
     db2.close()
 
 
+def test_executescript_is_banned_from_appdb_production_source() -> None:
+    # F2 NIT: the executescript ban (the crash-safety premise of the
+    # atomic transition) was pinned only INDIRECTLY by the crash pins;
+    # this is the DIRECT assertion — no CALL of executescript exists in
+    # the module's source (the prose mentions in docstrings/comments
+    # carry no call parens; the joined _SCHEMA text is fixture-only)
+    import gmail_labeler.appdb as appdb_module
+
+    source = Path(appdb_module.__file__).read_text(encoding="utf-8")
+    assert "executescript(" not in source
+
+
 def test_connection_isolation_mode_is_pinned(tmp_path: Path) -> None:
     # the atomic transition depends on the connect DEFAULT (legacy
     # isolation mode: implicit BEGIN before DML only — DDL is NEVER
@@ -1089,6 +1101,10 @@ def test_connection_isolation_mode_is_pinned(tmp_path: Path) -> None:
     db.open()
     assert db._conn is not None
     assert db._conn.isolation_level == ""
+    # the journal side of the crash story (F2 NIT, mode verified at
+    # runtime BEFORE the pin, not a pasted guess): DELETE journal mode
+    # is what rolls the uncommitted transition back for a dead process
+    assert db._conn.execute("PRAGMA journal_mode").fetchone() == ("delete",)
     db.close()
 
 
@@ -1104,7 +1120,8 @@ def test_tamper_refusals_name_their_recovery(tmp_path: Path) -> None:
     conn.close()
     with pytest.raises(AppDBError, match="schema_version is empty") as exc:
         AppDB(db_path).open()
-    assert "recovery" in str(exc.value)  # the message itself says how out
+    # the recovery is RUNNABLE SQL, not prose-about-SQL (F2)
+    assert "INSERT INTO schema_version (version) VALUES (2)" in str(exc.value)
     db_path.unlink()
     _v1_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -1116,4 +1133,4 @@ def test_tamper_refusals_name_their_recovery(tmp_path: Path) -> None:
     conn.close()
     with pytest.raises(AppDBError, match=r"schema_version \[1\]") as exc:
         AppDB(db_path).open()
-    assert "recovery" in str(exc.value)
+    assert "UPDATE schema_version SET version = 2" in str(exc.value)

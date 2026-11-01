@@ -5,13 +5,14 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 confident, reviewably when it isn't.
 
 > **Status: pre-alpha — Phase 0 (corpus acquisition) and Phase 1's
-> `train` have landed.** The architecture decisions, domain language,
-> and development standards are committed; the CLI installs
+> `train` and `eval` have landed.** The architecture decisions, domain
+> language, and development standards are committed; the CLI installs
 > (`uv sync`, then `gmail-labeler --help`) with a working OAuth flow,
-> `dataset export` / `import-gyb` / `analyze`, and `train` (fine-tune
-> on your own machine, checkpoint + identity sidecar). Graduation,
-> `eval`, the shadow pass, and the daemon arrive in later phases —
-> follow the phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> `dataset export` / `import-gyb` / `analyze`, `train` (fine-tune on
+> your own machine, checkpoint + identity sidecar), and `eval`
+> (per-label precision/recall on the temporal test split). Graduation,
+> the shadow pass, and the daemon arrive in later phases — follow the
+> phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -84,6 +85,7 @@ gmail-labeler dataset export          # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
+gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -145,13 +147,29 @@ staging-based (build in `<dir>.tmp`, verify the sidecar by readback,
 swap in): a crash leaves the old checkpoint intact, an empty dir, or
 the new one — each refusal-safe. `--device cpu|cuda` selects the
 device (single-device contract: a multi-GPU host is refused — set
-`CUDA_VISIBLE_DEVICES` to one).
+`CUDA_VISIBLE_DEVICES` to one). `eval` scores the temporal test split
+and reports per-label precision/recall at candidate thresholds — the
+measured table Threshold Bands and Graduation both read. It loads the
+checkpoint through the sidecar-validated loader (a mismatched
+checkpoint refuses with exit 5, naming every disagreeing field — no
+silent fallback), rebuilds the test-side membership THROUGH the
+checkpoint's materialized Split Manifest (the split is pinned, never
+re-derived — there is no `--split-date`), and predicts through the
+Model seam on the same `preprocess_text` train used. The split-boundary
+trust filter is inherited from the manifest, never re-applied (the
+report states it). The report is deterministic and diff-friendly
+(per-label rows x threshold columns with P/R + support), opened by a
+split-provenance header (split date + manifest hash — a saved report
+is never indistinguishable from a stale one), to stdout by default,
+`--out PATH` for the same bytes in a file (replacing an existing file
+is announced on stderr), and `--json` for the machine-readable
+payload; message bodies never enter it.
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`eval`, `shadow`, `apply`, `daemon`, and `status` are frozen command
-names that arrive in later phases (not wired yet) — until they are,
-they exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
+`shadow`, `apply`, `daemon`, and `status` are frozen command names
+that arrive in later phases (not wired yet) — until they are, they
+exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
 commands and currently unreachable. Scripts can branch on 0/2/4/5
 today; a `1` means an unhandled crash — that's a bug, please report it.
 

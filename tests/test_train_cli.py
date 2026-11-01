@@ -645,23 +645,23 @@ def test_train_factory_vocabulary_mismatch_exits_5(
 
 
 def test_train_is_on_the_frozen_surface() -> None:
-    result = runner.invoke(app, ["--help"])
-    assert result.exit_code == 0
-    assert "train" in result.output
-    # the FLAG SURFACE is asserted from click's parameter metadata, not
-    # the rendered help: rich wraps long option names differently per
-    # terminal width (a width-80 CI runner split "--split-date" across
-    # lines and this test went red with the surface unchanged).
+    # the COMMAND and FLAG SURFACE are asserted from click's parameter
+    # metadata, not the rendered help: rich wraps long option names
+    # differently per terminal width (a width-80 CI runner split
+    # "--split-date" across lines and this test went red with the
+    # surface unchanged).
     from typer.core import TyperGroup
     from typer.main import get_command
 
     root = get_command(app)
     assert isinstance(root, TyperGroup)
+    assert "train" in root.commands  # the command is on the frozen surface
     train_cmd = root.commands["train"]
     declared = {opt for p in train_cmd.params for opt in getattr(p, "opts", [])}
     for flag in ("--split-date", "--assume-no-filters", "--force", "--device"):
         assert flag in declared
-    # and the command still renders help successfully (exit 0 covers the
-    # rendering itself; content checks stay width-independent above)
-    result = runner.invoke(app, ["train", "--help"])
-    assert result.exit_code == 0
+    # and the commands still render help successfully (exit 0 covers
+    # the rendering itself; content checks stay width-independent above)
+    for args in (["--help"], ["train", "--help"]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0

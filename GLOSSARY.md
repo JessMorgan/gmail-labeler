@@ -163,6 +163,20 @@ slots into this field (e.g. `calibrated:<hash>`) without a sidecar
 format change.
 _Avoid_: threshold config, band source
 
+**Eval Report**:
+The per-label precision/recall table at candidate thresholds on the
+temporal test split — the measured table Threshold Bands and
+Graduation both read. Rows are Label Paths, columns the fixed
+candidate-threshold grid (tenths, named in the eval core, never
+scattered); each cell carries precision/recall, and each row its
+support count. The test side is EXACTLY the Split Manifest's test
+ids: the split-boundary trust filter
+(`server_authoritative_only`) is a split-identity decision owned by
+the manifest — eval inherits it, never re-applies it (no second split
+implementation, invariant #7). Deterministic and diff-friendly (same
+inputs → byte-identical); message bodies never enter it.
+_Avoid_: eval table, metric dump
+
 **Model (seam)**:
 The `Model` Protocol — batch predict → per-label sigmoid scores over the
 checkpoint's Label-Path vocabulary (row i ↔ text i, column j ↔

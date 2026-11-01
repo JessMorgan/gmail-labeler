@@ -1,16 +1,17 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add eval/shadow/apply/daemon/status (absent until wired,
-which surfaces as a usage error). Phase 0 subcommands and the Phase 1
-``train`` command are wired as they are implemented. Exit 3 is
-reserved for wired-but-stubbed commands and currently UNREACHABLE —
+later phases add shadow/apply/daemon/status (absent until wired, which
+surfaces as a usage error). Phase 0 subcommands and the Phase 1
+``train``/``eval`` commands are wired as they are implemented. Exit 3
+is reserved for wired-but-stubbed commands and currently UNREACHABLE —
 no command is stubbed; scripts can branch on 0/2/4/5 today.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -85,6 +86,22 @@ def auth_login(
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
     typer.echo("auth: signed in, refresh token stored")
+
+
+def _write_secret_tight(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` 0600 FROM CREATION (no 0644 window —
+    a write-then-chmod leaves a moment where the artifact is
+    world-readable) and fchmod'd if the file pre-existed loose. The
+    corpus-sidecar discipline for identity/report artifacts (the
+    manifest, the sidecar, the eval report)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:  # owns fd
+        fh.write(text)
 
 
 def _load_config(config: str | None):
@@ -497,7 +514,9 @@ def dataset_analyze(
         )
 
 
-_TRAIN_ERROR_EXIT = 5  # build refusal, unreadable corpus, recipe failure
+# Operation failure (train + eval share the one home): build refusal,
+# checkpoint refusal, unreadable corpus, recipe failure
+_OPERATION_FAILED_EXIT = 5
 
 
 def _model_factory(
@@ -582,7 +601,6 @@ def train(
     identity (vocabulary hash, thresholds source, corpus fingerprint,
     manifest hash, encoder id).
     """
-    import os
     import shutil
     from datetime import UTC, date, datetime
 
@@ -625,18 +643,18 @@ def train(
             "[corpus] dir",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     try:
         records = list(store.iter_records())
     except (CorpusError, OSError, UnicodeDecodeError):
         typer.echo("train failed: records unreadable", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     if not records:
         typer.echo(
             "train failed: corpus is empty \u2014 run dataset export/import-gyb first",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
@@ -648,7 +666,7 @@ def train(
             f"train failed: snapshot unreadable ({type(e).__name__}: {e})",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     if posture in ("missing", "bridge-incomplete"):
         # the build refuses (invariant #6) — name the REAL cause
         detail = (
@@ -661,7 +679,7 @@ def train(
             "refresh both"
         )
         typer.echo(f"train failed: build refused (invariant #6): {detail}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     # the existing-checkpoint refusal is hoisted BEFORE the two
     # corpus-scale build passes: a --force-less run on a 394k corpus
@@ -675,14 +693,14 @@ def train(
             "pass --force to replace it",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     if checkpoint_dir.is_dir() and any(checkpoint_dir.iterdir()) and not force:
         typer.echo(
             f"train failed: checkpoint dir {checkpoint_dir} is not empty "
             "\u2014 refusing to overwrite; pass --force to replace",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     now = datetime.now(UTC)  # the CLI may read the clock; the core may not
     try:
@@ -704,10 +722,10 @@ def train(
         )
     except BuildAbortedError as e:
         typer.echo(f"train failed: build refused (invariant #6): {e.reason}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except ValueError as e:
         typer.echo(f"train failed: build refused: {e}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     # the minted example list is no longer needed (result carries the
     # same manifest object) — drop it before the corpus-scale work below
     del minted
@@ -720,7 +738,7 @@ def train(
             "pick a LATER --split-date (train is strictly before it)",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     # preprocessing integrity (invariant #4): train and inference share
     # corpus_record.preprocess_text — the subject + body the store keeps
@@ -737,7 +755,7 @@ def train(
     except (OSError, UnicodeDecodeError) as e:
         # a corrupt/undecodable shard is an operation failure, not a bug
         typer.echo(f"train failed: a body shard is unreadable: {e}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     if missing_bodies:
         typer.echo(
             f"WARNING: {missing_bodies} training record(s) had no body shard "
@@ -764,7 +782,7 @@ def train(
         # weights must not sit world-readable in a crash window
     except OSError as e:
         typer.echo(f"train failed: checkpoint dir unusable: {e}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     try:
         model = _model_factory(cfg, examples, texts, vocabulary, staging_dir, device)
@@ -785,12 +803,12 @@ def train(
             "installed, the recipe import itself is broken — report it)",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (ValueError, OSError, RuntimeError) as e:
         # recipe-level failures (bad local weights, a corrupt checkpoint,
         # a missing device) are operation failures, not code bugs
         typer.echo(f"train failed: {e}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     # the sidecar must describe the TRAINER'S product, not the CLI's
     # claim: a vocabulary mismatch is a refusal, not a silent overwrite
     if model.vocabulary != tuple(vocabulary):
@@ -799,7 +817,7 @@ def train(
             "manifest's — refusing to write a lying sidecar",
             err=True,
         )
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     sidecar = CheckpointSidecar(
         format_version=SIDECAR_FORMAT_VERSION,
@@ -816,11 +834,10 @@ def train(
     try:
         # the Split Manifest is materialized with the checkpoint: train/
         # eval rebuild against it (invariant #7), and its content hash is
-        # independently verifiable against the sidecar
-        manifest_path.write_text(result.manifest.to_json(), encoding="utf-8")
-        os.chmod(manifest_path, 0o600)
-        sidecar_path.write_text(sidecar.to_json(), encoding="utf-8")
-        os.chmod(sidecar_path, 0o600)
+        # independently verifiable against the sidecar — 0600 from
+        # creation (no 0644 window)
+        _write_secret_tight(manifest_path, result.manifest.to_json())
+        _write_secret_tight(sidecar_path, sidecar.to_json())
         # readback verification: the on-disk identity must parse and
         # equal what we intended — a torn write is a refusal, not a
         # served lie
@@ -833,7 +850,7 @@ def train(
                 "identity does not parse back to what was written",
                 err=True,
             )
-            raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         if checkpoint_dir.exists():
             # --force: the old checkpoint is replaced WHOLESALE — stale
             # encoder-specific files (tokenizer, weight shards) cannot
@@ -843,11 +860,323 @@ def train(
         os.chmod(checkpoint_dir, 0o700)
     except OSError as e:
         typer.echo(f"train failed: sidecar write failed: {e}", err=True)
-        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     typer.echo(
         f"train: examples={len(examples)} vocab={len(vocabulary)} "
         f"checkpoint={checkpoint_dir} sidecar=ok"
     )
+
+
+def _eval_model_factory(checkpoint_dir: Path, vocabulary: tuple[str, ...]) -> Model:
+    """Model factory seam for ``eval`` (the ``load_model`` factory
+    shape): tests inject a FakeModel producer (the offline spine,
+    invariant #9). The real implementation lazy-imports the ``train/``
+    recipe (torch — the optional extra), so the CLI module itself stays
+    importable without torch."""
+    from train.recipe import load_hf_model
+
+    return load_hf_model(checkpoint_dir, vocabulary)
+
+
+@app.command("eval")
+def eval(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    assume_no_filters: bool = typer.Option(
+        False,
+        "--assume-no-filters",
+        help="Attest the mailbox has no labeling filters (GYB-only users)",
+    ),
+    out: str | None = typer.Option(
+        None,
+        "--out",
+        help="Write the report to PATH (the same bytes as stdout)",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Machine-readable output (graduation workflows)"
+    ),
+) -> None:
+    """Score the temporal test split; report per-label P/R at candidate
+    thresholds.
+
+    The checkpoint is sidecar-validated (refusal contract — a mismatch
+    refuses, no silent fallback); the test-side membership is rebuilt
+    THROUGH the checkpoint's Split Manifest (invariant #7 — the split
+    is pinned, never re-derived, so there is no --split-date);
+    predictions run through the Model seam. Nothing goes near the
+    mailbox: the report is labels, counts, and probabilities only.
+    """
+    import contextlib
+    from datetime import UTC, datetime
+
+    from .corpus_record import corpus_fingerprint, preprocess_text
+    from .corpus_store import CorpusError, CorpusStore
+    from .dataset_build import BuildAbortedError, SplitManifest, build_dataset
+    from .eval import eval_metrics, render_report
+    from .model import (
+        MANIFEST_FILENAME,
+        THRESHOLDS_SOURCE_NONE,
+        CheckpointRefusedError,
+        ExpectedIdentity,
+        load_model,
+    )
+
+    cfg = _load_config(config)
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        typer.echo(
+            f"eval failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset export/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        records = list(store.iter_records())
+    except (CorpusError, OSError, UnicodeDecodeError):
+        typer.echo("eval failed: records unreadable", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if not records:
+        typer.echo(
+            "eval failed: corpus is empty \u2014 run dataset export/import-gyb first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    try:
+        posture, filters, id_to_name = _load_attribution(
+            store.root, assume_no_filters=assume_no_filters
+        )
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"eval failed: snapshot unreadable ({type(e).__name__}: {e})",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if posture in ("missing", "bridge-incomplete"):
+        # the build refuses (invariant #6) — name the REAL cause
+        detail = (
+            "no filters.json snapshot \u2014 run `dataset export` to "
+            "capture it, or --assume-no-filters to attest a filterless "
+            "mailbox"
+            if posture == "missing"
+            else "filters.json label ids are not all present in labels.json "
+            "(missing or stale bridge) \u2014 re-run `dataset export` to "
+            "refresh both"
+        )
+        typer.echo(f"eval failed: build refused (invariant #6): {detail}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the checkpoint's materialized manifest is the split's authority
+    # (invariant #7): read + verify it BEFORE loading the model
+    checkpoint_dir = cfg.model.checkpoint_dir
+    manifest_path = checkpoint_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        typer.echo(
+            f"eval failed: checkpoint {checkpoint_dir} has no "
+            f"{MANIFEST_FILENAME} \u2014 no verifiable split identity "
+            "(run train first)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        manifest = SplitManifest.from_json(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        typer.echo(
+            f"eval failed: checkpoint manifest unreadable or tampered: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    expected = ExpectedIdentity(
+        vocabulary=manifest.vocabulary,
+        corpus_fingerprint=corpus_fingerprint(records, manifest.train_ids),
+        split_manifest_hash=manifest.content_hash,
+        thresholds_source=THRESHOLDS_SOURCE_NONE,
+        encoder_id=cfg.model.encoder,
+    )
+    try:
+        model = load_model(checkpoint_dir, expected, _eval_model_factory)
+    except CheckpointRefusedError as e:
+        # the refusal contract (AC#4): named fields, exit 5, no silent
+        # fallback — a mismatched checkpoint is never scored
+        typer.echo(
+            f"eval failed: checkpoint refused ({', '.join(e.fields)}) \u2014 "
+            "no silent fallback; rebuild the checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ImportError as e:
+        # DECISION (both review families, train's boundary): the
+        # optional `train` extra is missing — the recipe's lazy import
+        # fails. Operation failure, exit 5 with an install hint, never
+        # a raw ModuleNotFoundError traceback
+        typer.echo(
+            f"eval failed: the model recipe is unavailable ({e}) \u2014 install "
+            "the optional extra: `uv sync --extra train` (if it is already "
+            "installed, the recipe import itself is broken \u2014 report it)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        # recipe-level failures (bad local weights, a corrupt
+        # checkpoint, a missing device) are operation failures, not
+        # code bugs (train's documented taxonomy)
+        typer.echo(f"eval failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if model.vocabulary != manifest.vocabulary:
+        # a lying column order would silently misalign every score —
+        # refuse before scoring (train's guard, the serving side)
+        typer.echo(
+            "eval failed: the model's vocabulary does not match the "
+            "manifest's \u2014 refusing to score against a lying column "
+            "order",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    now = datetime.now(UTC)  # the CLI may read the clock; the core may not
+    try:
+        result = build_dataset(
+            records,
+            filters=filters,
+            id_to_name=id_to_name,
+            now=now,
+            split_date=manifest.split_date,
+            manifest=manifest,
+        )
+    except BuildAbortedError as e:
+        typer.echo(f"eval failed: build refused (invariant #6): {e.reason}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"eval failed: build refused: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the TEST side only (invariant #7): membership comes from the
+    # manifest — the split-boundary trust filter is a split-identity
+    # decision owned by it, inherited, never re-applied here
+    test_ids = set(manifest.test_ids)
+    test_examples = [example for example in result.examples if example.id in test_ids]
+    if not test_examples:
+        typer.echo(
+            "eval failed: no test-side examples \u2014 the manifest's test "
+            "split is empty; retrain with an EARLIER --split-date (test "
+            "is at/after it)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # preprocessing integrity (invariant #4): the SAME preprocess_text
+    # train used — subject + body, trailing newline on a missing shard
+    by_id = {record.id: record for record in records}
+    missing_bodies = 0
+    texts: list[str] = []  # aligned to test_examples (index i ↔ i)
+    try:
+        for example in test_examples:
+            body = store.get_body(example.id)
+            if body is None:
+                missing_bodies += 1  # an orphaned shard (crash residue)
+                body = ""
+            texts.append(preprocess_text(by_id[example.id].subject, body))
+    except (OSError, UnicodeDecodeError) as e:
+        typer.echo(f"eval failed: a body shard is unreadable: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if missing_bodies:
+        typer.echo(
+            f"WARNING: {missing_bodies} test record(s) had no body shard "
+            "\u2014 scored on subject + trailing newline (crash residue; "
+            "re-export to repair)",
+            err=True,
+        )
+
+    try:
+        rows = model.predict(texts)
+        if len(rows) != len(test_examples):
+            # a named operator message, not raw zip internals: a wrong
+            # row count is a checkpoint/recipe defect
+            raise ValueError(
+                f"the model returned {len(rows)} score rows for "
+                f"{len(test_examples)} texts \u2014 checkpoint/recipe defect"
+            )
+        # alignment by EXAMPLE ID (not position): the Protocol's row i
+        # ↔ texts[i] is re-keyed onto the example ids before the core
+        # sees it. A misaligned/NaN row (the core's refusals) is the
+        # same "no silent fallback" family as a refused checkpoint:
+        # exit 5, never a traceback
+        scores = {
+            example.id: row for example, row in zip(test_examples, rows, strict=True)
+        }
+        table = eval_metrics(test_examples, scores, vocabulary=manifest.vocabulary)
+    except (ValueError, OSError, RuntimeError) as e:
+        typer.echo(f"eval failed: prediction failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    trust = (
+        "server-authoritative-only" if manifest.server_authoritative_only else "none"
+    )
+    if as_json:
+        payload = {
+            "trust": trust,
+            # split identity: two reports from different splits (or a
+            # retrain) must be tellable apart by the consumer (#22)
+            "split_date": manifest.split_date.isoformat(),
+            "split_manifest_hash": manifest.content_hash,
+            "test_examples": table.test_examples,
+            "thresholds": list(table.thresholds),
+            "rows": [
+                {
+                    "label": row.label,
+                    "support": row.support,
+                    "cells": [
+                        {
+                            "threshold": t,
+                            "tp": cell.tp,
+                            "fp": cell.fp,
+                            "fn": cell.fn,
+                            "precision": cell.precision,
+                            "recall": cell.recall,
+                        }
+                        for t, cell in zip(table.thresholds, row.cells, strict=True)
+                    ],
+                }
+                for row in table.rows
+            ],
+        }
+        output = json.dumps(payload, sort_keys=True)
+        typer.echo(output)
+        file_text = output + "\n"
+    else:
+        output = (
+            f"eval: trust filter: {trust} (inherited from the split "
+            f"manifest)\n"
+            + render_report(
+                table,
+                split_date=manifest.split_date,
+                split_manifest_hash=manifest.content_hash,
+            )
+        )
+        typer.echo(output, nl=False)
+        file_text = output
+    if out is not None:
+        # the report carries the user's label taxonomy — treat it like
+        # every other artifact this repo writes: 0600 from creation,
+        # never world-readable (the corpus-sidecar discipline). Staging
+        # + atomic replace (train's staging pattern): a failure leaves
+        # any PREVIOUS report at the path intact, and no fd can leak.
+        # Replacing an EXISTING file is announced on stderr — a silent
+        # clobber of a typo'd path would be a lie (train refuses
+        # overwrites; --force is overkill for a regenerable report)
+        target = Path(out)
+        if target.exists():
+            typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
+        staging = Path(str(out) + ".tmp")
+        try:
+            _write_secret_tight(staging, file_text)
+            os.replace(staging, out)  # atomic on POSIX
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                staging.unlink()  # best-effort staging cleanup
+            typer.echo(f"eval failed: cannot write --out: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
 
 if __name__ == "__main__":

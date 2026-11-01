@@ -118,8 +118,17 @@ gmail-labeler dataset import-gmail --also-sync-labels  # import, then the Label 
 line with `uv run ` — e.g. `uv run gmail-labeler --help` always works.)
 
 Every command takes `--config PATH`. `dataset import-gmail` takes `--query`
-(default `in:anywhere -in:spam -in:trash`) and `--max-messages` (smoke
-runs); it writes `filters.json` and `labels.json` sidecars next to the
+(default `in:anywhere -in:spam -in:trash -in:draft`) and `--max-messages` (smoke
+runs). DRAFT and CHAT are deliberately out of the import — with Additive-only
++ skip-present and the append-only corpus, including them would be a
+permanent one-way door. Exclusion is two-layer: the query carries the
+documented `-in:draft` token, and the ingest layer hard-skips any message
+whose raw wire labelIds carry the system label id DRAFT or CHAT (no
+documented chat query token exists, and this layer is load-bearing: an
+explicit `--query` replaces the default wholesale but cannot bypass it).
+Records already in the corpus are unaffected (append-only). GYB import
+follows whatever the backup holds (tracked by #32). It writes
+`filters.json` and `labels.json` sidecars next to the
 corpus — the offline snapshot `dataset analyze` uses for filter
 attribution — and births the `sync-cursor.json` Sync Cursor (ADR-0008)
 when the corpus has none, seeded from the first list page before any

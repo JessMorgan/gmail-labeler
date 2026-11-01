@@ -245,7 +245,12 @@ def _dataset_store_modes(store: CorpusStore, *, enforce: bool = True) -> None:
 def dataset_import_gmail(
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
     query: str = typer.Option(
-        DEFAULT_QUERY, "--query", help="Gmail search query (single-sourced)"
+        DEFAULT_QUERY,
+        "--query",
+        help=(
+            "Gmail search query (single-sourced); replaces the default; "
+            "DRAFT/CHAT ingest rejection still applies"
+        ),
     ),
     max_messages: int | None = typer.Option(
         None,
@@ -309,8 +314,9 @@ def dataset_import_gmail(
     stats.retried += bootstrap.retried  # settings blips count too
     typer.echo(
         f"import-gmail: scanned={stats.scanned} written={stats.written} "
-        f"skipped_present={stats.skipped_present} retried={stats.retried} "
-        f"failed={len(stats.failed)}"
+        f"skipped_present={stats.skipped_present} "
+        f"skipped_draft_chat={stats.skipped_draft_chat} "
+        f"retried={stats.retried} failed={len(stats.failed)}"
     )
     if stats.failed:
         _render_failures(stats.failed)

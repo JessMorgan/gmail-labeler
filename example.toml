@@ -33,6 +33,17 @@ dir = "./corpus"
 # msg-db.sqlite) for `dataset import-gyb`.
 # path = "/mnt/backup/gmail"
 
+[bands]
+# Per-label Threshold Band calibration (ticket #21): the min-precision
+# targets a candidate column's measured precision must meet to earn the
+# band (tenths only — the tenth-grid stance). `eval --bands` writes the
+# calibrated bands artifact; a per-label override is a subtable:
+# [bands."Money/Bills"]
+# min_high_precision = 0.9
+# min_med_precision = 0.8
+min_high_precision = 0.9
+min_med_precision = 0.7
+
 [model]
 # Encoder identifier — the Checkpoint Sidecar's encoder_id field.
 encoder = "deberta-v3-base"

@@ -144,17 +144,52 @@ _Avoid_: shadow summary, evaluation report
 **state DB**:
 The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`;
 overridden per-command by the `--db` flag) holding the `shadow_results`
-table (run id, message id, label, probability, band, run timestamp) and
-the `applications` table (ticket #24, schema v2: message id, label, label
+table (run id, message id, label, probability, band, run timestamp), the
+`applications` table (ticket #24, schema v2: message id, label, label
 id, score, band, tier, applied-at, source — the join corrections and
-`status` read). It carries ids, probabilities, labels, and timestamps
-ONLY — never bodies (invariant #5) — so it is publicly attachable. One
-transaction per write (a crash leaves no half rows), and every schema
-transition is one transaction too — fresh create+stamp, the live v1
-DB's single-row v1→v2 restamp, self-heals — so a crash leaves the file
-fully prior-state or fully new-state, never the intermediate; a foreign
-schema_version is refused.
+`status` read), and the `daemon_state` table (ticket #25, schema v3: the
+single-row History Cursor). It carries ids, probabilities, labels,
+timestamps, and the cursor ONLY — never bodies (invariant #5) — so it is
+publicly attachable. One transaction per write (a crash leaves no half
+rows), and every schema transition is one transaction too — fresh
+create+stamp, the live v1 DB's v1→v2 and the v2 DB's v2→v3 single-row
+restamps, self-heals — so a crash leaves the file fully prior-state or
+fully new-state, never the intermediate; a foreign schema_version is
+refused.
 _Avoid_: shadow DB, label DB
+
+**History Cursor**:
+The Gmail mailbox history record id (`historyId`) the daemon syncs from:
+everything that changed after it is unprocessed. Stored in the state DB's
+`daemon_state` single-row table (schema v3). Established at startup by
+the documented full-sync bootstrap — the per-message `historyId` of the
+most recent message (the export path's own read pair: `list_messages` +
+`get_message`) — and advanced ONLY through Durable Handling. Wire truth:
+every page of a history delta carries the mailbox's CURRENT id, not a
+per-page watermark, so the cursor takes the id from the delta's FINAL
+response. An expired cursor (history 404 — Gmail retains records for
+typically a week or more, occasionally far less) forces a re-bootstrap:
+the daemon names the gap in a warning, and the mail that arrived during
+it was NOT processed (review it with the Shadow Pass or `apply`).
+_Avoid_: token, offset (it is a mailbox-wide watermark, not a query cursor)
+
+**Durable Handling**:
+The daemon's per-page commit contract (invariant #3): a page's events are
+durably handled exactly when the ONE state-DB transaction carrying the
+page's Application rows AND the History Cursor advance has COMMITTED —
+commit = handled. The ordering is locked: the Gmail writes land FIRST
+(additive-only `apply_labels`), then the single transaction
+(`appdb.commit_page`). A crash before the commit replays the page from
+the held cursor, and the replay converges via skip-present: an
+already-written label is now present, so the plan composes empty — no
+second write, no duplicate row. That pin IS the safety proof: the Gmail
+write cannot ride a database transaction, so skip-present idempotency is
+the mechanism, and the crash matrix proves it (including a real process
+kill). The documented face of the same design: a write that landed
+before a crash leaves its audit row uncommitted (the Gmail truth stands;
+the row is not re-added) — the audit truth is the Applications table
+plus the mailbox, not a guaranteed 1:1.
+_Avoid_: checkpoint (the encoder's artifact owns that word)
 
 **Backlog**:
 The pre-existing mailbox history, as opposed to newly-arriving mail. The

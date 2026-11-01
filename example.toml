@@ -15,12 +15,13 @@ token_file = "~/.config/gmail-labeler/token.json"
 history_poll_seconds = 30          # daemon polling cadence (ADR-0003)
 
 [labels]
-# Tier Labels attached to every Application (GLOSSARY.md):
+# Tier Labels attached to every Application (GLOSSARY.md). A name that
+# casefold-matches a System Label name is refused by the resolver with a
+# named error — never minted as a look-alike label (the live startup
+# call site lands with the daemon / apply CLI, #25/#26):
 applied = "ai-applied"             # umbrella: "the AI contributed something"
 high = "ai-high"                   # high-confidence band
 med = "ai-med"                     # review-me band
-# A name colliding (case-insensitively) with a System Label name aborts
-# startup with a named refusal — it is never minted as a look-alike label
 # Managed Labels this install may apply — empty until you graduate labels
 # from `dataset analyze` + `eval`, e.g.:
 # managed = ["Shipping", "Money/Bills"]

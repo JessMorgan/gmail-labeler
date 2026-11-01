@@ -312,8 +312,8 @@ umbrella plus the best band tier to every write, and
 (get-or-create: an existing USER label of exactly that name is used
 as-is; a casefolded System Label name-sake is refused named — the
 refusal guards minting a look-alike only; the daemon / `apply` startup
-of #25/#26 calls it once per configured name); the live write itself lands with
-the daemon / `apply` CLI (#25/#26);
+of #25/#26 calls it once per configured name); the live write itself
+lands with the daemon / `apply` CLI (#25/#26);
 GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)

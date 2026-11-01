@@ -1067,6 +1067,17 @@ def test_fake_list_labels_returns_a_copy() -> None:
     assert fake.ensure_label("ai-high") == "Label_9"
 
 
+def test_fake_list_filters_returns_a_copy() -> None:
+    # F3 review MINOR: the same trap, ONE METHOD BELOW — list_filters
+    # handed out the live filters_list (the REST adapter builds fresh
+    # FilterInfo per call; the copy rationale holds word-for-word).
+    # #25/#26 ride this fake; the read surfaces must be symmetric
+    fake = FakeGmailClient(filters=[FilterInfo(id="f1", criteria={"from": "x"})])
+    returned = fake.list_filters()
+    returned.clear()
+    assert fake.filters_list == [FilterInfo(id="f1", criteria={"from": "x"})]
+
+
 def test_fake_ensure_label_refuses_system_namesakes() -> None:
     # the fake mirrors the REST refusal (F1): no silent duplicate-named
     # user label, in CI or on the wire

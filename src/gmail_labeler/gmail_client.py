@@ -4,10 +4,11 @@ The Phase 0 read surface (labels, filters, message list/get, history) plus
 the application path's FIRST write methods (ticket #24): ``apply_labels``
 (the ONLY label write the product ever performs — addLabelIds ONLY,
 structurally incapable of carrying a removal — invariant #1) and
-``ensure_label`` (get-or-create for the configured Tier Label names —
-exact-case user hits win, casefolded System Label name-sakes are refused
-named — invoked from the daemon/apply startup only, never the Shadow
-Pass).
+``ensure_label`` (get-or-create for the configured Tier Label names: an
+existing USER label of exactly that name is used as-is; a casefolded
+System Label name-sake is refused named — the refusal guards minting a
+look-alike only — invoked from the daemon/apply startup only, never the
+Shadow Pass).
 Both live behind the same Protocol (FakeGmailClient is the test spine —
 invariant #9). Errors surface via gmail_errors taxonomy only.
 
@@ -335,8 +336,8 @@ class GmailRestClient:
         Label would make the tier visually indistinguishable from
         system state, and the plan's id screen cannot catch a fresh
         Label_* id — the operator must rename [labels]. A concurrent
-        create (another client won the
-        name between our list and our create; Gmail answers 409) is
+        create (another client won the name between our list and our
+        create; Gmail answers 409) is
         self-healed: re-list ONCE and adopt the winner's id — if the
         name is STILL not ours to see, the original refusal stands (no
         retry loop)."""

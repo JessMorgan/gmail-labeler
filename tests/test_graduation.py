@@ -826,6 +826,82 @@ def test_byte_identical_table_across_input_order() -> None:
     assert a.content_hash == b.content_hash
 
 
+def test_validate_refuses_bool_format_version() -> None:
+    # the True-vs-1 hole: True == 1 would pass a bare `!=` comparison;
+    # from_json's _need_int refuses a bool, so validate() must too
+    # (the "refused exactly like a parsed one" symmetry)
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    lying = _mutated_table(table, format_version=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="format_version"):
+        lying.validate()
+
+
+def test_validate_refuses_float_test_examples() -> None:
+    # 18.0 passes a bare `< 0` check; from_json's _need_int refuses a
+    # float, so validate() must too (the symmetry)
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    lying = _mutated_table(table, test_examples=18.0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="test_examples"):
+        lying.validate()
+
+
+def test_int_and_float_precision_values_are_one_identity() -> None:
+    # the canonical payload float-normalizes min_precision and
+    # precision_at_high: int 1 and 1.0 are ONE meaning, ONE identity —
+    # a directly constructed table with integral int values hashes
+    # identically to the same table with floats (and to its own
+    # from_json round-trip, which normalizes to float)
+    table = eval_metrics(
+        [_ex(0, ("Bills",))],
+        {"0000000000000000": (0.95,)},
+        vocabulary=("Bills",),
+    )
+    bands = build_artifact(
+        calibrate_bands(table),
+        vocabulary=("Bills",),
+        corpus_fingerprint=CORPUS_FP,
+        split_manifest_hash=MANIFEST_HASH,
+        encoder_id=ENCODER,
+        split_date=SPLIT_DATE,
+    )
+    grad = evaluate_graduation(
+        table, bands, min_precision=1.0, managed_labels=["Bills"]
+    )
+    float_table = build_table(
+        grad,
+        vocabulary=("Bills",),
+        corpus_fingerprint=CORPUS_FP,
+        split_manifest_hash=MANIFEST_HASH,
+        encoder_id=ENCODER,
+        split_date=SPLIT_DATE,
+    )
+    # the same meaning with integral INT values (one meaning, one
+    # identity — the payload normalizes to float)
+    int_table = dataclasses.replace(
+        float_table,
+        default_targets=GateTargets(
+            min_examples=float_table.default_targets.min_examples,
+            min_precision=1,  # type: ignore[arg-type]
+        ),
+        labels=(
+            dataclasses.replace(
+                float_table.labels[0],
+                min_precision=1,  # type: ignore[arg-type]
+                precision_at_high=1,  # type: ignore[arg-type]
+            ),
+        ),
+    )
+    int_table = dataclasses.replace(int_table, content_hash=int_table.compute_hash())
+    assert int_table.to_json() == float_table.to_json()
+    assert int_table.content_hash == float_table.content_hash
+    parsed = GraduationTable.from_json(int_table.to_json())
+    assert parsed.content_hash == float_table.content_hash
+
+
 def test_table_malformed_json_refused() -> None:
     for payload in (
         "[1, 2, 3]",  # not an object
@@ -943,10 +1019,16 @@ def test_diff_baseline_empty_when_no_existing_table() -> None:
     diff = render_graduation_diff(None, table, path="grad.json")
     assert "no existing table at grad.json" in diff
     # the everything-vs-nothing baseline: every label is (absent) on the
-    # old side
-    assert "Bills: (absent) -> graduated" in diff
+    # old side; the lines carry the effective gate targets + measured
+    # values (the human-confirm surface shows what is being confirmed)
     assert (
-        "Shipping: (absent) -> not graduated (below-min-examples, no-high-band)" in diff
+        "Bills: (absent) -> graduated (examples=10, precision@high=0.90, "
+        "min_examples=10, min_precision=0.9)" in diff
+    )
+    assert (
+        "Shipping: (absent) -> not graduated (below-min-examples, "
+        "no-high-band) (examples=5, precision@high=none, min_examples=10, "
+        "min_precision=0.9)" in diff
     )
 
 
@@ -970,10 +1052,17 @@ def test_diff_shows_old_to_new_per_label() -> None:
     # fix the hash so the old table is self-consistent
     old = dataclasses.replace(old, content_hash=old.compute_hash())
     diff = render_graduation_diff(old, table, path="grad.json")
-    assert "Bills: not graduated (below-min-examples) -> graduated" in diff
     assert (
-        "Shipping: graduated -> not graduated (below-min-examples, no-high-band)"
-        in diff
+        "Bills: not graduated (below-min-examples) "
+        "(examples=10, precision@high=0.90, min_examples=10, "
+        "min_precision=0.9) -> graduated (examples=10, "
+        "precision@high=0.90, min_examples=10, min_precision=0.9)" in diff
+    )
+    assert (
+        "Shipping: graduated (examples=5, precision@high=none, "
+        "min_examples=10, min_precision=0.9) -> not graduated "
+        "(below-min-examples, no-high-band) (examples=5, "
+        "precision@high=none, min_examples=10, min_precision=0.9)" in diff
     )
 
 
@@ -990,7 +1079,11 @@ def test_diff_names_absent_labels() -> None:
     )
     old = dataclasses.replace(old, content_hash=old.compute_hash())
     diff = render_graduation_diff(old, table, path="grad.json")
-    assert "(absent) -> not graduated (below-min-examples, no-high-band)" in diff
+    assert (
+        "(absent) -> not graduated (below-min-examples, no-high-band) "
+        "(examples=5, precision@high=none, min_examples=10, "
+        "min_precision=0.9)" in diff
+    )
 
 
 def test_diff_names_identity_disagreement() -> None:
@@ -1001,13 +1094,49 @@ def test_diff_names_identity_disagreement() -> None:
         evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
     )
     diff = render_graduation_diff(
-        table, table, path="grad.json", identity_disagreement=("split_date",)
+        table, table, path="grad.json", disagreeing_fields=("split_date",)
     )
     assert (
         "existing table at grad.json is bound to a different identity "
         "(split_date)" in diff
     )
     assert "foreign-bound" in diff
+
+
+def test_diff_shows_gate_changes() -> None:
+    # ds's repro: min_examples 10 → 5 with the label graduated on BOTH
+    # sides must be VISIBLE in the diff — a bare "graduated ->
+    # graduated" with a changed content_hash would be blind to the
+    # gate change (the human-confirm surface must show what the human
+    # is confirming)
+    old = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=["Bills"])
+    )
+    new = _table(
+        evaluate_graduation(
+            _golden_table(), _golden_bands(), min_examples=5, managed_labels=["Bills"]
+        )
+    )
+    diff = render_graduation_diff(old, new, path="grad.json")
+    assert (
+        "Bills: graduated (examples=10, precision@high=0.90, min_examples=10, "
+        "min_precision=0.9) -> graduated (examples=10, precision@high=0.90, "
+        "min_examples=5, min_precision=0.9)" in diff
+    )
+
+
+def test_diff_names_unparseable_existing() -> None:
+    # an existing target that does not parse as a Graduation Table is
+    # named as such — NOT "no existing table" (the file exists, it is
+    # just not a table)
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    diff = render_graduation_diff(
+        None, table, path="grad.json", unparseable_existing=True
+    )
+    assert "existing file at grad.json does not parse as a Graduation Table" in diff
+    assert "no existing table" not in diff
 
 
 def test_diff_is_deterministic() -> None:

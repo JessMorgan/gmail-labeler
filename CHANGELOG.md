@@ -96,8 +96,11 @@ does not ship releases yet.
   0.9 — refused on the raw value, named), empty tables (a no-op
   override is refused, not dropped), a raw `per_label` key (a
   reserved field name — the label-path spelling is the only
-  per-label form; the declared field is the typed programmatic API
-  and gets the same value checks), blank/over-length label keys
+  per-label form; an EMPTY raw table is the typed default and is
+  accepted — the model_dump round-trip produces exactly that
+  form — while a non-empty raw table stays refused; the
+  declared field is the typed programmatic API and gets the same
+  value checks), blank/over-length label keys
   (keys are stripped — a padded key must not survive to
   calibration), and the same label named more than once (refused,
   not silently shadowed); every problem is reported together (a
@@ -165,21 +168,32 @@ does not ship releases yet.
   the CLI-gated confirm act (0600 from creation, staging + atomic
   replace, replacing an existing file announced on stderr, post-write
   readback compared by content hash). The "existing" side of the diff
-  is read + parsed from the target file (absent/garbage target =
-  everything-vs-nothing baseline); an existing table bound to a
-  DIFFERENT identity is named in the diff (the disagreeing fields) and
-  refuses the confirm. The run must have bands available (the
+  is read + parsed from the target file (absent target = the
+  everything-vs-nothing baseline; an existing file that does not
+  parse as a Graduation Table is named as such, not "no existing
+  table"); an existing table bound to a DIFFERENT identity is named
+  in the diff (the disagreeing fields) and refuses the confirm. The
+  diff lines carry the EFFECTIVE gate targets + the measured values
+  (examples, precision@high) — a gate change (min_examples 10 →
+  5) is VISIBLE old → new, not a blind "graduated -> graduated". The run must have bands available (the
   precision-at-high comes from the run's calibration — computed
   in-memory, written only with `--bands`), and a degraded corpus
   (test records with missing body shards) refuses `--graduation` too —
-  the same serving-gate posture as `--bands`, sharing the guard.
+  the same serving-gate posture as `--bands`, sharing the guard. The
+  PURE gate computation (evaluate + build_table) runs BEFORE the
+  `--bands` write, so a gate evaluation refusal can no longer leave
+  the bands artifact published (the partial-effect class is closed
+  at the source; a write refusal after a prior write remains
+  possible and is named in the message).
   Usage refusals up front (exit 2): `--confirm-graduation` without
   `--graduation`; an empty `--out`/`--bands`/`--graduation` path;
   `--graduation` and `--out` naming the
   same file; `--bands` and `--graduation` naming the same file;
   `--graduation` naming an existing directory; `--graduation` naming
-  the config file; and ANY `--graduation` target whose resolved path
-  lies inside the checkpoint dir (manifest, sidecar, weights) or the
+  the config file; `--out` naming the config file (the report write
+  is no exception to the exact-path refusal); and ANY
+  `--graduation` target whose resolved path lies inside the checkpoint
+  dir (manifest, sidecar, weights) or the
   corpus store (records index, labels/filters sidecars, bodies) — the
   table must not live beside identity files (by resolved path — a link
   named inside pointing outside is allowed and replaces the link).
@@ -218,9 +232,12 @@ does not ship releases yet.
   (`min_examples` >= 0, `min_precision` in [0.0, 1.0]), scalars under
   a label name (named as unknown/typo'd keys), empty tables (a no-op
   override is refused, not dropped), a raw `per_label` key (a reserved
-  field name — the label-path spelling is the only per-label form; the
-  declared field is the typed programmatic API and gets the same value
-  checks), blank/over-length label keys (keys are stripped — a padded
+  field name — the label-path spelling is the only per-label form; an
+  EMPTY raw table is the typed default and is accepted — the
+  model_dump round-trip produces exactly that form — while a
+  non-empty raw table stays refused; the declared field is the typed
+  programmatic API and gets the same value checks), blank/over-length
+  label keys (keys are stripped — a padded
   key must not survive to the gate evaluation), and the same label
   named more than once (refused, not silently shadowed). `min_precision`
   is NOT tenth-grid (the documented asymmetry with `[bands]` — a gate

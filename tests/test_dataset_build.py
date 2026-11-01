@@ -42,18 +42,23 @@ def _build(
     *,
     filters: Sequence[Mapping[str, object]] = (),
     id_to_name: Mapping[str, str] | None = None,
+    now: datetime = NOW,
     split_date: datetime = SPLIT,
     manifest: SplitManifest | None = None,
     server_authoritative_only: bool = False,
+    recent_months: int = 24,
+    old_weight: float = 0.1,
 ) -> BuildResult:
     return build_dataset(
         recs,
         filters=filters,
         id_to_name=id_to_name if id_to_name is not None else {},
-        now=NOW,
+        now=now,
         split_date=split_date,
         manifest=manifest,
         server_authoritative_only=server_authoritative_only,
+        recent_months=recent_months,
+        old_weight=old_weight,
     )
 
 
@@ -421,6 +426,32 @@ def test_validate_requires_utc_split_date() -> None:
         SplitManifest.from_json(non_utc.to_json())
 
 
+def test_validate_requires_utc_weight_cutoff() -> None:
+    # mirror the split_date pin: a non-UTC weight_cutoff (utcoffset != 0)
+    # would make the same instant hash differently on a tz-offset host —
+    # validate() refuses it (both entry paths: in-memory and from_json);
+    # a naive weight_cutoff is refused too
+    from datetime import timezone
+
+    import pytest
+
+    manifest = _build([_rec(1, ("A",))]).manifest
+    non_utc = replace(
+        manifest,
+        weight_cutoff=manifest.weight_cutoff.astimezone(timezone(timedelta(hours=2))),
+    )
+    with pytest.raises(ValueError, match="UTC"):
+        non_utc.validate()
+    # and the from_json path (hash-consistent, so the tz check is what fires)
+    non_utc = replace(non_utc, content_hash=non_utc.compute_hash())
+    with pytest.raises(ValueError, match="UTC"):
+        SplitManifest.from_json(non_utc.to_json())
+    # naive weight_cutoff is refused too
+    naive = replace(manifest, weight_cutoff=datetime(2026, 1, 1))
+    with pytest.raises(ValueError, match="UTC"):
+        naive.validate()
+
+
 def test_manifest_mode_validates_in_memory_manifest() -> None:
     # an in-memory manifest is refused exactly like a parsed one — the
     # full format validation, not just the version
@@ -481,6 +512,10 @@ def test_from_json_rejects_naive_dates() -> None:
     with pytest.raises(ValueError, match="UTC"):
         SplitManifest.from_json(
             _hash_consistent_manifest(split_date=datetime(2026, 1, 1))
+        )
+    with pytest.raises(ValueError, match="UTC"):
+        SplitManifest.from_json(
+            _hash_consistent_manifest(weight_cutoff=datetime(2026, 1, 1))
         )
 
 
@@ -847,6 +882,140 @@ def test_bridge_hash_refuses_referenced_label_rename() -> None:
 
     with pytest.raises(ValueError, match="bridge_hash"):
         _build(recs, manifest=base.manifest, filters=[f1], id_to_name={"L1": "Cov2"})
+
+
+# ---- recency weighting (analyze's window shapes) ----
+
+
+def test_recent_weight_one_old_weight_constant() -> None:
+    recs = [
+        _rec(1, ("A",), days_ago=1),  # inside the 24-month window
+        _rec(2, ("A",), date=datetime(2005, 6, 1, tzinfo=UTC)),  # outside
+    ]
+    result = _build(recs)
+    weights = {e.id: e.weight for e in result.examples}
+    assert weights["0000000000000001"] == 1.0
+    assert weights["0000000000000002"] == 0.1
+
+
+def test_2005_tail_break_even_at_realistic_ratio() -> None:
+    # at a realistic >=10:1 old:recent ratio, old_weight=0.1 is the
+    # break-even point (1000*0.1 == 100*1.0) — the tail does not dominate,
+    # and the break-even math is asserted explicitly (deepseek minor)
+    old = [
+        _rec(1000 + i, ("Old",), date=datetime(2005, 1, 1 + (i % 27), tzinfo=UTC))
+        for i in range(1000)
+    ]
+    recent = [_rec(i, ("New",), days_ago=i) for i in range(100)]
+    result = _build(old + recent)
+    aggregate = {"Old": 0.0, "New": 0.0}
+    for example in result.examples:
+        for label in example.labels:
+            aggregate[label] += example.weight
+    # break-even: the tail's aggregate weight equals the recent mail's
+    # (approx — 0.1 is not exact in binary, so 1000*0.1 accumulates a hair
+    # over 100.0)
+    import pytest
+
+    assert aggregate["Old"] == pytest.approx(aggregate["New"])
+    assert pytest.approx(100 * 1.0) == 1000 * 0.1  # the break-even math
+    assert all(e.weight == 0.1 for e in result.examples if "Old" in e.labels)
+    assert all(e.weight == 1.0 for e in result.examples if "New" in e.labels)
+
+
+def test_weighting_window_is_analyze_shape() -> None:
+    # the cutoff is months_ago(now, recent_months) — a record exactly at
+    # the cutoff is inside (date >= cutoff), mirroring analyze's gate
+    from gmail_labeler.analyze import months_ago
+
+    cutoff = months_ago(NOW, 24)
+    result = _build(
+        [
+            _rec(1, ("A",), date=cutoff),
+            _rec(2, ("A",), date=cutoff - timedelta(seconds=1)),
+        ]
+    )
+    weights = {e.id: e.weight for e in result.examples}
+    assert weights["0000000000000001"] == 1.0
+    assert weights["0000000000000002"] == 0.1
+
+
+def test_weighting_params_ride_in_manifest() -> None:
+    # no ad-hoc decay constants: the parameters are named in the
+    # versioned format, so changing them changes the manifest
+    recs = [_rec(1, ("A",))]
+    m1 = _build(recs).manifest
+    m2 = _build(recs, recent_months=12, old_weight=0.25).manifest
+    assert (m1.recent_months, m1.old_weight) == (24, 0.1)
+    assert (m2.recent_months, m2.old_weight) == (12, 0.25)
+    assert m1.content_hash != m2.content_hash
+
+
+def test_weighting_coerced_int_vs_float_identical_hash() -> None:
+    # old_weight=1 (int) vs 1.0 (float) mint the same manifest (coerced at
+    # mint), and old_weight=1 round-trips through from_json (which requires
+    # a float) — the builder can parse its own artifact (deepseek minor)
+    recs = [_rec(1, ("A",))]
+    m_int = _build(recs, old_weight=1).manifest
+    m_float = _build(recs, old_weight=1.0).manifest
+    assert m_int.content_hash == m_float.content_hash
+    assert m_int.old_weight == 1.0  # coerced to float at mint
+    assert SplitManifest.from_json(m_int.to_json()) == m_int
+
+
+def test_old_weight_bounds() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="old_weight"):
+        _build([_rec(1, ("A",))], old_weight=1.5)
+    with pytest.raises(ValueError, match="old_weight"):
+        _build([_rec(1, ("A",))], old_weight=-0.1)
+    # a bool is not a weight: True would pass 0.0 <= x <= 1.0 (True == 1.0)
+    # and mint weight 1.0 — reject it explicitly (pinned)
+    with pytest.raises(ValueError, match="old_weight"):
+        _build([_rec(1, ("A",))], old_weight=True)
+    # 0.0 is a legitimate hard window
+    result = _build(
+        [_rec(1, ("A",), date=datetime(2005, 1, 1, tzinfo=UTC))], old_weight=0.0
+    )
+    assert result.examples[0].weight == 0.0
+
+
+def test_manifest_mode_uses_manifest_weighting() -> None:
+    # the manifest's parameters are authoritative — the caller's ignored
+    recs = [_rec(1, ("A",), date=datetime(2005, 1, 1, tzinfo=UTC))]
+    manifest = _build(recs, recent_months=24, old_weight=0.1).manifest
+    result = _build(recs, manifest=manifest, recent_months=12, old_weight=0.5)
+    assert result.examples[0].weight == 0.1
+    assert result.manifest == manifest
+
+
+def test_manifest_mode_reproducible_across_now() -> None:
+    # the weighting anchor (weight_cutoff) rides in the manifest — a
+    # rebuild with a different `now` gives identical examples. The record
+    # is dated INSIDE the frozen window (2025-06-01 >= 2024-10-30 cutoff)
+    # but OUTSIDE the now+400d window (2025-06-01 < 2025-11-04 cutoff), so
+    # it discriminates: a recomputed (non-frozen) cutoff would flip it
+    # 1.0 → 0.1 (deepseek major — the 2005 record couldn't discriminate).
+    recs = [_rec(1, ("A",), date=datetime(2025, 6, 1, tzinfo=UTC))]
+    manifest = _build(recs).manifest
+    r1 = _build(recs, manifest=manifest)
+    r2 = _build(recs, manifest=manifest, now=NOW + timedelta(days=400))
+    assert r1.examples == r2.examples
+    assert r1.examples[0].weight == 1.0  # frozen cutoff keeps it in-window
+
+
+def test_weight_cutoff_normalized_to_utc() -> None:
+    # the same `now` instant in another (fixed) zone gives the same
+    # manifest hash — scoped to fixed-offset/UTC-normalized inputs (a DST
+    # zone's offset change is out of scope; callers should pass `now` in
+    # UTC for cross-host stability)
+    from datetime import timezone
+
+    recs = [_rec(1, ("A",))]
+    m1 = _build(recs).manifest
+    m2 = _build(recs, now=NOW.astimezone(timezone(timedelta(hours=2)))).manifest
+    assert m1.content_hash == m2.content_hash
 
 
 # ---- empty corpus ----

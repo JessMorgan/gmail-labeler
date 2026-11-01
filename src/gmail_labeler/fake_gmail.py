@@ -209,7 +209,10 @@ class FakeGmailClient:
     ) -> None:
         self.messages = {m.id: m for m in messages or []}
         self.order = [m.id for m in messages or []]
-        self.labels_list = labels or []
+        # list() copy (F2 review NIT, pre-existing trap): ensure_label
+        # CREATES append here — an aliased caller list would mutate a
+        # shared #25 fixture behind its back
+        self.labels_list = list(labels or [])
         self.filters_list = filters or []
         self.page_size = page_size
         # True (default): list stubs carry historyId, the real shape. False:

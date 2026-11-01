@@ -65,6 +65,32 @@ def test_example_toml_matches_code_defaults(tmp_path: Path) -> None:
     assert load_config(str(example)) == load_config(str(empty))
 
 
+def test_example_toml_store_db_path_uncomments_to_the_default(
+    tmp_path: Path,
+) -> None:
+    # S5: the [store] db_path in example.toml is COMMENTED (a default),
+    # so the defaults-pin above can't see it — pin it here: uncommenting
+    # the documented line yields the code default (anchored to the
+    # config dir), so a drift in either direction turns this red.
+    text = (REPO_ROOT / "example.toml").read_text(encoding="utf-8")
+    out: list[str] = []
+    in_store = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_store = stripped == "[store]"
+        if in_store and stripped.startswith("# db_path = "):
+            out.append(line.removeprefix("# "))
+        else:
+            out.append(line)
+    p = tmp_path / "config.toml"
+    p.write_text("".join(out), encoding="utf-8")
+    cfg = load_config(str(p))
+    # the uncommented value anchors to the config dir, matching the
+    # code default (./gmail-labeler.db → <config dir>/gmail-labeler.db)
+    assert cfg.store.db_path == tmp_path / "gmail-labeler.db"
+
+
 def test_example_toml_bands_example_uncomments_to_a_valid_override(
     tmp_path: Path,
 ) -> None:

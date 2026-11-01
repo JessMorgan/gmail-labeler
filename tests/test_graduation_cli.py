@@ -954,6 +954,31 @@ def test_eval_graduation_unparseable_existing_named_in_diff(
     assert "NOTICE" not in result.stderr  # no replace NOTICE on a read
 
 
+def test_eval_graduation_undecodable_existing_named_unparseable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the decode-branch pin: readable bytes that are NOT valid UTF-8
+    # are undecodable, hence not a Graduation Table — the diff names
+    # them UNPARSEABLE ("does not parse"), NOT "unreadable (I/O
+    # failure)" (the misnomer the fold-6 split exists to prevent)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    out.write_bytes(b"\xff\xfe not a table")
+    result, _factory = _run_eval(
+        tmp_path, "--graduation", str(out), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "existing file at" in result.stderr
+        and "does not parse as a Graduation Table" in result.stderr
+    )
+    assert "unreadable (I/O failure)" not in result.stderr
+    assert "no existing table" not in result.stderr
+    assert "NOTICE" not in result.stderr  # no replace NOTICE on a read
+
+
 def test_eval_graduation_unreadable_existing_named_in_diff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1539,6 +1564,35 @@ def test_eval_graduation_readback_read_failure_is_post_replace(
     assert "readback fault" in result.stderr
     assert "failed to read back" in result.stderr
     assert "cannot write --graduation" not in result.stderr
+    assert "test examples=6" in result.stdout  # the report is not lost
+
+
+def test_eval_bands_readback_read_failure_is_post_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --bands twin of the graduation readback pin: the bands
+    # writer's post-replace readback has the SAME OSError wrap (the
+    # read's own I/O failure is a post-replace failure, not a write
+    # failure) — pinned here so the two writers stay symmetric
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    out = tmp_path / "bands.json"
+    orig_read_text = Path.read_text
+
+    def _read_text_boom(
+        self: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        if self == out:
+            raise OSError("simulated readback read failure")
+        return orig_read_text(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", _read_text_boom)
+    result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
+    assert result.exit_code == 5
+    assert "--bands write failed AFTER the target was replaced" in result.stderr
+    assert "readback fault" in result.stderr
+    assert "failed to read back" in result.stderr
+    assert "cannot write --bands" not in result.stderr
     assert "test examples=6" in result.stdout  # the report is not lost
 
 

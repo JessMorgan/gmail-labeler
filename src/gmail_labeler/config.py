@@ -289,8 +289,9 @@ class BandsConfig(BaseModel):
         override; a raw ``per_label`` key is a reserved field name —
         an EMPTY raw table is accepted (it equals the typed default
         {}, the model_dump round-trip form), while ANY non-empty raw
-        table is refused; a label key is stripped, refused
-        blank-after-strip, and
+        table WITH UNTYPED VALUES is refused (the typed
+        BandOverride-valued programmatic path accepts); a label key
+        is stripped, refused blank-after-strip, and
         acceptance-bounded at _MAX_LABEL_LENGTH (the echo bound
         _MAX_LOC_SEGMENT only truncates error messages — a long
         slash-nested Label Path is accepted, not refused)."""
@@ -620,9 +621,10 @@ class GraduationConfig(BaseModel):
         tenth-grid — see the class docstring); a raw ``per_label`` key
         is a reserved field name — an EMPTY raw table is accepted (it
         equals the typed default {}, the model_dump round-trip form),
-        while ANY non-empty raw table is refused; a label key is
-        stripped,
-        refused blank-after-strip, and acceptance-bounded at
+        while ANY non-empty raw table WITH UNTYPED VALUES is refused
+        (the typed GateOverride-valued programmatic path accepts); a
+        label key is stripped, refused blank-after-strip, and
+        acceptance-bounded at
         _MAX_LABEL_LENGTH (the echo bound _MAX_LOC_SEGMENT only
         truncates error messages — a long slash-nested Label Path is
         accepted, not refused)."""

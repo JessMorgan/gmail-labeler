@@ -65,6 +65,29 @@ does not ship releases yet.
   order and unreferenced label entries) so a drifted snapshot refuses the
   rebuild. The filter-shape rule is shared with `dataset analyze`
   (`filter_label_ids` / `filter_label_ids_strict`).
+- `train/` recipe (ticket #19): HF `Trainer` fine-tune over the
+  builder's Training Examples — one sigmoid head per Label Path
+  (multi-label BCE), the recency weight applied as a WEIGHTED MEAN of
+  per-example BCE losses from `outputs.logits` (`reduction='none'`,
+  `.mean(dim=-1)`, `(per*w).sum()/w.sum()` — the model's scalar
+  `outputs.loss` would make the weight mathematically inert),
+  LAZY tokenization (the dataset holds raw texts; the collator
+  tokenizes per batch — peak memory O(batch), not O(corpus)),
+  single-device contract (`use_cpu=True` on CPU; a multi-GPU host is
+  refused on the GPU path), `load_hf_model` refuses a checkpoint whose
+  `num_labels` does not match the served vocabulary, encoder weights
+  from a LOCAL path only (`local_files_only` everywhere — pinned by
+  spy, AC#6), checkpoint saved as a plain HF-style directory with the
+  `encoder_id` recorded on the HF config. The ONLY code that imports
+  torch/transformers, reached exclusively through lazy imports;
+  `torch` + `transformers` (v5 line) + `accelerate` (Trainer
+  hard-requires it) are the optional `train` extra. CPU-smoke tests
+  (incl. non-uniform-weight order-sensitivity, collator row
+  alignment, and the `local_files_only` pin) and one GPU test sit
+  behind the opt-in `smoke`/`gpu` markers, excluded from every
+  CI/local-ci run (AC#1/AC#2: the matrix stays torch-free and green);
+  the README carries the CPU-only torch install hint
+  (`uv sync --extra train --torch-backend=cpu`).
 - Checkpoint identity + loader refusal (`model.py`,
   `corpus_record.py`): a checkpoint is a plain HF-style directory
   (gitignored) plus a JSON Checkpoint Sidecar — label-vocabulary

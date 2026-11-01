@@ -620,6 +620,10 @@ def test_bootstrap_transient_holds_and_retries_next_tick(
     assert _run(tmp_path, fake, db=db) == 0
     assert db.get_history_cursor() is None  # never a fake value
     assert "cannot establish history cursor" in caplog.text
+    # the name's promise, kept (review round-2 NIT): the NEXT tick's
+    # retried bootstrap succeeds (fail-once queue) and lands the cursor
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777  # aa11's id (the bootstrap pin)
     db.close()
 
 

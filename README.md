@@ -407,8 +407,9 @@ kill, or a mid-delta write error that holds the cursor (a transient
 failure at a later message) — leaves its audit row uncommitted: the
 Gmail truth stands, the row is not re-added, so the Applications table
 plus the mailbox together are the audit truth, not the table alone. If
-the daemon was down longer than Gmail retains history (records are typically available for at least a week, and the
-retention can be significantly shorter), the cursor expires: the
+the daemon was down longer than Gmail retains history (records are
+typically available for at least a week, and the retention can be
+significantly shorter), the cursor expires: the
 daemon re-establishes it from the newest message (the documented
 full-sync bootstrap), warns loudly, and the mail that arrived during
 the gap was NOT labeled — review it with `shadow run` (or `apply`

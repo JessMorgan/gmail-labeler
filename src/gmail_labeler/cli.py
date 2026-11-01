@@ -2569,5 +2569,212 @@ def shadow_run(
         )
 
 
+@shadow_app.command("report")
+def shadow_report(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    run: str | None = typer.Option(
+        None,
+        "--run",
+        help="The run id to report (default: the latest run)",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Machine-readable output (graduation workflows)"
+    ),
+) -> None:
+    """Diff a Shadow Pass run's would-apply verdicts against the
+    mailbox's ACTUAL labels (the Phase 1 exit review, GLOSSARY: Shadow
+    Pass).
+
+    Reads the run's rows from the state DB (``[store] db_path``),
+    re-fetches each message's ACTUAL labels via the read path
+    (get_message — the labels may have changed since the run), and
+    renders a deterministic per-message diff: message id + label +
+    score + tier ONLY (subjects OUT, bodies out by construction —
+    invariant #5). Outcomes: ADDED (would apply, not present),
+    ALREADY-PRESENT (would apply, already present — skip-present
+    visible), NOT-APPLIED (no band verdict). A per-label summary block
+    carries the would-be tier mix. A message whose labels cannot be
+    re-fetched is SKIPPED (per-message fail-safe: warning + count, the
+    report continues) — the same posture as ``shadow run``.
+    """
+    from .appdb import AppDB, AppDBError
+    from .auth import AuthError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .labels import normalize_label_names
+    from .tiers import TIER_HIGH, TIER_MED
+    from .tokens import TokenStoreError
+
+    # usage refusal up front (exit 2): an empty --run would degenerate
+    # to a lookup on "" (the latest-run default is the empty-ABSENT
+    # case, not an empty-string run id)
+    if run is not None and not run.strip():
+        typer.echo("shadow report failed: --run must be non-empty", err=True)
+        raise typer.Exit(code=2) from None
+
+    cfg = _load_config(config)
+    # auth gate FIRST (exit 4 precedent): the report re-fetches the
+    # actual labels via the read path
+    try:
+        client = _shadow_client(cfg)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+
+    # the state DB (create-all-if-missing — a report on an empty DB is
+    # a named "no runs" refusal, not a crash)
+    db = AppDB(cfg.store.db_path)
+    try:
+        db.open()
+        run_id = run if run is not None else db.latest_run()
+        if run_id is None:
+            typer.echo(
+                "shadow report failed: no shadow runs recorded \u2014 run "
+                "`shadow run` first",
+                err=True,
+            )
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        if not db.run_exists(run_id):
+            typer.echo(
+                f"shadow report failed: no shadow run {run_id!r} recorded "
+                "\u2014 the run id is wrong (or the run was never "
+                "committed)",
+                err=True,
+            )
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        run_ts, rows = db.load_run(run_id)
+    except (AppDBError, OSError) as e:
+        typer.echo(f"shadow report failed: state DB read failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        db.close()
+
+    # the label bridge (the read path — list_labels only)
+    try:
+        labels = client.list_labels()
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"shadow report failed: label list failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    id_to_name = {li.id: li.name for li in labels}
+
+    # re-fetch the ACTUAL labels per message (the read path —
+    # get_message only). A fetch failure is a per-message SKIP (the
+    # documented posture choice — the report is a review, not a
+    # serving-gate mint): warning + count, the report continues.
+    message_ids = sorted({row.message_id for row in rows})
+    actual: dict[str, frozenset[str]] = {}
+    skipped = 0
+    for message_id in message_ids:
+        try:
+            raw = client.get_message(message_id)
+        except GmailAuthError as e:
+            typer.echo(f"auth: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailError as e:
+            skipped += 1
+            typer.echo(f"WARNING: skipped message {message_id}: {e}", err=True)
+            continue
+        actual[message_id] = frozenset(normalize_label_names(raw.label_ids, id_to_name))
+
+    # the deterministic per-message diff (ids + labels + scores + tiers
+    # ONLY — subjects OUT, bodies out by construction, invariant #5).
+    # Outcomes: ADDED (band + not present), ALREADY-PRESENT (band +
+    # present — skip-present visible), NOT-APPLIED (no band).
+    per_message: dict[str, list[dict[str, object]]] = {}
+    per_label: dict[str, dict[str, int]] = {}
+    outcomes = {"added": 0, "already_present": 0, "not_applied": 0}
+    for row in rows:  # load_run returns (message_id, label) order
+        present = actual.get(row.message_id)
+        if present is None:
+            # the message was skipped (fetch failure) — its rows are
+            # omitted from the diff (the skip is counted + warned)
+            continue
+        if row.band is None:
+            outcome = "not-applied"
+            tier: str | None = None
+        elif row.label in present:
+            outcome = "already-present"
+            tier = None  # skip-present: no Tier Label
+        else:
+            outcome = "added"
+            tier = TIER_HIGH if row.band == "high" else TIER_MED
+        outcomes[outcome.replace("-", "_")] += 1
+        per_message.setdefault(row.message_id, []).append(
+            {
+                "label": row.label,
+                "probability": row.probability,
+                "band": row.band,
+                "outcome": outcome,
+                "tier": tier,
+            }
+        )
+        label_summary = per_label.setdefault(
+            row.label,
+            {
+                "added": 0,
+                "already_present": 0,
+                "not_applied": 0,
+                "would_be_high": 0,
+                "would_be_med": 0,
+            },
+        )
+        label_summary[outcome.replace("-", "_")] += 1
+        if row.band == "high":
+            label_summary["would_be_high"] += 1
+        elif row.band == "med":
+            label_summary["would_be_med"] += 1
+
+    if as_json:
+        payload = {
+            "run_id": run_id,
+            "run_ts": run_ts.isoformat(),
+            "message_count": len(per_message),
+            "skipped": skipped,
+            "outcomes": outcomes,
+            "messages": [
+                {
+                    "message_id": message_id,
+                    "rows": per_message[message_id],
+                }
+                for message_id in sorted(per_message)
+            ],
+            "per_label": [
+                {"label": label, **per_label[label]} for label in sorted(per_label)
+            ],
+        }
+        typer.echo(json.dumps(payload, sort_keys=True))
+        return
+
+    # text mode: the report is the stdout content (the review surface)
+    typer.echo(
+        f"shadow report: run={run_id} ts={run_ts.isoformat()} "
+        f"messages={len(per_message)} skipped={skipped}"
+    )
+    for message_id in sorted(per_message):
+        typer.echo(f"  {message_id}:")
+        for row in per_message[message_id]:
+            band = str(row["band"]) if row["band"] is not None else "-"
+            tier = str(row["tier"]) if row["tier"] is not None else "-"
+            # the outcome renders UPPERCASE (the design's ADDED /
+            # ALREADY-PRESENT / NOT-APPLIED); the JSON keeps lowercase
+            # (machine-readable)
+            outcome = str(row["outcome"])
+            typer.echo(
+                f"    {outcome.upper():<16} {row['label']:<24} "
+                f"score={row['probability']:.2f} band={band} tier={tier}"
+            )
+    typer.echo("  per-label:")
+    for label in sorted(per_label):
+        s = per_label[label]
+        typer.echo(
+            f"    {label}: added={s['added']} "
+            f"already-present={s['already_present']} "
+            f"not-applied={s['not_applied']} "
+            f"(would-be: high={s['would_be_high']} med={s['would_be_med']})"
+        )
+
+
 if __name__ == "__main__":
     app()

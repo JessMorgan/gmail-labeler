@@ -950,11 +950,17 @@ def render_graduation_diff(
     """The human-confirm diff (ADR-0005): old → new per label, in
     label-sorted order over the union of both tables' labels. A label
     missing from the old table is named ``(absent)`` (the
-    everything-vs-nothing baseline); an existing target that does not
-    parse as a Graduation Table is named as such (NOT "no existing
-    table" — the file exists, it is just not a table); and a
-    foreign-bound old table (identity drift) is named in the header —
-    the human sees they are comparing a table bound to a different
+    everything-vs-nothing baseline). The baseline naming has THREE
+    cases, each named by its cause: the target is ABSENT → "no
+    existing table … baseline is empty"; the target is UNREADABLE (an
+    I/O failure) → "existing file … is unreadable (I/O failure) —
+    baseline is empty"; the target is UNPARSEABLE — a parse failure,
+    or readable bytes that are not valid UTF-8 (undecodable, hence
+    not a table) → "existing file … does not parse as a Graduation
+    Table — baseline is empty". The cause is never misdiagnosed
+    (NOT "no existing table" when the file exists). A foreign-bound
+    old table (identity drift) is named in the header — the human
+    sees they are comparing a table bound to a different
     checkpoint/eval/bands. Deterministic: same inputs → byte-identical
     text. This is the surface the human confirms BEFORE anything live
     changes; the write itself is CLI-gated

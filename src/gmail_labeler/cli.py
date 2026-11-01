@@ -274,9 +274,20 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
         try:
             readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
+            # a UnicodeDecodeError is a ValueError subclass — it lands
+            # here (the file exists, it just is not a valid artifact)
             raise ArtifactReadbackError(
                 f"artifact readback fault: {path} does not parse back "
                 f"to a valid artifact ({type(e).__name__})"
+            ) from e
+        except OSError as e:
+            # the replace ALREADY happened — a readback read failure
+            # is a post-replace failure, not a write failure ("cannot
+            # write" would be a lie; the outer except OSError would
+            # print exactly that)
+            raise ArtifactReadbackError(
+                f"artifact readback fault: {path} failed to read back "
+                f"({type(e).__name__})"
             ) from e
         if readback.content_hash != artifact.content_hash:
             # it DID parse — a valid artifact whose content hash
@@ -394,9 +405,19 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
         try:
             readback = GraduationTable.from_json(path.read_text(encoding="utf-8"))
         except ValueError as e:
+            # a UnicodeDecodeError is a ValueError subclass — it lands
+            # here (the file exists, it just is not a valid table)
             raise ArtifactReadbackError(
                 f"table readback fault: {path} does not parse back "
                 f"to a valid table ({type(e).__name__})"
+            ) from e
+        except OSError as e:
+            # the replace ALREADY happened — a readback read failure
+            # is a post-replace failure, not a write failure ("cannot
+            # write" would be a lie; the outer except OSError would
+            # print exactly that)
+            raise ArtifactReadbackError(
+                f"table readback fault: {path} failed to read back ({type(e).__name__})"
             ) from e
         if readback.content_hash != table.content_hash:
             # it DID parse — a valid table whose content hash
@@ -1862,14 +1883,20 @@ def eval(
             if graduation_path.is_file():
                 # the file EXISTS: the diff says what is wrong with it
                 # (honesty about what is on disk) — an UNREADABLE file
-                # (I/O failure) is named differently from an
-                # UNPARSEABLE one (parse failure); "no existing table"
-                # is reserved for the absent target
+                # (an I/O failure) is named differently from an
+                # UNPARSEABLE one (a parse failure); a readable file
+                # that is not valid UTF-8 is undecodable, hence not a
+                # Graduation Table — it is named as unparseable, not
+                # "unreadable (I/O failure)" (a misnomer); "no
+                # existing table" is reserved for the absent target
                 try:
                     text = graduation_path.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
+                except OSError:
                     existing = None
                     unreadable_existing = True
+                except UnicodeDecodeError:
+                    existing = None
+                    unparseable_existing = True
                 else:
                     try:
                         existing = GraduationTable.from_json(text)

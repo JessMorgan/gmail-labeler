@@ -712,8 +712,7 @@ def test_populated_per_label_dump_round_trip_refused_by_design() -> None:
     # NOT round-trip through model_dump() -> model_validate — the dump
     # produces a non-empty raw per_label dict, which is the refused
     # back door (BY DESIGN: the typed API — BandOverride / GateOverride
-    # values — is the programmatic round-trip path). The refusal names
-    # BOTH problems (the reserved key AND the duplicate it produces)
+    # values — is the programmatic round-trip path)
     from gmail_labeler.config import BandOverride, Config
 
     cfg = Config.model_validate(

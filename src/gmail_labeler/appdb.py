@@ -62,20 +62,22 @@ class AppDBError(Exception):
 @dataclass(frozen=True, slots=True)
 class ShadowRow:
     """One would-apply verdict row (NO bodies — invariant #5): the
-    message id, the label, the sigmoid probability, the band verdict
-    (``"high"`` / ``"med"`` / ``None`` — the explicit no-verdict state),
-    and the run's UTC timestamp (stamped by the run, not the row)."""
+    message id, the label, the sigmoid probability, and the band verdict
+    (``"high"`` / ``"med"`` / ``None`` — the explicit no-verdict state).
+    ``run_ts`` is the run's UTC timestamp — ``None`` on the write path
+    (``record_run`` stamps the run-level timestamp on every row) and
+    populated on the read path (``load_run``)."""
 
     message_id: str
     label: str
     probability: float
     band: str | None
-    run_ts: datetime
+    run_ts: datetime | None = None
 
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL
+    version INTEGER NOT NULL PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS shadow_results (
     run_id TEXT NOT NULL,
@@ -123,7 +125,15 @@ class AppDB:
         existed = self.path.exists()
         try:
             self._conn = sqlite3.connect(str(self.path))
+            # connect is LAZY: a non-SQLite file is not read until the
+            # first query, so force it here — a corrupt file is named at
+            # the failure site that actually raises (not a generic
+            # "unusable" later)
+            self._conn.execute("SELECT 1").fetchone()
         except sqlite3.DatabaseError as e:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
             raise AppDBError(
                 f"state DB corrupt (not a SQLite file): {self.path}: {e}"
             ) from e
@@ -132,30 +142,53 @@ class AppDB:
                 os.chmod(self.path, 0o600)  # foreign fs: best-effort
         try:
             self._conn.executescript(_SCHEMA)
-            self._conn.execute(
-                "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
-                (SCHEMA_VERSION,),
-            )
-            self._conn.commit()
+            # a fresh DB (no version row) gets stamped; an existing DB
+            # is NOT written before the version check — a foreign
+            # version is refused WITHOUT a row appended (the PK makes
+            # re-stamps a no-op, but the write-before-refusal is the
+            # lie this ordering closes)
+            versions = self._conn.execute(
+                "SELECT DISTINCT version FROM schema_version"
+            ).fetchall()
+            if not versions:
+                self._conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)",
+                    (SCHEMA_VERSION,),
+                )
+                self._conn.commit()
             self._verify_version()
-        except sqlite3.DatabaseError as e:
+        except (sqlite3.DatabaseError, AppDBError) as e:
+            # BOTH the I/O failure and the version refusal close the
+            # connection (open()'s lifecycle contract — a refused open
+            # leaves no open conn behind)
             self._conn.close()
             self._conn = None
+            if isinstance(e, AppDBError):
+                raise
             raise AppDBError(f"state DB unusable: {self.path}: {e}") from e
 
     def _verify_version(self) -> None:
         # a foreign version is refused, named (the SplitManifest
-        # discipline — a newer tool's DB is not served by an older one)
-        assert self._conn is not None
-        row = self._conn.execute("SELECT version FROM schema_version").fetchone()
-        if row is None:
+        # discipline — a newer tool's DB is not served by an older one).
+        # ALL version rows are read (not a LIMIT 1 min/max — a DB
+        # polluted with (99, 1) by a write-before-refusal must still
+        # refuse): the set must be EXACTLY {SCHEMA_VERSION}
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        versions = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT DISTINCT version FROM schema_version"
+            ).fetchall()
+        }
+        if not versions:
             raise AppDBError(
                 f"state DB has no schema_version row: {self.path} — corrupt"
             )
-        if row[0] != SCHEMA_VERSION:
+        if versions != {SCHEMA_VERSION}:
             raise AppDBError(
-                f"state DB schema_version {row[0]} != {SCHEMA_VERSION}: "
-                f"{self.path} — a newer tool wrote this DB"
+                f"state DB schema_version {sorted(versions)} != "
+                f"{SCHEMA_VERSION}: {self.path} — a newer tool wrote this DB"
             )
 
     def close(self) -> None:
@@ -179,6 +212,15 @@ class AppDB:
             raise AppDBError("state DB not open — call open() first")
         if not run_id.strip():
             raise AppDBError("run_id must be non-empty")
+        if not rows:
+            # an empty run is refused at the ONLY writer (load_run's
+            # docstring assumes "an empty run was never committed" — a
+            # future caller #24/#26 cannot create the state the reader
+            # assumes impossible)
+            raise AppDBError(
+                "record_run: no rows — an empty run is never committed "
+                "(the CLI refuses a zero-verdict run before the store)"
+            )
         if run_ts.tzinfo is None:
             raise AppDBError(
                 "run_ts must be timezone-aware (a naive timestamp is a "
@@ -271,17 +313,39 @@ class AppDB:
                 f"no shadow run {run_id!r} recorded — run `shadow run` first "
                 "(or the run id is wrong)"
             )
-        run_ts = datetime.fromisoformat(rows[0][4])
-        return run_ts, [
-            ShadowRow(
+        try:
+            run_ts = datetime.fromisoformat(rows[0][4])
+        except (ValueError, TypeError) as e:
+            # a tampered/hand-edited DB with a non-ISO (or NULL) run_ts is
+            # a corrupt row, named — not a bare ValueError/TypeError
+            # traceback (exit 1)
+            raise AppDBError(
+                f"state DB corrupt (run_ts {rows[0][4]!r} is not ISO-8601): "
+                f"{self.path}: {e}"
+            ) from e
+        out: list[ShadowRow] = []
+        for r in rows:
+            row = ShadowRow(
                 message_id=r[0],
                 label=r[1],
                 probability=r[2],
                 band=r[3],
                 run_ts=run_ts,
             )
-            for r in rows
-        ]
+            try:
+                # re-validate the read-back row (a tampered DB can carry an
+                # arbitrary band string / out-of-range probability / a NULL
+                # column — refused, named, not rendered)
+                _check_row(row)
+            except (ValueError, TypeError, AttributeError) as e:
+                # a NULL column (a hand-edited DB without the shipped
+                # NOT NULL constraints) raises AttributeError/TypeError in
+                # _check_row — a corrupt row, named, not an exit-1 traceback
+                raise AppDBError(
+                    f"state DB corrupt (row {r!r} fails validation): {self.path}: {e}"
+                ) from e
+            out.append(row)
+        return run_ts, out
 
 
 def _check_row(row: ShadowRow) -> None:

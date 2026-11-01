@@ -169,6 +169,7 @@ def test_row_validation_refusals(tmp_path: Path) -> None:
 
 def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
     # a newer tool's DB is refused, named (the SplitManifest discipline)
+    # — and NOT written before the refusal (no (1) row appended)
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
@@ -176,16 +177,54 @@ def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="schema_version 99"):
+    with pytest.raises(AppDBError, match="schema_version \\[99\\]"):
+        db.open()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(99,)]
+    finally:
+        conn.close()
+
+
+def test_polluted_schema_version_is_refused(tmp_path: Path) -> None:
+    # a DB polluted with BOTH (99) and (1) (the write-before-refusal
+    # interim state) is refused — the version set must be EXACTLY
+    # {SCHEMA_VERSION}, not a min/max that a second row would bypass
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (99)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="schema_version"):
         db.open()
 
 
+def test_schema_version_row_is_stable_across_opens(tmp_path: Path) -> None:
+    # the schema_version row is NOT appended on every open (the PK makes
+    # re-stamps a no-op) — repeated opens leave exactly one row
+    db_path = tmp_path / "state.db"
+    for _ in range(3):
+        db = AppDB(db_path)
+        db.open()
+        db.close()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+    finally:
+        conn.close()
+
+
 def test_corrupt_file_is_refused(tmp_path: Path) -> None:
-    # a non-SQLite file is a corrupt DB, named
+    # a non-SQLite file is a corrupt DB, named — the cause phrase is
+    # path-INDEPENDENT (the old match="corrupt" passed vacuously because
+    # tmp_path embeds the test name)
     db_path = tmp_path / "state.db"
     db_path.write_bytes(b"not a sqlite file")
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="corrupt"):
+    with pytest.raises(AppDBError, match="not a SQLite file"):
         db.open()
 
 

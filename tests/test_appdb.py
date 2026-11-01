@@ -177,9 +177,9 @@ def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    # a foreign-version schema_version (99) is NOT valid-ours (rows !=
-    # {1}) → refused as a foreign DB (the shape gate, disposition 2)
-    with pytest.raises(AppDBError, match="foreign tables"):
+    # a foreign-version schema_version (99) is refused by the version
+    # HARD gate (fold-4 item 1) with the version-named message
+    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
         db.open()
     conn = sqlite3.connect(str(db_path))
     try:
@@ -191,7 +191,12 @@ def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
 def test_polluted_schema_version_is_refused(tmp_path: Path) -> None:
     # a DB polluted with BOTH (99) and (1) (the write-before-refusal
     # interim state) is refused — the version set must be EXACTLY
-    # {SCHEMA_VERSION}, not a min/max that a second row would bypass
+    # {SCHEMA_VERSION}, not a min/max that a second row would bypass.
+    # fold-4 item 1: UN-RETARGETED to assert its docstring property —
+    # the exact-set refusal with the VERSION-named message (the old
+    # match="schema_version" substring was satisfied by the table name
+    # in a foreign-tables listing, certifying the opposite of the
+    # docstring — the retargeting is recorded in the commit attribution)
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
@@ -200,21 +205,51 @@ def test_polluted_schema_version_is_refused(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="schema_version"):
+    with pytest.raises(AppDBError, match=r"schema_version \[1, 99\] != 1"):
         db.open()
 
 
-def test_generic_schema_version_is_not_ours(tmp_path: Path) -> None:
-    # disposition 2 (the adoption hole ds reproduced): a foreign DB with
-    # ONLY a generic single-column `version` table (empty — not stamped
-    # by us) is NOT ours → named refusal, not silently adopted
+def test_our_shape_shadow_results_with_foreign_version_is_refused(
+    tmp_path: Path,
+) -> None:
+    # fold-4 item 1 (the data-integrity regression ds reproduced): a DB
+    # with our-shape shadow_results PLUS a foreign schema_version ({99})
+    # is REFUSED — the version is a HARD gate, not advisory (a v2 DB is
+    # not consumed by a v1 tool). The old OR-gate OPENED and WROTE this.
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE shadow_results ("
+        "run_id TEXT, message_id TEXT, label TEXT, probability REAL, "
+        "band TEXT, run_ts TEXT, "
+        "PRIMARY KEY (run_id, message_id, label))"
+    )
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (99)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
+        db.open()
+    # NOT opened/written: no new rows, no restamp
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(99,)]
+    finally:
+        conn.close()
+
+
+def test_our_shape_empty_schema_version_is_corrupt(tmp_path: Path) -> None:
+    # fold-4 item 1: an our-shape schema_version (single-column `version`)
+    # that is EMPTY (no version row) is named corrupt — NOT silently
+    # adopted (the version HARD gate: an empty stamp is not our version)
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="foreign tables"):
+    with pytest.raises(AppDBError, match="schema_version is empty"):
         db.open()
     # NOT adopted: no shadow_results table was created on the foreign DB
     conn = sqlite3.connect(str(db_path))
@@ -289,7 +324,7 @@ def test_versioned_foreign_db_gains_no_table_pre_refusal(tmp_path: Path) -> None
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="foreign tables"):
+    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
         db.open()
     conn = sqlite3.connect(str(db_path))
     try:

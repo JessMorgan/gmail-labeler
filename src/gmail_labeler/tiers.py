@@ -46,7 +46,9 @@ maps a band verdict to the CONFIGURED name (the ``[labels]`` surface
 drives the shadow report's tier names — a custom spelling is honored,
 not silently ignored). The bridge SHIPPED with #24:
 gmail_client.ensure_label resolves the configured names to Gmail label
-ids (get-or-create, System Label name-sakes refused named) and
+ids (get-or-create: an existing exact-case USER label is used as-is, a
+casefolded System Label name-sake is refused named — minting is what
+the refusal guards) and
 applications.plan_message_write takes the resolved map (the daemon
 #25 / apply #26 call them at startup — the contract: tiers names the
 default spellings, the config names the operator's labels, the client

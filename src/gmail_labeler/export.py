@@ -40,7 +40,40 @@ from .mime_extract import decode_gmail_raw, parse_mime
 
 log = logging.getLogger("gmail_labeler.export")
 
-DEFAULT_QUERY = "in:anywhere -in:spam -in:trash"
+# Export scope decision (maintainer, 2026-11-01; ticket #17 / issue #10
+# item 4): DRAFT and CHAT are EXCLUDED, not just spam/trash. With
+# Additive-only + skip-present (invariants #1/#2) and the append-only
+# corpus, the old implicit inclusion (in:anywhere) would become permanent
+# and unrecoverable — excluding them now is the safe direction under the
+# one-way door.
+#
+# Documented tokens only (provenance standard, labels.py precedent):
+#   -in:draft — Google-documented: "-in:draft means exclude drafts from
+#     the search results" (developers.google.com/workspace/gmail/api/
+#     reference/mcp/tools_list/search_threads, page 2026-07-21). High
+#     confidence as a token; medium for exact REST q composition — the
+#     ingest rejection below covers the gap.
+#   CHAT — NO documented exclusion token: is:chat documented 2014→2021,
+#     gone by 2023-01 (Wayback 7190 lineage); -in:chat is undocumented
+#     and carries a silent word-degradation hazard (an unknown in: value
+#     may be word-degraded and drop legit mail containing the word
+#     "chat"). Chat exclusion therefore lives at INGEST:
+#     _EXCLUDED_SYSTEM_LABEL_IDS below hard-skips raw-wire DRAFT/CHAT
+#     labelIds — the load-bearing layer, which an explicit --query
+#     override cannot bypass.
+# Pinned in test_export_scope_pins_both_layers.
+DEFAULT_QUERY = "in:anywhere -in:spam -in:trash -in:draft"
+
+# Ingest-layer exclusion (same decision as DEFAULT_QUERY above): a
+# message whose RAW wire labelIds carry the system label id DRAFT or
+# CHAT is hard-skipped before anything is stored. Exact id match on the
+# raw payload, BEFORE labels.py normalization — normalize_label_names
+# strips System Labels from the record vocabulary, so matching after it
+# would be impossible. Never name-matched: a user label named "chat" is
+# not chat. (labels.py's SYSTEM_LABEL_IDS already tracks these ids; the
+# pair is called out here because the consequence is corpus exclusion,
+# not just vocabulary filtering.)
+_EXCLUDED_SYSTEM_LABEL_IDS = frozenset({"DRAFT", "CHAT"})
 MAX_ATTEMPTS = 5
 _BASE_BACKOFF_S = 1.0
 
@@ -50,6 +83,7 @@ class ExportStats:
     scanned: int = 0
     written: int = 0
     skipped_present: int = 0
+    skipped_draft_chat: int = 0  # ingest-layer policy skips (see above)
     retried: int = 0
     failed: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
 
@@ -120,6 +154,8 @@ def export_corpus(
                     stats.written += 1
                 elif outcome == "present":
                     stats.skipped_present += 1
+                elif outcome == "policy_skip":
+                    stats.skipped_draft_chat += 1
             # bound checked on EVERY path (deepseek engine pass: continue
             # used to bypass it, scanning past max_messages on resume runs)
             if max_messages is not None and stats.scanned >= max_messages:
@@ -172,7 +208,7 @@ def _export_one(
     max_attempts: int,
     stats: ExportStats,
     sleeper: Callable[[float], None],
-) -> Literal["written", "present", "failed"]:
+) -> Literal["written", "present", "failed", "policy_skip"]:
     msg = _retrying(
         lambda: client.get_message(message_id),
         max_attempts=max_attempts,
@@ -183,6 +219,11 @@ def _export_one(
     if msg is None:
         stats.failed.append((message_id, "fetch failed (permanent/retries)"))
         return "failed"
+    if _EXCLUDED_SYSTEM_LABEL_IDS.intersection(msg.label_ids):
+        # policy skip on the RAW wire labelIds (before parse/normalize):
+        # counted by the caller, never stored, never a failure — the
+        # exclusion is a decision, not a defect
+        return "policy_skip"
     try:
         parsed = parse_mime(decode_gmail_raw(msg.raw_b64url))
     except ValueError as e:

@@ -87,17 +87,27 @@ gmail-labeler dataset analyze         # per-label report: counts, recency, dup r
 line with `uv run ` — e.g. `uv run gmail-labeler --help` always works.)
 
 Every command takes `--config PATH`. `dataset export` takes `--query`
-(default `in:anywhere -in:spam -in:trash`) and `--max-messages` (smoke
-runs); it writes `filters.json` and `labels.json` sidecars next to the
-corpus — the offline snapshot `dataset analyze` uses for filter
-attribution. `dataset import-gyb` takes `--path`, `--max-messages`, and
-`--system-labels` (comma-separated extras — the delimiter is a comma, so
-label names containing commas cannot be expressed via the flag); it does
-not write sidecars, so for GYB-only corpora `dataset analyze` withholds
-candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). Both export and import are resumable:
-the corpus id set is the cursor, so re-running after a failure skips what is
-already present. Transient failures resume cleanly; a deterministic abort
+(default `in:anywhere -in:spam -in:trash -in:draft`) and
+`--max-messages` (smoke runs). DRAFT and CHAT are deliberately out of
+the API export — with Additive-only + skip-present and the append-only
+corpus, including them would be a permanent one-way door. Exclusion is
+two-layer: the query carries the documented `-in:draft` token, and the
+ingest layer hard-skips any message whose raw wire labelIds carry the
+system label id DRAFT or CHAT (no documented chat query token exists,
+and this layer is load-bearing: an explicit `--query` replaces the
+default wholesale but cannot bypass it). Records already exported are
+unaffected (append-only corpus). GYB import follows whatever the backup
+holds (tracked by #32). It writes `filters.json` and `labels.json`
+sidecars next to the corpus — the offline snapshot `dataset analyze`
+uses for filter attribution. `dataset import-gyb` takes `--path`,
+`--max-messages`, and `--system-labels` (comma-separated extras — the
+delimiter is a comma, so label names containing commas cannot be
+expressed via the flag); it does not write sidecars, so for GYB-only
+corpora `dataset analyze` withholds candidates unless you pass
+`--assume-no-filters` (an attestation that the mailbox has no labeling
+filters). Both export and import are resumable: the corpus id set is
+the cursor, so re-running after a failure skips what is already
+present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself
 is fixed — resumable is not the same as completable. `dataset analyze`
 gates candidates on volume

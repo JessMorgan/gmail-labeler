@@ -183,8 +183,10 @@ def would_apply(
     ``system_labels`` is the System Label set (never targeted).
 
     ``system_labels`` is REQUIRED (keyword-only, no default) on purpose:
-    this module is the single safety authority for the live Application
-    path (#24/#26), and a fail-open default (``frozenset()``) would let
+    this module is the single safety authority for the graduated-NAME
+    vocabulary on the live Application path (#24/#26 — its #24 companion
+    is the composition-level id screen in ``applications._resolve_id``),
+    and a fail-open default (``frozenset()``) would let
     a caller that forgets the argument propose System Labels. Every
     caller must pass the mailbox's System Label set (the ``type ==
     "system"`` names from ``list_labels``) — no caller setup can be

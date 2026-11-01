@@ -176,14 +176,16 @@ It is opt-in: a bare `eval` never writes it
 remain the only recomputers. Refusals: up front (exit 2) an empty
 path, a path equal to `--out`, an existing directory, the config
 file, and any target inside the checkpoint dir or the corpus store
-(the artifact must not live beside identity files — the canonical
-location lands with the daemon phase); at run time (exit 5, the
-report preserved) a degraded corpus (test records missing body
-shards — the artifact feeds the daemon's serving gate), a
-calibration refusal (an unknown override label, a lying identity),
+(by resolved path — a link named inside pointing outside is allowed
+and replaces the link; the artifact must not live beside identity
+files, the canonical location lands with the daemon phase); at run
+time (exit 5, the report preserved) a degraded corpus (test records
+missing body shards — the artifact feeds the daemon's serving gate),
+a calibration refusal (an unknown override label, a lying identity),
 an existing artifact bound to a different identity (refused before
 any staging — the previous bytes stay intact), and a write failure
-or readback mismatch (a torn write).
+or readback fault (the on-disk bytes do not parse back to a valid
+artifact, or the hash differs — a torn/corrupt write).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.

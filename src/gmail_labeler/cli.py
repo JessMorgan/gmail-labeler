@@ -136,9 +136,12 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     symmetry) and compared by CONTENT HASH, not dataclass equality —
     the canonical payload serializes reasons sorted, so equality must
     be order-insensitive too (a reasons-order difference is the same
-    meaning, not a torn write). A torn write is an operation failure,
-    never a silently corrupt artifact. The ONLY writer of the artifact
-    in the package
+    meaning, not a torn write). A corrupt/torn file is refused by
+    ``from_json`` ITSELF (ValueError — mapped to the same named
+    operation failure, never a traceback); the OSError branch guards
+    I/O failures around the publish (a concurrent writer, a disk
+    error) — it is NOT the torn-write guard. The ONLY writer of the
+    artifact in the package
     (recompute posture, AC4 — pinned by
     ``test_only_eval_writes_the_bands_artifact``)."""
     from .thresholds import BandsArtifact
@@ -185,8 +188,19 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
         os.replace(staging, str(path))  # atomic on POSIX
         # readback symmetry (train's sidecar pattern): the on-disk
         # bytes must parse back to the minted artifact, compared by
-        # CONTENT HASH (order-insensitive — see the docstring)
-        readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
+        # CONTENT HASH (order-insensitive — see the docstring).
+        # from_json refuses a corrupt/torn file FIRST (ValueError —
+        # self-inconsistent bytes never reach the hash comparison);
+        # that refusal is the same named operation failure, not a
+        # traceback. The OSError branch below is the I/O guard
+        # (concurrent writer, disk error) — not the torn-write guard.
+        try:
+            readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
+        except ValueError as e:
+            raise OSError(
+                f"artifact readback fault: {path} does not parse back "
+                f"to a valid artifact ({type(e).__name__})"
+            ) from e
         if readback.content_hash != artifact.content_hash:
             raise OSError(
                 f"artifact readback mismatch: {path} does not parse "

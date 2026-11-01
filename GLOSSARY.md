@@ -190,9 +190,10 @@ second write, no duplicate row. That pin IS the safety proof: the Gmail
 write cannot ride a database transaction, so skip-present idempotency is
 the mechanism, and the crash matrix proves it (including a real process
 kill). The documented face of the same design: a write that landed
-before a crash leaves its audit row uncommitted (the Gmail truth stands;
-the row is not re-added) — the audit truth is the Applications table
-plus the mailbox, not a guaranteed 1:1.
+inside a delta that fails to commit — a crash, or a mid-delta write
+error that holds the cursor — leaves its audit row uncommitted (the
+Gmail truth stands; the row is not re-added) — the audit truth is the
+Applications table plus the mailbox, not a guaranteed 1:1.
 _Avoid_: checkpoint (the encoder's artifact owns that word)
 
 **Backlog**:

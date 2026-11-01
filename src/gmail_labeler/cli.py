@@ -1,23 +1,26 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add train/eval/shadow/apply/daemon/status (absent until wired,
-which surfaces as a usage error). Phase 0 subcommands are wired as they are
-implemented; unimplemented ones exit 3 with a clear "not implemented" marker
-— distinct from typer's usage-error code 2, so scripts can tell "not built
-yet" from "typo" — and never silently succeed.
+later phases add eval/shadow/apply/daemon/status (absent until wired,
+which surfaces as a usage error). Phase 0 subcommands and the Phase 1
+``train`` command are wired as they are implemented. Exit 3 is
+reserved for wired-but-stubbed commands and currently UNREACHABLE —
+no command is stubbed; scripts can branch on 0/2/4/5 today.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import typer
 
 from .analyze import filter_label_ids_strict
+from .dataset_build import TrainingExample
 from .export import DEFAULT_QUERY, SIDECAR_FILTERS, SIDECAR_LABELS
+from .model import Model
 
 # summary.filters_posture values, pinned for --json consumers
 AttributionPosture = Literal[
@@ -38,17 +41,6 @@ app = typer.Typer(
 )
 dataset_app = typer.Typer(help="Corpus acquisition and analysis.", no_args_is_help=True)
 app.add_typer(dataset_app, name="dataset")
-
-_NOT_IMPLEMENTED = "not implemented yet (Phase 0 lands this command)"
-
-
-_NOT_IMPLEMENTED_EXIT = 3
-
-
-def _stub(name: str) -> None:
-    typer.echo(f"{name}: {_NOT_IMPLEMENTED}", err=True)
-    raise typer.Exit(code=_NOT_IMPLEMENTED_EXIT)
-
 
 auth_app = typer.Typer(help="Gmail OAuth credential (ADR-0004).", no_args_is_help=False)
 app.add_typer(auth_app, name="auth")
@@ -503,6 +495,359 @@ def dataset_analyze(
             "(candidates are a SHORTLIST for eval/graduation, never a config "
             "change \u2014 ADR-0005 keeps retraining and applying human-gated)"
         )
+
+
+_TRAIN_ERROR_EXIT = 5  # build refusal, unreadable corpus, recipe failure
+
+
+def _model_factory(
+    cfg: Config,
+    examples: Sequence[TrainingExample],
+    texts: Sequence[str],
+    vocabulary: Sequence[str],
+    checkpoint_dir: Path,
+    device: str,
+) -> Model:
+    """Model factory seam: tests inject a FakeModel producer here (the
+    offline spine, invariant #9). The real implementation lazy-imports
+    the ``train/`` recipe (torch — the optional extra), so the CLI
+    module itself stays importable without torch. The encoder-path
+    guard runs BEFORE the import: a config typo must not pay a torch
+    import (or crash on its absence) to learn it is missing.
+    ``texts`` is ALIGNED to ``examples`` (index i ↔ examples[i])."""
+    if cfg.model.encoder_path is None:
+        raise ValueError(
+            "model.encoder_path is not set — training downloads nothing; "
+            "point [model] encoder_path at local encoder weights"
+        )
+    from train.recipe import train_encoder
+
+    return train_encoder(
+        examples,
+        texts,
+        vocabulary,
+        encoder_id=cfg.model.encoder,
+        encoder_path=cfg.model.encoder_path,
+        output_dir=checkpoint_dir,
+        device=device,
+    )
+
+
+@app.command("train")
+def train(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    split_date: str = typer.Option(
+        ...,
+        "--split-date",
+        help=(
+            "ISO date (YYYY-MM-DD): train is strictly before it, test at/"
+            "after (invariant #7) — the temporal split is pinned in the "
+            "Split Manifest the run mints"
+        ),
+    ),
+    assume_no_filters: bool = typer.Option(
+        False,
+        "--assume-no-filters",
+        help="Attest the mailbox has no labeling filters (GYB-only users)",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Replace an existing checkpoint. Retraining is human-gated "
+            "(ADR-0005): a silent overwrite would destroy the artifact a "
+            "graduated label serves from, so an existing checkpoint dir "
+            "refuses the run until --force is explicit. The replacement "
+            "is staging-based: the new checkpoint is built in "
+            "<dir>.tmp, its sidecar verified by readback, then swapped "
+            "in — a crash leaves the OLD checkpoint intact, an EMPTY "
+            "dir, or the NEW one; each state is refusal-safe, and no "
+            "stale encoder file can survive into the new dir"
+        ),
+    ),
+    device: str = typer.Option(
+        "cpu",
+        "--device",
+        help="Training device: cpu or cuda (single-device contract — a "
+        "multi-GPU host is refused; set CUDA_VISIBLE_DEVICES to one)",
+    ),
+) -> None:
+    """Fine-tune the encoder on the corpus; write checkpoint + sidecar.
+
+    Fully local (AC#6): the corpus comes from disk, the encoder weights
+    from a local path — no network at all. The run mints the Split
+    Manifest, rebuilds the examples THROUGH it (manifest mode — the
+    manifest is authoritative, invariant #7), trains behind the Model
+    seam, and writes the JSON Checkpoint Sidecar pinning the run's
+    identity (vocabulary hash, thresholds source, corpus fingerprint,
+    manifest hash, encoder id).
+    """
+    import os
+    import shutil
+    from datetime import UTC, date, datetime
+
+    from .corpus_record import corpus_fingerprint, preprocess_text
+    from .corpus_store import CorpusError, CorpusStore
+    from .dataset_build import BuildAbortedError, build_dataset
+    from .model import (
+        MANIFEST_FILENAME,
+        SIDECAR_FILENAME,
+        SIDECAR_FORMAT_VERSION,
+        THRESHOLDS_SOURCE_NONE,
+        CheckpointSidecar,
+        vocabulary_hash,
+    )
+
+    cfg = _load_config(config)
+    # strict DATE: time components are a usage error, not a split
+    try:
+        d = date.fromisoformat(split_date)
+    except ValueError:
+        typer.echo(
+            f"train failed: --split-date {split_date!r} is not an ISO date "
+            "(YYYY-MM-DD — no time component)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    split_dt = datetime(d.year, d.month, d.day, tzinfo=UTC)  # a date is a UTC instant
+    if device not in ("cpu", "cuda"):
+        typer.echo(
+            f"train failed: --device {device!r} must be 'cpu' or 'cuda'",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        typer.echo(
+            f"train failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset export/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    try:
+        records = list(store.iter_records())
+    except (CorpusError, OSError, UnicodeDecodeError):
+        typer.echo("train failed: records unreadable", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    if not records:
+        typer.echo(
+            "train failed: corpus is empty \u2014 run dataset export/import-gyb first",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    try:
+        posture, filters, id_to_name = _load_attribution(
+            store.root, assume_no_filters=assume_no_filters
+        )
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"train failed: snapshot unreadable ({type(e).__name__}: {e})",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    if posture in ("missing", "bridge-incomplete"):
+        # the build refuses (invariant #6) — name the REAL cause
+        detail = (
+            "no filters.json snapshot \u2014 run `dataset export` to "
+            "capture it, or --assume-no-filters to attest a filterless "
+            "mailbox"
+            if posture == "missing"
+            else "filters.json label ids are not all present in labels.json "
+            "(missing or stale bridge) \u2014 re-run `dataset export` to "
+            "refresh both"
+        )
+        typer.echo(f"train failed: build refused (invariant #6): {detail}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+
+    # the existing-checkpoint refusal is hoisted BEFORE the two
+    # corpus-scale build passes: a --force-less run on a 394k corpus
+    # must not pay the builds to learn it is refused
+    checkpoint_dir = cfg.model.checkpoint_dir
+    sidecar_path = checkpoint_dir / SIDECAR_FILENAME
+    if sidecar_path.is_file() and not force:
+        typer.echo(
+            f"train failed: checkpoint {checkpoint_dir} already exists "
+            "(sidecar present) \u2014 retraining is human-gated (ADR-0005); "
+            "pass --force to replace it",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    if checkpoint_dir.is_dir() and any(checkpoint_dir.iterdir()) and not force:
+        typer.echo(
+            f"train failed: checkpoint dir {checkpoint_dir} is not empty "
+            "\u2014 refusing to overwrite; pass --force to replace",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+
+    now = datetime.now(UTC)  # the CLI may read the clock; the core may not
+    try:
+        minted = build_dataset(
+            records,
+            filters=filters,
+            id_to_name=id_to_name,
+            now=now,
+            split_date=split_dt,
+            server_authoritative_only=True,
+        )
+        result = build_dataset(
+            records,
+            filters=filters,
+            id_to_name=id_to_name,
+            now=now,
+            split_date=split_dt,
+            manifest=minted.manifest,
+        )
+    except BuildAbortedError as e:
+        typer.echo(f"train failed: build refused (invariant #6): {e.reason}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"train failed: build refused: {e}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    # the minted example list is no longer needed (result carries the
+    # same manifest object) — drop it before the corpus-scale work below
+    del minted
+
+    train_ids = set(result.manifest.train_ids)
+    examples = [example for example in result.examples if example.id in train_ids]
+    if not examples:
+        typer.echo(
+            "train failed: no training examples before the split date \u2014 "
+            "pick a LATER --split-date (train is strictly before it)",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+
+    # preprocessing integrity (invariant #4): train and inference share
+    # corpus_record.preprocess_text — the subject + body the store keeps
+    by_id = {record.id: record for record in records}
+    missing_bodies = 0
+    texts: list[str] = []  # aligned to `examples` (index i ↔ examples[i])
+    try:
+        for example in examples:
+            body = store.get_body(example.id)
+            if body is None:
+                missing_bodies += 1  # an orphaned shard (crash residue)
+                body = ""
+            texts.append(preprocess_text(by_id[example.id].subject, body))
+    except (OSError, UnicodeDecodeError) as e:
+        # a corrupt/undecodable shard is an operation failure, not a bug
+        typer.echo(f"train failed: a body shard is unreadable: {e}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    if missing_bodies:
+        typer.echo(
+            f"WARNING: {missing_bodies} training record(s) had no body shard "
+            "— trained on subject + trailing newline (crash residue; "
+            "re-export to repair)",
+            err=True,
+        )
+    vocabulary = result.manifest.vocabulary
+
+    # staging-based replacement: the new checkpoint is built in
+    # <dir>.tmp, its identity verified by readback, then swapped in.
+    # Crash outcomes are each refusal-safe: mid-training → the OLD dir
+    # is intact (or nothing exists); between rmtree and rename → an
+    # EMPTY/absent dir (no identity); after rename → the NEW complete
+    # dir. No stale encoder file can survive into the new dir.
+    staging_dir = checkpoint_dir.with_name(checkpoint_dir.name + ".tmp")
+    try:
+        if staging_dir.exists():
+            # leftover from a crashed run: garbage, the real checkpoint
+            # dir is untouched — remove it
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(staging_dir, 0o700)  # BEFORE training: mail-derived
+        # weights must not sit world-readable in a crash window
+    except OSError as e:
+        typer.echo(f"train failed: checkpoint dir unusable: {e}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+
+    try:
+        model = _model_factory(cfg, examples, texts, vocabulary, staging_dir, device)
+    except ImportError as e:
+        # DECISION (both review families): the recipe's failure
+        # taxonomy is environment/operation, not code. ImportError
+        # (the optional `train` extra missing, or the recipe's own
+        # import broken by a version skew), ValueError/OSError (bad
+        # local weights, an unreadable file), and RuntimeError (a
+        # missing device) all map to exit 5 with the message echoed.
+        # Anything ELSE escaping (TypeError, AttributeError, ...) is a
+        # CODE BUG: it stays a traceback and exits 1, which the
+        # contract reserves for "unhandled crash — report it"
+        # (README).
+        typer.echo(
+            f"train failed: the model recipe is unavailable ({e}) \u2014 install "
+            "the optional extra: `uv sync --extra train` (if it is already "
+            "installed, the recipe import itself is broken — report it)",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        # recipe-level failures (bad local weights, a corrupt checkpoint,
+        # a missing device) are operation failures, not code bugs
+        typer.echo(f"train failed: {e}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    # the sidecar must describe the TRAINER'S product, not the CLI's
+    # claim: a vocabulary mismatch is a refusal, not a silent overwrite
+    if model.vocabulary != tuple(vocabulary):
+        typer.echo(
+            "train failed: the trainer's vocabulary does not match the "
+            "manifest's — refusing to write a lying sidecar",
+            err=True,
+        )
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+
+    sidecar = CheckpointSidecar(
+        format_version=SIDECAR_FORMAT_VERSION,
+        vocabulary_hash=vocabulary_hash(vocabulary),
+        thresholds_source=THRESHOLDS_SOURCE_NONE,
+        # TRAIN-SPLIT scoped: append-only corpus growth must not move
+        # the serving identity (#25's lifeline)
+        corpus_fingerprint=corpus_fingerprint(records, result.manifest.train_ids),
+        split_manifest_hash=result.manifest.content_hash,
+        encoder_id=cfg.model.encoder,
+    )
+    manifest_path = staging_dir / MANIFEST_FILENAME
+    sidecar_path = staging_dir / SIDECAR_FILENAME
+    try:
+        # the Split Manifest is materialized with the checkpoint: train/
+        # eval rebuild against it (invariant #7), and its content hash is
+        # independently verifiable against the sidecar
+        manifest_path.write_text(result.manifest.to_json(), encoding="utf-8")
+        os.chmod(manifest_path, 0o600)
+        sidecar_path.write_text(sidecar.to_json(), encoding="utf-8")
+        os.chmod(sidecar_path, 0o600)
+        # readback verification: the on-disk identity must parse and
+        # equal what we intended — a torn write is a refusal, not a
+        # served lie
+        if (
+            CheckpointSidecar.from_json(sidecar_path.read_text(encoding="utf-8"))
+            != sidecar
+        ):
+            typer.echo(
+                "train failed: sidecar readback mismatch — the on-disk "
+                "identity does not parse back to what was written",
+                err=True,
+            )
+            raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+        if checkpoint_dir.exists():
+            # --force: the old checkpoint is replaced WHOLESALE — stale
+            # encoder-specific files (tokenizer, weight shards) cannot
+            # survive into the new dir
+            shutil.rmtree(checkpoint_dir)
+        staging_dir.rename(checkpoint_dir)
+        os.chmod(checkpoint_dir, 0o700)
+    except OSError as e:
+        typer.echo(f"train failed: sidecar write failed: {e}", err=True)
+        raise typer.Exit(code=_TRAIN_ERROR_EXIT) from None
+    typer.echo(
+        f"train: examples={len(examples)} vocab={len(vocabulary)} "
+        f"checkpoint={checkpoint_dir} sidecar=ok"
+    )
 
 
 if __name__ == "__main__":

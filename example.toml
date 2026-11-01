@@ -32,3 +32,15 @@ dir = "./corpus"
 # Optional: path to an existing Got Your Back backup (contains
 # msg-db.sqlite) for `dataset import-gyb`.
 # path = "/mnt/backup/gmail"
+
+[model]
+# Encoder identifier — the Checkpoint Sidecar's encoder_id field.
+encoder = "deberta-v3-base"
+# LOCAL path to the encoder weights (a pre-downloaded HF-style dir).
+# Training downloads nothing — point this at weights you already have.
+# Required for `train`; optional until then.
+# encoder_path = "~/models/deberta-v3-base"
+# Where `train` writes the checkpoint dir (gitignored; the JSON sidecar
+# lands inside it). An existing checkpoint refuses a new run until you
+# pass --force (retraining is human-gated, ADR-0005).
+checkpoint_dir = "./checkpoints/latest"

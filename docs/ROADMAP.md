@@ -36,6 +36,12 @@ before Phase 1 trains.
 
 ## Phase 1 — train, eval, and the gates (nothing live)
 
+Landed so far: the temporal-split builder core with Filter-Authored
+exclusion and recency weighting (#18); the Model seam + `FakeModel`,
+checkpoint sidecar identity + loader refusal, the `train/` recipe
+(torch optional extra, smoke/gpu markers), and the `train` command
+(#19).
+
 Scope:
 
 - path-aware Label Path vocabulary (maintainer decision): classes are

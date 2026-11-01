@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Local CI parity: the gates .github/workflows/ci.yml runs, plus uv.lock
 # freshness checks around them. Required pre-push gate (AGENTS.md).
-# Coverage and the live-test exclusion come from pyproject addopts; a
+# Coverage comes from pyproject addopts; the live/smoke/gpu exclusions
+# are stated in the pytest -m flag below (which overrides addopts); a
 # targeted local run may pass --no-cov.
 # NOTE: cannot run from a git-archive export tree — the uv.lock git checks
 # at the bottom need a .git directory.
@@ -33,8 +34,10 @@ uv run --frozen ruff format --check .
 echo "== pyright"
 uv run --frozen pyright
 
-echo "== pytest + coverage (gate + live exclusion from pyproject addopts)"
-uv run --frozen pytest -m "not live"
+echo "== pytest + coverage (gate + opt-in exclusions from pyproject addopts)"
+# -m overrides addopts' marker expression, so the live/smoke/gpu
+# exclusions are stated here too (CI parity; the venv is torch-free).
+uv run --frozen pytest -m "not live and not smoke and not gpu"
 
 { git diff --exit-code uv.lock; git diff --cached --exit-code uv.lock; }
 

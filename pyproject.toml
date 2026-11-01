@@ -25,6 +25,21 @@ dependencies = [
     "httplib2>=0.22",
 ]
 
+[project.optional-dependencies]
+# The real encoder (ticket #19, ADR-0001): only the train/ recipe
+# imports these. CI and the importable core stay torch-free — the
+# opt-in smoke/gpu markers are excluded from every CI/local-ci run.
+train = [
+    "torch>=2.6",
+    # v5 line: the recipe uses v5's problem_type literal
+    # ("multi_label_classification") and loss_is_scaled_for_ga
+    "transformers>=5.22",
+    # Trainer HARD-requires accelerate (a clean install without it
+    # crashes the recipe on ImportError — verified on torch 2.15 /
+    # transformers 5.22.1)
+    "accelerate>=1.1.0",
+]
+
 [project.urls]
 Repository = "https://github.com/JessMorgan/gmail-labeler"
 Issues = "https://github.com/JessMorgan/gmail-labeler/issues"
@@ -45,13 +60,13 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gmail_labeler"]
+packages = ["src/gmail_labeler", "train"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/.agents", "/.github"]
 
 [tool.ruff]
-src = ["src", "tests"]
+src = ["src", "tests", "train"]
 target-version = "py312"
 extend-exclude = [".agents"]
 
@@ -60,13 +75,16 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The gate and the live-test exclusion (invariant #9) live here so a bare
-# `uv run pytest` cannot bypass either; coverage scope/level come from
-# [tool.coverage.*] below (single source of truth). Targeted local runs may
-# pass --no-cov; -m live overrides the exclusion on purpose.
-addopts = "-q --cov -m 'not live'"
+# The gate and the opt-in-test exclusions (invariant #9) live here so a
+# bare `uv run pytest` cannot bypass any of them; coverage scope/level
+# come from [tool.coverage.*] below (single source of truth). Targeted
+# local runs may pass --no-cov; -m live / -m smoke / -m gpu override
+# the exclusions on purpose.
+addopts = "-q --cov -m 'not live and not smoke and not gpu'"
 markers = [
     "live: tests that hit the real Gmail API (never run in CI; opt-in with -m live)",
+    "smoke: real-encoder CPU smoke — needs the optional `train` extra (torch); opt-in with -m smoke, excluded from CI",
+    "gpu: real-encoder GPU run — needs the optional `train` extra plus CUDA; opt-in with -m gpu, excluded from CI",
 ]
 
 [tool.coverage.run]
@@ -76,7 +94,7 @@ source = ["src/gmail_labeler"]
 fail_under = 80
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "train"]
 pythonVersion = "3.12"
 typeCheckingMode = "basic"
 # The pure core is held to strict (CODING-STANDARDS); list grows as modules land.
@@ -86,4 +104,5 @@ strict = [
     "src/gmail_labeler/mime_extract.py",
     "src/gmail_labeler/analyze.py",
     "src/gmail_labeler/dataset_build.py",
+    "src/gmail_labeler/model.py",
 ]

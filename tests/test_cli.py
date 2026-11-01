@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 
 import pytest
-import typer
 from typer.testing import CliRunner
 
 from gmail_labeler.cli import app
@@ -799,16 +798,6 @@ def test_analyze_long_labels_are_not_truncated(tmp_path: Path) -> None:
         ],
     )
     assert long_a in result.stdout and long_b in result.stdout
-
-
-def test_stub_helper_keeps_the_reserved_exit_3() -> None:
-    # deepseek MINOR: the exit-3 contract stays unit-pinned even with an
-    # empty stub surface (train/eval land on it in Phase 1)
-    import gmail_labeler.cli as cli
-
-    with pytest.raises(typer.Exit) as exc:
-        cli._stub("train")
-    assert exc.value.exit_code == 3
 
 
 def test_help_surface_is_clean() -> None:

@@ -77,17 +77,15 @@ def _golden_table() -> EvalTable:
 
 
 def _artifact(bands: Bands, **overrides: object) -> BandsArtifact:
+    # the eval identity (test_examples) and the default targets are
+    # DERIVED from the bands' provenance (calibrate_bands' inputs) —
+    # build_artifact no longer takes caller-told values
     kwargs: dict[str, object] = {
         "vocabulary": VOCAB,
         "corpus_fingerprint": CORPUS_FP,
         "split_manifest_hash": MANIFEST_HASH,
         "encoder_id": ENCODER,
         "split_date": SPLIT_DATE,
-        "test_examples": 4,
-        "default_targets": BandTargets(
-            min_high_precision=DEFAULT_MIN_HIGH_PRECISION,
-            min_med_precision=DEFAULT_MIN_MED_PRECISION,
-        ),
     }
     kwargs.update(overrides)
     return build_artifact(bands, **kwargs)  # type: ignore[arg-type]
@@ -96,8 +94,8 @@ def _artifact(bands: Bands, **overrides: object) -> BandsArtifact:
 # ---- the golden bands (hand-computed, independent of the code) ----
 #
 # Bills precision by threshold (tp/fp from the golden table):
-#   0.1: 2/4 = 0.5   0.2: 2/3   0.3: 2/3   0.4: 2/3   0.5: 1/2 = 0.5
-#   0.6: 1/1 = 1.0   0.7: 1.0   0.8: 1.0   0.9: 1.0
+#   0.1: 2/4 = 0.5   0.2: 2/4 = 0.5   0.3: 2/3   0.4: 2/3
+#   0.5: 1/2 = 0.5   0.6: 1/1 = 1.0   0.7: 1.0   0.8: 1.0   0.9: 1.0
 # Shipping precision:
 #   0.1: 1/4 = 0.25  0.2..0.5: 1/3   0.6: 1/2 = 0.5   0.7: 1.0   0.8: 1.0
 #   0.9: tp=0 fp=0 — UNDEFINED (the zero-denominator cell)
@@ -704,6 +702,87 @@ def test_artifact_from_json_refuses_tampered_hash() -> None:
         BandsArtifact.from_json(json.dumps(payload))
 
 
+def test_content_hash_covers_every_meaning_bearing_field() -> None:
+    # hash-coverage pin (mutation class M9/M10): flipping or removing
+    # EACH meaning-bearing field must change the content hash — a
+    # hash computed from a constant default_targets, or with reasons
+    # dropped from the payload, dies here
+    artifact = _artifact(calibrate_bands(_golden_table()))
+    base = artifact.compute_hash()
+    entries = artifact.labels
+    mutations: dict[str, BandsArtifact] = {
+        "format_version": _mutated(
+            artifact, format_version=artifact.format_version + 1
+        ),
+        "vocabulary_hash": _mutated(artifact, vocabulary_hash="1" * 64),
+        "corpus_fingerprint": _mutated(artifact, corpus_fingerprint="2" * 64),
+        "split_manifest_hash": _mutated(artifact, split_manifest_hash="3" * 64),
+        "encoder_id": _mutated(artifact, encoder_id="other-encoder"),
+        "split_date": _mutated(artifact, split_date=datetime(2026, 2, 1, tzinfo=UTC)),
+        "test_examples": _mutated(artifact, test_examples=999),
+        "candidate_thresholds": _mutated(
+            artifact, candidate_thresholds=artifact.candidate_thresholds[:-1]
+        ),
+        "default_targets": _mutated(artifact, default_targets=BandTargets(0.8, 0.7)),
+        "labels.high": _mutated(
+            artifact,
+            labels=(
+                dataclasses.replace(entries[0], high=0.8),
+                *entries[1:],
+            ),
+        ),
+        "labels.reasons": _mutated(
+            artifact,
+            labels=(
+                dataclasses.replace(
+                    entries[1], reasons=("no-candidate-meets-high-target",)
+                ),
+                *entries[2:],
+            ),
+        ),
+    }
+    for field, mutated in mutations.items():
+        assert mutated.compute_hash() != base, field
+
+
+def test_reason_order_is_canonical_in_the_hash() -> None:
+    # one meaning, one identity: the hash serializes reasons SORTED,
+    # so a reversed-reasons artifact is byte-identical and validates —
+    # validate's sorted comparison and the hash agree (both
+    # directions: the reversed order validates, and the serialization
+    # is byte-stable)
+    examples = [_ex(0, ())]
+    scores = {"0000000000000000": (0.0, 0.0)}
+    table = eval_metrics(examples, scores, vocabulary=VOCAB)
+    bands = calibrate_bands(table)
+    a1 = _artifact(bands)
+    assert all(entry.reasons for entry in a1.labels)  # no-band state
+    reversed_entries = tuple(
+        dataclasses.replace(entry, reasons=entry.reasons[::-1]) for entry in a1.labels
+    )
+    a2 = dataclasses.replace(a1, labels=reversed_entries)
+    assert a2.compute_hash() == a1.content_hash  # same meaning, same hash
+    a2.validate()  # the reversed order validates (the sorted comparison)
+    assert a2.to_json() == a1.to_json()  # byte-identical
+
+
+def test_artifact_blank_encoder_id_refused() -> None:
+    # an empty/blank encoder_id would verify against an equally empty
+    # expectation — refused at validate, not "verified"
+    artifact = _artifact(calibrate_bands(_golden_table()))
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="encoder_id"):
+            _mutated(artifact, encoder_id=bad).validate()
+
+
+def test_artifact_from_json_refuses_blank_label_key() -> None:
+    artifact = _artifact(calibrate_bands(_golden_table()))
+    payload = json.loads(artifact.to_json())
+    payload["labels"][0]["label"] = "  "
+    with pytest.raises(ValueError, match="label"):
+        BandsArtifact.from_json(json.dumps(payload))
+
+
 # ---- identity verification (the refusal contract, AC2) ----
 
 
@@ -758,6 +837,18 @@ def test_verify_bands_each_field_refused_independently(
     assert field in str(excinfo.value)
 
 
+def test_verify_bands_naive_split_date_is_a_caller_bug() -> None:
+    # a naive split_date (or a bare date) is a CALLER bug, not
+    # identity drift: build_artifact's naive refusal, mirrored — a
+    # plain ValueError naming it, never a BandsRefusedError with the
+    # "re-run eval --bands" remedy
+    artifact = _artifact(calibrate_bands(_golden_table()))
+    for bad in (SPLIT_DATE.replace(tzinfo=None), SPLIT_DATE.date()):
+        with pytest.raises(ValueError, match="caller bug") as ei:
+            _verify_with(artifact, {"split_date": bad})
+        assert not isinstance(ei.value, BandsRefusedError)
+
+
 def test_verify_bands_all_disagreements_named() -> None:
     # no first-fail: every disagreeing field is collected and named in
     # one refusal
@@ -785,6 +876,22 @@ def test_build_artifact_requires_aware_split_date() -> None:
             split_manifest_hash=MANIFEST_HASH,
             encoder_id=ENCODER,
             split_date=SPLIT_DATE.replace(tzinfo=None),
-            test_examples=4,
-            default_targets=BandTargets(0.9, 0.7),
         )
+
+
+def test_build_artifact_derives_provenance_from_bands() -> None:
+    # the eval identity (test_examples) and the default targets are
+    # DERIVED from the calibration's provenance (calibrate_bands'
+    # inputs) — a caller cannot tell build_artifact a lying identity
+    table = _golden_table()
+    bands = calibrate_bands(table, min_high_precision=0.5)
+    artifact = build_artifact(
+        bands,
+        vocabulary=VOCAB,
+        corpus_fingerprint=CORPUS_FP,
+        split_manifest_hash=MANIFEST_HASH,
+        encoder_id=ENCODER,
+        split_date=SPLIT_DATE,
+    )
+    assert artifact.test_examples == table.test_examples == 4
+    assert artifact.default_targets == BandTargets(0.5, 0.7)

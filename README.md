@@ -273,9 +273,10 @@ a `shadow report` would say "no runs recorded"), and a would-apply
 refusal (a lying score/band, a graduated System Label, a missing bands
 entry) refuses with exit 5 ("would-apply refused"). Refusals up front
 (exit 2, before any work): an empty `--bands` / `--graduation` /
-`--query` / `--db`, a non-ISO `--since`, and a `--db` path inside the
-checkpoint dir or the corpus store (by resolved path — the state DB
-must not live beside identity files). The summary goes to stderr;
+`--query` / `--db`, a non-ISO `--since`, `--limit <= 0`, and the state
+DB path — `--db PATH` or `[store] db_path` — inside the checkpoint dir
+or the corpus store (by resolved path, named by its source — the state
+DB must not live beside identity files). The summary goes to stderr;
 `--json` emits one parseable object. `shadow
 report` diffs a run's stored verdicts against the mailbox's ACTUAL
 labels (re-fetched via the read path — the labels may have changed
@@ -286,8 +287,9 @@ NOT-APPLIED outcomes and a per-label summary carrying the would-be
 tier mix. `--run` picks a specific run (default: the latest); `--db
 PATH` overrides `[store] db_path` the same way as for `shadow run`
 (`~` expanded, a relative `--db` anchors to the CWD). Refusals up front
-(exit 2, before any work): an empty `--run` / `--db`, and a `--db`
-path inside the checkpoint dir or the corpus store (by resolved path).
+(exit 2, before any work): an empty `--run` / `--db`, and the state DB
+path — `--db PATH` or `[store] db_path` — inside the checkpoint dir or
+the corpus store (by resolved path, named by its source).
 Config error -> exit 4; a no-DB / unknown-run / transport failure ->
 exit 5.
 Message bodies never enter the DB, the report, or any log path

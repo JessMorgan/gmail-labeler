@@ -104,6 +104,21 @@ def _write_secret_tight(path: Path, text: str) -> None:
         fh.write(text)
 
 
+def _write_bands_artifact(path: Path, text: str) -> None:
+    """Write the Bands Artifact (ticket #21): 0600 from creation,
+    staging + atomic replace (train's pattern) — a failure leaves any
+    PREVIOUS artifact intact, and no fd can leak. Replacing an
+    EXISTING artifact is announced on stderr (the #20 ``--out`` NOTICE
+    — a silent clobber of a typo'd path would be a lie). The ONLY
+    writer of the artifact in the package (recompute posture, AC4 —
+    pinned by ``test_only_eval_writes_the_bands_artifact``)."""
+    if path.exists():
+        typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
+    staging = Path(str(path) + ".tmp")
+    _write_secret_tight(staging, text)
+    os.replace(staging, str(path))  # atomic on POSIX
+
+
 def _load_config(config: str | None):
     from .config import ConfigError, load_config
 
@@ -894,6 +909,12 @@ def eval(
     as_json: bool = typer.Option(
         False, "--json", help="Machine-readable output (graduation workflows)"
     ),
+    bands: str | None = typer.Option(
+        None,
+        "--bands",
+        help="Write the calibrated Threshold Bands artifact to PATH "
+        "(opt-in; replacing an existing file is announced)",
+    ),
 ) -> None:
     """Score the temporal test split; report per-label P/R at candidate
     thresholds.
@@ -904,6 +925,14 @@ def eval(
     is pinned, never re-derived, so there is no --split-date);
     predictions run through the Model seam. Nothing goes near the
     mailbox: the report is labels, counts, and probabilities only.
+
+    ``--bands`` is the deliberate act that calibrates the per-label
+    Threshold Bands from the measured table and writes the versioned
+    artifact (ticket #21) — bound to the checkpoint + eval identity,
+    with the config's per-label band overrides applied. It is opt-in
+    (human-gated, ADR-0005: writing/updating the serving bands is a
+    decision, never a side effect of a report run); ``eval`` alone
+    never writes it.
     """
     import contextlib
     from datetime import UTC, datetime
@@ -921,6 +950,20 @@ def eval(
     )
 
     cfg = _load_config(config)
+    # usage refusals up front (exit 2, before any corpus-scale work):
+    # an empty --bands would degenerate to Path("") and fail awkwardly
+    # mid-run; --bands and --out naming the same file would let the
+    # artifact write silently destroy the report
+    if bands is not None:
+        if not bands.strip():
+            typer.echo("eval failed: --bands PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+        if out is not None and Path(bands).resolve() == Path(out).resolve():
+            typer.echo(
+                "eval failed: --bands and --out must name different files",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         typer.echo(
@@ -1177,6 +1220,78 @@ def eval(
                 staging.unlink()  # best-effort staging cleanup
             typer.echo(f"eval failed: cannot write --out: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    # the deliberate calibration act (ticket #21, opt-in): the measured
+    # table → per-label Threshold Bands → the versioned artifact bound
+    # to the checkpoint + eval identity. Rendered AFTER the report (the
+    # report is never lost — a calibration refusal, e.g. an override
+    # for a label the vocabulary does not carry, is exit 5 with the
+    # report already on stdout); the write is the ONLY artifact writer
+    # in the package (recompute posture, AC4).
+    if bands is not None:
+        from .thresholds import (
+            BandTargets,
+            build_artifact,
+            calibrate_bands,
+        )
+
+        overrides = {
+            label: BandTargets(
+                min_high_precision=(
+                    override.min_high_precision
+                    if override.min_high_precision is not None
+                    else cfg.bands.min_high_precision
+                ),
+                min_med_precision=(
+                    override.min_med_precision
+                    if override.min_med_precision is not None
+                    else cfg.bands.min_med_precision
+                ),
+            )
+            for label, override in cfg.bands.per_label.items()
+        }
+        try:
+            calibrated = calibrate_bands(
+                table,
+                min_high_precision=cfg.bands.min_high_precision,
+                min_med_precision=cfg.bands.min_med_precision,
+                overrides=overrides or None,
+            )
+            artifact = build_artifact(
+                calibrated,
+                vocabulary=manifest.vocabulary,
+                corpus_fingerprint=expected.corpus_fingerprint,
+                split_manifest_hash=manifest.content_hash,
+                encoder_id=cfg.model.encoder,
+                split_date=manifest.split_date,
+                test_examples=table.test_examples,
+                default_targets=BandTargets(
+                    min_high_precision=cfg.bands.min_high_precision,
+                    min_med_precision=cfg.bands.min_med_precision,
+                ),
+            )
+        except (ValueError, OSError) as e:
+            typer.echo(f"eval failed: band calibration refused: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        try:
+            _write_bands_artifact(Path(bands), artifact.to_json())
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                Path(str(bands) + ".tmp").unlink()  # best-effort staging cleanup
+            typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        # the human-readable summary (the text-report mode only — the
+        # --json payload is the machine-readable output, and the
+        # artifact file is the machine-readable bands)
+        if not as_json:
+            typer.echo(
+                "bands: "
+                + "; ".join(
+                    f"{lb.label} high={lb.high if lb.high is not None else 'none'} "
+                    f"med={lb.med if lb.med is not None else 'none'}"
+                    + (f" ({', '.join(lb.reasons)})" if lb.reasons else "")
+                    for lb in calibrated.labels
+                )
+            )
 
 
 if __name__ == "__main__":

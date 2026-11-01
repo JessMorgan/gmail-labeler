@@ -163,7 +163,15 @@ split-provenance header (split date + manifest hash — a saved report
 is never indistinguishable from a stale one), to stdout by default,
 `--out PATH` for the same bytes in a file (replacing an existing file
 is announced on stderr), and `--json` for the machine-readable
-payload; message bodies never enter it.
+payload; message bodies never enter it. `eval --bands PATH` is the
+deliberate act that calibrates the per-label Threshold Bands from the
+measured table (high/med per label, per-label min-precision targets
+from the config's `[bands]` section) and writes the versioned Bands
+Artifact — bound to the checkpoint + eval identity, byte-identical
+for the same eval, and refused by its consumers on any identity
+disagreement. It is opt-in: a bare `eval` never writes it
+(human-gated, ADR-0005), and it is the only writer — `train`/`eval`
+remain the only recomputers.
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.

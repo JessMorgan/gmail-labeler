@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from gmail_labeler.corpus_record import CorpusRecord, DateProvenance, body_hash
 from gmail_labeler.dataset_build import BuildResult, SplitManifest, build_dataset
@@ -20,12 +22,13 @@ def _rec(
     days_ago: int = 1,
     date: datetime | None = None,
     provenance: DateProvenance = "internal_date",
+    sender: str = "x@y.z",
 ) -> CorpusRecord:
     return CorpusRecord(
         id=f"{i:016x}",
         date=date if date is not None else NOW - timedelta(days=days_ago),
         subject="hello",
-        sender="x@y.z",
+        sender=sender,
         recipients=("me@x.y",),
         labels=labels,
         body_hash=body_hash(f"unique body {i}"),
@@ -37,12 +40,16 @@ def _rec(
 def _build(
     recs: list[CorpusRecord],
     *,
+    filters: Sequence[Mapping[str, object]] = (),
+    id_to_name: Mapping[str, str] | None = None,
     split_date: datetime = SPLIT,
     manifest: SplitManifest | None = None,
     server_authoritative_only: bool = False,
 ) -> BuildResult:
     return build_dataset(
         recs,
+        filters=filters,
+        id_to_name=id_to_name if id_to_name is not None else {},
         now=NOW,
         split_date=split_date,
         manifest=manifest,
@@ -163,14 +170,26 @@ def test_naive_split_date_rejected() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="split_date"):
-        build_dataset([_rec(1, ("A",))], now=NOW, split_date=datetime(2026, 1, 1))
+        build_dataset(
+            [_rec(1, ("A",))],
+            filters=[],
+            id_to_name={},
+            now=NOW,
+            split_date=datetime(2026, 1, 1),
+        )
 
 
 def test_naive_now_rejected() -> None:
     import pytest
 
     with pytest.raises(ValueError, match="timezone-aware"):
-        build_dataset([_rec(1, ("A",))], now=datetime(2026, 1, 1), split_date=SPLIT)
+        build_dataset(
+            [_rec(1, ("A",))],
+            filters=[],
+            id_to_name={},
+            now=datetime(2026, 1, 1),
+            split_date=SPLIT,
+        )
 
 
 def test_duplicate_record_id_rejected() -> None:
@@ -221,9 +240,8 @@ def test_manifest_determinism_byte_identical() -> None:
     assert r1.manifest.content_hash == r2.manifest.content_hash
     assert r1.manifest.to_json() == r2.manifest.to_json()  # byte-identical
     assert r1.examples == r2.examples
-    # all 20 records fall inside the recency window (cutoff 2024-10-30),
-    # so every weight is the in-window value 1.0 — this guards the
-    # in-window weight, not a "flat until weighting lands" default
+    # the fixture's 20 records all fall inside the recency window, so
+    # weights pin to its in-window value 1.0
     assert all(e.weight == 1.0 for e in r1.examples)
 
 
@@ -536,6 +554,299 @@ def test_split_is_purely_temporal_not_order_or_rng_dependent() -> None:
         result = _build(shuffled)
         assert set(result.manifest.train_ids) == expected_train
         assert set(result.manifest.test_ids) == expected_test
+
+
+# ---- Filter-Authored exclusion (invariant #6) ----
+
+
+def _filt(criteria: object, label_id: str = "L1") -> dict[str, object]:
+    f: dict[str, object] = {"action": {"addLabelIds": [label_id]}}
+    if criteria is not None:
+        f["criteria"] = criteria
+    return f
+
+
+def test_missing_snapshot_aborts_build() -> None:
+    # mirrors test_no_snapshot_withholds_everything: analyze withholds,
+    # the builder ABORTS — training on filter-covered signal is louder
+    # than a report row
+    import pytest
+
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    with pytest.raises(BuildAbortedError) as exc:
+        build_dataset(
+            [_rec(1, ("A",))], filters=None, id_to_name={}, now=NOW, split_date=SPLIT
+        )
+    assert exc.value.reason == "no-filter-snapshot"
+
+
+def test_bridge_incomplete_aborts_build() -> None:
+    # a filter whose label id is not resolvable through the id→name map:
+    # its filter-authored label would surface as trainable signal
+    import pytest
+
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    with pytest.raises(BuildAbortedError) as exc:
+        build_dataset(
+            [_rec(1, ("A",))],
+            filters=[_filt({"from": "x@y.z"}, "ZZ")],
+            id_to_name={},  # ZZ unresolvable
+            now=NOW,
+            split_date=SPLIT,
+        )
+    assert exc.value.reason == "bridge-incomplete"
+
+
+def test_filter_covered_evidence_excluded_per_message() -> None:
+    # half the records are from cov@x.z → their "Cov" evidence is
+    # excluded; the rest keep it
+    recs = [
+        _rec(i, ("Cov",), sender="cov@x.z" if i % 2 else "oth@x.z") for i in range(1, 9)
+    ]
+    result = _build(
+        recs, filters=[_filt({"from": "cov@x.z"})], id_to_name={"L1": "Cov"}
+    )
+    labeled = {e.id: e.labels for e in result.examples}
+    for i in range(1, 9):
+        expected = () if i % 2 else ("Cov",)
+        assert labeled[f"{i:016x}"] == expected
+    # Cov still has evidence → stays in the vocabulary
+    assert result.manifest.vocabulary == ("Cov",)
+
+
+def test_unverifiable_filter_excludes_whole_label() -> None:
+    # query criteria cannot be simulated → ALL of the label's evidence
+    # is excluded (exclusion, not guessing — analyze's doctrine)
+    recs = [_rec(i, ("Q",)) for i in range(1, 5)]
+    result = _build(recs, filters=[_filt({"query": "ql"})], id_to_name={"L1": "Q"})
+    assert all(e.labels == () for e in result.examples)
+    assert result.manifest.vocabulary == ()  # no evidence → no class
+
+
+def test_malformed_criteria_excludes_whole_label() -> None:
+    result = _build([_rec(1, ("M",))], filters=[_filt("junk")], id_to_name={"L1": "M"})
+    assert result.examples[0].labels == ()
+
+
+def test_match_all_filter_covers_every_message() -> None:
+    recs = [_rec(i, ("C",)) for i in range(1, 4)]
+    result = _build(recs, filters=[_filt({})], id_to_name={"L1": "C"})
+    assert all(e.labels == () for e in result.examples)
+
+
+def test_exclusion_leaves_other_labels() -> None:
+    result = _build(
+        [_rec(1, ("Cov", "Other"), sender="cov@x.z")],
+        filters=[_filt({"from": "cov@x.z"})],
+        id_to_name={"L1": "Cov"},
+    )
+    assert result.examples[0].labels == ("Other",)
+
+
+def test_filter_touching_label_absent_from_corpus_is_inert() -> None:
+    # the id IS resolvable (bridge complete) but no record carries the
+    # label: no abort, no effect
+    result = _build(
+        [_rec(1, ("A",))],
+        filters=[_filt({"from": "x@y.z"})],
+        id_to_name={"L1": "Ghost"},
+    )
+    assert result.examples[0].labels == ("A",)
+    assert result.manifest.vocabulary == ("A",)
+
+
+def test_filter_without_add_label_ids_is_inert() -> None:
+    result = _build(
+        [_rec(1, ("A",))],
+        filters=[{"criteria": {"from": "x@y.z"}, "action": {}}],
+        id_to_name={},
+    )
+    assert result.examples[0].labels == ("A",)
+
+
+def test_malformed_action_shape_aborts() -> None:
+    # unreadable bindings must not contribute zero ids and let the
+    # filter's label surface as trainable signal (the cli.py guard,
+    # deepseek CRITICAL precedent)
+    import pytest
+
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    for bad in (
+        {"criteria": {"from": "x@y.z"}, "action": "junk"},
+        {"criteria": {"from": "x@y.z"}, "action": {"addLabelIds": "L1"}},
+        {"criteria": {"from": "x@y.z"}, "action": {"addLabelIds": ["L1", 42]}},
+    ):
+        with pytest.raises(BuildAbortedError) as exc:
+            build_dataset(
+                [_rec(1, ("A",))],
+                filters=[bad],
+                id_to_name={"L1": "A"},
+                now=NOW,
+                split_date=SPLIT,
+            )
+        assert exc.value.reason == "bridge-malformed"
+
+
+def test_blank_mapped_name_is_bridge_incomplete() -> None:
+    # labels.py: a blank mapped name is namespaced id: — it must never
+    # enter the vocabulary, so the filter's binding is unresolvable
+    import pytest
+
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    with pytest.raises(BuildAbortedError) as exc:
+        build_dataset(
+            [_rec(1, ("A",))],
+            filters=[_filt({"from": "x@y.z"})],
+            id_to_name={"L1": "  "},
+            now=NOW,
+            split_date=SPLIT,
+        )
+    assert exc.value.reason == "bridge-incomplete"
+
+
+def test_non_mapping_filter_element_aborts_malformed() -> None:
+    # a filter element that is not a Mapping is bridge-malformed (the
+    # abort classes are totalized — no raw AttributeError escapes)
+    import pytest
+
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    with pytest.raises(BuildAbortedError) as exc:
+        build_dataset(
+            [_rec(1, ("A",))],
+            filters=cast(Sequence[Mapping[str, object]], ["not-a-mapping"]),
+            id_to_name={},
+            now=NOW,
+            split_date=SPLIT,
+        )
+    assert exc.value.reason == "bridge-malformed"
+
+
+def test_build_aborted_error_is_a_value_error() -> None:
+    # BuildAbortedError subclasses ValueError so a CLI mapping (#19/#25)
+    # catches the whole build-refusal family with one `except ValueError`
+    from gmail_labeler.dataset_build import BuildAbortedError
+
+    assert issubclass(BuildAbortedError, ValueError)
+
+
+def test_exclusion_observability_fields() -> None:
+    # wholly-excluded classes leave a trace (label, reason); records that
+    # had labels but came out all-negative are counted (item 16)
+    recs = [
+        _rec(1, ("Q", "Other")),  # Q unverifiable → excluded; Other kept
+        _rec(2, ("Q",)),  # Q unverifiable → emptied (all-negative)
+    ]
+    result = _build(recs, filters=[_filt({"query": "ql"})], id_to_name={"L1": "Q"})
+    assert result.excluded_classes == (("Q", "unverifiable"),)
+    assert result.emptied_examples == 1  # only record 2 came out all-negative
+    # malformed criteria → reason "malformed"
+    result2 = _build([_rec(1, ("M",))], filters=[_filt("junk")], id_to_name={"L1": "M"})
+    assert result2.excluded_classes == (("M", "malformed"),)
+    assert result2.emptied_examples == 1
+
+
+def test_manifest_mode_exclusion_reproduces_identically() -> None:
+    # positive reproduction (item 17): identical bridge + manifest →
+    # identical excluded examples (not just the drift-refusal pins)
+    recs = [
+        _rec(i, ("Cov",), sender="cov@x.z" if i % 2 else "oth@x.z") for i in range(1, 9)
+    ]
+    first = _build(recs, filters=[_filt({"from": "cov@x.z"})], id_to_name={"L1": "Cov"})
+    result = _build(
+        recs,
+        manifest=first.manifest,
+        filters=[_filt({"from": "cov@x.z"})],
+        id_to_name={"L1": "Cov"},
+    )
+    assert result.examples == first.examples
+    assert result.excluded_classes == first.excluded_classes
+    assert result.emptied_examples == first.emptied_examples
+    assert result.manifest == first.manifest
+
+
+def test_manifest_mode_refuses_referenced_bridge_change() -> None:
+    # a change to a REFERENCED filter (the "stricter snapshot silently
+    # empties a declared class" direction) is drift → refuse the rebuild
+    recs = [_rec(1, ("Cov",), sender="cov@x.z")]
+    manifest = _build(
+        recs, filters=[_filt({"from": "cov@x.z"})], id_to_name={"L1": "Cov"}
+    ).manifest
+    import pytest
+
+    with pytest.raises(ValueError, match="bridge_hash"):
+        _build(
+            recs,
+            manifest=manifest,
+            filters=[_filt({"query": "q"})],
+            id_to_name={"L1": "Cov"},
+        )
+
+
+def test_bridge_hash_insensitive_to_nonsemantic_variation() -> None:
+    # canonical _bridge_hash (item 12): non-semantic variation must NOT
+    # invalidate the manifest — filter reorder, an unreferenced-label
+    # rename, and an unreferenced-id addition all give the same hash
+    recs = [_rec(1, ("Cov",), sender="cov@x.z")]
+    f1 = _filt({"from": "cov@x.z"})
+    f2 = _filt({"to": "me@x.y"})
+    base = _build(recs, filters=[f1, f2], id_to_name={"L1": "Cov", "L2": "Ghost"})
+    # filter reorder: same effective bridge
+    assert (
+        _build(
+            recs, filters=[f2, f1], id_to_name={"L1": "Cov", "L2": "Ghost"}
+        ).manifest.bridge_hash
+        == base.manifest.bridge_hash
+    )
+    # unreferenced-label rename (L2 "Ghost" → "Phantom", not referenced)
+    assert (
+        _build(
+            recs, filters=[f1, f2], id_to_name={"L1": "Cov", "L2": "Phantom"}
+        ).manifest.bridge_hash
+        == base.manifest.bridge_hash
+    )
+    # unreferenced-id addition (L3, not referenced by any filter)
+    assert (
+        _build(
+            recs,
+            filters=[f1, f2],
+            id_to_name={"L1": "Cov", "L2": "Ghost", "L3": "New"},
+        ).manifest.bridge_hash
+        == base.manifest.bridge_hash
+    )
+    # and the rebuild against the manifest is accepted for all of them
+    for id_to_name in (
+        {"L1": "Cov", "L2": "Ghost"},
+        {"L1": "Cov", "L2": "Phantom"},
+        {"L1": "Cov", "L2": "Ghost", "L3": "New"},
+    ):
+        result = _build(
+            recs,
+            manifest=base.manifest,
+            filters=[f1, f2],
+            id_to_name=id_to_name,
+        )
+        assert result.manifest == base.manifest
+
+
+def test_bridge_hash_refuses_referenced_label_rename() -> None:
+    # a REFERENCED label rename (id_to_name[L1]: "Cov" → "Cov2") IS drift —
+    # the id→name value is part of the effective bridge, so the hash owns
+    # this class (a mutant that hashes ids-only would let it through; the
+    # vocabulary-drift backstop is separate and must not be the only guard)
+    recs = [_rec(1, ("Cov",), sender="cov@x.z")]
+    f1 = _filt({"from": "cov@x.z"})
+    base = _build(recs, filters=[f1], id_to_name={"L1": "Cov"})
+    renamed = _build(recs, filters=[f1], id_to_name={"L1": "Cov2"})
+    assert renamed.manifest.bridge_hash != base.manifest.bridge_hash
+    import pytest
+
+    with pytest.raises(ValueError, match="bridge_hash"):
+        _build(recs, manifest=base.manifest, filters=[f1], id_to_name={"L1": "Cov2"})
 
 
 # ---- empty corpus ----

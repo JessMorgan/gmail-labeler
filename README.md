@@ -214,7 +214,13 @@ post-write readback fault — the on-disk bytes do not parse back to a
 valid table (a torn/corrupt write); and a readback mismatch — a valid
 table whose content hash differs (a concurrent writer published a
 different table). Config error → exit 4 (an out-of-range gate value,
-a raw bool/string). `train`/`eval` remain the only recomputers, and
+a raw bool/string). With `--json` the proposal rides in the payload
+under the `graduation` key (stdout stays exactly one parseable JSON
+object); on a post-report refusal the base payload (the report,
+without the proposal) is emitted first — the report is never lost on
+stdout. The `--out` file lands before the serving-gate acts, so a run
+that later refuses still replaces a previous report file.
+`train`/`eval` remain the only recomputers, and
 only the confirm path writes the table.
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`

@@ -114,8 +114,13 @@ def _write_out_report(out: str, file_text: str) -> None:
     report at the path intact, and no fd can leak. Replacing an
     EXISTING file is announced on stderr — a silent clobber of a
     typo'd path would be a lie (train refuses overwrites; --force is
-    overkill for a regenerable report). Raises OSError on failure
-    (the caller maps it to exit 5)."""
+    overkill for a regenerable report). The report file lands BEFORE
+    the serving-gate acts (bands/graduation), so a run that later
+    refuses (a degraded corpus, a calibration refusal, a write
+    failure) still REPLACES a previous report file — the report is
+    the run's output, and the refusal is about the artifacts, not the
+    report. Raises OSError on failure (the caller maps it to exit
+    5)."""
     target = Path(out)
     if target.exists():
         typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
@@ -1492,43 +1497,44 @@ def eval(
             except OSError as e:
                 typer.echo(f"eval failed: cannot write --out: {e}", err=True)
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
     # --json: the payload dump (and the --out write) is deferred until
     # after the serving-gate computation below, so the graduation
     # proposal can ride in the payload; on a post-report refusal the
     # BASE payload (the report, without the proposal) is emitted first
     # — the report is never lost (stdout stays exactly one parseable
-    # JSON object; the diff lines are on stderr, never stdout)
-    base_payload = {
-        "trust": trust,
-        # split identity: two reports from different splits (or a
-        # retrain) must be tellable apart by the consumer (#22)
-        "split_date": manifest.split_date.isoformat(),
-        "split_manifest_hash": manifest.content_hash,
-        "test_examples": table.test_examples,
-        "thresholds": list(table.thresholds),
-        "rows": [
-            {
-                "label": row.label,
-                "support": row.support,
-                "cells": [
-                    {
-                        "threshold": t,
-                        "tp": cell.tp,
-                        "fp": cell.fp,
-                        "fn": cell.fn,
-                        "precision": cell.precision,
-                        "recall": cell.recall,
-                    }
-                    for t, cell in zip(table.thresholds, row.cells, strict=True)
-                ],
-            }
-            for row in table.rows
-        ],
-    }
-
+    # JSON object; the diff lines are on stderr, never stdout). The
+    # payload is built LAZILY inside the emitter (called at most once
+    # per run) — a text run never pays for the row/cell tree.
     def _emit_json_payload(proposal: dict[str, object] | None = None) -> None:
         nonlocal file_text
-        payload = dict(base_payload)
+        payload: dict[str, object] = {
+            "trust": trust,
+            # split identity: two reports from different splits (or a
+            # retrain) must be tellable apart by the consumer (#22)
+            "split_date": manifest.split_date.isoformat(),
+            "split_manifest_hash": manifest.content_hash,
+            "test_examples": table.test_examples,
+            "thresholds": list(table.thresholds),
+            "rows": [
+                {
+                    "label": row.label,
+                    "support": row.support,
+                    "cells": [
+                        {
+                            "threshold": t,
+                            "tp": cell.tp,
+                            "fp": cell.fp,
+                            "fn": cell.fn,
+                            "precision": cell.precision,
+                            "recall": cell.recall,
+                        }
+                        for t, cell in zip(table.thresholds, row.cells, strict=True)
+                    ],
+                }
+                for row in table.rows
+            ],
+        }
         if proposal is not None:
             # the proposal rides in the payload (the machine-readable
             # diff surface — the diff lines stay on stderr)
@@ -1715,6 +1721,10 @@ def eval(
                     err=True,
                 )
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+            # the proposal (the machine-readable diff surface) — parsed
+            # ONCE, shared by the success emit and the write-failure
+            # emits (no re-parse of the just-serialized text)
+            proposal = json.loads(new_table.to_json())
             # the human-confirm diff (ADR-0005): old → new per label,
             # on STDERR (the report/--out byte-identity stays literally
             # true — the diff is status, not report content). The
@@ -1758,7 +1768,7 @@ def eval(
                     if as_json:
                         # the report is never lost — and the proposal
                         # rides (the computation succeeded)
-                        _emit_json_payload(json.loads(table_text))
+                        _emit_json_payload(proposal)
                     typer.echo(f"eval failed: --graduation refused: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
                 except OSError as e:
@@ -1767,15 +1777,13 @@ def eval(
                     if as_json:
                         # the report is never lost — and the proposal
                         # rides (the computation succeeded)
-                        _emit_json_payload(json.loads(table_text))
+                        _emit_json_payload(proposal)
                     typer.echo(f"eval failed: cannot write --graduation: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         if as_json:
             # the success path: the payload carries the proposal when
             # the graduation table was computed
-            _emit_json_payload(
-                json.loads(new_table.to_json()) if graduation is not None else None
-            )
+            _emit_json_payload(proposal if graduation is not None else None)
     elif as_json:
         # no serving-gate flags: the base payload (the report)
         _emit_json_payload()

@@ -13,6 +13,7 @@ kill for the after-write row.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -27,11 +28,12 @@ from typing import Any
 import pytest
 
 from gmail_labeler.appdb import AppDB, AppDBError
-from gmail_labeler.daemon import ServingContext, daemon_loop
+from gmail_labeler.daemon import ServingContext, bootstrap_cursor, daemon_loop
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import HistoryPage, LabelInfo
 from gmail_labeler.gmail_errors import (
     GmailAuthError,
+    GmailPermanentError,
     GmailResyncError,
     GmailTransientError,
 )
@@ -419,15 +421,22 @@ def test_expired_cursor_resyncs_via_bootstrap(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # the 404 arm PER THE TAXONOMY (checked, not invented): the fake's
-    # start-outside-window GmailPermanentError(status=404) routes to the
+    # out-of-date-window GmailPermanentError(status=404) routes to the
     # re-bootstrap — via the export prior-art path, named warning,
-    # cursor re-established, gap mail NOT processed
+    # cursor re-established, gap mail NOT processed. F1 moved this onto
+    # the REAL expiry direction: the daemon down past retention leaves
+    # the cursor BEHIND the floor (the ahead-of-mailbox arm stays
+    # fake-level pinned; the injected-GmailResyncError adapter test
+    # below keeps its own route)
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
-        messages=_messages(), labels=_labels(), current_history_id=800
+        messages=_messages(),
+        labels=_labels(),
+        current_history_id=900,
+        retention_floor=700,
     )
     db = _db(tmp_path)
-    db.set_history_cursor(900)  # ahead of the retained window → typed 404
+    db.set_history_cursor(400)  # BEHIND the retained window → out-of-date 404
     assert _run(tmp_path, fake, db=db) == 0
     assert "expired" in caplog.text
     assert "NOT processed" in caplog.text  # the gap is named, honestly
@@ -545,6 +554,193 @@ def test_get_message_transient_holds_page_and_rewalks(
     assert db.get_history_cursor() == 900
     assert len(fake.writes) == 1
     db.close()
+
+
+def test_apply_transient_holds_cursor_and_retries_next_tick(tmp_path: Path) -> None:
+    # F1 MAJOR (the manager's mutant T2): a transient failure on the
+    # WRITE must not let the cursor advance past the failed message.
+    # Unpinned, the FULL suite stayed green while the daemon starved the
+    # mailbox: cursor 900, message never labeled, never retried,
+    # silently. Phase 1: the delta HOLDS (cursor stays, no writes, no
+    # rows). Phase 2: the next tick re-walks from the held cursor, the
+    # write lands, the rows commit.
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailTransientError("503 blip"))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777  # THE T2 PIN: no advance past a failed write
+    assert fake.writes == []
+    assert db.applications_for_message("aa22") == ()
+    assert _run(tmp_path, fake, db=db) == 0  # next tick: re-walk, retry
+    assert db.get_history_cursor() == 900
+    assert [w["message_id"] for w in fake.writes] == ["aa22"]
+    # one Application row (the umbrella/tier labels are Gmail-side state,
+    # not rows — the CLI full-stack pin shows the row shape)
+    assert [r.label for r in db.applications_for_message("aa22")] == ["Money/Bills"]
+    db.close()
+
+
+def test_apply_404_skips_message_delta_still_commits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F1 MAJOR arm (b): the message vanished between fetch and write
+    # (per-message 404 ON THE WRITE). The fail-safe skips it COUNTED,
+    # the other message's write is unaffected, the delta still commits.
+    # Counter pin (F1 nit): the ghost counts SKIPPED only — the
+    # end-of-delta line reads written=1 skipped=1 warnings=0.
+    caplog.set_level(logging.INFO)
+
+    def _both_write() -> dict[str, tuple[float, ...]]:
+        # aa11: Money/Bills high (absent — write); aa22: Shipping high
+        # (absent — write). The delta order makes aa11 the FIRST apply.
+        return {"one\nbody one": (0.9, 0.1), "two\nbody two": (0.1, 0.95)}
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailPermanentError("message aa11 not found", status=404))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert (
+        _run(tmp_path, fake, db=db, model=FakeModel(VOCAB, scores=_both_write())) == 0
+    )
+    assert [w["message_id"] for w in fake.writes] == ["aa22"]  # aa11 skipped
+    assert db.get_history_cursor() == 900  # the delta COMMITS (a ghost must not wedge)
+    assert (
+        db.applications_for_message("aa11") == ()
+    )  # no row for a write that never landed
+    assert [r.label for r in db.applications_for_message("aa22")] == ["Shipping"]
+    assert "skipped message aa11: apply refused" in caplog.text
+    assert "written=1 skipped=1 warnings=0" in caplog.text
+    db.close()
+
+
+def test_apply_auth_error_propagates_for_exit_4(tmp_path: Path) -> None:
+    # F1 MAJOR arm (c): auth on the WRITE is human-gated — it re-raises
+    # out of the loop (the CLI maps 4; pinned at the CLI seam in
+    # test_daemon_cli), NEVER held-forever like a transient.
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailAuthError("token revoked"))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    with pytest.raises(GmailAuthError):
+        _run(tmp_path, fake, db=db)
+    assert db.get_history_cursor() == 777  # nothing committed over an auth death
+    assert fake.writes == []
+    db.close()
+
+
+def test_get_message_auth_error_propagates(tmp_path: Path) -> None:
+    # F1 MINOR 1 (the dead line): the fetch arm's `except GmailAuthError:
+    # raise` had NO node — a refactor swallowing auth there would hang
+    # the daemon in hold-retry forever instead of the exit-4 landing
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("get_message", GmailAuthError("token revoked"))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    with pytest.raises(GmailAuthError):
+        _run(tmp_path, fake, db=db)
+    assert db.get_history_cursor() == 777
+    db.close()
+
+
+def test_malformed_messages_list_holds_cursor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F1 MINOR 1: a history record whose messages event carries no id is
+    # a lying wire — the typed permanent from _message_ids routes to
+    # the HOLD arm (never a skip: the whole delta is untrustworthy)
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page({"id": 1, "messages": [{"threadId": "tx"}]})],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777
+    assert "delta failed" in caplog.text
+    db.close()
+
+
+def test_undecodable_raw_skips_message_and_delta_commits(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F1 MINOR 1: corrupt raw is the per-message fail-safe (skipped,
+    # counted, id-only warning) — the delta still commits (one ghost
+    # body must not wedge the cursor)
+    caplog.set_level(logging.WARNING)
+
+    # the decode surface is BASE64URL (decode_gmail_raw does not utf-8
+    # decode — parse_mime never raises on bytes), so the corrupt field
+    # is an unpaddable base64url string, injected at the wire shape
+    class _BadRawClient(FakeGmailClient):
+        def get_message(self, message_id: str):
+            raw = super().get_message(message_id)
+            if message_id == "aa22":
+                return dataclasses.replace(raw, raw_b64url="A")  # ValueError
+            return raw
+
+    fake = _BadRawClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 900
+    assert fake.writes == []  # aa11 skip-present, aa22 skipped: nothing to write
+    assert "skipped message aa22: raw undecodable" in caplog.text
+    db.close()
+
+
+def test_bootstrap_anchors_on_the_documented_newest_first_order() -> None:
+    # F1 MINOR 6 (resolved by PRIMARY source, not by guessing): the List
+    # Gmail messages guide states the response is "listed in reverse
+    # chronological order (newest first)" and the sync guide names the
+    # first entry the full-sync seed source. The fake MODELS that order
+    # (documented_order=True sorts by internal_date_ms desc); the
+    # insertion order here is deliberately OLDEST-first, so a bootstrap
+    # taking the wrong stub changes the seed value (the wrong-stub
+    # scenario is pinned by construction, not assumed away)
+    msgs = [
+        FakeMessage(
+            id="old", eml=_eml("o", "ob"), internal_date_ms=1_000, history_id=500
+        ),
+        FakeMessage(
+            id="new", eml=_eml("n", "nb"), internal_date_ms=2_000, history_id=900
+        ),
+    ]
+    fake = FakeGmailClient(messages=msgs, labels=_labels(), documented_order=True)
+    assert bootstrap_cursor(fake) == 900
+    assert fake.calls == ["list_messages::", "get_message:new"]
+    # the modeling is honest: a message without the recency field is
+    # refused, never silently sorted to the top
+    with pytest.raises(ValueError, match="internal_date_ms"):
+        FakeGmailClient(messages=[FakeMessage(id="x", eml=b"x")], documented_order=True)
 
 
 def test_predict_failure_holds_cursor(

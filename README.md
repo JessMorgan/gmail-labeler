@@ -241,18 +241,23 @@ file lands before the serving-gate acts in TEXT mode and at the
 payload emit (after the acts) in `--json` mode — in both, a run that
 later refuses still replaces a previous report file.
 `train`/`eval` remain the only recomputers, and
-only the confirm path writes the table. `shadow run` is the Phase 1
-exit (the Shadow Pass, GLOSSARY: Shadow Pass): it scores the recent
+only the confirm path writes the table. The Shadow Pass (GLOSSARY:
+Shadow Pass) is the Phase 1 exit path: `shadow run` scores the recent
 Backlog through the sidecar-validated checkpoint, the Graduation
 Table, and the Threshold Bands and APPLIES NOTHING — the verdicts are
 recorded in the state DB (`[store] db_path`) as one transaction per
-run (a crash mid-run leaves no half rows). It requires `--bands` and
+run (a crash mid-run leaves no half rows) — and the HUMAN review of
+`shadow report` IS the Phase 1 exit (choosing the graduates,
+ADR-0005). `shadow run` requires `--bands` and
 `--graduation` (the calibrated Bands Artifact and the Graduation
 Table — both are verified against the run's identity, the FIRST real
 consumers of the `verify_bands`/`verify_graduation` gates; a
 foreign-bound artifact refuses with exit 5, naming every disagreeing
-field). The Backlog query defaults to `in:inbox newer_than:YYYY/MM/DD`
-(`--since` ISO date, default 90 days ago; `--limit` max messages,
+field). The Backlog query defaults to `in:inbox after:<epoch-seconds>`
+(the EPOCH form — calendar dates in API queries are interpreted as
+MIDNIGHT PST; `--since` ISO date → UTC midnight of that date → epoch,
+default 90 days ago; the default window includes recent arrivals as
+well as the older history — GLOSSARY: Backlog; `--limit` max messages,
 default 100; `--query` replaces the default wholesale). A message
 whose body cannot be fetched is skipped (per-message fail-safe:
 warning + count, the run continues) — the documented posture choice
@@ -279,14 +284,21 @@ Message bodies never enter the DB, the report, or any log path
 The Phase 1 exit is a human reviewing the shadow report and choosing
 the graduates (ADR-0005). The offline spine is `FakeModel` +
 `FakeGmailClient` (CI, invariant #9); the opt-in REAL-checkpoint run
-is the demo, behind the `live` marker (never run in CI — it needs the
-`train` extra, a signed-in Gmail account, and a corpus):
+is the demo, behind the `live` + `smoke` markers (never run in CI —
+it needs the `train` extra for the real encoder, a signed-in Gmail
+account, a corpus, and the human-step artifacts below). The test is
+READ-ONLY against Gmail (no write), costs API quota, writes ONLY a
+tmp-redirected state DB (`--db`), and SKIPS (with a reason) when the
+config / corpus / checkpoint / `bands.json` / `graduation.json` are
+absent — it never trains and never confirms a Graduation Table
+(those stay the human actions below):
 
 ```sh
-uv run pytest -m live tests/test_shadow_cli.py::test_live_shadow_run_real_checkpoint
+uv run pytest -m "live and smoke" tests/test_shadow_cli.py::test_live_shadow_run_real_checkpoint
 ```
 
-By hand, on a signed-in install:
+By hand, on a signed-in install (the human steps — a test never runs
+these):
 
 ```sh
 gmail-labeler train --split-date YYYY-MM-DD --force

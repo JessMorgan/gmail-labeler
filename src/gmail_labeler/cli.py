@@ -35,7 +35,7 @@ AttributionPosture = Literal[
 ]
 
 if TYPE_CHECKING:
-    from .config import Config
+    from .config import Config, LabelsConfig
     from .gmail_client import GmailClient
     from .graduation import GraduationTable
     from .thresholds import BandsArtifact
@@ -2066,14 +2066,27 @@ def _shadow_model_factory(checkpoint_dir: Path, vocabulary: tuple[str, ...]) -> 
     return load_hf_model(checkpoint_dir, vocabulary)
 
 
-def _check_store_db_path(cfg: Config, command: str) -> None:
+def _resolve_db_path(cfg: Config, db: str | None, command: str) -> Path:
+    """The effective state DB path (D3): the ``--db`` flag is a
+    usage-level override of ``[store] db_path`` (consistent with the
+    flag doctrine — an explicit flag beats the config). An empty --db is
+    a usage refusal (exit 2)."""
+    if db is not None:
+        if not db.strip():
+            typer.echo(f"{command} failed: --db PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+        return Path(db)
+    return cfg.store.db_path
+
+
+def _check_store_db_path(db_path: Path, cfg: Config, command: str) -> None:
     """S3: the [store] db_path must not live inside the checkpoint dir
     or the corpus store (both sides RESOLVED — a link named outside
     pointing inside is caught). A state DB in there is silently
     destroyable: ``train --force`` destroys the checkpoint dir (a state
     DB in it dies with it), and a corpus re-export rewrites the store.
     Usage refusal exit 2 (the eval containment loop shape)."""
-    db_path = cfg.store.db_path.resolve()
+    db_path = db_path.resolve()
     for root, what in (
         (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
         (Path(cfg.corpus.dir).resolve(), "the corpus store"),
@@ -2088,7 +2101,7 @@ def _check_store_db_path(cfg: Config, command: str) -> None:
             raise typer.Exit(code=2) from None
 
 
-def _validate_store_db(cfg: Config) -> None:
+def _validate_store_db(db_path: Path) -> None:
     """S5: validate the state DB FAIL-FAST (open + ownership + version)
     before any network work — a foreign/corrupt/foreign-version DB is
     refused (exit 5) before we pay for list_labels/list_messages. The
@@ -2096,7 +2109,7 @@ def _validate_store_db(cfg: Config) -> None:
     re-opens it at the store step."""
     from .appdb import AppDB, AppDBError
 
-    db = AppDB(cfg.store.db_path)
+    db = AppDB(db_path)
     try:
         db.open()
     except (AppDBError, OSError) as e:
@@ -2157,7 +2170,15 @@ def shadow_run(
     query: str | None = typer.Option(
         None,
         "--query",
-        help="Gmail search query — replaces the default in:inbox newer_than:… query",
+        help="Gmail search query — replaces the default in:inbox after:<epoch> query",
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help=(
+            "State DB path (overrides [store] db_path — the opt-in demo "
+            "redirects it to a tmp path)"
+        ),
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Machine-readable output (graduation workflows)"
@@ -2232,9 +2253,11 @@ def shadow_run(
     cutoff_dt = _backlog_cutoff(since_date, datetime.now(UTC))
 
     cfg = _load_config(config)
+    # D3: the effective state DB path (--db overrides [store] db_path)
+    db_path = _resolve_db_path(cfg, db, "shadow run")
     # S3: the [store] db_path must not live inside the checkpoint dir or
     # the corpus store (usage refusal exit 2, before any work)
-    _check_store_db_path(cfg, "shadow run")
+    _check_store_db_path(db_path, cfg, "shadow run")
     # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
     # pay the corpus-scale work below
     try:
@@ -2248,7 +2271,7 @@ def shadow_run(
     # version DB is refused before we pay for list_labels/list_messages.
     # The connection is closed immediately (validation only); the write
     # re-opens it at the store step (idempotent create-all-if-missing).
-    _validate_store_db(cfg)
+    _validate_store_db(db_path)
 
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
@@ -2640,15 +2663,15 @@ def shadow_run(
     # rows; the DB carries ids/probabilities/labels/timestamps ONLY —
     # invariant #5). The DB was validated fail-fast before the network
     # work (S5); it is opened here for the single write point.
-    db = AppDB(cfg.store.db_path)
+    store_db = AppDB(db_path)
     try:
-        db.open()
-        db.record_run(run_id, run_ts, all_rows)
+        store_db.open()
+        store_db.record_run(run_id, run_ts, all_rows)
     except (AppDBError, OSError) as e:
         typer.echo(f"shadow run failed: state DB write failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     finally:
-        db.close()
+        store_db.close()
 
     if as_json:
         payload = {
@@ -2676,6 +2699,28 @@ def shadow_run(
         )
 
 
+def _tier_name_for_band(
+    band: str | None, *, present: bool, labels: LabelsConfig
+) -> str | None:
+    """The CONFIGURED Tier Label NAME for a band verdict (D2): the
+    band→tier DECISION lives in tiers.tier_for_band (the single home);
+    this maps the DEFAULT tier constant to the CONFIGURED name
+    (``[labels] high`` / ``[labels] med``) — the config drives the
+    report's tier names, so a custom ``[labels]`` spelling is honored,
+    not silently ignored (refuse-never-drop). Skip-present earns no
+    tier (invariant #2). The daemon (#24) resolves these configured
+    names to Gmail label ids (the contract is recorded in the tiers
+    module docstring)."""
+    from .tiers import TIER_HIGH, TIER_MED, tier_for_band
+
+    default_tier = tier_for_band(band, present=present)
+    if default_tier == TIER_HIGH:
+        return labels.high
+    if default_tier == TIER_MED:
+        return labels.med
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ReportRow:
     """One would-apply verdict row in the shadow report diff (ids +
@@ -2698,6 +2743,11 @@ def shadow_report(
         None,
         "--run",
         help="The run id to report (default: the latest run)",
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path)",
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Machine-readable output (graduation workflows)"
@@ -2734,7 +2784,7 @@ def shadow_report(
     from .auth import AuthError
     from .gmail_errors import GmailAuthError, GmailError
     from .labels import normalize_label_names
-    from .tiers import BAND_HIGH, BAND_MED, tier_for_band
+    from .tiers import BAND_HIGH, BAND_MED
     from .tokens import TokenStoreError
 
     # usage refusal up front (exit 2): an empty --run would degenerate
@@ -2745,9 +2795,11 @@ def shadow_report(
         raise typer.Exit(code=2) from None
 
     cfg = _load_config(config)
+    # D3: the effective state DB path (--db overrides [store] db_path)
+    db_path = _resolve_db_path(cfg, db, "shadow report")
     # S3: the [store] db_path must not live inside the checkpoint dir or
     # the corpus store (usage refusal exit 2, before any work)
-    _check_store_db_path(cfg, "shadow report")
+    _check_store_db_path(db_path, cfg, "shadow report")
     # auth gate FIRST (exit 4 precedent): the report re-fetches the
     # actual labels via the read path
     try:
@@ -2759,10 +2811,10 @@ def shadow_report(
     # the state DB (create-all-if-missing — a report on an empty DB is
     # a named "no runs" refusal, not a crash). The open (ownership +
     # version) is BEFORE the network work (S5 fail-fast).
-    db = AppDB(cfg.store.db_path)
+    store_db = AppDB(db_path)
     try:
-        db.open()
-        run_id = run if run is not None else db.latest_run()
+        store_db.open()
+        run_id = run if run is not None else store_db.latest_run()
         if run_id is None:
             typer.echo(
                 "shadow report failed: no shadow runs recorded \u2014 run "
@@ -2773,12 +2825,12 @@ def shadow_report(
         # an unknown --run is refused by load_run's NAMED refusal (a
         # separate run_exists pre-check would be a redundant second
         # lookup — the reader is the authority)
-        run_ts, rows = db.load_run(run_id)
+        run_ts, rows = store_db.load_run(run_id)
     except (AppDBError, OSError) as e:
         typer.echo(f"shadow report failed: state DB read failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     finally:
-        db.close()
+        store_db.close()
 
     # the label bridge (the read path — list_labels only)
     try:
@@ -2830,10 +2882,11 @@ def shadow_report(
             outcome = "already-present"
         else:
             outcome = "added"
-        # the band→tier mapping + skip-present live in tiers.tier_for_band
-        # (the single decision core — no second implementation): an
-        # already-present label earns NO Tier Label (present=True → None)
-        tier = tier_for_band(row.band, present=is_present)
+        # the band→tier DECISION lives in tiers.tier_for_band (the single
+        # home); the CONFIGURED name comes from [labels] (D2 — a custom
+        # spelling is honored, not silently ignored): an already-present
+        # label earns NO Tier Label (present=True → None)
+        tier = _tier_name_for_band(row.band, present=is_present, labels=cfg.labels)
         outcomes[outcome.replace("-", "_")] += 1
         per_message.setdefault(row.message_id, []).append(
             ReportRow(

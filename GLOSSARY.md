@@ -107,6 +107,13 @@ than fetching through the Gmail API. Optional fast path; the Gmail Import is
 the canonical source.
 _Avoid_: backup restore (this reads, never restores)
 
+**Training Example**:
+One corpus record turned for training: its id, date, label names, a
+recency weight, and the record's Date Provenance stamped for
+split-boundary filtering. The unit the model trains on; the corpus →
+examples transform is one shared pure function.
+_Avoid_: sample, data point
+
 **Full Resync**:
 The ground-truth Label Reconciliation that needs no history: one
 `labels.list` plus local resolved-view counts price both strategies up

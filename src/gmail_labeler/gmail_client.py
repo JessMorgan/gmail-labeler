@@ -1,9 +1,13 @@
-"""Gmail API surface for corpus acquisition — Protocol + REST adapter.
+"""Gmail API surface — Protocol + REST adapter.
 
-Only the Phase 0 read surface (labels, filters, message list/get, history);
-the ONLY write the product ever performs (addLabelIds) arrives with the
-daemon phase and will live behind the same Protocol (FakeGmailClient is the
-test spine — invariant #9). Errors surface via gmail_errors taxonomy only.
+The Phase 0 read surface (labels, filters, message list/get, history) plus
+the application path's FIRST write methods (ticket #24): ``apply_labels``
+(the ONLY label write the product ever performs — addLabelIds ONLY,
+structurally incapable of carrying a removal — invariant #1) and
+``ensure_label`` (get-or-create for the configured Tier Label names,
+invoked from the daemon/apply startup only — never from the Shadow Pass).
+Both live behind the same Protocol (FakeGmailClient is the test spine —
+invariant #9). Errors surface via gmail_errors taxonomy only.
 
 Wire-shape rule (verified against the Gmail v1 discovery schema): int64 /
 uint64 fields (internalDate, historyId) arrive as STRINGS — googleapiclient
@@ -15,7 +19,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -112,6 +116,10 @@ class GmailClient(Protocol):
     def history(
         self, start_history_id: int, page_token: str | None = None
     ) -> HistoryPage: ...
+
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None: ...
+
+    def ensure_label(self, name: str) -> str: ...
 
 
 class GmailRestClient:
@@ -271,6 +279,39 @@ class GmailRestClient:
             next_page_token=_token(data),
             records=tuple(records),
         )
+
+    # -- write surface (ticket #24 — the ONLY label write is addLabelIds) --
+
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None:
+        """Add labels to one message (GLOSSARY: Application). The body is
+        a literal with the ONE key ``addLabelIds`` — structurally
+        incapable of carrying a removal (invariant #1: additive-only, no
+        code path may remove labels). The composition layer (tickets
+        #24/#26) never calls this with an empty list — an empty plan is
+        no API call at all (pinned at the plan level, not here). Wire
+        errors surface through the SAME taxonomy as every read (the
+        ``_call`` path: transient blips retry, auth is human-gated)."""
+        body: dict[str, object] = {"addLabelIds": list(add_label_ids)}
+        self._call(
+            self._svc().users().messages().modify(userId="me", id=message_id, body=body)
+        )
+
+    def ensure_label(self, name: str) -> str:
+        """Get-or-create a USER label by exact name (the daemon/apply
+        startup resolves the configured ``[labels] applied/high/med``
+        names to Gmail label ids ONCE — pure thereafter; never called
+        from the Shadow Pass, which is zero-write). Idempotent when the
+        name is present: NO create call is made. A System Label that
+        name-sakes the requested name is NOT a hit — the match is
+        user-type only, so a tier name can never resolve its write at a
+        System Label id (the never-target companion of invariant #1);
+        Gmail then either creates the user label or rejects the name,
+        loudly."""
+        for label in self.list_labels():
+            if label.name == name and label.type == "user":
+                return label.id
+        data = self._call(self._svc().labels().create(userId="me", body={"name": name}))
+        return _s(data, "id")
 
 
 # -- strict shape helpers (a malformed response is a loud permanent error,

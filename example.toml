@@ -19,6 +19,8 @@ history_poll_seconds = 30          # daemon polling cadence (ADR-0003)
 applied = "ai-applied"             # umbrella: "the AI contributed something"
 high = "ai-high"                   # high-confidence band
 med = "ai-med"                     # review-me band
+# A name colliding (case-insensitively) with a System Label name aborts
+# startup with a named refusal — it is never minted as a look-alike label
 # Managed Labels this install may apply — empty until you graduate labels
 # from `dataset analyze` + `eval`, e.g.:
 # managed = ["Shipping", "Money/Bills"]

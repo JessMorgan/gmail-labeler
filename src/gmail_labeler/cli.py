@@ -2070,22 +2070,28 @@ def _resolve_db_path(cfg: Config, db: str | None, command: str) -> Path:
     """The effective state DB path (D3): the ``--db`` flag is a
     usage-level override of ``[store] db_path`` (consistent with the
     flag doctrine — an explicit flag beats the config). An empty --db is
-    a usage refusal (exit 2)."""
+    a usage refusal (exit 2). The value is STRIPPED (a trailing-space
+    filename would be a bug) and ``~`` is expanded (matching the config
+    path fields). A relative --db anchors to the CWD (like --bands /
+    --graduation) — unlike the config's ``[store] db_path``, which
+    anchors to the config dir."""
     if db is not None:
         if not db.strip():
             typer.echo(f"{command} failed: --db PATH must be non-empty", err=True)
             raise typer.Exit(code=2) from None
-        return Path(db)
+        return Path(db.strip()).expanduser()
     return cfg.store.db_path
 
 
-def _check_store_db_path(db_path: Path, cfg: Config, command: str) -> None:
-    """S3: the [store] db_path must not live inside the checkpoint dir
-    or the corpus store (both sides RESOLVED — a link named outside
+def _check_store_db_path(db_path: Path, cfg: Config, command: str, origin: str) -> None:
+    """S3: the state DB path must not live inside the checkpoint dir or
+    the corpus store (both sides RESOLVED — a link named outside
     pointing inside is caught). A state DB in there is silently
     destroyable: ``train --force`` destroys the checkpoint dir (a state
     DB in it dies with it), and a corpus re-export rewrites the store.
-    Usage refusal exit 2 (the eval containment loop shape)."""
+    Usage refusal exit 2 (the eval containment loop shape). ``origin``
+    names the SOURCE of the path (``--db`` vs ``[store] db_path``) so
+    the refusal message points at the right knob (disposition 6-cli)."""
     db_path = db_path.resolve()
     for root, what in (
         (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
@@ -2093,7 +2099,7 @@ def _check_store_db_path(db_path: Path, cfg: Config, command: str) -> None:
     ):
         if db_path == root or root in db_path.parents:
             typer.echo(
-                f"{command} failed: [store] db_path {db_path} lives inside "
+                f"{command} failed: {origin} {db_path} lives inside "
                 f"{what} ({root}) \u2014 a state DB there is destroyable by "
                 "train --force / a corpus re-export; use any other path",
                 err=True,
@@ -2121,10 +2127,12 @@ def _validate_store_db(db_path: Path) -> None:
 
 def _backlog_cutoff(since_date: date | None, now: datetime) -> datetime:
     """The UTC-aware cutoff datetime for the Backlog query (S4): a
-    --since date → UTC MIDNIGHT of that date (the operator's "newer than
-    this day" boundary); the default (``None``) → ``now - 90 days`` (the
-    time component kept — the boundary is "90 days ago", not "90 days
-    ago at midnight"). Pure (takes ``now``) so the epoch math is
+    --since date → UTC MIDNIGHT of that date — the named day is
+    INCLUDED (``after:<epoch>`` is strictly-newer than that midnight, so
+    mail from the named day onward is in the window); the default
+    (``None``) → ``now - 90 days`` WITH the time kept (the boundary is
+    "90 days ago", not "90 days ago at midnight" — the documented
+    intent, disposition 1). Pure (takes ``now``) so the epoch math is
     testable with a fixed instant."""
     if since_date is not None:
         return datetime(since_date.year, since_date.month, since_date.day, tzinfo=UTC)
@@ -2162,7 +2170,11 @@ def shadow_run(
     since: str | None = typer.Option(
         None,
         "--since",
-        help=("ISO date (YYYY-MM-DD): score mail newer than it (default: 90 days ago)"),
+        help=(
+            "ISO date (YYYY-MM-DD): score mail from that day onward (the "
+            "named day is INCLUDED — the cutoff is UTC midnight of it); "
+            "default: 90 days ago (now - 90d, time kept)"
+        ),
     ),
     limit: int = typer.Option(
         100, "--limit", min=1, help="Max messages to score (default 100)"
@@ -2176,8 +2188,9 @@ def shadow_run(
         None,
         "--db",
         help=(
-            "State DB path (overrides [store] db_path — the opt-in demo "
-            "redirects it to a tmp path)"
+            "State DB path (overrides [store] db_path; ~ expanded, "
+            "relative anchors to the CWD; the opt-in demo redirects it "
+            "to a tmp path)"
         ),
     ),
     as_json: bool = typer.Option(
@@ -2233,6 +2246,11 @@ def shadow_run(
     if query is not None and not query.strip():
         typer.echo("shadow run failed: --query must be non-empty", err=True)
         raise typer.Exit(code=2) from None
+    # ONE datetime.now(UTC) read per run (disposition 1): the default
+    # window is now - 90 days WITH the time kept (the documented intent);
+    # --since → UTC midnight of the named day (the day is INCLUDED —
+    # `after:` is strictly-newer than that midnight)
+    now = datetime.now(UTC)
     if since is not None:
         # strict ISO (YYYY-MM-DD) — strptime, not date.fromisoformat
         # (3.11+ fromisoformat is lenient and would accept "20261001")
@@ -2244,20 +2262,18 @@ def shadow_run(
                 err=True,
             )
             raise typer.Exit(code=2) from None
-        cutoff_dt = None  # computed below (the --since midnight)
+        cutoff_dt = _backlog_cutoff(since_date, now)  # UTC midnight of that day
     else:
-        since_date = datetime.now(UTC).date() - timedelta(days=90)
-        cutoff_dt = None
-    # the cutoff (S4): --since → UTC midnight of that date; default →
-    # now - 90 days (the time component kept)
-    cutoff_dt = _backlog_cutoff(since_date, datetime.now(UTC))
+        since_date = now.date() - timedelta(days=90)  # for the --json payload
+        cutoff_dt = _backlog_cutoff(None, now)  # now - 90d, time kept
 
     cfg = _load_config(config)
     # D3: the effective state DB path (--db overrides [store] db_path)
     db_path = _resolve_db_path(cfg, db, "shadow run")
-    # S3: the [store] db_path must not live inside the checkpoint dir or
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    # S3: the state DB path must not live inside the checkpoint dir or
     # the corpus store (usage refusal exit 2, before any work)
-    _check_store_db_path(db_path, cfg, "shadow run")
+    _check_store_db_path(db_path, cfg, "shadow run", db_origin)
     # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
     # pay the corpus-scale work below
     try:
@@ -2726,8 +2742,10 @@ class ReportRow:
     """One would-apply verdict row in the shadow report diff (ids +
     labels + scores + tiers ONLY — no subjects, no bodies, invariant
     #5). ``outcome`` is the diff verdict (``added`` / ``already-present``
-    / ``not-applied``); ``tier`` is the Tier Label name (``None`` for
-    skip-present and no-band — the single home is ``tiers.tier_for_band``)."""
+    / ``not-applied``); ``tier`` is the CONFIGURED Tier Label name (the
+    ``[labels]`` high/med — the single home is ``_tier_name_for_band``,
+    which maps the ``tiers.tier_for_band`` decision to the configured
+    name; ``None`` for skip-present and no-band)."""
 
     label: str
     probability: float
@@ -2747,7 +2765,11 @@ def shadow_report(
     db: str | None = typer.Option(
         None,
         "--db",
-        help="State DB path (overrides [store] db_path)",
+        help=(
+            "State DB path (overrides [store] db_path; ~ expanded, "
+            "relative anchors to the CWD; the opt-in demo redirects it "
+            "to a tmp path)"
+        ),
     ),
     as_json: bool = typer.Option(
         False, "--json", help="Machine-readable output (graduation workflows)"
@@ -2780,7 +2802,7 @@ def shadow_report(
     ``shadow run`` after any retrain/recalibration to refresh the
     basis.
     """
-    from .appdb import AppDB, AppDBError
+    from .appdb import AppDB, AppDBError, RunNotFoundError
     from .auth import AuthError
     from .gmail_errors import GmailAuthError, GmailError
     from .labels import normalize_label_names
@@ -2797,9 +2819,10 @@ def shadow_report(
     cfg = _load_config(config)
     # D3: the effective state DB path (--db overrides [store] db_path)
     db_path = _resolve_db_path(cfg, db, "shadow report")
-    # S3: the [store] db_path must not live inside the checkpoint dir or
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    # S3: the state DB path must not live inside the checkpoint dir or
     # the corpus store (usage refusal exit 2, before any work)
-    _check_store_db_path(db_path, cfg, "shadow report")
+    _check_store_db_path(db_path, cfg, "shadow report", db_origin)
     # auth gate FIRST (exit 4 precedent): the report re-fetches the
     # actual labels via the read path
     try:
@@ -2822,10 +2845,15 @@ def shadow_report(
                 err=True,
             )
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-        # an unknown --run is refused by load_run's NAMED refusal (a
-        # separate run_exists pre-check would be a redundant second
-        # lookup — the reader is the authority)
+        # an unknown --run is refused by load_run's NAMED not-found
+        # refusal (a separate run_exists pre-check would be a redundant
+        # second lookup — the reader is the authority)
         run_ts, rows = store_db.load_run(run_id)
+    except RunNotFoundError as e:
+        # a named NOT-FOUND refusal (cause-naming doctrine — not wrapped
+        # in "state DB read failed", which would misname the cause)
+        typer.echo(f"shadow report failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (AppDBError, OSError) as e:
         typer.echo(f"shadow report failed: state DB read failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
@@ -2944,6 +2972,13 @@ def shadow_report(
     }
 
     if as_json:
+        # disposition 8: the rows serialize via dataclasses.asdict — the
+        # five-field contract (label/probability/band/outcome/tier) is
+        # now in LOCKSTEP with the ReportRow dataclass (a field added to
+        # the dataclass is automatically in the payload, not a silent
+        # drift)
+        import dataclasses
+
         payload = {
             "run_id": run_id,
             "run_ts": run_ts.isoformat(),
@@ -2954,16 +2989,7 @@ def shadow_report(
             "messages": [
                 {
                     "message_id": message_id,
-                    "rows": [
-                        {
-                            "label": r.label,
-                            "probability": r.probability,
-                            "band": r.band,
-                            "outcome": r.outcome,
-                            "tier": r.tier,
-                        }
-                        for r in per_message[message_id]
-                    ],
+                    "rows": [dataclasses.asdict(r) for r in per_message[message_id]],
                 }
                 for message_id in sorted(per_message)
             ],

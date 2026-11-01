@@ -34,6 +34,23 @@ does not ship releases yet.
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
+- Model seam (`model.py`): the `Model` Protocol — batch predict →
+  per-label sigmoid scores over the checkpoint's Label-Path vocabulary
+  (rows aligned to inputs, columns to the vocabulary; `texts` is an
+  Iterable that implementations materialize once) plus vocabulary
+  exposure — the ONE new test seam (spec #13). Conformance is
+  structural (a consumer annotated `Model` is the pin; no
+  `isinstance` anywhere). `FakeModel` is the offline spine
+  (hand-authored score vectors, call log, refuses misaligned/out-of-
+  range programming, RAISES on an unprogrammed text unless the caller
+  passed an explicit `default` — no silent 0.5) mirroring
+  `FakeGmailClient`'s role; `vocabulary_hash` is the ORDER-SENSITIVE
+  sha256 identity the checkpoint sidecar carries (a reordered
+  vocabulary must refuse). The sorted-unique helper now lives in
+  `dataset_build.sorted_unique` (one home, shared). No torch import
+  anywhere in the importable core — the real encoder stays behind the
+  `train/` recipe (pinned: importing `gmail_labeler.model` leaves
+  `torch` out of `sys.modules`).
 - Phase 1 dataset builder core (`dataset_build.py`): the shared pure
   Corpus → Training Example transform — Label Path vocabulary (a leaf
   path is a distinct class; a parent may scope its subtree), examples

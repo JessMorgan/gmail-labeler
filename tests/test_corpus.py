@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 from gmail_labeler.corpus_record import (
+    _DATE_PROVENANCES,
+    SERVER_AUTHORITATIVE_PROVENANCES,
     CorpusRecord,
+    DateProvenance,
     body_hash,
     utc_datetime,
     with_body,
@@ -27,6 +31,7 @@ def rec(id_: str = "abc123", **kw: object) -> CorpusRecord:
         "labels": ("Shipping",),
         "body_hash": DUMMY_HASH,
         "source": "api",
+        "date_provenance": "internal_date",
     }
     base.update(kw)
     return CorpusRecord(**base)  # type: ignore[arg-type]
@@ -35,6 +40,96 @@ def rec(id_: str = "abc123", **kw: object) -> CorpusRecord:
 def test_record_json_round_trip() -> None:
     r = with_body(rec(), "the body")
     assert CorpusRecord.from_json_line(r.to_json_line()) == r
+
+
+def test_date_provenance_round_trips_for_every_provenance() -> None:
+    for prov in ("internal_date", "mime_date", "gyb_internaldate", "unknown"):
+        r = with_body(rec(date_provenance=prov), "body")  # type: ignore[arg-type]
+        line = r.to_json_line()
+        assert f'"date_provenance": "{prov}"' in line  # part of the line
+        assert CorpusRecord.from_json_line(line) == r  # round-trips intact
+
+
+def test_server_authoritative_provenances_is_the_trust_class() -> None:
+    # the split-builder's correct filter (GLOSSARY: Date Provenance):
+    # exactly the server-authoritative class — never mime_date (sender-
+    # claimed) or unknown (legacy)
+    assert set(SERVER_AUTHORITATIVE_PROVENANCES) == {
+        "internal_date",
+        "gyb_internaldate",
+    }
+    # Literal-vs-tuple drift door (corpus_record.py): the runtime
+    # allow-list must match the compile-time Literal in ORDER (Literal
+    # dedupes, so not multiplicity), not just as a set
+    assert tuple(get_args(DateProvenance)) == _DATE_PROVENANCES
+
+
+def test_date_provenance_line_is_byte_stable() -> None:
+    # guards the byte-stable line contract with the field in place: the
+    # round trip must not reorder keys or change separators. Does NOT pin
+    # the field's PRESENCE — that is the per-value round-trip test above.
+    line = with_body(rec("aaaa"), "body").to_json_line()
+    assert CorpusRecord.from_json_line(line).to_json_line() == line
+
+
+def test_legacy_line_without_provenance_reads_as_unknown() -> None:
+    # append-only corpus: a line written BEFORE the field existed must stay
+    # readable with an explicit unknown default — never rewritten, never
+    # guessed from other fields
+    line = rec().to_json_line()
+    legacy = line.replace('"date_provenance": "internal_date", ', "")
+    assert "date_provenance" not in legacy
+    assert CorpusRecord.from_json_line(legacy).date_provenance == "unknown"
+
+
+def test_record_rejects_bad_date_provenance() -> None:
+    with pytest.raises(ValueError, match="date_provenance"):
+        rec(date_provenance="whenever")  # type: ignore[arg-type]
+
+
+def test_from_json_line_rejects_bad_date_provenance() -> None:
+    # reader-side rejection branch, pinned against the DISCRIMINATING
+    # mutation: a branch-collapse reader (returns "unknown" for any value)
+    # would not raise and fails this test. (A pure pass-through survives
+    # end-to-end — the constructor re-validates — so it is not the pin.)
+    # A value outside the contract, or a non-string, is loud — never stored
+    line = rec().to_json_line()
+    bogus = line.replace(
+        '"date_provenance": "internal_date"', '"date_provenance": "bogus"'
+    )
+    with pytest.raises(ValueError, match="date_provenance"):
+        CorpusRecord.from_json_line(bogus)
+    not_str = line.replace(
+        '"date_provenance": "internal_date"', '"date_provenance": 42'
+    )
+    with pytest.raises(ValueError, match="date_provenance"):
+        CorpusRecord.from_json_line(not_str)
+
+
+def test_legacy_line_with_explicit_null_provenance_reads_as_unknown() -> None:
+    # documented choice: an explicit null is treated as ABSENT (fail-safe
+    # read — one exotic producer bug must not hard-stop iteration over the
+    # whole corpus; deliberate divergence from the required fields, which
+    # reject null)
+    line = rec().to_json_line()
+    nulled = line.replace(
+        '"date_provenance": "internal_date"', '"date_provenance": null'
+    )
+    assert CorpusRecord.from_json_line(nulled).date_provenance == "unknown"
+
+
+def test_provenance_is_record_data_not_derived(tmp_path: Path) -> None:
+    # mutation pin: split-boundary consumers filter on the flag itself —
+    # it must survive the store round trip, not be recomputable from
+    # source/other fields (source alone cannot distinguish the two API
+    # paths)
+    store = CorpusStore(tmp_path / "c")
+    store.put(with_body(rec("aaaa", date_provenance="internal_date"), "a"), "a")
+    store.put(with_body(rec("bbbb", date_provenance="mime_date"), "b"), "b")
+    fresh = CorpusStore(tmp_path / "c")
+    recs = list(fresh.iter_records())
+    assert [r.id for r in recs if r.date_provenance == "internal_date"] == ["aaaa"]
+    assert [r.id for r in recs if r.date_provenance == "mime_date"] == ["bbbb"]
 
 
 def test_record_line_is_stable_json() -> None:

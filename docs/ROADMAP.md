@@ -16,10 +16,13 @@ records the deviations from that session.
 - Forward-fix the Phase 0 review non-blockers (#10 items 1–3 plus the
   post-push additions) — comment/wording/test only, zero behavior changes
   (#16).
-- Export query scope (maintainer decision recorded in #17, 2026-11-01):
-  the export query explicitly excludes DRAFT and CHAT. The rationale:
-  the previous default `in:anywhere -in:spam -in:trash` included both,
-  and under append-only corpus storage + skip-present that was a one-way
+- Export scope (maintainer decision recorded in #17, 2026-11-01):
+  DRAFT and CHAT are excluded from the API export — the query carries
+  the documented `-in:draft` token, and the ingest-layer labelIds
+  rejection (raw wire DRAFT/CHAT) is the load-bearing layer, covering
+  chat where no documented query token exists. The rationale: the
+  previous default `in:anywhere -in:spam -in:trash` included both, and
+  under append-only corpus storage + skip-present that was a one-way
   door. Implementation lands in #17 — before Phase 1 trains.
 - Date-provenance field on the record contract (#17): a record's date may
   come from the server's internalDate, a fallback to the MIME `Date`

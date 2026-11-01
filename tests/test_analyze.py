@@ -30,6 +30,7 @@ def _rec(
         labels=labels,
         body_hash=body_hash(text),
         source="api",
+        date_provenance="internal_date",
     )
 
 

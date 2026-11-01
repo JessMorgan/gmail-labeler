@@ -163,7 +163,31 @@ split-provenance header (split date + manifest hash — a saved report
 is never indistinguishable from a stale one), to stdout by default,
 `--out PATH` for the same bytes in a file (replacing an existing file
 is announced on stderr), and `--json` for the machine-readable
-payload; message bodies never enter it.
+payload; message bodies never enter it. `eval --bands PATH` is the
+deliberate act that calibrates the per-label Threshold Bands from the
+measured table (high/med per label, per-label min-precision targets
+from the config's `[bands]` section) and writes the versioned Bands
+Artifact — bound to the checkpoint + eval identity (verifiable
+against the checkpoint sidecar's identity fields), byte-identical
+for the same eval; its consumers (the daemon's shadow path, later
+phases) will refuse it on any identity disagreement once they land.
+It is opt-in: a bare `eval` never writes it
+(human-gated, ADR-0005), and it is the only writer — `train`/`eval`
+remain the only recomputers. Refusals: up front (exit 2) an empty
+path, a path equal to `--out`, an existing directory, the config
+file, and any target inside the checkpoint dir or the corpus store
+(by resolved path — a link named inside pointing outside is allowed
+and replaces the link; the artifact must not live beside identity
+files; the canonical location lands with the daemon phase); at run
+time (exit 5, the report preserved) a degraded corpus (test records
+missing body shards — the artifact feeds the daemon's serving gate),
+a calibration refusal (an unknown override label, a lying identity),
+an existing artifact bound to a different identity (refused before
+any staging — the previous bytes stay intact), a write failure; a
+post-write readback fault — the on-disk bytes do not parse back to
+a valid artifact (a torn/corrupt write); and a readback mismatch —
+a valid artifact whose content hash differs (a concurrent writer
+published a different artifact).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.

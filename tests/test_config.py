@@ -62,6 +62,41 @@ def test_example_toml_matches_code_defaults(tmp_path: Path) -> None:
     assert load_config(str(example)) == load_config(str(empty))
 
 
+def test_example_toml_bands_example_uncomments_to_a_valid_override(
+    tmp_path: Path,
+) -> None:
+    # the commented per-label example in example.toml must be
+    # UNCOMMENTABLE: uncommenting the documented subtable lines yields
+    # valid TOML that loads with the documented override (the example
+    # sits BELOW the two defaults — a layout above them would
+    # duplicate the keys and parse-fail)
+    from gmail_labeler.config import BandOverride
+
+    text = (REPO_ROOT / "example.toml").read_text(encoding="utf-8")
+    out: list[str] = []
+    in_bands = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_bands = stripped == "[bands]"
+        if in_bands and (
+            stripped.startswith("# [bands.")
+            or stripped.startswith("# min_high_precision = ")
+            or stripped.startswith("# min_med_precision = ")
+        ):
+            out.append(line.removeprefix("# "))
+        else:
+            out.append(line)
+    p = tmp_path / "config.toml"
+    p.write_text("".join(out), encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.bands.min_high_precision == 0.9
+    assert cfg.bands.min_med_precision == 0.7
+    assert cfg.bands.per_label == {
+        "Money/Bills": BandOverride(min_high_precision=0.9, min_med_precision=0.8)
+    }
+
+
 def test_full_config_parses(tmp_path: Path) -> None:
     p = _write(
         tmp_path,
@@ -125,6 +160,11 @@ def test_all_section_defaults_are_literal_pinned() -> None:
         "med": "ai-med",
         "managed": [],
     }
+    assert Config().bands.model_dump() == {
+        "min_high_precision": 0.9,
+        "min_med_precision": 0.7,
+        "per_label": {},
+    }
 
 
 def test_instances_do_not_share_submodels() -> None:
@@ -161,6 +201,242 @@ def test_utf16_config_is_typed_error(tmp_path: Path) -> None:
 def test_unknown_key_rejected(tmp_path: Path) -> None:
     p = _write(tmp_path, "[gmail]\nbatch_size = 5\n")
     with pytest.raises(ConfigError, match=r"batch_size|Extra"):
+        load_config(str(p))
+
+
+# ---- [bands] (ticket #21: per-label band overrides) ----
+
+
+def test_bands_defaults_are_literal_pinned() -> None:
+    # the defaults ride the named constants — pin the literal values so
+    # a changed default goes red HERE (and in example.toml's match test)
+    from gmail_labeler.thresholds import (
+        DEFAULT_MIN_HIGH_PRECISION,
+        DEFAULT_MIN_MED_PRECISION,
+    )
+
+    bands = Config().bands
+    assert bands.min_high_precision == DEFAULT_MIN_HIGH_PRECISION == 0.9
+    assert bands.min_med_precision == DEFAULT_MIN_MED_PRECISION == 0.7
+    assert bands.per_label == {}
+
+
+def test_bands_per_label_override_parses(tmp_path: Path) -> None:
+    # a per-label subtable (label names may carry slashes — quoted TOML
+    # keys); only the stated target is overridden, the other stays None
+    p = _write(
+        tmp_path,
+        "[bands]\nmin_high_precision = 0.8\n\n"
+        '[bands."Money/Bills"]\nmin_high_precision = 0.9\n',
+    )
+    cfg = load_config(str(p))
+    assert cfg.bands.min_high_precision == 0.8
+    assert cfg.bands.min_med_precision == 0.7
+    assert set(cfg.bands.per_label) == {"Money/Bills"}
+    override = cfg.bands.per_label["Money/Bills"]
+    assert override.min_high_precision == 0.9
+    assert override.min_med_precision is None
+
+
+def test_bands_override_unknown_key_rejected(tmp_path: Path) -> None:
+    p = _write(
+        tmp_path,
+        '[bands."Money/Bills"]\nmin_high = 0.9\n',
+    )
+    with pytest.raises(ConfigError, match="min_high"):
+        load_config(str(p))
+
+
+def test_bands_non_tenth_target_rejected(tmp_path: Path) -> None:
+    # the tenth-grid stance (#20): a target between grid points refuses
+    for section in (
+        "[bands]\nmin_high_precision = 0.93\n",
+        "[bands]\nmin_med_precision = 0.65\n",
+        '[bands."Bills"]\nmin_high_precision = 0.93\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="tenth"):
+            load_config(str(p))
+
+
+def test_bands_out_of_range_rejected(tmp_path: Path) -> None:
+    for section in (
+        "[bands]\nmin_high_precision = 1.5\n",
+        "[bands]\nmin_med_precision = -0.1\n",
+        '[bands."Bills"]\nmin_med_precision = 1.1\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="must be in"):
+            load_config(str(p))
+
+
+def test_bands_string_target_rejected(tmp_path: Path) -> None:
+    # a string is not a target: pydantic's lax float coercion would
+    # turn "0.9" into 0.9 — refused on the RAW value, named (numeric
+    # and non-numeric strings alike), never silently coerced
+    for section in (
+        '[bands]\nmin_high_precision = "0.9"\n',
+        '[bands]\nmin_med_precision = "abc"\n',
+        '[bands."Bills"]\nmin_high_precision = "0.9"\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="not a string"):
+            load_config(str(p))
+
+
+def test_bands_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
+    # the per_label back door: a raw per_label table in the [bands]
+    # table bypassed every custom refusal (bool→1.0, non-tenth, empty
+    # table, silent discard against the label-path form). It is a
+    # reserved field name — refused with the label-path spelling
+    # shown, so an operator who wrote it gets guidance
+    for section in (
+        '[bands]\nper_label = { "Bills" = { min_high_precision = true } }\n',
+        '[bands]\nper_label = { "Bills" = { min_high_precision = 0.93 } }\n',
+        '[bands]\nper_label = { "Bills" = {} }\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="reserved field name"):
+            load_config(str(p))
+        p = _write(
+            tmp_path,
+            '[bands]\nper_label = { "Bills" = { min_high_precision = 0.9 } }\n'
+            '[bands."Bills"]\nmin_med_precision = 0.8\n',
+        )
+        with pytest.raises(ConfigError, match="reserved field name"):
+            load_config(str(p))
+        # the guidance shows the label-path spelling
+        p = _write(
+            tmp_path,
+            '[bands]\nper_label = { "Bills" = { min_high_precision = 0.9 } }\n',
+        )
+        with pytest.raises(ConfigError, match=r'bands\."Some/Label"'):
+            load_config(str(p))
+
+
+def test_bands_programmatic_per_label_gets_the_same_checks() -> None:
+    # defense in depth: the declared per_label field (the programmatic
+    # API — typed BandOverride values) gets the SAME tenth-grid, range,
+    # and empty-override checks as the label-path form
+    from gmail_labeler.config import BandOverride, BandsConfig
+
+    good = BandsConfig(per_label={"Bills": BandOverride(min_high_precision=0.5)})
+    assert good.per_label["Bills"].min_high_precision == 0.5
+    for bad in (
+        BandOverride(min_high_precision=0.93),  # non-tenth
+        BandOverride(min_high_precision=1.5),  # out of range
+        BandOverride(),  # empty override
+    ):
+        with pytest.raises(ValueError, match=r"bands\.Bills"):
+            BandsConfig(per_label={"Bills": bad})
+
+
+def test_bands_same_label_named_twice_refused(tmp_path: Path) -> None:
+    # the same label named more than once — a typed per_label entry
+    # AND a [bands."<key>"] subtable, or padded keys that strip to
+    # one — is refused, not silently shadowed (the LabelsConfig
+    # uniqueness precedent, post-clean)
+    from gmail_labeler.config import BandOverride, BandsConfig
+
+    with pytest.raises(ValueError, match="duplicate"):
+        BandsConfig.model_validate(
+            {
+                "per_label": {"Bills": BandOverride(min_high_precision=0.5)},
+                "Bills": {"min_high_precision": 0.9},
+            }
+        )
+    p = _write(
+        tmp_path,
+        '[bands."Foo"]\nmin_high_precision = 0.9\n'
+        '[bands."Foo "]\nmin_med_precision = 0.8\n',
+    )
+    with pytest.raises(ConfigError, match="duplicate"):
+        load_config(str(p))
+
+
+def test_bands_label_key_stripped_and_bounded(tmp_path: Path) -> None:
+    # a whitespace-padded key is stored stripped (the LabelsConfig
+    # stripping precedent — a padded key must not survive to
+    # calibration); blank-after-strip and over-length keys refuse
+    p = _write(tmp_path, '[bands."  Bills  "]\nmin_high_precision = 0.9\n')
+    cfg = load_config(str(p))
+    assert set(cfg.bands.per_label) == {"Bills"}
+    p = _write(tmp_path, '[bands."   "]\nmin_high_precision = 0.9\n')
+    with pytest.raises(ConfigError, match="non-empty after stripping"):
+        load_config(str(p))
+    long_key = "B" * 41
+    p = _write(tmp_path, f'[bands."{long_key}"]\nmin_high_precision = 0.9\n')
+    with pytest.raises(ConfigError, match="longer than"):
+        load_config(str(p))
+
+
+def test_bands_bool_target_rejected(tmp_path: Path) -> None:
+    # a TOML bool is not a target: pydantic's lax float coercion would
+    # turn true into 1.0 (false into 0.0) — refused on the RAW value,
+    # never silently coerced (the core's "a bool is not a target")
+    for section in (
+        "[bands]\nmin_high_precision = true\n",
+        "[bands]\nmin_med_precision = false\n",
+        '[bands."Bills"]\nmin_high_precision = true\n',
+    ):
+        p = _write(tmp_path, section)
+        with pytest.raises(ConfigError, match="not a bool"):
+            load_config(str(p))
+
+
+def test_bands_empty_override_table_rejected(tmp_path: Path) -> None:
+    # an empty [bands."<label>"] table sets nothing — a no-op that
+    # would silently calibrate with the defaults; refused, not dropped
+    p = _write(tmp_path, '[bands."Bills"]\n')
+    with pytest.raises(ConfigError, match="at least one target"):
+        load_config(str(p))
+
+
+def test_all_band_problems_reported_together(tmp_path: Path) -> None:
+    # aggregation, not first-fail (the LabelsConfig doctrine): a bad
+    # default + two bad per-label tables are ALL named in one error
+    p = _write(
+        tmp_path,
+        "[bands]\nmin_high_precision = 0.93\n"
+        '[bands."Bills"]\nmin_med_precision = 1.5\n'
+        '[bands."Shipping"]\nmin_high = 0.9\n',
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "tenth" in msg  # the bad default
+    # the out-of-range override (the collecting validator's range
+    # message — the ge/le field constraints are gone, so this problem
+    # can no longer skip the collection)
+    assert "Bills" in msg and "must be in [0.0, 1.0]" in msg
+    assert "Shipping" in msg and "min_high" in msg  # the unknown key
+
+
+def test_all_band_problems_reported_together_including_bool(tmp_path: Path) -> None:
+    # the aggregation mutation pin: a RAW bool used to fire the
+    # separate pre-scan (which raised before the collection ran) —
+    # now bool + non-tenth + out-of-range + unknown key are ALL named
+    # in one error by the single raw-seeing validator
+    p = _write(
+        tmp_path,
+        "[bands]\nmin_high_precision = true\nmin_med_precision = 0.93\n"
+        '[bands."Bills"]\nmin_med_precision = 1.5\n'
+        '[bands."Shipping"]\nmin_high = 0.9\n',
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(str(p))
+    msg = str(ei.value)
+    assert "not a bool" in msg  # the raw bool
+    assert "tenth" in msg  # the non-tenth default
+    assert "must be in [0.0, 1.0]" in msg  # the out-of-range override
+    assert "Shipping" in msg and "min_high" in msg  # the unknown key
+
+
+def test_bands_scalar_override_rejected(tmp_path: Path) -> None:
+    # a per-label override must be a TABLE of targets — a scalar under a
+    # label name is a typo, refused (not silently dropped)
+    p = _write(tmp_path, '[bands]\n"Bills" = 0.9\n')
+    with pytest.raises(ConfigError, match="Bills"):
         load_config(str(p))
 
 

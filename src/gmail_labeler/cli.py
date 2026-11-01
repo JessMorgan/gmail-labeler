@@ -2129,9 +2129,10 @@ def _validate_store_db(db_path: Path) -> None:
 def _now() -> datetime:
     """The injectable clock seam (fold-4 item 2): the single
     ``datetime.now(UTC)`` read per ``shadow run`` command (its window math
-    and run_ts both go through it — ONE read; the train/eval sites still
-    read the clock directly, which is #24's clock-seam reuse item, not
-    this ticket's scope). A test can monkeypatch it to a fixed aware
+    and run_ts both go through it — ONE read; the other commands
+    (train/eval/analyze) still read the clock directly, which is #24's
+    clock-seam reuse item, not this ticket's scope). A test can
+    monkeypatch it to a fixed aware
     datetime and pin the EXACT shipped default (now - 90d, time kept) at
     the CLI level (the recorded ``list_messages`` query)."""
     return datetime.now(UTC)
@@ -2194,7 +2195,10 @@ def shadow_run(
     query: str | None = typer.Option(
         None,
         "--query",
-        help="Gmail search query — replaces the default in:inbox after:<epoch> query",
+        help=(
+            "Gmail search query — REPLACES the backlog window entirely "
+            "(the default in:inbox after:<epoch> query and --since alike)"
+        ),
     ),
     db: str | None = typer.Option(
         None,
@@ -2700,10 +2704,12 @@ def shadow_run(
 
     if as_json:
         # fold-4 item 3 + fold-5 A1: the window fields are derived from
-        # the SAME cutoff_dt that built the query — but ONLY when the
-        # default window was used. When --query overrides the default
-        # wholesale, cutoff_epoch/cutoff would describe a window the
-        # query never used, so they are OMITTED (no phantom window).
+        # the SAME cutoff_dt that built the query — emitted whenever NO
+        # --query override is in effect (--since windows included, since
+        # the cutoff_dt built the query in every non-override case).
+        # Under --query the cutoff_epoch/cutoff fields would describe a
+        # window the query never used, so they are OMITTED (no phantom
+        # window).
         payload = {
             "run_id": run_id,
             "run_ts": run_ts.isoformat(),
@@ -2717,10 +2723,11 @@ def shadow_run(
             "rows": json_rows,
         }
         if query is None:
-            # default window active: the cutoff fields describe the SAME
-            # cutoff_dt that built the query (epoch + its ISO datetime —
-            # the date-only `since` is retired, it diverged from the
-            # shipped default, which keeps the time)
+            # no --query override (default OR --since window): the cutoff
+            # fields describe the SAME cutoff_dt that built the query
+            # (epoch + its ISO datetime — the date-only `since` is
+            # retired, it diverged from the shipped default, which keeps
+            # the time)
             payload["cutoff_epoch"] = int(cutoff_dt.timestamp())
             payload["cutoff"] = cutoff_dt.isoformat()
         typer.echo(json.dumps(payload, sort_keys=True))

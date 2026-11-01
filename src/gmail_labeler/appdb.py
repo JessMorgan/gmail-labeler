@@ -287,10 +287,17 @@ class AppDB:
                 if not versions:
                     # our-shape but EMPTY (no version row) — corrupt, named.
                     # This state is also REACHABLE by a crash between
-                    # executescript (table created) and the version stamp
-                    # (row never inserted): the fail-safe direction is
-                    # correct (refuse, not adopt) and it is recoverable by
-                    # re-running (a fresh open re-stamps the version).
+                    # executescript (tables created) and the version stamp
+                    # (row never inserted). EXECUTED probe (fold-6): the
+                    # state survives closed refusing — re-running open()
+                    # keeps refusing, because the ownership gate raises
+                    # HERE, before the re-stamp branch in open() (3/3
+                    # attempts refused). Recovery is NOT re-running: it
+                    # is DELETE the state DB file (a fresh open then
+                    # re-creates + stamps — executed: open OK, version
+                    # row (1,) restored) or stamp the row manually
+                    # (executed: open OK). The fail-safe direction is
+                    # correct (refuse, never adopt).
                     raise AppDBError(
                         f"state DB schema_version is empty (our shape, no "
                         f"version row) — corrupt: {self.path}"

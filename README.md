@@ -277,7 +277,9 @@ entry) refuses with exit 5 ("would-apply refused"). Refusals up front
 DB path — `--db PATH` or `[store] db_path` — inside the checkpoint dir
 or the corpus store (by resolved path, named by its source — the state
 DB must not live beside identity files). The summary goes to stderr;
-`--json` emits one parseable object. `shadow
+`--json` emits one parseable object (its `cutoff_epoch`/`cutoff` window
+fields are present except under the `--query` override, which replaces the
+window entirely). `shadow
 report` diffs a run's stored verdicts against the mailbox's ACTUAL
 labels (re-fetched via the read path — the labels may have changed
 since the run): a deterministic per-message diff of message id + label

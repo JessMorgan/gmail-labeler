@@ -62,23 +62,25 @@ does not ship releases yet.
   ANY `--bands` target whose resolved path lies inside the checkpoint
   dir (manifest, sidecar, weights) or the corpus store (records
   index, labels/filters sidecars, bodies) — the artifact must not
-  live beside identity files (by resolved path: a link named inside
+  live beside identity files (by resolved path — a link named inside
   pointing outside is allowed and replaces the link); the canonical
-  location lands with the daemon phase, any other path works. The recompute posture is
-  pinned: eval remains the only command that writes the artifact — a
-  structural source-scan tripwire against named mints (a tripwire,
-  not a sandbox: getattr-construction and a hand-rolled dict evade
-  any string scan) + the behavioral pins (AC4). Exit-code contract
-  preserved (config error → 4; run-time refusals → 5, the report
-  preserved on stdout: a degraded corpus — test records with missing
-  body shards, scored subject-only — because the artifact feeds the
-  daemon's serving gate; a calibration refusal — an unknown override
-  label, a lying identity; replacing an existing artifact whose
-  identity fields disagree with the current run — refused BEFORE any
-  staging, the previous bytes intact; a write failure, or a
-  post-write readback fault — the on-disk bytes do not parse back to
-  a valid artifact (a torn/corrupt write), or the content hash
-  differs from the minted artifact).
+  location lands with the daemon phase, any other path works. The
+  recompute posture is pinned: eval remains the only command that
+  writes the artifact — a structural source-scan tripwire against
+  named mints (a tripwire, not a sandbox: getattr-construction and
+  a hand-rolled dict evade any string scan) + the behavioral pins
+  (AC4). Exit-code contract preserved (config error → 4; run-time
+  refusals → 5, the report preserved on stdout: a degraded corpus —
+  test records with missing body shards, scored subject-only —
+  because the artifact feeds the daemon's serving gate; a
+  calibration refusal — an unknown override label, a lying identity;
+  replacing an existing artifact whose identity fields disagree with
+  the current run — refused BEFORE any staging, the previous bytes
+  intact; a write failure; a post-write readback fault — the
+  on-disk bytes do not parse back to a valid artifact (a
+  torn/corrupt write); or a readback mismatch — a valid artifact
+  whose content hash differs from the minted one, a concurrent
+  writer's signature).
 - Config `[bands]` (ticket #21): the run's default min-precision
   targets (`min_high_precision` 0.9 / `min_med_precision` 0.7) +
   per-label overrides as `[bands."<label>"]` subtables (label names

@@ -16,6 +16,7 @@ from gmail_labeler.appdb import (
     SCHEMA_VERSION,
     AppDB,
     AppDBError,
+    ApplicationRow,
     ShadowRow,
 )
 
@@ -180,7 +181,7 @@ def test_foreign_schema_version_is_refused(tmp_path: Path) -> None:
     db = AppDB(db_path)
     # a foreign-version schema_version (99) is refused by the version
     # HARD gate (fold-4 item 1) with the version-named message
-    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
+    with pytest.raises(AppDBError, match=rf"schema_version \[99\] != {SCHEMA_VERSION}"):
         db.open()
     conn = sqlite3.connect(str(db_path))
     try:
@@ -206,7 +207,9 @@ def test_polluted_schema_version_is_refused(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match=r"schema_version \[1, 99\] != 1"):
+    with pytest.raises(
+        AppDBError, match=rf"schema_version \[1, 99\] != {SCHEMA_VERSION}"
+    ):
         db.open()
 
 
@@ -230,7 +233,7 @@ def test_our_shape_shadow_results_with_foreign_version_is_refused(
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
+    with pytest.raises(AppDBError, match=rf"schema_version \[99\] != {SCHEMA_VERSION}"):
         db.open()
     # NOT opened/written: no new rows, no restamp
     conn = sqlite3.connect(str(db_path))
@@ -368,7 +371,7 @@ def test_versioned_foreign_db_gains_no_table_pre_refusal(tmp_path: Path) -> None
     conn.commit()
     conn.close()
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match=r"schema_version \[99\] != 1"):
+    with pytest.raises(AppDBError, match=rf"schema_version \[99\] != {SCHEMA_VERSION}"):
         db.open()
     conn = sqlite3.connect(str(db_path))
     try:
@@ -396,7 +399,9 @@ def test_schema_version_row_is_stable_across_opens(tmp_path: Path) -> None:
         db.close()
     conn = sqlite3.connect(str(db_path))
     try:
-        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [
+            (SCHEMA_VERSION,)
+        ]
     finally:
         conn.close()
 
@@ -487,7 +492,7 @@ def _tampered_db(db_path: Path) -> None:
     # read-back validation is the gate that fires)
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
-    conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
     conn.execute(
         "CREATE TABLE shadow_results ("
         "run_id TEXT, message_id TEXT, label TEXT, probability REAL, "
@@ -546,3 +551,398 @@ def test_load_run_tampered_rows_are_refused(tmp_path: Path) -> None:
     with pytest.raises(AppDBError, match="distinct run_ts"):
         db3.load_run("run-2")
     db3.close()
+
+
+# -- applications table + the v1->v2 migration (ticket #24) ------------------
+
+_APPLICATIONS_COLUMNS = {
+    "message_id",
+    "label",
+    "label_id",
+    "score",
+    "band",
+    "tier",
+    "applied_at",
+    "source",
+}
+
+
+def _app_row(
+    message_id: str = "aa",
+    label: str = "Shipping",
+    label_id: str = "Label_1",
+    score: float = 0.9,
+    band: str | None = "high",
+    tier: str = "ai-high",
+    applied_at: datetime = TS,
+    source: str = "daemon",
+) -> ApplicationRow:
+    return ApplicationRow(
+        message_id=message_id,
+        label=label,
+        label_id=label_id,
+        score=score,
+        band=band,  # pyright: ignore[reportArgumentType] — the lying-row fixture
+        tier=tier,
+        applied_at=applied_at,
+        source=source,
+    )
+
+
+def _v1_db(db_path: Path, *, with_run: bool = True) -> None:
+    """A DB exactly as ticket #23 shipped it: schema_version {1} +
+    shadow_results (our shape), NO applications table."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+    conn.execute(
+        "CREATE TABLE shadow_results ("
+        "run_id TEXT NOT NULL, message_id TEXT NOT NULL, label TEXT NOT NULL, "
+        "probability REAL NOT NULL, band TEXT, run_ts TEXT NOT NULL, "
+        "PRIMARY KEY (run_id, message_id, label))"
+    )
+    if with_run:
+        conn.execute(
+            "INSERT INTO shadow_results VALUES "
+            "('run-1', 'aa', 'Shipping', 0.9, 'high', '2026-11-01T12:00:00+00:00')"
+        )
+    conn.commit()
+    conn.close()
+
+
+def _versions(db_path: Path) -> list[int]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [r[0] for r in conn.execute("SELECT version FROM schema_version")]
+    finally:
+        conn.close()
+
+
+def test_fresh_db_is_v2_with_applications(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    assert _versions(db.path) == [SCHEMA_VERSION] == [2]
+    conn = sqlite3.connect(str(db.path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
+        assert cols == _APPLICATIONS_COLUMNS
+        # the corrections/status join (#27): indexes on message_id AND
+        # label (the #23 NIT)
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'applications'"
+            )
+        }
+        assert {"idx_applications_message_id", "idx_applications_label"} <= indexes
+    finally:
+        conn.close()
+    db.close()
+
+
+def test_v1_db_migrates_to_a_single_v2_row(tmp_path: Path) -> None:
+    # the migration story (#23's recorded debt): opening a live v1 DB
+    # with the v2 tool CREATES the applications table and RESTAMPS the
+    # version row to 2 — single-row model: UPDATE, never a second row
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    db = AppDB(db_path)
+    db.open()
+    assert _versions(db_path) == [2]  # exactly one row, restamped
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
+        assert cols == _APPLICATIONS_COLUMNS
+    finally:
+        conn.close()
+    # the recorded shadow run SURVIVES the migration (the data is the
+    # operator's, the restamp is metadata)
+    _run_ts, rows = db.load_run("run-1")
+    assert len(rows) == 1
+    db.close()
+    # re-opening in-process is v2-clean (the tool that just migrated IS
+    # the v2 tool)
+    db2 = AppDB(db_path)
+    db2.open()
+    db2.close()
+
+
+def test_migrated_db_refused_by_the_v1_gate(tmp_path: Path, monkeypatch) -> None:
+    # the OTHER direction of the pin: the SAME migrated file opened by
+    # the version-gate logic as a v1 tool refuses it — {2} != {1},
+    # named. The forward-compat story IS the hard gate (documented
+    # honestly: our own v2 is the tool that just migrated it)
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    migrator = AppDB(db_path)
+    migrator.open()
+    migrator.close()
+    import gmail_labeler.appdb as appdb_module
+
+    monkeypatch.setattr(appdb_module, "SCHEMA_VERSION", 1)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[2\] != 1"):
+        db.open()
+
+
+def test_v1_stamp_with_applications_table_is_refused(tmp_path: Path) -> None:
+    # the single-row model's inconsistent state: a v1 tool never writes
+    # an applications table — {1} + applications is corrupt, refused
+    # named (the crash between the restamp UPDATE and the table creation
+    # is self-healing; THIS direction is not, and refuses)
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE applications (message_id TEXT, label TEXT, label_id TEXT, "
+        "score REAL, band TEXT, tier TEXT, applied_at TEXT, source TEXT)"
+    )
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[1\]"):
+        db.open()
+
+
+def test_v2_stamp_without_applications_self_heals(tmp_path: Path) -> None:
+    # the crash-window direction that IS safe: {2} stamped but the
+    # applications table never created (crash between the UPDATE and the
+    # schema script) — the next open re-runs create-all-if-missing and
+    # heals, no refusal
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE schema_version SET version = 2")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
+        assert cols == _APPLICATIONS_COLUMNS
+    finally:
+        conn.close()
+    db.close()
+
+
+def test_wrong_shape_applications_is_refused(tmp_path: Path) -> None:
+    # the ownership gate EXTENDED: applications, if present, must match
+    # ITS shape too (the column-set equality pattern of shadow_results)
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute(
+        "INSERT INTO schema_version (version) VALUES (2)",
+    )
+    conn.execute("CREATE TABLE applications (message_id TEXT, note TEXT)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="applications has the wrong shape"):
+        db.open()
+
+
+def test_v2_db_with_only_applications_is_ours(tmp_path: Path) -> None:
+    # a v2 DB carrying ONLY the applications table (no shadow_results) is
+    # ours by the shape gate — the applications validity stands alone
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+    conn.execute(
+        "CREATE TABLE applications (message_id TEXT NOT NULL, label TEXT NOT NULL, "
+        "label_id TEXT NOT NULL, score REAL NOT NULL, band TEXT NOT NULL, "
+        "tier TEXT NOT NULL, applied_at TEXT NOT NULL, source TEXT NOT NULL "
+        "CHECK (source IN ('daemon', 'apply')))"
+    )
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()  # no refusal; shadow_results is created if-missing
+    db.record_applications([_app_row()])
+    assert len(db.applications_for_message("aa")) == 1
+    db.close()
+
+
+def test_applications_coeexists_with_unknown_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.record_applications([_app_row()])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE other_app_data (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    assert len(db2.applications_for_message("aa")) == 1
+    db2.close()
+
+
+def test_record_applications_roundtrip(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    count = db.record_applications(
+        [
+            _app_row("bb", "Money/Bills", "Label_2", 0.7, "med", "ai-med"),
+            _app_row("aa", "Shipping", "Label_1", 0.9, "high", "ai-high"),
+            _app_row("aa", "Invoices", "Label_3", 0.8, "high", "ai-high"),
+        ]
+    )
+    assert count == 3
+    rows = db.applications_for_message("aa")
+    assert [r.label for r in rows] == ["Invoices", "Shipping"]  # label-sorted tie
+    assert rows[0].applied_at == TS  # aware UTC round-trip
+    assert rows[0].source == "daemon"
+    assert rows[0].score == 0.8
+    by_label = db.applications_for_label("Money/Bills")
+    assert [r.message_id for r in by_label] == ["bb"]
+    assert db.applications_for_message("deadbeef") == ()  # empty is legitimate
+    db.close()
+    # the join read survives re-open (durability)
+    db2 = AppDB(tmp_path / "state.db")
+    db2.open()
+    assert len(db2.applications_for_message("aa")) == 2  # the bb row is other's
+    db2.close()
+
+
+def test_record_applications_empty_is_refused(tmp_path: Path) -> None:
+    # like record_run: an empty batch is refused at the writer
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="no rows"):
+        db.record_applications([])
+    db.close()
+
+
+def test_record_applications_allows_reapplication_history(tmp_path: Path) -> None:
+    # NO PK on (message_id, label): a label manually removed and later
+    # re-earned earns a NEW Application — the audit history is the
+    # operator's, not a uniqueness constraint
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.record_applications([_app_row()])
+    db.record_applications([_app_row(applied_at=TS.replace(hour=13))])
+    assert len(db.applications_for_message("aa")) == 2
+    db.close()
+
+
+def test_record_applications_row_validation(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    bad: list[tuple[ApplicationRow, str]] = [
+        (_app_row(message_id="zz"), "hex"),
+        (_app_row(label="  "), "non-empty"),
+        (_app_row(label_id=""), "non-empty"),
+        (_app_row(score=1.5), r"out of \[0, 1\]"),
+        (_app_row(score=True), "must be a number"),
+        (_app_row(band="low"), "band"),
+        (_app_row(band=None), "band"),
+        (_app_row(tier=""), "non-empty"),
+        (_app_row(source="shadow"), "source"),
+        (_app_row(source="DAEMON"), "source"),
+        (_app_row(applied_at=TS.replace(tzinfo=None)), "timezone-aware"),
+    ]
+    for row, cause in bad:
+        with pytest.raises(AppDBError, match=cause):
+            db.record_applications([row])
+    # duplicate (message_id, label) WITHIN one batch is a composition bug
+    with pytest.raises(AppDBError, match="duplicate"):
+        db.record_applications([_app_row(), _app_row(label_id="Label_2")])
+    assert db.applications_for_message("aa") == ()  # nothing half-written
+    db.close()
+
+
+def test_record_applications_one_transaction(tmp_path: Path) -> None:
+    # the crash-safety contract (record_run's): a mid-batch INSERT
+    # failure rolls back the whole batch — no half rows
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.record_applications([_app_row("aa")])
+
+    class _FlakyConn:
+        # delegating proxy: the next executemany raises (a simulated
+        # mid-write crash — sqlite3.Connection itself refuses attribute
+        # injection)
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        def executemany(self, *_a: object, **_k: object) -> None:
+            raise sqlite3.OperationalError("disk full (simulated)")
+
+        def __enter__(self) -> _FlakyConn:
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> object:
+            return self._real.__exit__(*exc)  # type: ignore[arg-type,no-any-return]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+    real_conn = db._conn
+    assert real_conn is not None
+    db._conn = _FlakyConn(real_conn)  # type: ignore[assignment]
+    with pytest.raises(AppDBError, match="disk full"):
+        db.record_applications([_app_row("bb"), _app_row("cc")])
+    db._conn = real_conn
+    assert len(db.applications_for_message("aa")) == 1  # prior batch intact
+    assert db.applications_for_message("bb") == ()  # rolled back
+    assert db.applications_for_message("cc") == ()
+    db.close()
+
+
+def test_applications_schema_has_no_body_columns(tmp_path: Path) -> None:
+    # invariant #5, structural: the table carries the EIGHT metadata
+    # columns and nothing else — no body/subject/raw column exists to
+    # put a body in (the caplog side of the proof lands with the plan's
+    # id-only warnings in applications.py)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    conn = sqlite3.connect(str(db.path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
+        assert cols == _APPLICATIONS_COLUMNS
+        assert not {"body", "subject", "raw", "snippet"} & cols
+    finally:
+        conn.close()
+    db.close()
+
+
+def test_applications_read_revalidates_tampered_rows(tmp_path: Path) -> None:
+    # a hand-edited applications row (bad band / lying source) is
+    # refused, named — not rendered (the load_run doctrine)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.record_applications([_app_row()])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE applications SET band = 'low'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="band"):
+        db2.applications_for_message("aa")
+    db2.close()
+
+
+def test_applications_tampered_applied_at_is_corrupt(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.record_applications([_app_row()])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE applications SET applied_at = 'not-a-date'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="not-a-date"):
+        db2.applications_for_message("aa")
+    db2.close()

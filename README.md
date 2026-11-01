@@ -309,9 +309,10 @@ distinct from `high`/`med`) and consumed by the Application write
 composition (ticket #24): `applications.plan_message_write` adds the
 umbrella plus the best band tier to every write, and
 `gmail_client.ensure_label` ships the name→Gmail-label-id resolution
-(get-or-create: exact-case user hits win, casefolded System Label
-name-sakes are refused named; the daemon / `apply` startup of #25/#26
-calls it once per configured name); the live write itself lands with
+(get-or-create: an existing USER label of exactly that name is used
+as-is; a casefolded System Label name-sake is refused named — the
+refusal guards minting a look-alike only; the daemon / `apply` startup
+of #25/#26 calls it once per configured name); the live write itself lands with
 the daemon / `apply` CLI (#25/#26);
 GLOSSARY: Application, Tier Label.
 

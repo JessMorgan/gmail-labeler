@@ -1049,6 +1049,24 @@ def test_fake_ensure_label_is_idempotent_and_creates() -> None:
     assert len(fake.writes) == 1
 
 
+def test_fake_list_labels_returns_a_copy() -> None:
+    # F3 (deepseek): list_labels() returned the LIVE internal list —
+    # the ctor aliasing trap, OTHER direction: a caller mutating the
+    # returned list corrupted the fake's mailbox behind its back (and
+    # #25's exact-call tests ride this fake). The REST adapter builds
+    # fresh objects per call; the fake now returns a copy
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    returned = fake.list_labels()
+    returned.append(LabelInfo(id="Label_x", name="sneaked", type="user"))
+    returned[0] = LabelInfo(id="INBOX", name="INBOX", type="system")
+    assert fake.labels_list == [LabelInfo(id="Label_9", name="ai-high", type="user")]
+    # the mailbox the fake READS from is untouched: ensure_label still
+    # hits the real entry, not the corrupted view
+    assert fake.ensure_label("ai-high") == "Label_9"
+
+
 def test_fake_ensure_label_refuses_system_namesakes() -> None:
     # the fake mirrors the REST refusal (F1): no silent duplicate-named
     # user label, in CI or on the wire

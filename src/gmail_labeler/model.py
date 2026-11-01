@@ -174,9 +174,7 @@ def vocabulary_hash(vocabulary: Sequence[str]) -> str:
     refuse — the hash is the drift detector. ASCII + compact
     separators make it a pure function of the content, stable across
     hosts."""
-    canonical = json.dumps(
-        list(vocabulary), ensure_ascii=True, separators=(",", ":")
-    )
+    canonical = json.dumps(list(vocabulary), ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -297,8 +295,7 @@ class ExpectedIdentity:
             value = getattr(self, name)
             if not _HASH_RE.fullmatch(value):
                 raise ValueError(
-                    f"ExpectedIdentity.{name} must be a 64-char hex hash, "
-                    f"got {value!r}"
+                    f"ExpectedIdentity.{name} must be a 64-char hex hash, got {value!r}"
                 )
 
 

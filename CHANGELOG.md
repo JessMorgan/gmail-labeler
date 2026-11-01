@@ -34,6 +34,20 @@ does not ship releases yet.
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
+- Phase 1 dataset builder core (`dataset_build.py`): the shared pure
+  Corpus → Training Example transform — Label Path vocabulary (a leaf
+  path is a distinct class; a parent may scope its subtree), examples
+  sorted by id with canonical sorted label tuples and Date Provenance
+  stamped, required `now`, input-order invariant.
+- Dataset builder bridge (invariant #6): Filter-Authored evidence is
+  excluded from training examples (per-message for simulatable filters,
+  whole-label for unverifiable/malformed ones); a missing, incomplete,
+  or malformed filters/labels snapshot aborts the build loudly
+  (`BuildAbortedError`, a `ValueError`). The effective bridge is pinned
+  in the Split Manifest (`bridge_hash`, canonical — insensitive to filter
+  order and unreferenced label entries) so a drifted snapshot refuses the
+  rebuild. The filter-shape rule is shared with `dataset analyze`
+  (`filter_label_ids` / `filter_label_ids_strict`).
 - Model seam (`model.py`): the `Model` Protocol — batch predict →
   per-label sigmoid scores over the checkpoint's Label-Path vocabulary
   (rows aligned to inputs, columns to the vocabulary; `texts` is an
@@ -51,20 +65,44 @@ does not ship releases yet.
   anywhere in the importable core — the real encoder stays behind the
   `train/` recipe (pinned: importing `gmail_labeler.model` leaves
   `torch` out of `sys.modules`).
-- Phase 1 dataset builder core (`dataset_build.py`): the shared pure
-  Corpus → Training Example transform — Label Path vocabulary (a leaf
-  path is a distinct class; a parent may scope its subtree), examples
-  sorted by id with canonical sorted label tuples and Date Provenance
-  stamped, required `now`, input-order invariant.
-- Dataset builder bridge (invariant #6): Filter-Authored evidence is
-  excluded from training examples (per-message for simulatable filters,
-  whole-label for unverifiable/malformed ones); a missing, incomplete,
-  or malformed filters/labels snapshot aborts the build loudly
-  (`BuildAbortedError`, a `ValueError`). The effective bridge is pinned
-  in the Split Manifest (`bridge_hash`, canonical — insensitive to filter
-  order and unreferenced label entries) so a drifted snapshot refuses the
-  rebuild. The filter-shape rule is shared with `dataset analyze`
-  (`filter_label_ids` / `filter_label_ids_strict`).
+- `train` command (ticket #19): fine-tunes the encoder on the corpus,
+  fully local (AC#6). The run mints the Split Manifest, rebuilds the
+  examples THROUGH it (manifest mode — the manifest is authoritative,
+  invariant #7; the split boundary uses only server-authoritative
+  dates; the rebuild-via-manifest call is pinned by a `build_dataset`
+  spy), trains behind the Model seam (the recipe is reached through a
+  monkeypatchable factory — the offline tests drive `FakeModel`; the
+  factory's return is consumed: a trainer vocabulary that does not
+  match the manifest's refuses before any sidecar is written),
+  materializes the Split Manifest (`manifest.json`) with the
+  checkpoint, and writes the JSON Checkpoint Sidecar pinning the
+  run's identity (train-split scoped corpus fingerprint).
+  `--split-date` (required, strict ISO DATE — time components are a
+  usage error → 2) pins the temporal split; `--device cpu|cuda`
+  (default cpu) is plumbed to the recipe; `--assume-no-filters`
+  attests a filterless mailbox (the builder refuses a
+  missing/incomplete filters/labels bridge — invariant #6); the
+  existing-checkpoint refusal is hoisted BEFORE the two corpus-scale
+  build passes and REFUSES the run until `--force` is explicit
+  (retraining is human-gated, ADR-0005). `--force` replaces
+  staging-based: build in `<dir>.tmp` (0700 before training), verify
+  the sidecar by readback, rmtree the old dir, rename in — a crash
+  leaves the OLD checkpoint intact, an EMPTY dir, or the NEW one,
+  each refusal-safe, and no stale encoder file survives into the new
+  dir. The train text is `corpus_record.preprocess_text` (invariant
+  #4: train and inference share one preprocess function); missing
+  body shards warn with a count, an undecodable shard is exit 5. A
+  missing `train` extra (torch) is exit 5 with an install hint, not a
+  traceback (the recipe exception boundary is a documented decision:
+  ImportError/ValueError/OSError/RuntimeError → 5; anything else is a
+  code bug → traceback/exit 1). The dead `_stub`/`_NOT_IMPLEMENTED`
+  surface is removed (exit 3 stays documented as currently
+  unreachable); `store.verify_modes()` runs on the read path. Config
+  gains `[model]` (`encoder`, `encoder_path` — local weights only,
+  `checkpoint_dir`); exit-code contract 0/2/3/4/5 preserved (bad
+  `--split-date`/`--device` are usage errors → 2; build refusal,
+  unreadable corpus, recipe failure, and the checkpoint refusal are
+  5).
 - `train/` recipe (ticket #19): HF `Trainer` fine-tune over the
   builder's Training Examples — one sigmoid head per Label Path
   (multi-label BCE), the recency weight applied as a WEIGHTED MEAN of

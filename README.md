@@ -29,9 +29,10 @@ you would.
 
 - **Your mail never leaves your machines.** Training, inference, and storage
   are 100% local. No telemetry, no hosted training, no API keys to us.
-- **It only ever adds labels.** `gmail-labeler` will not remove anything, and
-  every application carries an `ai-applied` umbrella plus a confidence tier
-  (`ai-high` / `ai-med`) so you can audit every decision it ever made.
+- **It only ever adds labels.** `gmail-labeler` will not remove anything,
+  and every application (once the write phase lands) carries an `ai-applied`
+  umbrella plus one band Tier Label (`ai-high` / `ai-med`) so you can audit
+  every decision it ever made.
 - **Nothing goes live unproven.** Each label is trained, scored on a recent
   held-out slice of *your* mail, and shadow-scored before it is ever applied
   silently. Labels that don't earn it stay in review.
@@ -48,8 +49,9 @@ you would.
 3. **Graduate** — labels pass per-label precision gates on a temporal test
    split before they're allowed to apply silently.
 4. **Run** — a daemon polls the Gmail History API (~30s), classifies new
-   messages, and applies graduated labels with confidence tiers. Your manual
-   corrections are captured as training signal for the next round.
+   messages, and applies graduated labels with Tier Labels (once the write
+   phase lands). Your manual corrections are captured as training signal
+   for the next round.
 
 ## Setup
 
@@ -89,7 +91,10 @@ gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
-gmail-labeler shadow run --bands bands.json --graduation graduation.json    # score the recent Backlog, apply NOTHING (Shadow Pass)
+gmail-labeler eval --bands bands.json --graduation graduation.json --confirm-graduation
+                                      # ^ mints the artifacts the Shadow Pass reads (ADR-0005 gate)
+gmail-labeler shadow run --bands bands.json --graduation graduation.json
+                                      # score the recent Backlog, apply NOTHING (Shadow Pass)
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 ```
 

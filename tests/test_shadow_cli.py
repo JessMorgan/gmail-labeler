@@ -471,7 +471,8 @@ def test_shadow_run_since_strict_iso(
 def test_shadow_run_query_escape_hatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # --query replaces the default wholesale (the operator's query)
+    # --query replaces the whole backlog window — the default and
+    # --since alike (the README's --query scope, #23)
     _prepare(tmp_path, monkeypatch)
     result, fake = _run_shadow(
         tmp_path, "--query", "is:starred", monkeypatch=monkeypatch

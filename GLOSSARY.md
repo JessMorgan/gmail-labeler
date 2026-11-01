@@ -19,10 +19,13 @@ contributed something"), `ai-high` (the high-confidence band), and `ai-med`
 (the review-me band). The configured `high` / `med` names drive the shadow
 report's tier names NOW (the report renders the band tier name for would-be
 rows); the `applied` umbrella is VALIDATED at config NOW (stripped, and
-distinct from `high` / `med`) and CONSUMED by the write phase later — the
-name→Gmail-label-id resolution and the umbrella application are a WRITE-time
-concern the daemon WILL implement in the Application phase (#24/#25) —
-unshipped here (the report attaches no labels).
+distinct from `high` / `med`) and CONSUMED by the Application write
+composition (ticket #24): `applications.plan_message_write` adds the
+umbrella plus the best band tier to every write, and the daemon/apply
+startup resolves the configured names to Gmail label ids (get-or-create,
+never a System Label name-sake). The live write itself lands with the
+daemon / `apply` CLI (#25/#26); the shadow report still attaches no
+labels.
 _Avoid_: confidence label, meta label
 
 **Application**:
@@ -33,9 +36,11 @@ audits are counted against. The REAL contract: every Application carries the
 umbrella Tier Label (`[labels] applied`) AND exactly one band Tier Label
 (`[labels] high` or `med` — the BEST band among the applied labels, high beats
 med; a skip-present label earns no band tier, it is not applied). That
-composition (umbrella + one band tier) is done at WRITE time by the
-daemon phase (#24/#25), which also resolves the configured names to
-Gmail label ids. The shadow report is a PREVIEW, not an Application: it renders
+composition (umbrella + one band tier) SHIPS at the library level
+(ticket #24): `applications.plan_message_write` composes it from the
+tiers core and the startup-resolved Gmail label ids; the daemon /
+`apply` CLI (#25/#26) rides that plan for the live write. The shadow
+report is a PREVIEW, not an Application: it renders
 the band tier NAME for would-be rows and attaches no labels (no umbrella, no
 band tier on the wire).
 _Avoid_: auto-label (the event, not the label)
@@ -124,12 +129,15 @@ _Avoid_: shadow summary, evaluation report
 
 **state DB**:
 The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`;
-overridden per-command by the `--db` flag) holding the `shadow_results` table
-(run id, message id, label, probability,
-band, run timestamp) and, with the daemon phase, the `applications` table. It
-carries ids, probabilities, labels, and timestamps ONLY — never bodies
-(invariant #5) — so it is publicly attachable. One transaction per run (a crash
-mid-run leaves no half rows); a foreign schema_version is refused.
+overridden per-command by the `--db` flag) holding the `shadow_results`
+table (run id, message id, label, probability, band, run timestamp) and
+the `applications` table (ticket #24, schema v2: message id, label, label
+id, score, band, tier, applied-at, source — the join corrections and
+`status` read). It carries ids, probabilities, labels, and timestamps
+ONLY — never bodies (invariant #5) — so it is publicly attachable. One
+transaction per write (a crash leaves no half rows); a foreign
+schema_version is refused, and a live v1 DB is migrated in place (the
+single-row restamp to v2).
 _Avoid_: shadow DB, label DB
 
 **Backlog**:

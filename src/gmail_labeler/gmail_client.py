@@ -94,6 +94,13 @@ class RawMessage:
     # (export does); never trust presence.
     internal_date_ms: int | None
     raw_b64url: str
+    # The per-message history record id (Message.historyId — "the ID of
+    # the last history record that modified this message"): the sync
+    # guide's documented cursor-bootstrap source for the daemon (#25 —
+    # full sync stores the most recent message's historyId). Same
+    # presence doctrine as internal_date_ms: tolerate absence, never
+    # trust presence.
+    history_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +277,7 @@ class GmailRestClient:
             label_ids=_str_list(data, "labelIds"),
             internal_date_ms=_opt_int64(data, "internalDate"),
             raw_b64url=_raw_nonempty(data),  # absent OR empty: loud
+            history_id=_opt_int64(data, "historyId"),
         )
 
     def history(

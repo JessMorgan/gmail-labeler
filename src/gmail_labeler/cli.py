@@ -17,6 +17,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -2600,6 +2601,21 @@ def shadow_run(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ReportRow:
+    """One would-apply verdict row in the shadow report diff (ids +
+    labels + scores + tiers ONLY — no subjects, no bodies, invariant
+    #5). ``outcome`` is the diff verdict (``added`` / ``already-present``
+    / ``not-applied``); ``tier`` is the Tier Label name (``None`` for
+    skip-present and no-band — the single home is ``tiers.tier_for_band``)."""
+
+    label: str
+    probability: float
+    band: str | None
+    outcome: str
+    tier: str | None
+
+
 @shadow_app.command("report")
 def shadow_report(
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
@@ -2624,9 +2640,20 @@ def shadow_report(
     invariant #5). Outcomes: ADDED (would apply, not present),
     ALREADY-PRESENT (would apply, already present — skip-present
     visible), NOT-APPLIED (no band verdict). A per-label summary block
-    carries the would-be tier mix. A message whose labels cannot be
-    re-fetched is SKIPPED (per-message fail-safe: warning + count, the
-    report continues) — the same posture as ``shadow run``.
+    carries the would-be tier mix (ONLY labels that would actually be
+    added — skip-present labels are not applied, so they are not
+    counted). A message whose labels cannot be re-fetched is SKIPPED
+    (per-message fail-safe: warning + count, the report continues) —
+    the same posture as ``shadow run``; if EVERY message is skipped
+    (no evidence) the report refuses with exit 5 (mirroring shadow
+    run's zero-verdict posture).
+
+    The verdicts are bound to the bands/graduation artifacts AS OF THE
+    RUN — the report does NOT re-verify them (a basis disclosure, in
+    the header + the ``basis`` payload field). Hash persistence is
+    deferred to #26-27 (the status/corrections surface); re-run
+    ``shadow run`` after any retrain/recalibration to refresh the
+    basis.
     """
     from .appdb import AppDB, AppDBError
     from .auth import AuthError
@@ -2664,14 +2691,9 @@ def shadow_report(
                 err=True,
             )
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-        if not db.run_exists(run_id):
-            typer.echo(
-                f"shadow report failed: no shadow run {run_id!r} recorded "
-                "\u2014 the run id is wrong (or the run was never "
-                "committed)",
-                err=True,
-            )
-            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        # an unknown --run is refused by load_run's NAMED refusal (a
+        # separate run_exists pre-check would be a redundant second
+        # lookup — the reader is the authority)
         run_ts, rows = db.load_run(run_id)
     except (AppDBError, OSError) as e:
         typer.echo(f"shadow report failed: state DB read failed: {e}", err=True)
@@ -2713,7 +2735,7 @@ def shadow_report(
     # ONLY — subjects OUT, bodies out by construction, invariant #5).
     # Outcomes: ADDED (band + not present), ALREADY-PRESENT (band +
     # present — skip-present visible), NOT-APPLIED (no band).
-    per_message: dict[str, list[dict[str, object]]] = {}
+    per_message: dict[str, list[ReportRow]] = {}
     per_label: dict[str, dict[str, int]] = {}
     outcomes = {"added": 0, "already_present": 0, "not_applied": 0}
     for row in rows:  # load_run returns (message_id, label) order
@@ -2722,27 +2744,26 @@ def shadow_report(
             # the message was skipped (fetch failure) — its rows are
             # omitted from the diff (the skip is counted + warned)
             continue
-        # the band→tier mapping + skip-present live in tiers.tier_for_band
-        # (the single decision core — no second implementation)
         is_present = row.label in present
         if row.band is None:
             outcome = "not-applied"
-            tier: str | None = None
         elif is_present:
             outcome = "already-present"
-            tier = None  # skip-present: no Tier Label
         else:
             outcome = "added"
-            tier = tier_for_band(row.band, present=False)
+        # the band→tier mapping + skip-present live in tiers.tier_for_band
+        # (the single decision core — no second implementation): an
+        # already-present label earns NO Tier Label (present=True → None)
+        tier = tier_for_band(row.band, present=is_present)
         outcomes[outcome.replace("-", "_")] += 1
         per_message.setdefault(row.message_id, []).append(
-            {
-                "label": row.label,
-                "probability": row.probability,
-                "band": row.band,
-                "outcome": outcome,
-                "tier": tier,
-            }
+            ReportRow(
+                label=row.label,
+                probability=row.probability,
+                band=row.band,
+                outcome=outcome,
+                tier=tier,
+            )
         )
         label_summary = per_label.setdefault(
             row.label,
@@ -2755,12 +2776,40 @@ def shadow_report(
             },
         )
         label_summary[outcome.replace("-", "_")] += 1
-        # the band constants come from tiers (the single decision core —
-        # the report summary cannot drift from the band verdict names)
-        if row.band == BAND_HIGH:
-            label_summary["would_be_high"] += 1
-        elif row.band == BAND_MED:
-            label_summary["would_be_med"] += 1
+        # the would-be tier mix reflects ONLY labels that would ACTUALLY
+        # be added (skip-present: an already-present label is not
+        # applied, so it is NOT counted in the would-be mix) — the band
+        # constants come from tiers (the single decision core)
+        if outcome == "added":
+            if row.band == BAND_HIGH:
+                label_summary["would_be_high"] += 1
+            elif row.band == BAND_MED:
+                label_summary["would_be_med"] += 1
+
+    if not per_message:
+        # ALL messages were skipped (fetch failure) — no evidence to
+        # diff. Refuse with exit 5 (mirroring shadow run's zero-verdict
+        # posture): a report with zero evidence is not a review.
+        typer.echo(
+            f"shadow report failed: no evidence to report (all {skipped} "
+            "message(s) were skipped — labels could not be re-fetched) "
+            "\u2014 re-run when the mailbox is reachable",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the basis disclosure (T3): the verdicts are bound to the
+    # bands/graduation artifacts AS OF THE RUN — the report does NOT
+    # re-verify them (hash persistence is deferred to #26-27, when the
+    # status/corrections surface needs it). A retrain/recalibration
+    # moves the basis; re-run shadow run to refresh.
+    basis = {
+        "note": (
+            "verdicts bound to the bands/graduation artifacts as of the "
+            "run — not re-verified; re-run shadow run after any "
+            "retrain/recalibration"
+        ),
+    }
 
     if as_json:
         payload = {
@@ -2769,10 +2818,20 @@ def shadow_report(
             "message_count": len(per_message),
             "skipped": skipped,
             "outcomes": outcomes,
+            "basis": basis,
             "messages": [
                 {
                     "message_id": message_id,
-                    "rows": per_message[message_id],
+                    "rows": [
+                        {
+                            "label": r.label,
+                            "probability": r.probability,
+                            "band": r.band,
+                            "outcome": r.outcome,
+                            "tier": r.tier,
+                        }
+                        for r in per_message[message_id]
+                    ],
                 }
                 for message_id in sorted(per_message)
             ],
@@ -2788,18 +2847,18 @@ def shadow_report(
         f"shadow report: run={run_id} ts={run_ts.isoformat()} "
         f"messages={len(per_message)} skipped={skipped}"
     )
+    typer.echo(f"  basis: {basis['note']}")
     for message_id in sorted(per_message):
         typer.echo(f"  {message_id}:")
-        for row in per_message[message_id]:
-            band = str(row["band"]) if row["band"] is not None else "-"
-            tier = str(row["tier"]) if row["tier"] is not None else "-"
+        for r in per_message[message_id]:
+            band = r.band if r.band is not None else "-"
+            tier = r.tier if r.tier is not None else "-"
             # the outcome renders UPPERCASE (the design's ADDED /
             # ALREADY-PRESENT / NOT-APPLIED); the JSON keeps lowercase
             # (machine-readable)
-            outcome = str(row["outcome"])
             typer.echo(
-                f"    {outcome.upper():<16} {row['label']:<24} "
-                f"score={row['probability']:.2f} band={band} tier={tier}"
+                f"    {r.outcome.upper():<16} {r.label:<24} "
+                f"score={r.probability:.2f} band={band} tier={tier}"
             )
     typer.echo("  per-label:")
     for label in sorted(per_label):

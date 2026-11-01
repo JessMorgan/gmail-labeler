@@ -56,7 +56,13 @@ Graduation Table bound to checkpoint + eval identity + the Bands
 Artifact's content hash (refused on any disagreement), the config's
 `[graduation]` per-label overrides, and `eval --graduation` with the
 human-confirm diff + CLI-gated `--confirm-graduation` write (ADR-0005;
-recompute posture, #22).
+recompute posture, #22); the Shadow Pass — the pure `tiers.py`
+would-apply decision core (the single home #24/#26 reuse), the
+`[store]` state DB (`appdb.py`, transaction-per-run, no bodies),
+`shadow run` (scores the recent Backlog, applies nothing; the FIRST
+real consumers of `verify_bands`/`verify_graduation`), and `shadow
+report` (diffs the verdicts against the mailbox's actual labels — the
+Phase 1 exit review; #23).
 
 Scope:
 

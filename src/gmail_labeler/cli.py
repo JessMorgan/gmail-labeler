@@ -1,11 +1,12 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add shadow/apply/daemon/status (absent until wired, which
-surfaces as a usage error). Phase 0 subcommands and the Phase 1
-``train``/``eval`` commands are wired as they are implemented. Exit 3
-is reserved for wired-but-stubbed commands and currently UNREACHABLE —
-no command is stubbed; scripts can branch on 0/2/4/5 today.
+later phases add apply/daemon/status (absent until wired, which
+surfaces as a usage error). Phase 0 subcommands, the Phase 1
+``train``/``eval`` commands, and the Phase 1 exit ``shadow`` commands
+are wired as they are implemented. Exit 3 is reserved for
+wired-but-stubbed commands and currently UNREACHABLE — no command is
+stubbed; scripts can branch on 0/2/4/5 today.
 """
 
 from __future__ import annotations
@@ -14,7 +15,9 @@ import contextlib
 import json
 import os
 import tempfile
+import uuid
 from collections.abc import Sequence
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -2031,6 +2034,539 @@ def eval(
     elif as_json:
         # no serving-gate flags: the base payload (the report)
         _emit_json_payload()
+
+
+shadow_app = typer.Typer(
+    help="Shadow Pass: score the recent Backlog, apply NOTHING (ADR-0005).",
+    no_args_is_help=True,
+)
+app.add_typer(shadow_app, name="shadow")
+
+
+def _shadow_client(config: Config) -> GmailClient:
+    """Client factory seam: tests inject FakeGmailClient here (the
+    offline spine, invariant #9). The read surface only — the Shadow
+    Pass performs NO Gmail write (the write surface lands #24/#25; the
+    zero-write pin in the tests depends on that)."""
+    from .auth import credentials as build_credentials
+    from .gmail_client import GmailRestClient
+
+    return GmailRestClient(build_credentials(config))
+
+
+def _shadow_model_factory(checkpoint_dir: Path, vocabulary: tuple[str, ...]) -> Model:
+    """Model factory seam for ``shadow`` (the ``load_model`` factory
+    shape): tests inject a FakeModel producer (the offline spine,
+    invariant #9). The real implementation lazy-imports the ``train/``
+    recipe (torch — the optional extra), so the CLI module itself stays
+    importable without torch."""
+    from train.recipe import load_hf_model
+
+    return load_hf_model(checkpoint_dir, vocabulary)
+
+
+def _backlog_query(since: date, query: str | None) -> str:
+    """The Backlog query (the recent inbox, GLOSSARY: Backlog): the
+    default is ``in:inbox newer_than:YYYY/MM/DD`` (the --since window);
+    an explicit --query is the escape hatch (it replaces the default
+    wholesale — the operator's query, the operator's risk)."""
+    if query is not None:
+        return query
+    return f"in:inbox newer_than:{since:%Y/%m/%d}"
+
+
+@shadow_app.command("run")
+def shadow_run(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — the calibrated Threshold Bands)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — the per-label gate results)",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help=("ISO date (YYYY-MM-DD): score mail newer than it (default: 90 days ago)"),
+    ),
+    limit: int = typer.Option(
+        100, "--limit", min=1, help="Max messages to score (default 100)"
+    ),
+    query: str | None = typer.Option(
+        None,
+        "--query",
+        help="Gmail search query — replaces the default in:inbox newer_than:… query",
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Machine-readable output (graduation workflows)"
+    ),
+) -> None:
+    """Score the recent Backlog through the sidecar-validated
+    checkpoint, the Graduation Table, and the Threshold Bands — and
+    APPLY NOTHING (Shadow Pass, GLOSSARY: Shadow Pass).
+
+    The verdicts are recorded in the state DB (``[store] db_path``) as
+    one transaction per run (a crash mid-run leaves no half rows); the
+    report (``shadow report``) diffs them against the mailbox's actual
+    labels. Message bodies are fetched for scoring (in-memory only) and
+    never enter the DB, the summary, or any log path (invariant #5).
+
+    A message whose body cannot be fetched is SKIPPED (per-message
+    fail-safe: warning + count, the run continues) — the documented
+    posture choice vs ``eval``'s whole-run refusal: shadow is a
+    read-only survey, not a serving-gate artifact mint.
+    """
+    from datetime import UTC, date, datetime, timedelta
+
+    from .appdb import AppDB, AppDBError, ShadowRow
+    from .auth import AuthError
+    from .corpus_record import corpus_fingerprint, preprocess_text
+    from .corpus_store import CorpusError, CorpusStore
+    from .dataset_build import SplitManifest
+    from .gmail_client import MessageStub
+    from .gmail_errors import GmailAuthError, GmailError
+    from .labels import normalize_label_names
+    from .mime_extract import decode_gmail_raw, parse_mime
+    from .model import (
+        MANIFEST_FILENAME,
+        THRESHOLDS_SOURCE_NONE,
+        CheckpointRefusedError,
+        ExpectedIdentity,
+        load_model,
+    )
+    from .tiers import would_apply
+    from .tokens import TokenStoreError
+
+    # usage refusals up front (exit 2, before any corpus-scale work):
+    # an empty --bands/--graduation would degenerate to Path("") and
+    # fail awkwardly mid-run; a non-ISO --since is a usage error (the
+    # train --split-date precedent); an empty --query would send an
+    # unbounded query to Gmail (the escape hatch is explicit, not
+    # accidental)
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if not target.strip():
+            typer.echo(f"shadow run failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+    if query is not None and not query.strip():
+        typer.echo("shadow run failed: --query must be non-empty", err=True)
+        raise typer.Exit(code=2) from None
+    if since is not None:
+        try:
+            since_date = date.fromisoformat(since)
+        except ValueError:
+            typer.echo(
+                f"shadow run failed: --since {since!r} is not an ISO date (YYYY-MM-DD)",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
+    else:
+        since_date = datetime.now(UTC).date() - timedelta(days=90)
+
+    cfg = _load_config(config)
+    # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
+    # pay the corpus-scale work below
+    try:
+        client = _shadow_client(cfg)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        typer.echo(
+            f"shadow run failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset export/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        records = list(store.iter_records())
+    except (CorpusError, OSError, UnicodeDecodeError):
+        typer.echo("shadow run failed: records unreadable", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if not records:
+        typer.echo(
+            "shadow run failed: corpus is empty \u2014 run dataset "
+            "export/import-gyb first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the checkpoint's materialized manifest is the split's authority
+    # (invariant #7) — read + verify it BEFORE loading the model (the
+    # eval pattern)
+    checkpoint_dir = cfg.model.checkpoint_dir
+    manifest_path = checkpoint_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        typer.echo(
+            f"shadow run failed: checkpoint {checkpoint_dir} has no "
+            f"{MANIFEST_FILENAME} \u2014 no verifiable split identity "
+            "(run train first)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        manifest = SplitManifest.from_json(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        typer.echo(
+            f"shadow run failed: checkpoint manifest unreadable or tampered: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    expected = ExpectedIdentity(
+        vocabulary=manifest.vocabulary,
+        corpus_fingerprint=corpus_fingerprint(records, manifest.train_ids),
+        split_manifest_hash=manifest.content_hash,
+        thresholds_source=THRESHOLDS_SOURCE_NONE,
+        encoder_id=cfg.model.encoder,
+    )
+    try:
+        model = load_model(checkpoint_dir, expected, _shadow_model_factory)
+    except CheckpointRefusedError as e:
+        # the refusal contract (the eval precedent): named fields, exit
+        # 5, no silent fallback — a mismatched checkpoint is never scored
+        typer.echo(
+            f"shadow run failed: checkpoint refused ({', '.join(e.fields)}) "
+            "\u2014 no silent fallback; rebuild the checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ImportError as e:
+        typer.echo(
+            f"shadow run failed: the model recipe is unavailable ({e}) "
+            "\u2014 install the optional extra: `uv sync --extra train` "
+            "(if it is already installed, the recipe import itself is "
+            "broken \u2014 report it)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        typer.echo(f"shadow run failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if model.vocabulary != manifest.vocabulary:
+        # a lying column order would silently misalign every score —
+        # refuse before scoring (the eval guard, the serving side)
+        typer.echo(
+            "shadow run failed: the model's vocabulary does not match the "
+            "manifest's \u2014 refusing to score against a lying column "
+            "order",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the Bands Artifact: read + parse + verify against the run's
+    # identity (the FIRST real consumer of verify_bands — the artifact
+    # identity gate becomes real here). Cause naming per #22's
+    # doctrine: absent vs unreadable (I/O failure) vs undecodable/
+    # unparseable — each named by its cause, never misdiagnosed.
+    from .thresholds import BandsArtifact, BandsRefusedError, verify_bands
+
+    bands_path = Path(bands)
+    if not bands_path.is_file():
+        typer.echo(
+            f"shadow run failed: no bands artifact at {bands_path} \u2014 "
+            "run `eval --bands` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        bands_text = bands_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"shadow run failed: bands artifact at {bands_path} is "
+            "unreadable (I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"shadow run failed: bands artifact at {bands_path} is not "
+            "valid UTF-8 \u2014 it does not parse as a Bands Artifact",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        artifact = BandsArtifact.from_json(bands_text)
+    except ValueError as e:
+        typer.echo(
+            f"shadow run failed: bands artifact at {bands_path} does not "
+            f"parse as a Bands Artifact: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_bands(
+            artifact,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+        )
+    except BandsRefusedError as e:
+        # the identity refusal (the sidecar doctrine): named fields,
+        # exit 5 — a foreign-bound artifact is never served
+        typer.echo(
+            f"shadow run failed: bands artifact refused ({', '.join(e.fields)}) "
+            "\u2014 it disagrees with this checkpoint/eval; re-run "
+            "`eval --bands` against this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        # a naive-dated split_date is a caller bug, not identity drift
+        # (verify_bands' documented refusal) — operation failure
+        typer.echo(f"shadow run failed: bands verification failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the Graduation Table: read + parse + verify against the run's
+    # identity + the bands binding (the FIRST real consumer of
+    # verify_graduation — the table identity gate becomes real here)
+    from .graduation import (
+        GraduationRefusedError,
+        GraduationTable,
+        verify_graduation,
+    )
+
+    graduation_path = Path(graduation)
+    if not graduation_path.is_file():
+        typer.echo(
+            f"shadow run failed: no graduation table at {graduation_path} "
+            "\u2014 run `eval --graduation --confirm-graduation` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        graduation_text = graduation_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"shadow run failed: graduation table at {graduation_path} is "
+            "unreadable (I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"shadow run failed: graduation table at {graduation_path} is "
+            "not valid UTF-8 \u2014 it does not parse as a Graduation Table",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        table = GraduationTable.from_json(graduation_text)
+    except ValueError as e:
+        typer.echo(
+            f"shadow run failed: graduation table at {graduation_path} "
+            f"does not parse as a Graduation Table: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_graduation(
+            table,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+            bands_content_hash=artifact.content_hash,
+        )
+    except GraduationRefusedError as e:
+        typer.echo(
+            f"shadow run failed: graduation table refused "
+            f"({', '.join(e.fields)}) \u2014 it disagrees with this "
+            "checkpoint/eval/bands; re-run `eval --graduation` against "
+            "this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(
+            f"shadow run failed: graduation verification failed: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the label bridge (presence + System Labels): the id→name map and
+    # the system-name set (the read path — list_labels only)
+    try:
+        labels = client.list_labels()
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"shadow run failed: label list failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    id_to_name = {li.id: li.name for li in labels}
+    system_names = frozenset(li.name for li in labels if li.type == "system")
+
+    # the Backlog fetch (the read path — list_messages only): the
+    # pageToken loop honors --limit across pages (#17's historyId
+    # wire-fidelity precedent)
+    q = _backlog_query(since_date, query)
+    try:
+        stubs: list[MessageStub] = []
+        token: str | None = None
+        while len(stubs) < limit:
+            page = client.list_messages(q, token)
+            stubs.extend(page.stubs)
+            token = page.next_page_token
+            if token is None:
+                break
+        stubs = stubs[:limit]
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        # transport failure after retries (the gmail_errors precedent)
+        typer.echo(f"shadow run failed: backlog fetch failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # per message: get_message → decode → parse → preprocess_text
+    # (invariant #4: the scoring text comes ONLY from
+    # corpus_record.preprocess_text). A fetch failure is a per-message
+    # SKIP (the documented posture choice vs eval's refusal — shadow is
+    # a read-only survey): warning + count, the run continues.
+    texts: list[str] = []
+    fetched: list[tuple[str, frozenset[str]]] = []  # (id, present names)
+    skipped = 0
+    for stub in stubs:
+        try:
+            raw = client.get_message(stub.id)
+        except GmailAuthError as e:
+            typer.echo(f"auth: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailError as e:
+            skipped += 1
+            typer.echo(f"WARNING: skipped message {stub.id}: {e}", err=True)
+            continue
+        try:
+            data = decode_gmail_raw(raw.raw_b64url)
+        except (ValueError, UnicodeEncodeError) as e:
+            skipped += 1
+            typer.echo(
+                f"WARNING: skipped message {stub.id}: raw undecodable "
+                f"({type(e).__name__})",
+                err=True,
+            )
+            continue
+        parsed = parse_mime(data)  # never raises (the mime contract)
+        present = frozenset(normalize_label_names(raw.label_ids, id_to_name))
+        texts.append(preprocess_text(parsed.subject, parsed.body_text))
+        fetched.append((stub.id, present))
+    if not fetched:
+        typer.echo(
+            f"shadow run failed: no messages to score (backlog query "
+            f"{q!r} returned {len(stubs)} message(s), {skipped} skipped) "
+            "\u2014 nothing recorded",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the batched predict (the #20 batching seam: ONE call over all
+    # texts — the model materializes the iterable once)
+    try:
+        rows = model.predict(texts)
+        if len(rows) != len(fetched):
+            raise ValueError(
+                f"the model returned {len(rows)} score rows for "
+                f"{len(fetched)} texts \u2014 checkpoint/recipe defect"
+            )
+    except (ValueError, OSError, RuntimeError) as e:
+        typer.echo(f"shadow run failed: prediction failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the would-apply verdicts (the single decision core — tiers.py):
+    # graduated labels only, skip-present, System Labels never targeted
+    bands_map = {entry.label: (entry.high, entry.med) for entry in artifact.labels}
+    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
+    run_ts = datetime.now(UTC)
+    run_id = uuid.uuid4().hex
+    all_rows: list[ShadowRow] = []
+    json_rows: list[dict[str, object]] = []
+    proposed = 0
+    already_present = 0
+    not_applied = 0
+    for (message_id, present), row in zip(fetched, rows, strict=True):
+        scores = dict(zip(model.vocabulary, row, strict=True))
+        decisions = would_apply(
+            scores=scores,
+            bands=bands_map,
+            graduated=graduated,
+            present=present,
+            system_labels=system_names,
+        )
+        for d in decisions:
+            all_rows.append(
+                ShadowRow(
+                    message_id=message_id,
+                    label=d.label,
+                    probability=d.score,
+                    band=d.band,
+                    run_ts=run_ts,
+                )
+            )
+            json_rows.append(
+                {
+                    "message_id": message_id,
+                    "label": d.label,
+                    "probability": d.score,
+                    "band": d.band,
+                    "present": d.present,
+                    "applied": d.applied,
+                }
+            )
+            if d.applied:
+                proposed += 1
+            elif d.present and d.band is not None:
+                already_present += 1
+            else:
+                not_applied += 1
+
+    # the store (transaction per run — a crash mid-run leaves no half
+    # rows; the DB carries ids/probabilities/labels/timestamps ONLY —
+    # invariant #5)
+    db = AppDB(cfg.store.db_path)
+    try:
+        db.open()
+        db.record_run(run_id, run_ts, all_rows)
+    except (AppDBError, OSError) as e:
+        typer.echo(f"shadow run failed: state DB write failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        db.close()
+
+    if as_json:
+        payload = {
+            "run_id": run_id,
+            "run_ts": run_ts.isoformat(),
+            "query": q,
+            "since": since_date.isoformat(),
+            "limit": limit,
+            "scored": len(fetched),
+            "skipped": skipped,
+            "proposed": proposed,
+            "already_present": already_present,
+            "not_applied": not_applied,
+            "rows": json_rows,
+        }
+        typer.echo(json.dumps(payload, sort_keys=True))
+    else:
+        # the summary is STATUS, not report content — on stderr (the
+        # report is `shadow report`'s stdout)
+        typer.echo(
+            f"shadow run: run={run_id} scored={len(fetched)} "
+            f"skipped={skipped} proposed={proposed} "
+            f"already_present={already_present} not_applied={not_applied}",
+            err=True,
+        )
 
 
 if __name__ == "__main__":

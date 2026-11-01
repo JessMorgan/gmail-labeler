@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1119,25 +1120,38 @@ def test_protocol_ensure_label_docstring_carries_the_startup_contract() -> None:
     # gmail_errors taxonomy — the exit-4 mapping excepts ValueError
     # explicitly), and the precedence word ("otherwise": the refusal
     # guards MINTING a look-alike only). Whitespace-normalized: the
-    # prose wraps lines, the contract does not.
+    # prose wraps lines, the contract does not. The module header's
+    # error-surface claim must carry the SAME exception (the review
+    # round's synced-text finding: an unscoped "taxonomy only" header
+    # contradicted the very claim this commit added).
+    import gmail_labeler.gmail_client as gmail_client_module
+
     doc = " ".join((GmailClient.ensure_label.__doc__ or "").split())
-    assert "Gmail label id" in doc
+    assert "Returns the Gmail label id" in doc
     assert "BARE ValueError" in doc
     assert "otherwise," in doc
+    module_doc = " ".join((gmail_client_module.__doc__ or "").split()).lower()
+    assert "bare ``valueerror``" in module_doc
 
 
 def test_fake_read_surface_comment_says_list_level_copy() -> None:
-    # #25 C0 (the F3 residual cell): the fake's list_filters comment
-    # claimed the read surfaces stay "symmetric" — overstated: the copy
-    # is LIST-LEVEL (the FilterInfo nested criteria/action dicts remain
-    # shared; safety rests on the documented nested-mutation ban). The
-    # word must not survive in the fake's source (the direct-assertion
-    # precedent: test_executescript_is_banned_from_appdb_production_source).
-    from pathlib import Path
-
+    # #25 C0 (the F3 residual cell) + the review round's pin-scope
+    # MINOR: the fake's list_filters comment claimed the read surfaces
+    # stay "symmetric" — overstated: the copy is LIST-LEVEL (the
+    # FilterInfo nested criteria/action dicts remain shared; safety
+    # rests on the documented nested-mutation ban). POSITIVE pin (the
+    # wording is present) AND the negative ban (the word must not
+    # survive in the fake's source — the direct-assertion precedent:
+    # test_executescript_is_banned_from_appdb_production_source). The
+    # ban is intentionally NARROW: it scopes to fake_gmail.py only;
+    # the ordinary English word stays legal everywhere else (the
+    # test_graduation_cli prose proves it).
     import gmail_labeler.fake_gmail as fake_module
 
     source = Path(fake_module.__file__).read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+    assert "LIST-LEVEL COPY" in normalized
+    assert "NESTED" in normalized and "REMAIN SHARED" in normalized
     assert "symmetric" not in source
 
 

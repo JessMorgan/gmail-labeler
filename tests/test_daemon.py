@@ -965,10 +965,64 @@ def test_prediction_unsized_row_holds(
     db.close()
 
 
+def test_prediction_unsized_container_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 round-2 MINOR (reviewer probes): len(score_rows) ran BEFORE
+    # any Sized check — a GENERATOR of rows escaped as TypeError to
+    # exit 1; same for a non-iterable vocabulary at len/tuple. The
+    # checks are TOTAL now: every shape defect holds the cursor.
+    caplog.set_level(logging.WARNING)
+
+    class _GenRowsModel(FakeModel):
+        def predict(self, texts):  # (lying wire shape)
+            self.calls.append(tuple(texts))
+            return (score for score in ((0.9, 0.1), (0.1, 0.95)))
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_GenRowsModel(VOCAB, scores={})) == 0
+    assert db.get_history_cursor() == 777  # held, loop alive
+    assert "unsized score-row container" in caplog.text
+    db.close()
+
+
+def test_prediction_non_iterable_vocabulary_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+
+    class _BadVocab:  # minimal lying model (bypasses FakeModel's init)
+        vocabulary = 5  # not iterable at all
+
+        def predict(self, texts):  # (wire shape)
+            return tuple((0.9, 0.1) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_BadVocab()) == 0
+    assert db.get_history_cursor() == 777
+    assert "not iterable" in caplog.text
+    db.close()
+
+
 def test_stop_flag_during_write_capture_drains_and_commits(tmp_path: Path) -> None:
-    # F2 NIT (ds probe: correct behavior, no node): the stop flag lands
-    # while the write loop runs — the delta completes to its commit
-    # point, the loop exits before any sleep
+    # F2 NIT (ds probe: correct behavior, no node): the stop is
+    # observed after the message's capture (the per-message check) and
+    # before compose/write — the delta still completes to its commit
+    # point and the loop exits before any sleep
     fake = FakeGmailClient(
         messages=_messages(),
         labels=_labels(),

@@ -383,7 +383,7 @@ class GmailRestClient:
             label_ids=_str_list(data, "labelIds"),
             internal_date_ms=_opt_int64(data, "internalDate"),
             raw_b64url=_raw_nonempty(data),  # absent OR empty: loud
-            history_id=_opt_int64(data, "historyId"),
+            history_id=_opt_history_id(data, "historyId"),
         )
 
     def get_message_metadata(self, message_id: str) -> MessageMetadata:

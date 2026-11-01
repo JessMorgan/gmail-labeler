@@ -34,6 +34,26 @@ does not ship releases yet.
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
+- Phase 1 dataset builder core (`dataset_build.py`): the shared pure
+  Corpus → Training Example transform — Label Path vocabulary (a leaf
+  path is a distinct class; a parent may scope its subtree), examples
+  sorted by id with canonical sorted label tuples and Date Provenance
+  stamped, required `now`, input-order invariant.
+- Dataset builder bridge (invariant #6): Filter-Authored evidence is
+  excluded from training examples (per-message for simulatable filters,
+  whole-label for unverifiable/malformed ones); a missing, incomplete,
+  or malformed filters/labels snapshot aborts the build loudly
+  (`BuildAbortedError`, a `ValueError`). The effective bridge is pinned
+  in the Split Manifest (`bridge_hash`, canonical — insensitive to filter
+  order and unreferenced label entries) so a drifted snapshot refuses the
+  rebuild. The filter-shape rule is shared with `dataset analyze`
+  (`filter_label_ids` / `filter_label_ids_strict`).
+- Dataset builder recency weighting: each Training Example carries a
+  recency weight (1.0 at/after the cutoff, `old_weight` before) mirroring
+  analyze's `months_ago` window shape; the cutoff (UTC-normalized) and
+  both constants ride in the Split Manifest (FORMAT_VERSION=3) so a
+  21-year corpus is not dominated by its oldest mail and a manifest-input
+  rebuild is reproducible from the artifact alone.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).

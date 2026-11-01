@@ -114,9 +114,40 @@ def _address_shaped(value: object) -> bool:
     return "@" in value or bool(_DOMAINISH_RE.fullmatch(value))
 
 
-def _filter_label_names(filter_: Mapping[str, object]) -> list[str]:
+def filter_label_ids_strict(filter_: Mapping[str, object]) -> list[str]:
+    """The label ids a filter's action adds — refusing a present-but-
+    wrong-shaped action/addLabelIds with ValueError (the cli.py guard):
+    unreadable bindings must not contribute zero ids and let the filter's
+    labels surface un-attributed. The shape rule lives in exactly one
+    place, shared by the CLI bridge check and the dataset builder."""
     action = filter_.get("action")
+    if action is not None and not isinstance(action, Mapping):
+        raise ValueError("action must be an object")
     # JSON payload: cheap isinstance checks + casts, strict-mode style
+    ids = (
+        cast(Mapping[str, object], action).get("addLabelIds")
+        if isinstance(action, Mapping)
+        else None
+    )
+    if ids is not None and not isinstance(ids, list):
+        raise ValueError("addLabelIds must be a list of strings")
+    if isinstance(ids, list):
+        items = cast("list[object]", ids)  # narrowed by the isinstance above
+        if any(not isinstance(i, str) for i in items):
+            raise ValueError("addLabelIds entries must be strings")
+        return cast("list[str]", items)  # narrowed by the all-str check
+    return []
+
+
+def filter_label_ids(filter_: Mapping[str, object]) -> list[str]:
+    """The label ids a filter's action adds (lenient — EXACT base
+    ``_filter_label_names`` parity: a present-but-wrong-shaped action
+    contributes no ids, and list entries are str-coerced, so a type-
+    corrupt id like 42 attributes as "42" rather than vanishing; the
+    analyze report treats such a filter as touching that label). Strict
+    consumers (the dataset builder, the CLI bridge check) use
+    filter_label_ids_strict, which refuses non-str entries."""
+    action = filter_.get("action")
     ids = (
         cast(Mapping[str, object], action).get("addLabelIds")
         if isinstance(action, Mapping)
@@ -127,8 +158,12 @@ def _filter_label_names(filter_: Mapping[str, object]) -> list[str]:
     return [str(i) for i in cast(list[object], ids)]
 
 
-def _simulates(criteria: Mapping[str, object], record: CorpusRecord) -> bool | None:
-    """True/False when faithfully simulatable; None when not."""
+def simulates_filter(
+    criteria: Mapping[str, object], record: CorpusRecord
+) -> bool | None:
+    """True/False when faithfully simulatable; None when not. Shared with
+    the dataset builder: the simulation doctrine (invariant #6) lives in
+    exactly one place, so attribution and exclusion can never drift."""
     if set(criteria) - SIMULATABLE_CRITERIA:
         return None
     for key in criteria:
@@ -213,7 +248,7 @@ def analyze_corpus(
             )
             names = [
                 id_to_name.get(label_id, f"id:{label_id}")
-                for label_id in _filter_label_names(filter_)
+                for label_id in filter_label_ids(filter_)
             ]
             for name in names:
                 if name not in members:
@@ -221,7 +256,7 @@ def analyze_corpus(
                 if malformed_criteria:
                     unreliable[name] += 1
                     continue
-                verdicts = [_simulates(criteria, rec) for rec in members[name]]
+                verdicts = [simulates_filter(criteria, rec) for rec in members[name]]
                 if None in verdicts:
                     # this filter unverifiably touches this label — on ANY
                     # message: the whole label becomes unverifiable

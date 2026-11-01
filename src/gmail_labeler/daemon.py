@@ -73,7 +73,7 @@ cli._now seam doctrine, #23/#24).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sized
+from collections.abc import Callable, Iterable, Mapping, Sized
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -354,7 +354,12 @@ def _run_tick(
         # raised TypeError from len(row), and an unsized CONTAINER or a
         # non-iterable vocabulary from their len/tuple calls — all
         # outside the caught tuple, exit 1. Every shape defect lands in
-        # _PredictionShapeError territory: the checks are TOTAL.
+        # _PredictionShapeError territory: the checks are TOTAL for the
+        # defect classes a checkpoint can produce (the review round's
+        # marginal Sized-but-not-iterable row is covered by the Iterable
+        # term below; a vocabulary whose __iter__ raises something other
+        # than TypeError stays the documented residual — pathological
+        # by construction, deferred).
         try:
             vocab = tuple(model.vocabulary)  # materialized ONCE (the
             # compose zip below rides this, never the live attribute)
@@ -365,7 +370,10 @@ def _run_tick(
             ) from e
         vocab_len = len(vocab)
         if any(
-            not isinstance(row, Sized) or len(row) != vocab_len for row in score_rows
+            not isinstance(row, Sized)
+            or not isinstance(row, Iterable)
+            or len(row) != vocab_len
+            for row in score_rows
         ):
             raise _PredictionShapeError(
                 f"a score row does not align to the {vocab_len}-label "

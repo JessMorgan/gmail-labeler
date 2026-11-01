@@ -42,6 +42,21 @@ computed from (AC3 — a consumer that verifies the table against a
 disagreeing checkpoint/eval/bands REFUSES it, ``GraduationRefusedError``
 — every field checked independently, all disagreements named; the
 sidecar doctrine).
+
+Trust boundary (stated, per the SplitManifest discipline): the
+measured values (``examples``, ``precision_at_high``) are trusted from
+the Eval Table + Bands Artifact at mint time — the content hash
+authenticates the table AS A WHOLE, and ``verify_graduation`` binds it
+to the identity it was measured against; a hand-forged table with a
+recomputed hash is caught by the identity check, not by field
+recomputation (the table carries no tp/fp — the eval table is the
+measurement authority, and the bands/table cross-check in
+``evaluate_graduation`` refuses a bands artifact whose high band has no
+measured predictions on the table). The Bands Artifact itself is
+computed IN-MEMORY per run (deterministically — the same eval + config
+recomputes the same artifact), so the table's ``bands_content_hash``
+binding is reproducible even when the bands file was never written
+(``eval --graduation`` without ``--bands``).
 """
 
 from __future__ import annotations
@@ -71,9 +86,24 @@ __all__ = [
     "GraduationTable",
     "build_table",
     "evaluate_graduation",
+    "identity_disagreement",
     "render_graduation_diff",
     "verify_graduation",
 ]
+
+#: The identity fields a consumer compares between two tables (the six
+#: eval fields + the bands binding) — named in ONE place so a future
+#: field addition gates every comparison site (the CLI's diff warning
+#: and the write-path replace gate both read this).
+IDENTITY_FIELDS: tuple[str, ...] = (
+    "vocabulary_hash",
+    "corpus_fingerprint",
+    "split_manifest_hash",
+    "encoder_id",
+    "split_date",
+    "test_examples",
+    "bands_content_hash",
+)
 
 #: The default gate targets (the config defaults mirror these — the
 #: equality is pinned by test_config, not by an import: config.py stays
@@ -405,7 +435,14 @@ class GraduationRefusedError(ValueError):
 
 
 def _check_targets(name: str, targets: GateTargets) -> None:
-    if isinstance(targets.min_examples, bool) or targets.min_examples < 0:
+    # type() (not isinstance): a bool is an int subclass, and a lying
+    # caller can pass a float / numpy int past the int-typed field —
+    # the exact type must be int (the from_json symmetry)
+    if type(targets.min_examples) is not int:
+        raise ValueError(
+            f"{name}.min_examples must be an integer >= 0, got {targets.min_examples!r}"
+        )
+    if targets.min_examples < 0:
         raise ValueError(
             f"{name}.min_examples must be an integer >= 0, got {targets.min_examples!r}"
         )
@@ -566,12 +603,32 @@ def evaluate_graduation(
         if high is not None:
             # the high band was earned at a cell with DEFINED precision
             # (calibration reads tp/fp — a zero-denominator cell never
-            # earns a band), so the ratio is well-defined here
+            # earns a band). The bands artifact is a SEPARATE input,
+            # though: if it was calibrated on a DIFFERENT eval table
+            # (same vocabulary + grid — the exact reason the artifact
+            # exists), the cell at the high band may have NO
+            # predictions on THIS table (tp=fp=0, undefined precision)
+            # — a lying measurement, refused, never a division
             for t, cell in zip(table.thresholds, row.cells, strict=True):
                 if t == high:
+                    if cell.tp + cell.fp == 0:
+                        raise ValueError(
+                            f"bands for {label!r}: the high band {high} "
+                            "has no measured predictions on this table "
+                            "(tp=fp=0, undefined precision) — the bands "
+                            "were calibrated on a different eval; re-run "
+                            "the calibration against this table"
+                        )
                     precision_at_high = cell.tp / (cell.tp + cell.fp)
                     break
-            assert precision_at_high is not None  # high is a grid point
+            if precision_at_high is None:
+                # unreachable (high is a grid point — checked above),
+                # named in the refusal family, never an assert (which
+                # -O strips and which is not a ValueError)
+                raise ValueError(
+                    f"bands for {label!r}: the high band {high} is not a "
+                    "candidate threshold of the table"
+                )
         reasons: list[str] = []
         # the operators MIRROR analyze.py exactly (the strict-gt
         # precedent): `total < min_total` → a value exactly at the gate
@@ -730,6 +787,20 @@ def verify_graduation(
             "served against — re-run `eval --graduation` against this "
             "checkpoint",
         )
+
+
+def identity_disagreement(
+    existing: GraduationTable, current: GraduationTable
+) -> tuple[str, ...]:
+    """The identity fields on which two tables disagree (each field
+    checked INDEPENDENTLY — the sidecar doctrine). The CLI's human-
+    confirm diff warning and the write-path replace gate both read
+    this, so the field list has exactly one home."""
+    return tuple(
+        field
+        for field in IDENTITY_FIELDS
+        if getattr(existing, field) != getattr(current, field)
+    )
 
 
 def _state(entry: GraduationEntry | None) -> str:

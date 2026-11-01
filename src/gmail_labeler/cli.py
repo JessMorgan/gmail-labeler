@@ -10,6 +10,7 @@ no command is stubbed; scripts can branch on 0/2/4/5 today.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -105,6 +106,27 @@ def _write_secret_tight(path: Path, text: str) -> None:
         raise
     with os.fdopen(fd, "w", encoding="utf-8") as fh:  # owns fd
         fh.write(text)
+
+
+def _write_out_report(out: str, file_text: str) -> None:
+    """The eval ``--out`` write: 0600 from creation, staging + atomic
+    replace (train's staging pattern) — a failure leaves any PREVIOUS
+    report at the path intact, and no fd can leak. Replacing an
+    EXISTING file is announced on stderr — a silent clobber of a
+    typo'd path would be a lie (train refuses overwrites; --force is
+    overkill for a regenerable report). Raises OSError on failure
+    (the caller maps it to exit 5)."""
+    target = Path(out)
+    if target.exists():
+        typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
+    staging = Path(str(out) + ".tmp")
+    try:
+        _write_secret_tight(staging, file_text)
+        os.replace(staging, out)  # atomic on POSIX
+    except OSError:
+        with contextlib.suppress(OSError):
+            staging.unlink()  # best-effort staging cleanup
+        raise
 
 
 class BandsTargetRefusedError(Exception):
@@ -258,7 +280,7 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
     the torn-write guard. The ONLY writer of the table in the package
     (recompute posture, AC4 — pinned by
     ``test_only_eval_confirm_writes_the_graduation_table``)."""
-    from .graduation import GraduationTable
+    from .graduation import GraduationTable, identity_disagreement
 
     if path.is_file():
         try:
@@ -268,19 +290,7 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
             # the replace NOTICE proceeds (regenerable by design)
             typer.echo(f"eval: NOTICE: replacing existing {path}", err=True)
         else:
-            disagreeing = [
-                field
-                for field in (
-                    "vocabulary_hash",
-                    "corpus_fingerprint",
-                    "split_manifest_hash",
-                    "encoder_id",
-                    "split_date",
-                    "test_examples",
-                    "bands_content_hash",
-                )
-                if getattr(existing, field) != getattr(table, field)
-            ]
+            disagreeing = identity_disagreement(existing, table)
             if disagreeing:
                 raise GraduationTargetRefusedError(
                     f"existing table at {path} is bound to "
@@ -1169,7 +1179,6 @@ def eval(
     hash; an existing table bound to a different identity refuses the
     confirm (exit 5, the previous bytes intact).
     """
-    import contextlib
     from datetime import UTC, datetime
 
     from .corpus_record import corpus_fingerprint, preprocess_text
@@ -1204,6 +1213,13 @@ def eval(
             err=True,
         )
         raise typer.Exit(code=2) from None
+    # the empty checks run BEFORE the equal-path checks: an empty
+    # target would resolve to the cwd and report a spurious
+    # "different files" collision instead of "non-empty"
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if target is not None and not target.strip():
+            typer.echo(f"eval failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
     if (
         bands is not None
         and graduation is not None
@@ -1217,9 +1233,6 @@ def eval(
     for flag, target in (("--bands", bands), ("--graduation", graduation)):
         if target is None:
             continue
-        if not target.strip():
-            typer.echo(f"eval failed: {flag} PATH must be non-empty", err=True)
-            raise typer.Exit(code=2) from None
         if out is not None and Path(target).resolve() == Path(out).resolve():
             typer.echo(
                 f"eval failed: {flag} and --out must name different files",
@@ -1456,12 +1469,11 @@ def eval(
     trust = (
         "server-authoritative-only" if manifest.server_authoritative_only else "none"
     )
-    # text mode renders the report NOW (the report is never lost — a
-    # post-report refusal below exits 5 with the report on stdout);
-    # --json defers the payload dump until AFTER the serving-gate
-    # computation below, so the graduation proposal can ride in the
-    # payload (stdout stays exactly one parseable JSON object — the
-    # diff lines are on stderr, never stdout)
+    # text mode: the report renders NOW and the --out file lands NOW —
+    # the report is never lost: a post-report refusal below exits 5
+    # with the report on stdout AND the --out file in place (the
+    # documented "same bytes as stdout" promise holds even when an
+    # artifact act refuses)
     if not as_json:
         output = (
             f"eval: trust filter: {trust} (inherited from the split "
@@ -1474,6 +1486,63 @@ def eval(
         )
         typer.echo(output, nl=False)
         file_text = output
+        if out is not None:
+            try:
+                _write_out_report(out, file_text)
+            except OSError as e:
+                typer.echo(f"eval failed: cannot write --out: {e}", err=True)
+                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    # --json: the payload dump (and the --out write) is deferred until
+    # after the serving-gate computation below, so the graduation
+    # proposal can ride in the payload; on a post-report refusal the
+    # BASE payload (the report, without the proposal) is emitted first
+    # — the report is never lost (stdout stays exactly one parseable
+    # JSON object; the diff lines are on stderr, never stdout)
+    base_payload = {
+        "trust": trust,
+        # split identity: two reports from different splits (or a
+        # retrain) must be tellable apart by the consumer (#22)
+        "split_date": manifest.split_date.isoformat(),
+        "split_manifest_hash": manifest.content_hash,
+        "test_examples": table.test_examples,
+        "thresholds": list(table.thresholds),
+        "rows": [
+            {
+                "label": row.label,
+                "support": row.support,
+                "cells": [
+                    {
+                        "threshold": t,
+                        "tp": cell.tp,
+                        "fp": cell.fp,
+                        "fn": cell.fn,
+                        "precision": cell.precision,
+                        "recall": cell.recall,
+                    }
+                    for t, cell in zip(table.thresholds, row.cells, strict=True)
+                ],
+            }
+            for row in table.rows
+        ],
+    }
+
+    def _emit_json_payload(proposal: dict[str, object] | None = None) -> None:
+        nonlocal file_text
+        payload = dict(base_payload)
+        if proposal is not None:
+            # the proposal rides in the payload (the machine-readable
+            # diff surface — the diff lines stay on stderr)
+            payload["graduation"] = proposal
+        output = json.dumps(payload, sort_keys=True)
+        typer.echo(output)
+        file_text = output + "\n"
+        if out is not None:
+            try:
+                _write_out_report(out, file_text)
+            except OSError as e:
+                typer.echo(f"eval failed: cannot write --out: {e}", err=True)
+                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
     # the deliberate serving-gate acts (ticket #21 bands, ticket #22
     # graduation): the measured table → per-label Threshold Bands →
     # the versioned artifacts bound to the checkpoint + eval identity.
@@ -1501,6 +1570,8 @@ def eval(
                 )
                 if given
             )
+            if as_json:
+                _emit_json_payload()  # the report is never lost
             typer.echo(
                 f"eval failed: {degraded_flags} refused: {missing_bodies} "
                 "test record(s) had no body shard \u2014 the scores are "
@@ -1553,6 +1624,8 @@ def eval(
                 split_date=manifest.split_date,
             )
         except (ValueError, OSError) as e:
+            if as_json:
+                _emit_json_payload()  # the report is never lost
             typer.echo(f"eval failed: band calibration refused: {e}", err=True)
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         if bands is not None:
@@ -1562,11 +1635,15 @@ def eval(
                 # the serving-gate hardening: the existing target is a
                 # verifiably-different artifact — exit 5, before any
                 # staging, the previous bytes intact
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
                 typer.echo(f"eval failed: --bands refused: {e}", err=True)
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             except OSError as e:
                 # the helper already cleaned up its (mkstemp-named)
                 # staging
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
                 typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
                 raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
             # the human-readable summary (the text-report mode only —
@@ -1592,6 +1669,7 @@ def eval(
                 GraduationTable,
                 build_table,
                 evaluate_graduation,
+                identity_disagreement,
                 render_graduation_diff,
             )
 
@@ -1630,6 +1708,8 @@ def eval(
                     split_date=manifest.split_date,
                 )
             except (ValueError, OSError) as e:
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
                 typer.echo(
                     f"eval failed: graduation gate evaluation refused: {e}",
                     err=True,
@@ -1652,19 +1732,10 @@ def eval(
                     existing = None  # a garbage target is the baseline
             disagreeing: tuple[str, ...] = ()
             if existing is not None:
-                disagreeing = tuple(
-                    field
-                    for field in (
-                        "vocabulary_hash",
-                        "corpus_fingerprint",
-                        "split_manifest_hash",
-                        "encoder_id",
-                        "split_date",
-                        "test_examples",
-                        "bands_content_hash",
-                    )
-                    if getattr(existing, field) != getattr(new_table, field)
-                )
+                # the identity fields are named in ONE place
+                # (graduation.IDENTITY_FIELDS — the write-path replace
+                # gate reads the same list)
+                disagreeing = identity_disagreement(existing, new_table)
             typer.echo(
                 render_graduation_diff(
                     existing,
@@ -1684,69 +1755,30 @@ def eval(
                 try:
                     _write_graduation_table(Path(graduation), new_table, table_text)
                 except GraduationTargetRefusedError as e:
+                    if as_json:
+                        # the report is never lost — and the proposal
+                        # rides (the computation succeeded)
+                        _emit_json_payload(json.loads(table_text))
                     typer.echo(f"eval failed: --graduation refused: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
                 except OSError as e:
                     # the helper already cleaned up its (mkstemp-named)
                     # staging
+                    if as_json:
+                        # the report is never lost — and the proposal
+                        # rides (the computation succeeded)
+                        _emit_json_payload(json.loads(table_text))
                     typer.echo(f"eval failed: cannot write --graduation: {e}", err=True)
                     raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    if as_json:
-        payload = {
-            "trust": trust,
-            # split identity: two reports from different splits (or a
-            # retrain) must be tellable apart by the consumer (#22)
-            "split_date": manifest.split_date.isoformat(),
-            "split_manifest_hash": manifest.content_hash,
-            "test_examples": table.test_examples,
-            "thresholds": list(table.thresholds),
-            "rows": [
-                {
-                    "label": row.label,
-                    "support": row.support,
-                    "cells": [
-                        {
-                            "threshold": t,
-                            "tp": cell.tp,
-                            "fp": cell.fp,
-                            "fn": cell.fn,
-                            "precision": cell.precision,
-                            "recall": cell.recall,
-                        }
-                        for t, cell in zip(table.thresholds, row.cells, strict=True)
-                    ],
-                }
-                for row in table.rows
-            ],
-        }
-        if graduation is not None:
-            # the proposal rides in the payload (the machine-readable
-            # diff surface — the diff lines stay on stderr)
-            payload["graduation"] = json.loads(new_table.to_json())
-        output = json.dumps(payload, sort_keys=True)
-        typer.echo(output)
-        file_text = output + "\n"
-    if out is not None:
-        # the report carries the user's label taxonomy — treat it like
-        # every other artifact this repo writes: 0600 from creation,
-        # never world-readable (the corpus-sidecar discipline). Staging
-        # + atomic replace (train's staging pattern): a failure leaves
-        # any PREVIOUS report at the path intact, and no fd can leak.
-        # Replacing an EXISTING file is announced on stderr — a silent
-        # clobber of a typo'd path would be a lie (train refuses
-        # overwrites; --force is overkill for a regenerable report)
-        target = Path(out)
-        if target.exists():
-            typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
-        staging = Path(str(out) + ".tmp")
-        try:
-            _write_secret_tight(staging, file_text)
-            os.replace(staging, out)  # atomic on POSIX
-        except OSError as e:
-            with contextlib.suppress(OSError):
-                staging.unlink()  # best-effort staging cleanup
-            typer.echo(f"eval failed: cannot write --out: {e}", err=True)
-            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        if as_json:
+            # the success path: the payload carries the proposal when
+            # the graduation table was computed
+            _emit_json_payload(
+                json.loads(new_table.to_json()) if graduation is not None else None
+            )
+    elif as_json:
+        # no serving-gate flags: the base payload (the report)
+        _emit_json_payload()
 
 
 if __name__ == "__main__":

@@ -126,10 +126,12 @@ _EXPECTED_IDENTITY_KEYS: frozenset[str] = frozenset(
     }
 )
 # a raise, not an assert: `python -O` strips asserts, and a stripped
-# guard would turn the drift into a KeyError/exit-1 at a consumer
-# (pyright sees the two literals as equal today — the guard is for
-# FUTURE drift, so the comparison is deliberate)
-if set(IDENTITY_FIELDS) != _EXPECTED_IDENTITY_KEYS:  # pyright: ignore[reportUnnecessaryComparison]
+# guard would turn the drift into a KeyError/exit-1 at a consumer.
+# The cast widens the literal tuple to plain str — the guard is for
+# FUTURE drift, so the comparison must not be narrowed away by the
+# type checker (no pyright-ignore needed)
+_fields: tuple[str, ...] = cast("tuple[str, ...]", IDENTITY_FIELDS)
+if set(_fields) != set(_EXPECTED_IDENTITY_KEYS):
     raise RuntimeError(
         "IDENTITY_FIELDS drifted from verify_graduation's expected-"
         "identity keys — add the field to BOTH (the expected-value "
@@ -415,10 +417,18 @@ class GraduationTable:
         for entry in self.labels:
             if not entry.label.strip():
                 raise ValueError("graduation label keys must be non-empty")
-            # the two-entry-path symmetry: from_json refuses a negative
-            # examples count, so validate() must too (a directly
-            # constructed table is refused exactly like a parsed one)
-            if isinstance(entry.examples, bool) or entry.examples < 0:
+            # the two-entry-path symmetry: from_json's _need_int
+            # refuses a non-int (and a negative) examples count, so
+            # validate() must too — type() is int, the same policing
+            # as min_examples/test_examples/format_version (a float
+            # 5.0 would pass a bare `isinstance(bool) or < 0` check
+            # and mint a hash that from_json then refuses)
+            if type(entry.examples) is not int:
+                raise ValueError(
+                    f"graduation for {entry.label!r}: examples must be "
+                    f"an integer, got {entry.examples!r}"
+                )
+            if entry.examples < 0:
                 raise ValueError(
                     f"graduation for {entry.label!r}: examples must be a "
                     f"non-negative integer, got {entry.examples!r}"
@@ -906,23 +916,26 @@ def _state(entry: GraduationEntry | None) -> str:
     # values: a gate change (min_examples 10 → 5) must be VISIBLE in
     # the old → new diff — a bare "graduated -> graduated" with a
     # changed content_hash would be blind to it (the human-confirm
-    # surface must show what the human is confirming)
+    # surface must show what the human is confirming). Precision
+    # values render at 4 decimals so a sub-0.005 move (0.9000 →
+    # 0.9010) is visible, not rounded away
     precision = (
-        f"{entry.precision_at_high:.2f}"
+        f"{entry.precision_at_high:.4f}"
         if entry.precision_at_high is not None
         else "none"
     )
     detail = (
         f"examples={entry.examples}, precision@high={precision}, "
         f"min_examples={entry.min_examples}, "
-        f"min_precision={entry.min_precision}"
+        f"min_precision={entry.min_precision:.4f}"
     )
     if entry.graduated:
         return f"graduated ({detail})"
     # CANONICAL order (sorted): the hash serializes reasons sorted, so
     # the same identity must render the same human text — a reversed
-    # reasons tuple is the same meaning, not a different one
-    return f"not graduated ({', '.join(sorted(entry.reasons))}) ({detail})"
+    # reasons tuple is the same meaning, not a different one; one
+    # parenthetical (reasons; detail), not two
+    return f"not graduated ({', '.join(sorted(entry.reasons))}; {detail})"
 
 
 def render_graduation_diff(
@@ -932,6 +945,7 @@ def render_graduation_diff(
     path: str,
     disagreeing_fields: tuple[str, ...] = (),
     unparseable_existing: bool = False,
+    unreadable_existing: bool = False,
 ) -> str:
     """The human-confirm diff (ADR-0005): old → new per label, in
     label-sorted order over the union of both tables' labels. A label
@@ -953,7 +967,14 @@ def render_graduation_diff(
             "diff compares a foreign-bound table"
         )
     if old is None:
-        if unparseable_existing:
+        if unreadable_existing:
+            # an I/O failure, not a parse failure — the cause is not
+            # misdiagnosed
+            lines.append(
+                f"graduation: existing file at {path} is unreadable "
+                "(I/O failure) — baseline is empty"
+            )
+        elif unparseable_existing:
             lines.append(
                 f"graduation: existing file at {path} does not parse as a "
                 "Graduation Table — baseline is empty"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from gmail_labeler.config import Config, ConfigError, find_config, load_config
 
@@ -704,6 +705,30 @@ def test_full_config_model_dump_round_trip() -> None:
     assert cfg.graduation.per_label == {}
     round_tripped = Config.model_validate(cfg.model_dump())
     assert round_tripped == cfg
+
+
+def test_populated_per_label_dump_round_trip_refused_by_design() -> None:
+    # the round-trip boundary: a config WITH per-label overrides does
+    # NOT round-trip through model_dump() -> model_validate — the dump
+    # produces a non-empty raw per_label dict, which is the refused
+    # back door (BY DESIGN: the typed API — BandOverride / GateOverride
+    # values — is the programmatic round-trip path). The refusal names
+    # BOTH problems (the reserved key AND the duplicate it produces)
+    from gmail_labeler.config import BandOverride, Config
+
+    cfg = Config.model_validate(
+        {"bands": {"per_label": {"Bills": BandOverride(min_high_precision=0.9)}}}
+    )
+    # a direct model_validate surfaces the wrap validator's ValueError
+    # as a pydantic ValidationError (load_config maps it to ConfigError).
+    # The refusal names the reserved field name — the raw per_label
+    # form is consumed as the declared field (no extras), so the
+    # duplicate check (the label-path form's same-label-twice case)
+    # does not also fire here
+    with pytest.raises(ValidationError) as ei:
+        Config.model_validate(cfg.model_dump())
+    msg = str(ei.value)
+    assert "reserved field name" in msg
 
 
 def test_graduation_handler_failure_still_collects_all_problems(

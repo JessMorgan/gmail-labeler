@@ -347,16 +347,16 @@ def test_eval_graduation_diff_shows_old_to_new(
     )
     assert r2.exit_code == 0, r2.stderr
     assert (
-        "Money/Bills: graduated (examples=3, precision@high=1.00, "
-        "min_examples=3, min_precision=0.9) -> not graduated "
-        "(below-min-examples) (examples=3, precision@high=1.00, "
-        "min_examples=4, min_precision=0.9)" in r2.stderr
+        "Money/Bills: graduated (examples=3, precision@high=1.0000, "
+        "min_examples=3, min_precision=0.9000) -> not graduated "
+        "(below-min-examples; examples=3, precision@high=1.0000, "
+        "min_examples=4, min_precision=0.9000)" in r2.stderr
     )
     assert (
-        "Shipping: graduated (examples=3, precision@high=1.00, "
-        "min_examples=3, min_precision=0.9) -> not graduated "
-        "(below-min-examples) (examples=3, precision@high=1.00, "
-        "min_examples=4, min_precision=0.9)" in r2.stderr
+        "Shipping: graduated (examples=3, precision@high=1.0000, "
+        "min_examples=3, min_precision=0.9000) -> not graduated "
+        "(below-min-examples; examples=3, precision@high=1.0000, "
+        "min_examples=4, min_precision=0.9000)" in r2.stderr
     )
     assert out.read_bytes() == bytes_graduated  # nothing applied itself
     # confirm: the file moves to the demoted table
@@ -704,6 +704,79 @@ def test_eval_out_empty_path_is_a_usage_error(
     assert set(os.listdir(Path.cwd())) == cwd_files  # no stray file in cwd
 
 
+def test_eval_out_inside_corpus_store_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1: --out naming a file inside the corpus store would clobber
+    # identity material (labels.json) — refused up front (exit 2),
+    # the bytes intact (the ds live probe at 0534077: this exited 0
+    # and NOTICE-replaced the file)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    labels = tmp_path / "corpus" / "labels.json"
+    bytes_before = labels.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path, "--out", str(labels), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "corpus store" in result.stderr
+    assert "test examples=6" not in result.stdout  # pre-report refusal
+    assert labels.read_bytes() == bytes_before  # bytes intact
+
+
+def test_eval_out_inside_checkpoint_dir_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1: --out naming a file inside the checkpoint dir (the split
+    # manifest) — refused up front, the bytes intact
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    manifest = tmp_path / "ckpt" / "manifest.json"
+    bytes_before = manifest.read_bytes()
+    result, _factory = _run_eval(
+        tmp_path, "--out", str(manifest), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "checkpoint" in result.stderr
+    assert "test examples=6" not in result.stdout  # pre-report refusal
+    assert manifest.read_bytes() == bytes_before  # bytes intact
+
+
+def test_eval_out_symlink_into_corpus_store_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1: a symlink whose NAME sits outside the corpus store but
+    # POINTS inside it — both sides are resolved, so the guard catches
+    # it (an unresolved check would let the clobber through)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    labels = tmp_path / "corpus" / "labels.json"
+    bytes_before = labels.read_bytes()
+    link = tmp_path / "report-link.json"
+    os.symlink(labels, link)
+    result, _factory = _run_eval(tmp_path, "--out", str(link), monkeypatch=monkeypatch)
+    assert result.exit_code == 2
+    assert "corpus store" in result.stderr
+    assert labels.read_bytes() == bytes_before  # the target intact
+
+
+def test_eval_out_benign_target_still_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1: the containment refusal does not over-refuse — a benign
+    # target (outside the checkpoint dir and the corpus store) still
+    # writes the report
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    report = tmp_path / "report.txt"
+    result, _factory = _run_eval(
+        tmp_path, "--out", str(report), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 0, result.stderr
+    assert report.is_file()
+    assert "test examples=6" in report.read_text(encoding="utf-8")
+
+
 def test_eval_out_same_path_as_config_is_a_usage_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -879,6 +952,34 @@ def test_eval_graduation_unparseable_existing_named_in_diff(
     )
     assert "no existing table" not in result.stderr
     assert "NOTICE" not in result.stderr  # no replace NOTICE on a read
+
+
+def test_eval_graduation_unreadable_existing_named_in_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F6: an UNREADABLE existing target (I/O failure) is named as
+    # unreadable — NOT "does not parse" (the cause is not
+    # misdiagnosed); the diff still renders on the baseline
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("running as root — chmod 000 cannot deny reads")
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    out.write_text("not a table", encoding="utf-8")
+    os.chmod(out, 0o000)
+    try:
+        result, _factory = _run_eval(
+            tmp_path, "--graduation", str(out), monkeypatch=monkeypatch, cfg=cfg
+        )
+    finally:
+        os.chmod(out, 0o600)  # restore for cleanup
+    assert result.exit_code == 0, result.stderr
+    assert "is unreadable" in result.stderr
+    assert "does not parse" not in result.stderr
+    assert "no existing table" not in result.stderr
 
 
 def test_eval_graduation_json_out_refusal(
@@ -1331,7 +1432,7 @@ def test_eval_graduation_readback_fault_exits_5(
         cfg=cfg,
     )
     assert result.exit_code == 5
-    assert "cannot write --graduation" in result.stderr
+    assert "--graduation write failed AFTER the target was replaced" in result.stderr
     assert "readback fault" in result.stderr
     assert "test examples=6" in result.stdout  # the report is not lost
 
@@ -1396,7 +1497,7 @@ def test_eval_graduation_readback_mismatch_exits_5(
         cfg=cfg,
     )
     assert result.exit_code == 5
-    assert "cannot write --graduation" in result.stderr
+    assert "--graduation write failed AFTER the target was replaced" in result.stderr
     assert "readback mismatch" in result.stderr
     # the message names the real semantics: it DID parse
     assert "content hash differs" in result.stderr

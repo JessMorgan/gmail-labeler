@@ -51,7 +51,9 @@ does not ship releases yet.
     failure) = per-message SKIP + stderr warning + count (the
     documented posture choice vs eval's refusal — shadow is a read-only
     survey). Summary to stderr, not stdout; `--json` one parseable
-    object.
+    object (its `cutoff_epoch`/`cutoff` window fields are present except under
+    the `--query` override, which replaces the window entirely — no
+    phantom-window fields).
   - `shadow report` CLI: reads the run's rows from the state DB (latest
     run by default, `--run` to pick), re-fetches each message's ACTUAL
     labels via the read path, and renders a deterministic per-message

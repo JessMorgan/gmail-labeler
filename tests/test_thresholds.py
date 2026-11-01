@@ -445,7 +445,8 @@ def test_override_targets_get_the_same_validation() -> None:
     # an override's targets are validated EXACTLY like the run's — an
     # out-of-range, bool, or non-tenth per-label target would
     # miscalibrate silently (the config layer shields the CLI path;
-    # the core is the public boundary #24/#25 consume)
+    # the core is the public boundary #23's shadow run consumes and
+    # #25/#26 will)
     table = _golden_table()
     for bad in (
         BandTargets(min_high_precision=1.5, min_med_precision=0.7),

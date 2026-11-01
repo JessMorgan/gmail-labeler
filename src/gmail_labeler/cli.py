@@ -2048,8 +2048,8 @@ app.add_typer(shadow_app, name="shadow")
 def _shadow_client(config: Config) -> GmailClient:
     """Client factory seam: tests inject FakeGmailClient here (the
     offline spine, invariant #9). The read surface only — the Shadow
-    Pass performs NO Gmail write (the write surface lands #24/#25; the
-    zero-write pin in the tests depends on that)."""
+    Pass performs NO Gmail write (the write surface LANDED in #24 — the
+    zero-write pin catches a read-path write BY NAME)."""
     from .auth import credentials as build_credentials
     from .gmail_client import GmailRestClient
 
@@ -2752,9 +2752,10 @@ def _tier_name_for_band(
     (``[labels] high`` / ``[labels] med``) — the config drives the
     report's tier names, so a custom ``[labels]`` spelling is honored,
     not silently ignored (refuse-never-drop). Skip-present earns no
-    tier (invariant #2). The daemon (#24) resolves these configured
-    names to Gmail label ids (the contract is recorded in the tiers
-    module docstring)."""
+    tier (invariant #2). The name→id resolution SHIPPED in #24
+    (gmail_client.ensure_label + applications.plan_message_write taking
+    the resolved map); the daemon (#25) / apply (#26) call it at
+    startup (the contract is recorded in the tiers module docstring)."""
     from .tiers import TIER_HIGH, TIER_MED, tier_for_band
 
     default_tier = tier_for_band(band, present=present)

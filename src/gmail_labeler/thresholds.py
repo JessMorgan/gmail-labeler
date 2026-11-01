@@ -237,7 +237,7 @@ def calibrate_bands(
     # the override targets get the SAME validation as the run's — an
     # out-of-range or non-tenth per-label target would miscalibrate
     # silently (the config layer shields the CLI path; the core is the
-    # public boundary #24/#25 consume)
+    # public boundary #23's shadow run consumes and #25/#26 will)
     override_map: Mapping[str, BandTargets] = overrides if overrides is not None else {}
     for label, override in sorted(override_map.items()):
         _check_target(

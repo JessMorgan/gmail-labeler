@@ -10,6 +10,7 @@ from gmail_labeler.gmail_client import (
     GmailClient,
     GmailRestClient,
     HistoryPage,
+    LabelInfo,
     MessagePage,
     MessageStub,
     RawMessage,
@@ -735,3 +736,393 @@ def test_refresh_error_credential_state_is_auth() -> None:
         )
     )
     assert isinstance(broken_store, GmailAuthError)
+
+
+# -- write surface (ticket #24): apply_labels / ensure_label -----------------
+
+
+class _WriteService:
+    """Transport shim for the write methods: captures the modify/create
+    kwargs (the FULL body as the adapter composed it) and serves canned
+    payloads. The chain shape mirrors googleapiclient:
+    ``users().messages().modify`` and ``labels().create``."""
+
+    def __init__(
+        self,
+        *,
+        labels_payload: Any = None,
+        create_payload: Any = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.labels_payload = labels_payload if labels_payload is not None else {}
+        self.create_payload = (
+            create_payload
+            if create_payload is not None
+            else {"id": "Label_new", "name": "x", "type": "user"}
+        )
+        self.error = error
+        self.modify_calls: list[dict[str, object]] = []
+        self.create_calls: list[dict[str, object]] = []
+
+    def users(self) -> _WriteService:
+        return self
+
+    def messages(self) -> _WriteService:
+        return self
+
+    def labels(self) -> _WriteService:
+        return self
+
+    def modify(self, **kw: object) -> _Req:
+        self.modify_calls.append(kw)
+        return _Req({}, self.error)
+
+    def create(self, **kw: object) -> _Req:
+        self.create_calls.append(kw)
+        return _Req(self.create_payload, self.error)
+
+    def list(self, **kw: object) -> _Req:
+        return _Req(self.labels_payload, self.error)
+
+
+def _write_rest(
+    *,
+    labels: Any = None,
+    create: Any = None,
+    error: Exception | None = None,
+) -> tuple[GmailRestClient, _WriteService]:
+    service = _WriteService(labels_payload=labels, create_payload=create, error=error)
+    return (
+        GmailRestClient(credentials=object(), build_service=lambda _c: service),
+        service,
+    )
+
+
+def test_apply_labels_body_is_add_label_ids_only() -> None:
+    # AC2 write-shape pin: the composed wire body is modify with
+    # addLabelIds ONLY — the body snapshot is asserted EXACTLY, so any
+    # extra key reddens it (mutation pin: a removeLabelIds presence in
+    # the body kills this test — invariant #1's structural guard)
+    client, service = _write_rest()
+    client.apply_labels("abcd", ["Label_1", "ai-high"])
+    assert service.modify_calls == [
+        {"userId": "me", "id": "abcd", "body": {"addLabelIds": ["Label_1", "ai-high"]}}
+    ]
+
+
+def test_apply_labels_wire_errors_use_the_taxonomy() -> None:
+    # the write rides the SAME _call taxonomy as the reads: 5xx is a
+    # transient blip, a permission 403 is auth (human-gated) — no new
+    # error class is invented for the write path
+    client, _ = _write_rest(error=_HttpError(500))
+    with pytest.raises(GmailTransientError):
+        client.apply_labels("abcd", ["Label_1"])
+    client, _ = _write_rest(error=_HttpError(403, reason="permissionDenied"))
+    with pytest.raises(GmailAuthError):
+        client.apply_labels("abcd", ["Label_1"])
+
+
+def test_ensure_label_returns_the_existing_user_label_id_without_create() -> None:
+    # get-or-create: present means NO create call hits the wire
+    # (idempotent startup resolution — the daemon calls this once per
+    # configured tier name)
+    client, service = _write_rest(
+        labels={
+            "labels": [
+                {"id": "Label_9", "name": "ai-high", "type": "user"},
+                {"id": "INBOX", "name": "INBOX", "type": "system"},
+            ]
+        }
+    )
+    assert client.ensure_label("ai-high") == "Label_9"
+    assert service.create_calls == []
+
+
+def test_ensure_label_creates_when_absent() -> None:
+    client, service = _write_rest(
+        labels={"labels": [{"id": "Label_9", "name": "other", "type": "user"}]},
+        create={"id": "Label_new", "name": "ai-applied", "type": "user"},
+    )
+    assert client.ensure_label("ai-applied") == "Label_new"
+    assert service.create_calls == [{"userId": "me", "body": {"name": "ai-applied"}}]
+
+
+def test_ensure_label_refuses_a_system_label_name_collision() -> None:
+    # F1 (qwen MINOR): a configured tier name that name-sakes a System
+    # Label is REFUSED, named — minting a USER label named "INBOX" would
+    # make the tier visually indistinguishable from system state (the
+    # plan's id screen cannot catch it: the fresh id is a Label_* id).
+    # The remedy is renaming [labels], and it fires at startup, not
+    # silently on the wire
+    client, service = _write_rest(
+        labels={"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]},
+        create={"id": "Label_new", "name": "INBOX", "type": "user"},
+    )
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        client.ensure_label("INBOX")
+    assert service.create_calls == []  # no duplicate-named user label minted
+
+
+def test_ensure_label_casefold_catches_lowercase_collision() -> None:
+    # F2 (deepseek MINOR): the collision guard casefolds — a configured
+    # lowercase variant (high = "inbox") must NOT slip past == and mint
+    # the visually-system user label. The Gmail v1 REST reference
+    # documents the 409 duplicate-name refusal but NOT a case rule, and
+    # CI cannot ask the live API (invariant #9) — casefold is the
+    # belt-and-braces posture: an "inbox"-named user label beside the
+    # system INBOX is the same visual trap the guard exists to refuse
+    client, service = _write_rest(
+        labels={"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]},
+        create={"id": "Label_new", "name": "inbox", "type": "user"},
+    )
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        client.ensure_label("inbox")
+    assert service.create_calls == []
+
+
+def test_ensure_label_user_hit_wins_regardless_of_list_order() -> None:
+    # F2 review MINOR: deterministic precedence — the exact-case user
+    # hit is pass 1, the casefolded collision guard is pass 2. The old
+    # single loop RAISED when the system entry preceded the user entry
+    # in labels.list (same mailbox, order-dependent outcome); an
+    # EXISTING exact-case user label is always reused — the guard only
+    # prevents MINTING a look-alike
+    client, service = _write_rest(
+        labels={
+            "labels": [
+                {"id": "INBOX", "name": "INBOX", "type": "system"},
+                {"id": "Label_user", "name": "inbox", "type": "user"},
+            ]
+        }
+    )
+    assert client.ensure_label("inbox") == "Label_user"
+    assert service.create_calls == []
+
+
+def test_fake_ensure_label_user_hit_wins_regardless_of_list_order() -> None:
+    # the mirrored pin (F2 review NIT): #25's exact-call tests ride the
+    # FAKE, so its two-pass split needs its own order-determinism pin —
+    # a single-pass revert in the fake must not stay green
+    fake = FakeGmailClient(
+        labels=[
+            LabelInfo(id="INBOX", name="INBOX", type="system"),
+            LabelInfo(id="Label_user", name="inbox", type="user"),
+        ]
+    )
+    assert fake.ensure_label("inbox") == "Label_user"
+    assert fake.writes == []
+
+
+def test_ensure_label_case_variant_of_a_user_label_creates_not_refuses() -> None:
+    # F2 review NIT: the guard's negative direction — a case variant of
+    # a USER label (no system collision) must proceed to create, not
+    # refuse: the refusal is for System-Label look-alikes only (what
+    # Gmail's own uniqueness rule then answers on the wire is the 409
+    # self-heal's story, not the guard's)
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    created = fake.ensure_label("AI-HIGH")
+    assert created != "Label_9"
+    assert fake.writes == [{"method": "ensure_label", "body": {"name": "AI-HIGH"}}]
+
+
+def test_ensure_label_409_race_self_heals_by_relisting() -> None:
+    # F1 (qwen MINOR): a concurrent create (another client won the name
+    # between our list and our create — Gmail answers 409) is NOT a hard
+    # failure: re-list ONCE and adopt the winner's id (the get-or-create
+    # promise survives the race). If the re-list still finds nothing,
+    # the original 409 refusal stands (the name is taken by something we
+    # cannot see — no silent retry loop)
+
+    class _RaceService(_WriteService):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lists = 0
+
+        def list(self, **kw: object) -> _Req:
+            self.lists += 1
+            if self.lists == 1:
+                return _Req({"labels": []})
+            return _Req(
+                {"labels": [{"id": "Label_won", "name": "ai-high", "type": "user"}]}
+            )
+
+        def create(self, **kw: object) -> _Req:
+            return _Req(None, _HttpError(409, reason="labelName: already exists"))
+
+    service = _RaceService()
+    client = GmailRestClient(credentials=object(), build_service=lambda _c: service)
+    assert client.ensure_label("ai-high") == "Label_won"
+
+    class _StillAbsentService(_RaceService):
+        def list(self, **kw: object) -> _Req:
+            self.lists += 1
+            return _Req({"labels": []})
+
+    service2 = _StillAbsentService()
+    client2 = GmailRestClient(credentials=object(), build_service=lambda _c: service2)
+    with pytest.raises(GmailPermanentError, match="409"):
+        client2.ensure_label("ai-high")
+    assert service2.lists == 2  # exactly ONE re-list — no retry loop
+
+
+def test_ensure_label_create_response_without_id_is_loud() -> None:
+    client, _ = _write_rest(create={"name": "ai-med"})
+    with pytest.raises(GmailPermanentError, match="field 'id'"):
+        client.ensure_label("ai-med")
+
+
+def test_apply_labels_rejects_a_bare_string() -> None:
+    # F1 (deepseek MINOR): Sequence[str] admits a bare str at the TYPE
+    # level (a str is a Sequence of its characters) — the wire would
+    # carry one-char label ids. Runtime guard, both surfaces, BEFORE any
+    # call/writes land (the REST guard fires before the transport, so
+    # the fake raises before even the call-log entry — mirroring
+    # "no wire call happened")
+    client, service = _write_rest()
+    with pytest.raises(ValueError, match="bare string"):
+        client.apply_labels("abcd", "Label_1")
+    assert service.modify_calls == []
+    fake = FakeGmailClient(messages=[FakeMessage(id="aa", eml=b"x")])
+    with pytest.raises(ValueError, match="bare string"):
+        fake.apply_labels("aa", "Label_1")
+    assert fake.calls == []
+    assert fake.writes == []
+
+
+def test_fake_apply_labels_records_snapshot_and_updates_state() -> None:
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aa", eml=b"x", label_ids=("INBOX",))]
+    )
+    fake.apply_labels("aa", ["Label_1", "ai-high"])
+    assert fake.calls == ["apply_labels:aa"]
+    # full body snapshot — the wire-shape pin at the fake level: the
+    # recorded body carries addLabelIds ONLY (no removeLabelIds key)
+    assert fake.writes == [
+        {
+            "method": "apply_labels",
+            "message_id": "aa",
+            "body": {"addLabelIds": ["Label_1", "ai-high"]},
+        }
+    ]
+    assert fake.messages["aa"].label_ids == ("INBOX", "Label_1", "ai-high")
+
+
+def test_fake_apply_labels_dedupes_like_the_wire() -> None:
+    # the real API stores a label SET: re-adding a present id is a
+    # no-op, not a duplicate — the fake must not lie about it, ACROSS
+    # calls AND WITHIN one call (F1 deepseek MINOR: the intra-call
+    # duplicate used to land twice)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aa", eml=b"x", label_ids=("Label_1",))]
+    )
+    fake.apply_labels("aa", ["Label_1", "ai-high", "ai-high"])
+    assert fake.messages["aa"].label_ids == ("Label_1", "ai-high")
+    # the body SNAPSHOT keeps the raw caller input (wire evidence — a
+    # composition bug that sends duplicates stays VISIBLE here even
+    # though the state dedupes like Gmail)
+    assert fake.writes[0]["body"] == {"addLabelIds": ["Label_1", "ai-high", "ai-high"]}
+
+
+def test_fake_apply_labels_unknown_message_is_typed_404() -> None:
+    fake = FakeGmailClient()
+    with pytest.raises(GmailPermanentError, match="not found"):
+        fake.apply_labels("deadbeef", ["Label_1"])
+    # the attempt is visible in the call log (the zero-write pin must
+    # see it), but nothing landed: no write recorded
+    assert fake.calls == ["apply_labels:deadbeef"]
+    assert fake.writes == []
+
+
+def test_fake_ensure_label_is_idempotent_and_creates() -> None:
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    assert fake.ensure_label("ai-high") == "Label_9"
+    assert fake.writes == []  # present: no create hit the wire
+    created = fake.ensure_label("ai-applied")
+    assert created != "Label_9"
+    assert fake.writes == [{"method": "ensure_label", "body": {"name": "ai-applied"}}]
+    # the created label is now present — the second call is a pure hit
+    assert fake.ensure_label("ai-applied") == created
+    assert len(fake.writes) == 1
+
+
+def test_fake_list_labels_returns_a_copy() -> None:
+    # F3 (deepseek): list_labels() returned the LIVE internal list —
+    # the ctor aliasing trap, OTHER direction: a caller mutating the
+    # returned list corrupted the fake's mailbox behind its back (and
+    # #25's exact-call tests ride this fake). The REST adapter builds
+    # fresh objects per call; the fake now returns a copy
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    returned = fake.list_labels()
+    returned.append(LabelInfo(id="Label_x", name="sneaked", type="user"))
+    returned[0] = LabelInfo(id="INBOX", name="INBOX", type="system")
+    assert fake.labels_list == [LabelInfo(id="Label_9", name="ai-high", type="user")]
+    # the mailbox the fake READS from is untouched: ensure_label still
+    # hits the real entry, not the corrupted view
+    assert fake.ensure_label("ai-high") == "Label_9"
+
+
+def test_fake_list_filters_returns_a_copy() -> None:
+    # F3 review MINOR: the same trap, ONE METHOD BELOW — list_filters
+    # handed out the live filters_list (the REST adapter builds fresh
+    # FilterInfo per call; the copy rationale holds word-for-word).
+    # #25/#26 ride this fake; the read surfaces must be symmetric
+    fake = FakeGmailClient(filters=[FilterInfo(id="f1", criteria={"from": "x"})])
+    returned = fake.list_filters()
+    returned.clear()
+    assert fake.filters_list == [FilterInfo(id="f1", criteria={"from": "x"})]
+
+
+def test_fake_ensure_label_refuses_system_namesakes() -> None:
+    # the fake mirrors the REST refusal (F1): no silent duplicate-named
+    # user label, in CI or on the wire
+    fake = FakeGmailClient(labels=[LabelInfo(id="INBOX", name="INBOX", type="system")])
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        fake.ensure_label("INBOX")
+    assert fake.writes == []
+
+
+def test_fake_ensure_label_casefold_catches_lowercase_collision() -> None:
+    # the fake mirrors the casefold guard (F1/F2 fidelity)
+    fake = FakeGmailClient(labels=[LabelInfo(id="INBOX", name="INBOX", type="system")])
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        fake.ensure_label("inbox")
+    assert fake.writes == []
+
+
+def test_fake_ensure_label_logs_the_list_labels_wire_call() -> None:
+    # F1 (qwen MINOR): the REST adapter does list_labels + maybe create
+    # — the fake records the SAME call sequence so #25's exact-call
+    # tests do not diverge between faked and real wiring. list_labels is
+    # a READ (READ_SURFACE untouched — the shadow zero-write pin is
+    # unaffected)
+    fake = FakeGmailClient(
+        labels=[LabelInfo(id="Label_9", name="ai-high", type="user")]
+    )
+    assert fake.ensure_label("ai-high") == "Label_9"
+    assert fake.calls == ["ensure_label:ai-high", "list_labels"]
+
+
+def test_fake_write_failures_are_programmable() -> None:
+    fake = FakeGmailClient(messages=[FakeMessage(id="aa", eml=b"x")])
+    fake.fail("apply_labels", GmailTransientError("blip"))
+    with pytest.raises(GmailTransientError):
+        fake.apply_labels("aa", ["Label_1"])
+    assert fake.writes == []  # the programmed failure landed BEFORE the record
+    fake.apply_labels("aa", ["Label_1"])  # fail-once semantics
+    assert len(fake.writes) == 1
+    fake.fail("ensure_label", GmailAuthError("revoked"))
+    with pytest.raises(GmailAuthError):
+        fake.ensure_label("ai-high")
+    assert fake.writes == [
+        {
+            "method": "apply_labels",
+            "message_id": "aa",
+            "body": {"addLabelIds": ["Label_1"]},
+        }
+    ]

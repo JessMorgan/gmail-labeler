@@ -386,8 +386,10 @@ def test_shadow_run_zero_gmail_writes(
 ) -> None:
     # AC1: zero Gmail writes — the recorded calls are a subset of the
     # READ surface (list_messages, get_message, list_labels,
-    # list_filters); no write method of any shape (the Protocol has
-    # none in this ticket — the write surface lands #24/#25)
+    # list_filters); no write method of any shape. (The Protocol gained
+    # apply_labels/ensure_label in #24 — the name-based pin catches
+    # them BY NAME if a read path ever calls one; the assertion below
+    # is byte-identical to the #23 original)
     _prepare(tmp_path, monkeypatch)
     result, fake = _run_shadow(tmp_path, monkeypatch=monkeypatch)
     assert result.exit_code == 0, result.stderr
@@ -471,7 +473,8 @@ def test_shadow_run_since_strict_iso(
 def test_shadow_run_query_escape_hatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # --query replaces the default wholesale (the operator's query)
+    # --query replaces the whole backlog window — the default and
+    # --since alike (the README's --query scope, #23)
     _prepare(tmp_path, monkeypatch)
     result, fake = _run_shadow(
         tmp_path, "--query", "is:starred", monkeypatch=monkeypatch

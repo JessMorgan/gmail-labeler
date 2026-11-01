@@ -1,9 +1,16 @@
-"""Gmail API surface for corpus acquisition — Protocol + REST adapter.
+"""Gmail API surface — Protocol + REST adapter.
 
-Only the Phase 0 read surface (labels, filters, message list/get, history);
-the ONLY write the product ever performs (addLabelIds) arrives with the
-daemon phase and will live behind the same Protocol (FakeGmailClient is the
-test spine — invariant #9). Errors surface via gmail_errors taxonomy only.
+The Phase 0 read surface (labels, filters, message list/get, history) plus
+the application path's FIRST write methods (ticket #24): ``apply_labels``
+(the ONLY label write the product ever performs — addLabelIds ONLY,
+structurally incapable of carrying a removal — invariant #1) and
+``ensure_label`` (get-or-create for the configured Tier Label names: an
+existing USER label of exactly that name is used as-is; a casefolded
+System Label name-sake is refused named — the refusal guards minting a
+look-alike only — invoked from the daemon/apply startup only, never the
+Shadow Pass).
+Both live behind the same Protocol (FakeGmailClient is the test spine —
+invariant #9). Errors surface via gmail_errors taxonomy only.
 
 Wire-shape rule (verified against the Gmail v1 discovery schema): int64 /
 uint64 fields (internalDate, historyId) arrive as STRINGS — googleapiclient
@@ -15,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -31,6 +38,14 @@ from .gmail_errors import (
 # Adapter bound (CODING-STANDARDS: bounded transports): google_auth_httplib2
 # ignores per-request timeouts, so the bound lives on the httplib2 transport.
 _REQUEST_TIMEOUT_S = 30.0
+
+#: The bare-str/bare-bytes refusal for apply_labels — Sequence[str]
+#: admits a str at the type level (a str is a Sequence of its
+#: characters, the wire would carry one-char label ids). ONE message
+#: for both surfaces (F2: FakeGmailClient imports this, never a copy).
+BARE_ADD_IDS_REFUSAL = (
+    "apply_labels: add_label_ids must be a sequence of label ids, not a bare string"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +127,22 @@ class GmailClient(Protocol):
     def history(
         self, start_history_id: int, page_token: str | None = None
     ) -> HistoryPage: ...
+
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None:
+        """Add labels to one message — the ONLY label write the product
+        performs. The wire body carries addLabelIds ONLY (invariant #1:
+        structurally incapable of carrying a removal); the caller's
+        no-call-on-empty rule keeps an empty plan off the wire."""
+        ...
+
+    def ensure_label(self, name: str) -> str:
+        """Get-or-create a USER label by exact name (daemon/apply
+        startup only — never the Shadow Pass). An existing USER label of
+        exactly that name is used as-is; a casefolded System Label
+        name-sake is refused named — the refusal guards minting a
+        look-alike only; a concurrent-create 409 self-heals by
+        re-listing once."""
+        ...
 
 
 class GmailRestClient:
@@ -271,6 +302,80 @@ class GmailRestClient:
             next_page_token=_token(data),
             records=tuple(records),
         )
+
+    # -- write surface (ticket #24 — the ONLY label write is addLabelIds) --
+
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None:
+        """Add labels to one message (GLOSSARY: Application). The body is
+        a literal with the ONE key ``addLabelIds`` — structurally
+        incapable of carrying a removal (invariant #1: additive-only, no
+        code path may remove labels). The composition layer (tickets
+        #24/#26) never calls this with an empty list — an empty plan is
+        no API call at all (pinned at the plan level, not here). Wire
+        errors surface through the SAME taxonomy as every read (the
+        ``_call`` path: transient blips retry, auth is human-gated).
+
+        ``Sequence[str]`` admits a bare str at the TYPE level (a str is
+        a Sequence of its characters — the wire would carry one-char
+        label ids), so the guard is RUNTIME: a str (or bytes) is refused
+        as a caller bug before anything reaches the transport."""
+        if isinstance(add_label_ids, (str, bytes)):
+            raise ValueError(f"{BARE_ADD_IDS_REFUSAL} (got {add_label_ids!r})")
+        body: dict[str, object] = {"addLabelIds": list(add_label_ids)}
+        self._call(
+            self._svc().users().messages().modify(userId="me", id=message_id, body=body)
+        )
+
+    def ensure_label(self, name: str) -> str:
+        """Get-or-create a USER label by exact name (the daemon/apply
+        startup resolves the configured ``[labels] applied/high/med``
+        names to Gmail label ids ONCE — pure thereafter; never called
+        from the Shadow Pass, which is zero-write). Idempotent when the
+        name is present (EXACT-case match, pass 1 — an existing user
+        label is always reused): NO create call is made. A System Label
+        whose name casefold-matches the requested name is REFUSED,
+        named (F1/F2, pass 2): minting a USER label named like a System
+        Label would make the tier visually indistinguishable from
+        system state, and the plan's id screen cannot catch a fresh
+        Label_* id — the operator must rename [labels]. A concurrent
+        create (another client won the name between our list and our
+        create; Gmail answers 409) is
+        self-healed: re-list ONCE and adopt the winner's id — if the
+        name is STILL not ours to see, the original refusal stands (no
+        retry loop)."""
+        labels = self.list_labels()
+        wanted = name.casefold()
+        for label in labels:  # pass 1: the exact-case get-or-create hit
+            if label.name == name and label.type == "user":
+                return label.id
+        for label in labels:  # pass 2 (F2 review): the collision guard
+            # runs AFTER the user-hit pass — an EXISTING exact-case user
+            # label is always reused (deterministic regardless of the
+            # list order); the guard only prevents MINTING a look-alike
+            if label.type == "system" and label.name.casefold() == wanted:
+                # CASEFOLDED (F2): the Gmail REST reference documents the
+                # 409 duplicate-name refusal but not a case rule, and CI
+                # cannot ask the live API — belt-and-braces: the visual
+                # trap is the same whichever way Gmail's rule falls (the
+                # hit/refuse contract, incl. the exact-case HIT, is the
+                # method docstring — no restatement here)
+                raise ValueError(
+                    f"ensure_label: {name!r} collides with a System Label "
+                    "name in the mailbox — rename [labels] applied/high/med "
+                    "(System Labels are never write targets)"
+                )
+        try:
+            data = self._call(
+                self._svc().labels().create(userId="me", body={"name": name})
+            )
+        except GmailPermanentError as e:
+            if e.status != 409:
+                raise
+            for label in self.list_labels():  # the ONE re-list
+                if label.name == name and label.type == "user":
+                    return label.id
+            raise  # still absent after the race: the original refusal
+        return _s(data, "id")
 
 
 # -- strict shape helpers (a malformed response is a loud permanent error,

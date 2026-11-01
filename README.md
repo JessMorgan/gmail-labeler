@@ -29,9 +29,10 @@ you would.
 
 - **Your mail never leaves your machines.** Training, inference, and storage
   are 100% local. No telemetry, no hosted training, no API keys to us.
-- **It only ever adds labels.** `gmail-labeler` will not remove anything, and
-  every application carries an `ai-applied` umbrella plus a confidence tier
-  (`ai-high` / `ai-med`) so you can audit every decision it ever made.
+- **It only ever adds labels.** `gmail-labeler` will not remove anything,
+  and every application (once the write phase lands) carries an `ai-applied`
+  umbrella plus one band Tier Label (`ai-high` / `ai-med`) so you can audit
+  every decision it ever made.
 - **Nothing goes live unproven.** Each label is trained, scored on a recent
   held-out slice of *your* mail, and shadow-scored before it is ever applied
   silently. Labels that don't earn it stay in review.
@@ -48,8 +49,9 @@ you would.
 3. **Graduate** — labels pass per-label precision gates on a temporal test
    split before they're allowed to apply silently.
 4. **Run** — a daemon polls the Gmail History API (~30s), classifies new
-   messages, and applies graduated labels with confidence tiers. Your manual
-   corrections are captured as training signal for the next round.
+   messages, and applies graduated labels with Tier Labels (once the write
+   phase lands). Your manual corrections are captured as training signal
+   for the next round.
 
 ## Setup
 
@@ -89,7 +91,10 @@ gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
-gmail-labeler shadow run --bands bands.json --graduation graduation.json    # score the recent Backlog, apply NOTHING (Shadow Pass)
+gmail-labeler eval --bands bands.json --graduation graduation.json --confirm-graduation
+                                      # ^ mints the artifacts the Shadow Pass reads (ADR-0005 gate)
+gmail-labeler shadow run --bands bands.json --graduation graduation.json
+                                      # score the recent Backlog, apply NOTHING (Shadow Pass)
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 ```
 
@@ -300,10 +305,16 @@ Message bodies never enter the DB, the report, or any log path
 PREVIEW, not an Application: it renders the band tier NAME (the
 configured `[labels] high`/`med`) for would-be rows and attaches no
 labels — the `applied` umbrella is validated at config NOW (stripped,
-distinct from `high`/`med`) and consumed by the write phase later: the
-umbrella + one band-tier composition (and the name→label-id resolution)
-is a WRITE-time concern the daemon will implement in the Application
-phase (#24/#25); GLOSSARY: Application, Tier Label.
+distinct from `high`/`med`) and consumed by the Application write
+composition (ticket #24): `applications.plan_message_write` adds the
+umbrella plus the best band tier to every write, and
+`gmail_client.ensure_label` ships the name→Gmail-label-id resolution
+(get-or-create: an existing USER label of exactly that name is used
+as-is; a casefolded System Label name-sake is refused named — the
+refusal guards minting a look-alike only; the daemon / `apply` startup
+of #25/#26 calls it once per configured name); the live write itself
+lands with the daemon / `apply` CLI (#25/#26);
+GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
 

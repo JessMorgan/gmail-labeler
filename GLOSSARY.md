@@ -114,6 +114,14 @@ split-boundary filtering. The unit the model trains on; the corpus →
 examples transform is one shared pure function.
 _Avoid_: sample, data point
 
+**Split Manifest**:
+The versioned, hashable artifact materializing the temporal train/test
+split: format version, split date, train/test id sets, the label
+vocabulary, the split-boundary trust filter, and a content hash over all
+of it. `train`/`eval` rebuild against it — same records + manifest →
+same examples, no re-split (invariant #7).
+_Avoid_: split config, train/test file
+
 **Full Resync**:
 The ground-truth Label Reconciliation that needs no history: one
 `labels.list` plus local resolved-view counts price both strategies up

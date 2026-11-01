@@ -101,11 +101,27 @@ mailbox's actual labels — and chooses the graduates.
 
 ## Phase 2 — live application
 
+Landed so far: the Application write composition and its audit record —
+`applications.plan_message_write` (the fail-safe plan on the tiers core),
+the `apply_labels`/`ensure_label` write surface (additive-only, the
+bare-ValueError tier-name collision refusal), the schema-v2
+`applications` table with the atomic single-row migration, and the
+batch-homogeneity contract (#24); the daemon itself — `daemon.py`'s
+fully injected poll loop with the Durable Handling commit point (write
+first, then ONE transaction of Application rows AND the cursor advance:
+commit = handled, invariant #3; the crash matrix incl. a real
+`os._exit` kill proves the skip-present replay converges), the
+schema-v3 `daemon_state` single-row History Cursor (the v2→v3 migration
+rides the same atomic machinery), the sync-guide full-sync bootstrap
+and the 404 re-bootstrap arm, graceful SIGTERM/SIGINT shutdown, and the
+`daemon` command with the exit-code contract (the collision refusal →
+exit 4 naming the `[labels]` key) (#25).
+
 Scope:
 
 - `daemon`: ~30 s History-API polling, cursor durability (invariant #3),
   skip-present idempotency (invariant #2), Tier Labels on every
-  Application;
+  Application — LANDED (#25);
 - Correction capture (manual fixes on applied mail become the next
   retrain's signal) and `status` (realized precision per graduated label);
 - the deliberate bulk path: `apply --since … --apply` — always

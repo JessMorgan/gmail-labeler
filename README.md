@@ -4,18 +4,22 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 **your own** mailbox, then let it label arriving mail — quietly when it's
 confident, reviewably when it isn't.
 
-> **Status: pre-alpha — Phase 0 (corpus acquisition) and Phase 1's
-> `train`, `eval`, and the Shadow Pass (`shadow run` / `shadow report`)
-> have landed.** The architecture decisions, domain language, and
-> development standards are committed; the CLI installs (`uv sync`,
-> then `gmail-labeler --help`) with a working OAuth flow,
+> **Status: pre-alpha — Phase 0 (corpus acquisition), Phase 1 (train,
+> eval, and the Shadow Pass), and Phase 2's `daemon` have landed.** The
+> architecture decisions, domain language, and development standards are
+> committed; the CLI installs (`uv sync`, then `gmail-labeler --help`)
+> with a working OAuth flow,
 > `dataset export` / `import-gyb` / `analyze`, `train` (fine-tune on
 > your own machine, checkpoint + identity sidecar), `eval` (per-label
-> precision/recall on the temporal test split), and the Shadow Pass —
+> precision/recall on the temporal test split), the Shadow Pass —
 > `shadow run` scores the recent Backlog and applies nothing, and
 > `shadow report` diffs the verdicts against your actual labels (the
-> Phase 1 exit review). The daemon arrives in a later phase — follow
-> the phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> Phase 1 exit review) — and the `daemon`: it polls the Gmail History
+> API (~30 s), scores arriving mail in-process, and applies only
+> GRADUATED labels with Tier Labels, additive-only. Phase 2's exit
+> posture: high-band labels apply silently; you work the `ai-med`
+> queue. `apply` / correction capture / `status` follow — see the phase
+> plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -48,10 +52,11 @@ you would.
    label. CPU works; a GPU is faster.
 3. **Graduate** — labels pass per-label precision gates on a temporal test
    split before they're allowed to apply silently.
-4. **Run** — a daemon polls the Gmail History API (~30s), classifies new
-   messages, and applies graduated labels with Tier Labels (once the write
-   phase lands). Your manual corrections are captured as training signal
-   for the next round.
+4. **Run** — the daemon polls the Gmail History API (~30 s), classifies
+   new messages in-process, and applies graduated labels with Tier
+   Labels — additive only, already-present labels never touched. Your
+   manual corrections are captured as training signal for the next
+   round (Phase 2, landing).
 
 ## Setup
 
@@ -96,6 +101,8 @@ gmail-labeler eval --bands bands.json --graduation graduation.json --confirm-gra
 gmail-labeler shadow run --bands bands.json --graduation graduation.json
                                       # score the recent Backlog, apply NOTHING (Shadow Pass)
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
+gmail-labeler daemon --bands bands.json --graduation graduation.json
+                                      # poll the History API (~30s), apply GRADUATED labels as mail lands (Phase 2)
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -352,6 +359,65 @@ in later phases (not wired yet) — until they are, they exit `2` as
 unknown commands; `3` is reserved for wired-but-stubbed commands and
 currently unreachable. Scripts can branch on 0/2/4/5 today; a `1`
 means an unhandled crash — that's a bug, please report it.
+
+### Running the daemon (Phase 2)
+
+`daemon` is the live application path (ticket #25). It polls the Gmail
+History API every `[gmail] history_poll_seconds` (default 30, floor 5),
+scores arriving mail in-process through the sidecar-validated
+checkpoint, and applies only GRADUATED labels — every Application
+carries the umbrella Tier Label plus its best band tier, additive-only
+(`addLabelIds` is the only write the product ever performs), and an
+already-present label is never re-applied (skip-present). The Phase 2
+posture: **high-band labels apply silently; work the `ai-med` queue**
+— the med tier is the review-me band, and your manual corrections on
+applied mail become the next retrain's signal (correction capture is a
+later Phase 2 ticket).
+
+Startup runs the identity gates FIRST, exactly like `shadow run`: the
+state DB is validated fail-fast, then the checkpoint, the Bands
+Artifact, and the Graduation Table are verified against your
+corpus/checkpoint identity — any disagreement refuses with exit 5,
+naming the fields. Then the three configured Tier Label names
+(`[labels] applied` / `high` / `med`) resolve ONCE via get-or-create:
+an existing USER label of exactly that name is reused; a brand-new name
+is created in your mailbox. **If a configured name case-insensitively
+matches a System Label name in your mailbox (e.g. `INBOX`, `STARRED`),
+the daemon refuses to start with exit 4 and names the offending
+`[labels]` key** — minting a look-alike would make the tier visually
+indistinguishable from Gmail's own system state, so the fix is yours:
+rename that `[labels]` entry and restart.
+
+The **history cursor** (the mailbox `historyId` the daemon syncs from)
+lives in the state DB — the `daemon_state` single-row table at
+`[store] db_path` (schema v3). It is persisted ONLY after the page's
+events are durably handled (invariant #3): the Gmail write lands
+first, then ONE database transaction carries the page's Application
+rows AND the cursor advance — commit = handled. A `kill -9` anywhere
+before that commit replays the page on restart, and the replay is
+harmless: labels already written are now present, so skip-present
+composes an empty plan — zero double-writes, zero duplicate audit
+rows (the crash matrix in `tests/test_daemon.py` pins this, including
+a real process kill). If the daemon was down longer than Gmail
+retains history (typically at least a week, occasionally far less),
+the cursor expires: the daemon re-establishes it from the newest
+message (the documented full-sync bootstrap), warns loudly, and the
+mail that arrived during the gap was NOT labeled — review it with
+`shadow run` (or `apply` when it lands).
+
+Shutdown is graceful: `SIGTERM` / `SIGINT` finish the current page to
+its commit point (cursor written) and exit 0; a signal during the
+inter-poll sleep exits immediately with the cursor untouched. A
+transient API failure never advances the cursor — the next tick
+retries the page. A per-message failure (a deleted message, a lying
+model row) means NO write for that message (invariant #1's fail-safe)
+with a counted id-only warning; the page's cursor still advances.
+Message bodies never enter the database, the warnings, or any log
+(invariant #5) — the state DB stays publicly attachable.
+
+Exit codes: 0 clean shutdown · 2 usage · 4 auth/config (including the
+tier-name collision above) · 5 artifact/store failure. Exit 3 stays
+the reserved not-implemented arm.
 
 ## Docs
 

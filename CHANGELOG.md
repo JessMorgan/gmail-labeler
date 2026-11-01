@@ -8,6 +8,70 @@ does not ship releases yet.
 
 ### Added
 
+- Daemon: poll, decide, write (ticket #25) — the live application loop
+  and its `daemon` command.
+  - `daemon.py`: the fully injected poll loop (client/db/model/clock/
+    sleep/stop-flag — tests never real-sleep). Per poll: drain the
+    History-API delta (token chain; the cursor takes the FINAL
+    response's id — every page carries the mailbox CURRENT id), fetch
+    and score each message (ONE batched predict, vocab zip like
+    shadow; ONE clock read per delta — the batch-homogeneity contract
+    pinned at the call site), compose through `plan_message_write`
+    (called, never re-derived), and per nonempty plan `apply_labels`
+    FIRST, then ONE `commit_page` transaction carrying the page's
+    Application rows AND the cursor advance — COMMIT = handled
+    (invariant #3). The crash-before-commit replay converges via
+    skip-present: that pin IS the safety proof, and the crash matrix
+    proves it (injected raises at mid-page after-write,
+    mid-transaction, and after-commit, plus a REAL `os._exit`
+    subprocess kill — zero double-writes, zero duplicate rows).
+    Arms per the `gmail_errors` taxonomy: auth propagates (exit 4);
+    the history 404 re-bootstraps via the export prior-art path
+    (`list_messages` + `get_message` → the newest message's
+    per-message `historyId`, the sync guide's full-sync cursor
+    source), naming the un-processed gap; other page errors HOLD the
+    cursor counted; a per-message 404 (deleted mail) skips counted —
+    the cursor never wedges on a ghost. Model predict failures log
+    the exception CLASS only (a model error may quote the scored
+    text, which carries the body — invariant #5).
+  - `appdb` schema v3: the `daemon_state` single-row cursor table
+    (the writer UPSERTS rowid 1; a second row or a bad value is
+    refused on read, named). The v2→v3 migration rides the #24
+    one-explicit-transaction machinery (the restamp is parameterized
+    on the legacy version; {1} pre-applications and {2}
+    pre-daemon_state are the two migratable stamps; {1}-with-later-
+    table and {2}-with-daemon_state stay tamper guards, recovery
+    named); the shape gate extends to `daemon_state`; both migration
+    directions and the crash directions are pinned (the v2→v3 crash
+    marker sits on the restamp UPDATE — the daemon_state CREATE
+    marker survived a split-BEGIN mutant; the placement is an
+    executed statement-order fact).
+  - `gmail_client`/`FakeGmailClient` wire fidelity: `RawMessage.
+    history_id` (the Message resource's per-message history record
+    id — the bootstrap source, presence tolerated like
+    internalDate); the fake's `history()` gained the RE-WALK (a
+    token-less call with the same start id re-serves the scripted
+    window — the real API is stateless per request, so polling
+    again from a HELD cursor replays the gap; every other token
+    mismatch keeps the typed guard).
+  - `daemon` CLI: identity gates first (the shadow-run shape —
+    fail-fast state DB, checkpoint, Bands Artifact, Graduation
+    Table; refusals exit 5 naming fields), then the three configured
+    `[labels]` tier names resolve ONCE via `ensure_label`; a System
+    Label name collision (the BARE ValueError per the Protocol
+    contract) refuses with exit 4 NAMING the offending `[labels]`
+    key. SIGTERM/SIGINT shut the loop down gracefully (the current
+    page completes to its commit point, exit 0; mid-sleep exits
+    immediately, cursor untouched); `[gmail]
+    history_poll_seconds` drives the interruptible sleep. Exit-code
+    contract 0/2/3/4/5 per the project surface (4 = auth/config
+    including the collision; 3 stays the reserved unreachable arm).
+  - Carryover precision from the #24 review trail (C0): the
+    Protocol `ensure_label` docstring now states the return (the
+    Gmail label id) and the raise type (bare `ValueError`), with the
+    one-word "otherwise," precedence tightening; the fake's copy
+    comments and the pin comment say LIST-LEVEL (the FilterInfo
+    nested dicts remain shared).
 - Application path, decision core + store (ticket #24): the write
   composition and its audit record, at the library level (the daemon
   CLI is #25, `apply` is #26).

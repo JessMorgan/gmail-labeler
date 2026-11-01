@@ -3147,22 +3147,27 @@ def daemon(
     only, skip-present, Tier Labels on every Application (ticket #25;
     GLOSSARY: Durable Handling).
 
-    The cursor is persisted ONLY after the page's events are durably
-    handled (invariant #3): the Gmail write lands first, then ONE
-    transaction carries the page's Application rows AND the cursor
+    The cursor is persisted ONLY after the delta's events are durably
+    handled (invariant #3): the Gmail writes land first, then ONE
+    transaction carries the delta's Application rows AND the cursor
     advance — COMMIT = handled; a kill before the commit replays the
-    page and skip-present makes the retry idempotent (daemon.py).
+    delta and skip-present makes the retry idempotent (daemon.py).
     Identity gates run FIRST (the shadow-run shape: checkpoint,
     Graduation Table, Bands Artifact), then the three configured Tier
     Label names resolve ONCE via ensure_label (a System-Label name
-    collision refuses at exit 4, naming the [labels] key). SIGTERM/
+    collision refuses AT MINT at exit 4, naming the [labels] key: an
+    existing exact-case USER label of that name is reused first). SIGTERM/
     SIGINT shut down gracefully: the current delta completes to its
     commit point, exit 0 (the handlers wrap the LOOP only: Ctrl-C
     during the startup gates/corpus read keeps the default
     disposition — nothing is open yet, so nothing needs unwinding).
     Bodies never enter the DB or any log (invariant #5). Exit
     codes: 0 clean stop · 2 usage · 4 auth/config (incl. the tier-name
-    collision) · 5 artifact/store failure."""
+    collision) · 5 artifact/store failure, startup tier-resolution wire
+    failure, or a loop I/O failure."""
+    import logging
+    import sys
+
     from .appdb import AppDB, AppDBError
     from .auth import AuthError
     from .corpus_record import corpus_fingerprint
@@ -3476,6 +3481,19 @@ def daemon(
     )
     stop_flag = threading.Event()
     previous_handlers = _install_shutdown_handlers(stop_flag)
+    # OPERATOR VISIBILITY (F2 MINOR 7): the per-delta counter line is
+    # INFO, and an unconfigured root logger shows WARNING+ only
+    # (logging.lastResort) — the daemon installs a stderr handler for
+    # ITS logger so the counter line reaches the operator; the finally
+    # removes it (a daemon run must not leak handlers, the signal
+    # precedent above). caplog pins keep working: propagation to the
+    # root is untouched.
+    daemon_log = logging.getLogger("gmail_labeler.daemon")
+    log_handler = logging.StreamHandler(sys.stderr)
+    log_handler.setLevel(logging.INFO)
+    previous_log_level = daemon_log.level
+    daemon_log.setLevel(logging.INFO)
+    daemon_log.addHandler(log_handler)
     store_db = AppDB(db_path)
     try:
         store_db.open()
@@ -3507,6 +3525,8 @@ def daemon(
         typer.echo(f"daemon failed: I/O failure: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     finally:
+        daemon_log.removeHandler(log_handler)
+        daemon_log.setLevel(previous_log_level)
         _restore_shutdown_handlers(previous_handlers)
         store_db.close()
 

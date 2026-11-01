@@ -390,6 +390,35 @@ def test_daemon_ensure_label_transient_exit_5(
     assert "tier label resolution failed" in result.stderr
 
 
+def test_daemon_counter_line_reaches_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 MINOR 7 (qwen-B5): the per-delta counter line is INFO and an
+    # unconfigured root logger shows WARNING+ only (lastResort) — the
+    # command installs a stderr handler for the daemon logger so the
+    # operator SEES handled-delta counts; removed in the finally. This
+    # is the reach-the-operator pin: the line must land in stderr
+    # without any caplog fixture (mutant: drop the addHandler call ->
+    # the line vanishes from result.stderr)
+    _prepare(tmp_path, monkeypatch)
+    fake = FakeGmailClient(
+        messages=_backlog_messages(),
+        labels=_shadow_labels(),
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+            )
+        ],
+        current_history_id=900,
+    )
+    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
+    assert result.exit_code == 0, result.stderr
+    assert "daemon: delta handled" in result.stderr
+    assert "cursor=900" in result.stderr
+
+
 def test_daemon_apply_auth_error_exit_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

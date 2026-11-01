@@ -37,7 +37,7 @@ Invariants:
 - TRANSACTION PER WRITE: ``record_run``, ``record_applications`` and
   ``commit_page`` insert their batch in ONE transaction — a crash
   mid-write (or a mid-write refusal) rolls back, leaving no half rows;
-  a committed batch is atomic (``commit_page`` carries the page's rows
+  a committed batch is atomic (``commit_page`` carries the delta's rows
   AND the cursor advance in the SAME transaction — the Durable Handling
   commit point, invariant #3);
 - create-all-if-missing: opening a fresh path creates the schema;
@@ -191,8 +191,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     -- The daemon's history cursor (ticket #25; GLOSSARY: History
     -- Cursor, Durable Handling): the mailbox historyId persisted ONLY
-    -- after the page's events are durably handled (invariant #3) — the
-    -- advance rides the SAME transaction as the page's Application rows
+    -- after the delta's events are durably handled (invariant #3) — the
+    -- advance rides the SAME transaction as the delta's Application rows
     -- (``commit_page``; COMMIT = handled). SINGLE-ROW model: the writer
     -- UPSERTS rowid 1 (below), so the table never grows; a second row
     -- is hand-made and the read refuses it, named (the schema_version
@@ -792,10 +792,10 @@ class AppDB:
         )
 
     def set_history_cursor(self, history_cursor: int) -> None:
-        """Establish/replace the history cursor OUTSIDE a page commit
+        """Establish/replace the history cursor OUTSIDE a delta commit
         (bootstrap and re-bootstrap — no Application rows ride it). The
-        PAGE advance goes through ``commit_page``: the cursor must ride
-        the same transaction as the page's rows (invariant #3). A
+        DELTA advance goes through ``commit_page``: the cursor must ride
+        the same transaction as the delta's rows (invariant #3). A
         refusal (a non-cursor value) raises BEFORE any write."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
@@ -809,8 +809,8 @@ class AppDB:
     def commit_page(self, rows: Sequence[ApplicationRow], history_cursor: int) -> int:
         """The daemon's DURABLE HANDLING commit point (ticket #25,
         GLOSSARY: Durable Handling; invariant #3): ONE transaction
-        carrying the page's Application rows AND the cursor advance —
-        COMMIT = handled. ``rows`` may be EMPTY (a page whose messages
+        carrying the delta's Application rows AND the cursor advance —
+        COMMIT = handled. ``rows`` may be EMPTY (a delta whose messages
         all composed empty plans was still handled — the cursor must
         move; record_applications' empty-batch refusal is deliberately
         NOT inherited here). Refusals raise BEFORE the transaction: a
@@ -818,7 +818,7 @@ class AppDB:
         duplicate, MORE THAN ONE distinct applied_at stamp across the
         batch (the #24 homogeneity contract as a store invariant, F1),
         or a non-cursor value. A crash before the COMMIT
-        replays the page; skip-present makes the replay idempotent —
+        replays the delta; skip-present makes the replay idempotent —
         the safety proof is the daemon loop's write-first ordering
         (daemon.py, the pinned comment there). Returns the row count."""
         if self._conn is None:

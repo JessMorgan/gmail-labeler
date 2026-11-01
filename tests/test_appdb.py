@@ -925,7 +925,7 @@ def test_applications_schema_has_no_body_columns(tmp_path: Path) -> None:
     # invariant #5, structural: the table carries the EIGHT metadata
     # columns and nothing else — no body/subject/raw column exists to
     # put a body in (the caplog side of the proof lands with the plan's
-    # id-only warnings in applications.py)
+    # body-free warnings (id + label + score) in applications.py)
     db = AppDB(tmp_path / "state.db")
     db.open()
     conn = sqlite3.connect(str(db.path))
@@ -1337,7 +1337,7 @@ def test_unknown_stamp_set_refusal_names_the_honest_diagnosis(tmp_path: Path) ->
 
 def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:
     # the durable-handling commit point (#25, invariant #3): ONE
-    # transaction carries the page's Application rows AND the cursor
+    # transaction carries the delta's Application rows AND the cursor
     # advance — COMMIT = handled
     db = AppDB(tmp_path / "state.db")
     db.open()

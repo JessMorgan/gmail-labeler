@@ -409,25 +409,29 @@ Gmail truth stands, the row is not re-added, so the Applications table
 plus the mailbox together are the audit truth, not the table alone. If
 the daemon was down longer than Gmail retains history (records are
 typically available for at least a week, and the retention can be
-significantly shorter), the cursor expires: the
-daemon re-establishes it from the newest message (the documented
-full-sync bootstrap), warns loudly, and the mail that arrived during
-the gap was NOT labeled — review it with `shadow run` (or `apply`
-when it lands).
+significantly shorter), the cursor expires: the daemon re-establishes
+it from the newest message (the documented full-sync bootstrap), warns
+loudly, and the gap mail was NOT labeled — review it with
+`shadow run` (or `apply` when it lands).
 
 Shutdown is graceful: `SIGTERM` / `SIGINT` finish the current delta to
 its commit point (cursor written) and exit 0; a signal during the
-inter-poll sleep exits immediately with the cursor untouched. A
-transient API failure never advances the cursor — the next tick
-re-walks the delta from the held cursor. A per-message failure (a
-deleted message, a lying model row) means NO write for that message
-(invariant #1's fail-safe) with a counted id-only warning; the
-delta's cursor still advances.
+inter-poll sleep exits immediately with the cursor untouched. An API
+failure that is not the per-message 404 never advances the cursor —
+the next tick re-walks the delta from the held cursor (a PERMANENT
+non-404 error therefore retries loudly forever: the loud hold beats
+silent label loss). A per-message failure (a deleted message, corrupt
+raw) means NO write for that message (invariant #1's fail-safe) with a
+counted warning naming the message id and the typed error, never the
+body; the delta's cursor still advances. A lying model row (score rows
+that do not match the delta) is SYSTEMATIC, not per-message: the whole
+delta holds and retries — its cursor does NOT advance.
 Message bodies never enter the database, the warnings, or any log
 (invariant #5) — the state DB stays publicly attachable.
 
 Exit codes: 0 clean shutdown · 2 usage · 4 auth/config (including the
-tier-name collision above) · 5 artifact/store failure. Exit 3 stays
+tier-name collision above) · 5 artifact/store failure, startup
+tier-resolution wire failure, or a loop I/O failure. Exit 3 stays
 the reserved not-implemented arm.
 
 ## Docs

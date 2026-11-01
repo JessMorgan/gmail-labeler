@@ -1,6 +1,6 @@
 """gmail-labeler command-line interface.
 
-Command surface is frozen by the Phase 0 design (AGENTS.md "Target layout");
+Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
 later phases add train/eval/shadow/apply/daemon/status (absent until wired,
 which surfaces as a usage error). Phase 0 subcommands are wired as they are
 implemented; unimplemented ones exit 3 with a clear "not implemented" marker

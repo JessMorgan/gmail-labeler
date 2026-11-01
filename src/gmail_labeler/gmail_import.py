@@ -7,7 +7,7 @@ the same property that makes crash-retry harmless — invariant #2's corpus
 twin), so the import can die at any moment and simply be re-run. Retry policy
 is driven by the typed taxonomy only (transient→backoff-retry,
 rate_limited→honored backoff, permanent→record-and-continue: one unreadable
-message must never abort a 394k-message import). Messages whose timestamp
+message must never abort the whole import). Messages whose timestamp
 cannot be established from either source (API internalDate or Date header) are
 FAILED, not fabricated — the temporal split (invariant #7) starts honest.
 """
@@ -251,7 +251,7 @@ def _import_one(
         )
     except ValueError as e:
         # a wire value violating the record contract fails THIS message
-        # only — one impossible id must not abort a 394k import
+        # only — one impossible id must not abort the whole import
         stats.failed.append((message_id, f"record shape: {e}"))
         return "failed"
     # Structural store failures (CorpusError) PROPAGATE and stop the run

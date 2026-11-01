@@ -162,7 +162,10 @@ def test_shadow_report_unknown_run_exits_5(
         tmp_path, "--run", "nonexistent", monkeypatch=monkeypatch
     )
     assert report.exit_code == 5
+    # disposition 3: the not-found refusal is NAMED directly, NOT wrapped
+    # in "state DB read failed" (cause-naming doctrine)
     assert "no shadow run" in report.stderr
+    assert "state DB read failed" not in report.stderr
 
 
 def test_shadow_report_degraded_fetch_skips(
@@ -389,6 +392,73 @@ def test_shadow_report_zero_gmail_writes(
     assert methods <= READ_SURFACE, f"write call recorded: {methods - READ_SURFACE}"
     assert "get_message" in methods
     assert "list_labels" in methods
+
+
+def test_shadow_report_all_skipped_json_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: all-skipped --json direct pin — the no-evidence
+    # refusal is exit 5 in --json mode too (stdout stays empty — no
+    # partial payload)
+    _prepare(tmp_path, monkeypatch)
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_shadow_labels())
+    for _ in _backlog_messages():
+        fake.fail("get_message", GmailTransientError("network blip"))
+    report, _f2 = _run_report(tmp_path, "--json", monkeypatch=monkeypatch, fake=fake)
+    assert report.exit_code == 5
+    assert "no evidence to report" in report.stderr
+    assert report.stdout == ""  # no partial payload
+
+
+def test_shadow_report_containment_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: shadow report containment — a [store] db_path inside
+    # the checkpoint dir OR the corpus store is a usage refusal (exit 2)
+    _prepare(tmp_path, monkeypatch)
+    cfg_ckpt = _shadow_cfg(tmp_path, store='db_path = "ckpt/state.db"\n')
+    report, _f = _run_report(tmp_path, monkeypatch=monkeypatch, cfg=cfg_ckpt)
+    assert report.exit_code == 2
+    assert "[store] db_path" in report.stderr
+    assert "lives inside the checkpoint directory" in report.stderr
+
+
+def test_shadow_report_db_flag_containment_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: --db containment inheritance (report) — a --db path
+    # inside the checkpoint dir is a usage refusal (exit 2), naming --db
+    _prepare(tmp_path, monkeypatch)
+    report, _f = _run_report(
+        tmp_path,
+        "--db",
+        str(tmp_path / "ckpt" / "state.db"),
+        monkeypatch=monkeypatch,
+    )
+    assert report.exit_code == 2
+    assert "--db PATH" in report.stderr
+    assert "lives inside the checkpoint directory" in report.stderr
+
+
+def test_shadow_report_db_flag_reads_supplied_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: offline pin that shadow report --db ACTUALLY reads
+    # the supplied file (not the config default) — the run writes to the
+    # --db path, and the report reads from it
+    _prepare(tmp_path, monkeypatch)
+    custom_db = tmp_path / "custom" / "state.db"
+    run, _f1 = _run_shadow(tmp_path, "--db", str(custom_db), monkeypatch=monkeypatch)
+    assert run.exit_code == 0, run.stderr
+    assert custom_db.is_file()
+    # the report reads from the --db path (not the config default)
+    report, _f2 = _run_report(tmp_path, "--db", str(custom_db), monkeypatch=monkeypatch)
+    assert report.exit_code == 0, report.stderr
+    assert "shadow report: run=" in report.stdout
+    # the config default was NOT written
+    assert not (tmp_path / "gmail-labeler.db").exists()
 
 
 def test_shadow_report_json_refusal_combos(

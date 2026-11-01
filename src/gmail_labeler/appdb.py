@@ -35,6 +35,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "AppDB",
     "AppDBError",
+    "RunNotFoundError",
     "ShadowRow",
 ]
 
@@ -52,11 +53,25 @@ _ID_RE = re.compile(r"^[0-9a-fA-F]{1,64}$")
 # test_appdb).
 _BANDS = ("high", "med")
 
+# The table SHAPES the ownership gate requires (disposition 2 —
+# ownership is by shape, not by name): the exact column-name sets.
+_SHADOW_RESULTS_COLUMNS = frozenset(
+    {"run_id", "message_id", "label", "probability", "band", "run_ts"}
+)
+_SCHEMA_VERSION_COLUMNS = frozenset({"version"})
+
 
 class AppDBError(Exception):
     """State DB failure: a foreign schema version, a corrupt file, a
     validation refusal, or an I/O failure. The CLI maps it to exit 5
     (operation failed) — never a raw sqlite3 traceback."""
+
+
+class RunNotFoundError(AppDBError):
+    """A named NOT-FOUND refusal: the requested run id has no rows (the
+    run was never committed, or the id is wrong). Distinct from an I/O
+    failure so the CLI can name the cause directly (not wrap it in
+    "state DB read failed" — the cause-naming doctrine)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,20 +170,18 @@ class AppDB:
             with contextlib.suppress(OSError):
                 os.chmod(self.path, 0o600)  # foreign fs: best-effort
         try:
-            # the OWNERSHIP gate BEFORE any write: a SQLite file that
-            # already carries tables, NONE of which are ours, is a
-            # foreign DB — refusing it (named) keeps the "checked
-            # before any write" claim true (a foreign DB is not
-            # silently adopted with our schema_version stamped on it).
-            # An empty file (no tables) is fresh; a file with our
-            # tables proceeds to the version check.
+            # the OWNERSHIP gate (shape + version) BEFORE any write: a
+            # SQLite file that carries foreign tables (or a
+            # wrong-shape / foreign-version same-named table) is
+            # refused, named — the "verified before any write" claim is
+            # literally true (a foreign DB is not adopted, and a
+            # versioned-foreign DB does not gain a shadow_results table
+            # pre-refusal). An empty file (no tables) is fresh.
             self._check_ownership()
             self._conn.executescript(_SCHEMA)
-            # a fresh DB (no version row) gets stamped; an existing DB
-            # is NOT written before the version check — a foreign
-            # version is refused WITHOUT a row appended (the PK makes
-            # re-stamps a no-op, but the write-before-refusal is the
-            # lie this ordering closes)
+            # a fresh DB (no version row) gets stamped; an existing
+            # ours-DB is NOT re-stamped (the version is already
+            # {SCHEMA_VERSION} — verified in the ownership gate above)
             versions = self._conn.execute(
                 "SELECT DISTINCT version FROM schema_version"
             ).fetchall()
@@ -178,7 +191,6 @@ class AppDB:
                     (SCHEMA_VERSION,),
                 )
                 self._conn.commit()
-            self._verify_version()
         except (sqlite3.DatabaseError, AppDBError) as e:
             # BOTH the I/O failure and the ownership/version refusal
             # close the connection (open()'s lifecycle contract — a
@@ -192,11 +204,28 @@ class AppDB:
             ) from e
 
     def _check_ownership(self) -> None:
-        # the ownership gate (S1): read sqlite_master BEFORE any write.
-        # A file that carries existing tables and NONE of ours is a
-        # foreign DB — refused, named (the foreign table names are
-        # listed). An empty file (no tables) is fresh; a file with at
-        # least one of our tables is ours (the version check follows).
+        # the ownership gate (disposition 2): ownership is by SHAPE, not
+        # by table NAME. A DB is "ours" iff it carries a VALID
+        # shadow_results (our exact column set) OR a VALID
+        # schema_version (single-column `version`, stamped with EXACTLY
+        # our version). Everything is read BEFORE any write (the
+        # "verified before any write" claim is literally true — a
+        # foreign DB is not adopted, and a versioned-foreign DB does not
+        # gain a shadow_results table pre-refusal):
+        #
+        # - shadow_results present → its PRAGMA column set must EQUAL
+        #   ours (a same-named wrong-shape table is refused, named);
+        # - schema_version present → it must be the single-column
+        #   `version` table (a generic same-named table is NOT ours —
+        #   the adoption hole ds reproduced), and if populated its rows
+        #   must be EXACTLY {SCHEMA_VERSION} (a foreign version, or an
+        #   empty generic table, is NOT ours);
+        # - a DB with a valid ours-table PLUS foreign extra tables
+        #   COEXISTS (documented decision — our tables are the
+        #   authority; the extras are left alone);
+        # - a DB with tables but NONE valid-ours is FOREIGN — refused,
+        #   named (the foreign table names are listed);
+        # - an empty file (no tables) is fresh.
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         tables = {
@@ -205,37 +234,56 @@ class AppDB:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-        ours = {"schema_version", "shadow_results"}
-        if tables and not (tables & ours):
+        shadow_results_valid = False
+        schema_version_valid = False
+        if "shadow_results" in tables:
+            cols = self._column_set("shadow_results")
+            if cols != _SHADOW_RESULTS_COLUMNS:
+                raise AppDBError(
+                    f"state DB shadow_results has the wrong shape "
+                    f"(columns {sorted(cols)} != {sorted(_SHADOW_RESULTS_COLUMNS)}) "
+                    f"— refusing to adopt it: {self.path}"
+                )
+            shadow_results_valid = True
+        if "schema_version" in tables:
+            cols = self._column_set("schema_version")
+            if cols != _SCHEMA_VERSION_COLUMNS:
+                # a generic same-named table (not our single-column
+                # `version` table) is NOT ours — the adoption hole
+                raise AppDBError(
+                    f"state DB schema_version has the wrong shape "
+                    f"(columns {sorted(cols)} != {sorted(_SCHEMA_VERSION_COLUMNS)}) "
+                    f"— a generic table, not a gmail-labeler state DB: "
+                    f"{self.path}"
+                )
+            versions = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT DISTINCT version FROM schema_version"
+                ).fetchall()
+            }
+            # a valid schema_version is stamped with EXACTLY our version
+            # (an empty generic table, or a foreign version, is NOT ours)
+            if versions == {SCHEMA_VERSION}:
+                schema_version_valid = True
+        if shadow_results_valid or schema_version_valid:
+            return  # ours (coexist with any foreign extra tables)
+        if tables:
             raise AppDBError(
                 f"state DB is not a gmail-labeler state DB (foreign "
                 f"tables: {sorted(tables)}) — refusing to adopt it: "
                 f"{self.path}"
             )
+        # no tables → fresh (proceed to create the schema)
 
-    def _verify_version(self) -> None:
-        # a foreign version is refused, named (the SplitManifest
-        # discipline — a newer tool's DB is not served by an older one).
-        # ALL version rows are read (not a LIMIT 1 min/max — a DB
-        # polluted with (99, 1) by a write-before-refusal must still
-        # refuse): the set must be EXACTLY {SCHEMA_VERSION}
+    def _column_set(self, table: str) -> set[str]:
+        # the PRAGMA column-name set for a table (shape, not values)
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
-        versions = {
-            row[0]
-            for row in self._conn.execute(
-                "SELECT DISTINCT version FROM schema_version"
-            ).fetchall()
+        return {
+            row[1]
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
-        if not versions:
-            raise AppDBError(
-                f"state DB has no schema_version row: {self.path} — corrupt"
-            )
-        if versions != {SCHEMA_VERSION}:
-            raise AppDBError(
-                f"state DB schema_version {sorted(versions)} != "
-                f"{SCHEMA_VERSION}: {self.path} — a newer tool wrote this DB"
-            )
 
     def close(self) -> None:
         if self._conn is not None:
@@ -355,7 +403,7 @@ class AppDB:
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         if not rows:
-            raise AppDBError(
+            raise RunNotFoundError(
                 f"no shadow run {run_id!r} recorded — run `shadow run` first "
                 "(or the run id is wrong)"
             )

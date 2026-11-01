@@ -955,6 +955,182 @@ def test_shadow_run_empty_backlog_exits_5(
     assert "no messages to score" in result.stderr
 
 
+def test_shadow_run_graduated_system_label_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 7: a Graduation Table that GRADUATES a System Label
+    # (INBOX — the fake declares LabelInfo("INBOX","INBOX","system"))
+    # → shadow run exit 5 "would-apply refused". This pins the CALL
+    # SITE passes a real NON-EMPTY system set to would_apply (kwarg
+    # presence alone never proves non-emptiness — ds).
+    from datetime import UTC, datetime
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.dataset_build import TrainingExample
+    from gmail_labeler.eval import eval_metrics
+    from gmail_labeler.graduation import (
+        GateTargets,
+        Graduation,
+        GraduationEntry,
+        build_table,
+    )
+    from gmail_labeler.model import MANIFEST_FILENAME
+    from gmail_labeler.thresholds import BandsArtifact
+
+    # a corpus whose vocabulary includes the System Label NAME "INBOX"
+    # (a user label named INBOX — the checkpoint vocabulary carries it)
+    store = CorpusStore(tmp_path / "corpus")
+    store.enforce_modes()
+    now = datetime.now(UTC)
+    for i in range(12):
+        days_ago = 400 - i if i < 6 else 10 + i
+        rec = CorpusRecord(
+            id=f"{i:016x}",
+            date=now - timedelta(days=days_ago),
+            subject=f"subject {i}",
+            sender="shop@x.z",
+            recipients=("me@x.y",),
+            labels=("INBOX", "Shipping") if i % 2 == 0 else ("Shipping",),
+            body_hash=body_hash(f"body {i}"),
+            source="api",
+            date_provenance="internal_date",
+        )
+        store.put(rec, f"body {i}")
+    for name, payload in (("filters.json", "[]"), ("labels.json", "{}")):
+        f = store.root / name
+        f.write_text(payload, encoding="utf-8")
+        os.chmod(f, 0o600)
+
+    # train the checkpoint (vocabulary = ("INBOX", "Shipping"))
+    cfg = _shadow_cfg(tmp_path, labels='managed = ["INBOX", "Shipping"]')
+    assert _run_train(tmp_path, monkeypatch, cfg=cfg).exit_code == 0
+    # calibrate the bands
+    bands_path = tmp_path / "bands.json"
+    assert (
+        _run_eval(
+            tmp_path, "--bands", str(bands_path), monkeypatch=monkeypatch, cfg=cfg
+        ).exit_code
+        == 0
+    )
+    artifact = BandsArtifact.from_json(bands_path.read_text(encoding="utf-8"))
+    # the checkpoint identity (for the graduation table binding): the
+    # manifest carries split_date + content_hash; the sidecar carries
+    # corpus_fingerprint
+    manifest = json.loads(
+        (tmp_path / "ckpt" / MANIFEST_FILENAME).read_text(encoding="utf-8")
+    )
+    sidecar = json.loads(
+        (tmp_path / "ckpt" / "sidecar.json").read_text(encoding="utf-8")
+    )
+    split_date = datetime.fromisoformat(manifest["split_date"])
+    # construct a Graduation that GRADUATES INBOX (a System Label)
+    examples = [
+        TrainingExample(
+            id=f"{i:016x}",
+            date=now,
+            labels=(),
+            weight=1.0,
+            date_provenance="internal_date",
+        )
+        for i in range(6)
+    ]
+    table = eval_metrics(
+        examples,
+        {f"{i:016x}": (0.9, 0.9) for i in range(6)},
+        vocabulary=("INBOX", "Shipping"),
+    )
+    grad = Graduation(
+        vocabulary=("INBOX", "Shipping"),
+        candidate_thresholds=table.thresholds,
+        labels=(
+            GraduationEntry(
+                label="INBOX",
+                examples=6,
+                precision_at_high=1.0,
+                high=0.9,
+                med=0.8,
+                min_examples=1,
+                min_precision=0.9,
+                graduated=True,
+                reasons=(),
+            ),
+            GraduationEntry(
+                label="Shipping",
+                examples=6,
+                precision_at_high=1.0,
+                high=0.9,
+                med=0.8,
+                min_examples=1,
+                min_precision=0.9,
+                graduated=True,
+                reasons=(),
+            ),
+        ),
+        targets=(
+            ("INBOX", GateTargets(min_examples=1, min_precision=0.9)),
+            ("Shipping", GateTargets(min_examples=1, min_precision=0.9)),
+        ),
+        test_examples=6,
+        default_targets=GateTargets(min_examples=1, min_precision=0.9),
+        bands_content_hash=artifact.content_hash,
+    )
+    graduation_table = build_table(
+        grad,
+        vocabulary=("INBOX", "Shipping"),
+        corpus_fingerprint=sidecar["corpus_fingerprint"],
+        split_manifest_hash=manifest["content_hash"],
+        encoder_id="tiny-encoder",
+        split_date=split_date,
+    )
+    graduation_path = tmp_path / "graduation.json"
+    graduation_path.write_text(graduation_table.to_json(), encoding="utf-8")
+    # shadow run → would_apply refuses the graduated System Label (INBOX)
+    result, _fake = _run_shadow(tmp_path, monkeypatch=monkeypatch, cfg=cfg)
+    assert result.exit_code == 5
+    assert "would-apply refused" in result.stderr
+    assert "INBOX" in result.stderr
+
+
+def test_shadow_run_fail_fast_db_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: the state DB is validated FAIL-FAST — a corrupt /
+    # foreign / unreadable DB is exit 5 BEFORE any network work (the
+    # fake's call log is EMPTY — no list_labels / list_messages /
+    # get_message was paid for)
+    _prepare(tmp_path, monkeypatch)
+    # a corrupt (non-SQLite) DB at the --db path
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_bytes(b"not a sqlite file")
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_shadow_labels())
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_shadow_client", lambda cfg_: fake)
+    monkeypatch.setattr(
+        cli, "_shadow_model_factory", _shadow_factory(_backlog_scores())
+    )
+    result = runner.invoke(
+        app,
+        [
+            "shadow",
+            "run",
+            "--config",
+            str(_shadow_cfg(tmp_path)),
+            "--bands",
+            str(tmp_path / "bands.json"),
+            "--graduation",
+            str(tmp_path / "graduation.json"),
+            "--db",
+            str(corrupt_db),
+        ],
+    )
+    assert result.exit_code == 5
+    assert "state DB unusable" in result.stderr
+    assert "corrupt (not a SQLite file)" in result.stderr
+    assert fake.calls == []  # NO network work was done
+
+
 def test_shadow_run_db_flag_overrides_store_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -970,6 +1146,33 @@ def test_shadow_run_db_flag_overrides_store_path(
     assert _db_has_rows(custom_db)
     # the config default was NOT written
     assert not (tmp_path / "gmail-labeler.db").exists()
+
+
+def test_shadow_run_db_flag_containment_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # disposition 4: --db containment inheritance — a --db path inside
+    # the checkpoint dir OR the corpus store is a usage refusal (exit 2),
+    # and the refusal names the SOURCE flag (--db, not [store] db_path)
+    _prepare(tmp_path, monkeypatch)
+    result, _fake = _run_shadow(
+        tmp_path,
+        "--db",
+        str(tmp_path / "ckpt" / "state.db"),
+        monkeypatch=monkeypatch,
+    )
+    assert result.exit_code == 2
+    assert "--db PATH" in result.stderr
+    assert "lives inside the checkpoint directory" in result.stderr
+    result2, _fake2 = _run_shadow(
+        tmp_path,
+        "--db",
+        str(tmp_path / "corpus" / "state.db"),
+        monkeypatch=monkeypatch,
+    )
+    assert result2.exit_code == 2
+    assert "--db PATH" in result2.stderr
+    assert "lives inside the corpus store" in result2.stderr
 
 
 def test_shadow_run_db_flag_empty_is_usage_error(
@@ -1023,8 +1226,6 @@ def test_live_shadow_run_real_checkpoint(tmp_path: Path) -> None:
     (needs the ``train`` extra for the real encoder, a signed-in Gmail
     account, a corpus, and the human-step artifacts in the cwd).
     """
-    from pathlib import Path
-
     from gmail_labeler.config import ConfigError, find_config, load_config
     from gmail_labeler.model import MANIFEST_FILENAME
 
@@ -1076,7 +1277,24 @@ def test_live_shadow_run_real_checkpoint(tmp_path: Path) -> None:
             "5",
         ],
     )
-    assert run.exit_code == 0, run.stderr
+    # disposition 6-cli: the test SKIPS (not fails) on setup-state
+    # stderr per its docstring promise — a mailbox whose Graduation
+    # Table graduated no labels ("no verdicts to record"), or whose
+    # bands/graduation artifacts don't match the checkpoint (an
+    # identity refusal), is a "not set up for this mailbox" state, not
+    # a test failure
+    if run.exit_code != 0:
+        if "no verdicts to record" in run.stderr:
+            pytest.skip(
+                "the Graduation Table graduated no labels for this "
+                "mailbox (no verdicts to record)"
+            )
+        if "refused" in run.stderr:
+            pytest.skip(
+                "the bands/graduation artifacts do not match this "
+                f"checkpoint (identity refusal): {run.stderr.strip()}"
+            )
+        pytest.fail(f"shadow run failed unexpectedly: {run.stderr}")
     assert db.is_file()  # the tmp DB was written (the only write)
     # the report (the Phase 1 exit review) — READ-ONLY
     report = runner.invoke(

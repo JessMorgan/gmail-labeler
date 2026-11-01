@@ -334,16 +334,26 @@ def test_tier_for_band_golden(band, present, expected) -> None:
 
 
 def test_system_labels_is_required_keyword_only() -> None:
-    # T1: system_labels has NO fail-open default — calling would_apply
-    # without it is a TypeError (keyword-only enforced), so no caller
-    # setup can be forgotten (the module is the single safety authority
-    # for #24/#26)
+    # T1 + disposition 9: system_labels has NO fail-open default AND is
+    # KEYWORD-ONLY — calling would_apply without it is a TypeError
+    # (required), and passing it POSITIONALLY is also a TypeError
+    # (keyword-only enforced), so no caller setup can be forgotten (the
+    # module is the single safety authority for #24/#26)
     with pytest.raises(TypeError, match="system_labels"):
         would_apply(  # pyright: ignore[reportCallIssue] — deliberate
             scores={"Shipping": 0.9},
             bands={"Shipping": (0.9, 0.8)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+        )
+    # positional-pass is also a TypeError (keyword-only is literally true)
+    with pytest.raises(TypeError, match="positional"):
+        would_apply(  # pyright: ignore[reportCallIssue] — deliberate
+            {"Shipping": 0.9},  # pyright: ignore[reportCallIssue]
+            {"Shipping": (0.9, 0.8)},  # pyright: ignore[reportCallIssue]
+            frozenset({"Shipping"}),  # pyright: ignore[reportCallIssue]
+            frozenset(),  # pyright: ignore[reportCallIssue]
+            frozenset(),  # pyright: ignore[reportCallIssue]
         )
 
 

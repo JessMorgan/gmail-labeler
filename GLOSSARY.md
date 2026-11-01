@@ -123,8 +123,9 @@ summary with the would-be tier mix.
 _Avoid_: shadow summary, evaluation report
 
 **state DB**:
-The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`)
-holding the `shadow_results` table (run id, message id, label, probability,
+The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`;
+overridden per-command by the `--db` flag) holding the `shadow_results` table
+(run id, message id, label, probability,
 band, run timestamp) and, with the daemon phase, the `applications` table. It
 carries ids, probabilities, labels, and timestamps ONLY — never bodies
 (invariant #5) — so it is publicly attachable. One transaction per run (a crash

@@ -175,9 +175,14 @@ def test_fail_safe_warning_carries_no_body(caplog: pytest.LogCaptureFixture) -> 
         plan = _plan({"Money/Bills": 0.5, "Shipping": 1.5})
     assert plan.adds == ()
     assert plan.warning is not None
+    # the positive shape check (the negative "no body string" assertion
+    # was unfalsifiable — bodies are structurally absent from the plan's
+    # inputs): the warning is exactly "{id}: {type}: {tiers message}",
+    # built from ids/labels/scores ONLY
+    assert plan.warning.startswith("aa: ValueError: tiers for ")
+    assert "1.5" in plan.warning  # the lying score, named
     logging.getLogger("gmail_labeler.test").warning("skipped message: %s", plan.warning)
     assert "aa" in caplog.text
-    assert "BODY-SECRET" not in caplog.text
 
 
 def test_missing_managed_id_is_fail_safe() -> None:

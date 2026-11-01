@@ -1,8 +1,12 @@
 """The Corpus record format (GLOSSARY: Corpus) — pure core.
 
 One record per message: identity, envelope essentials, normalized label
-names (System Labels already filtered, GLOSSARY: Label Path), and a hash of
-the stored body. Deliberately excludes anything derivable from the body —
+names (System Labels already filtered, GLOSSARY: Label Path), a hash of the
+stored body, and the Date Provenance (GLOSSARY) — where the record's date
+came from, stamped by the writer. The provenance is record data, not
+derivable: temporal-split consumers filter on it, so a forged/future MIME
+Date header can no longer silently move a record across the split
+(invariant #7). Deliberately excludes anything derivable from the body —
 this is metadata + a content fingerprint, and the jsonl line round-trips
 byte-stably: the writer emits exactly one \n per record (json.dumps escapes
 control chars but NOT U+2028/U+2029 under ensure_ascii=False), and the reader
@@ -20,6 +24,24 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
 
 Source = Literal["api", "gyb"]
+
+# Where the record's date came from (GLOSSARY: Date Provenance).
+# Convention: writers stamp one of the first three; "unknown" is
+# RESERVED for the reader — the explicit default for pre-existing lines
+# written before the field existed (append-only corpus — no rewrite).
+# No writer/reader type split: the constructor accepts all four, because
+# the reader side (dataset build) consumes the same type.
+DateProvenance = Literal["internal_date", "mime_date", "gyb_internaldate", "unknown"]
+# KEEP IN SYNC with DateProvenance: the tuple is the runtime allow-list,
+# the Literal is compile-time only — a value added to one without the
+# other silently breaks validation.
+_DATE_PROVENANCES = ("internal_date", "mime_date", "gyb_internaldate", "unknown")
+
+# The server-authoritative trust class (GLOSSARY: Date Provenance) — the
+# split-builder's correct filter; mime_date is sender-claimed, unknown legacy.
+SERVER_AUTHORITATIVE_PROVENANCES: frozenset[DateProvenance] = frozenset(
+    {"internal_date", "gyb_internaldate"}
+)
 
 # Gmail message ids are hex; the API/web show both cases (GYB stores lower).
 _ID_RE = re.compile(r"^[0-9a-fA-F]{1,64}$")
@@ -43,6 +65,9 @@ class CorpusRecord:
     labels: tuple[str, ...]  # normalized label *names*, no System Labels
     body_hash: str  # sha256 hex of the stored body text (UTF-8)
     source: Source
+    date_provenance: DateProvenance  # where `date` came from (no default:
+    # writers stamp it explicitly — "unknown" is the reader's, not a
+    # writer's, choice)
     thread_id: str = ""
 
     def __post_init__(self) -> None:
@@ -56,6 +81,11 @@ class CorpusRecord:
             raise ValueError(
                 f"CorpusRecord.source must be 'api' or 'gyb', got {self.source!r}"
             )
+        if self.date_provenance not in _DATE_PROVENANCES:
+            raise ValueError(
+                "CorpusRecord.date_provenance must be one of "
+                f"{_DATE_PROVENANCES}, got {self.date_provenance!r}"
+            )
 
     def to_json_line(self) -> str:
         payload = {
@@ -67,6 +97,7 @@ class CorpusRecord:
             "labels": list(self.labels),
             "body_hash": self.body_hash,
             "source": self.source,
+            "date_provenance": self.date_provenance,
             "thread_id": self.thread_id,
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -89,8 +120,27 @@ class CorpusRecord:
             labels=_need_str_list(payload, "labels"),
             body_hash=_need(payload, "body_hash", str),
             source=cast("Source", _need(payload, "source", str)),
+            date_provenance=_opt_date_provenance(payload),
             thread_id=_need_opt_str(payload, "thread_id"),
         )
+
+
+def _opt_date_provenance(payload: dict[str, object]) -> DateProvenance:
+    value = payload.get("date_provenance")
+    if value is None:
+        # append-only corpus: a line written before the field existed stays
+        # readable; the default is an EXPLICIT unknown, never a guess.
+        # An explicit null is treated as absent on purpose: a fail-safe
+        # read beats a hard stop — one exotic producer bug must not kill
+        # iteration over the whole corpus (deliberate divergence from the
+        # required fields, which reject null loudly; the optional
+        # thread_id is equally tolerant).
+        return "unknown"
+    if not isinstance(value, str) or value not in _DATE_PROVENANCES:
+        raise ValueError(
+            f"field 'date_provenance' must be one of {_DATE_PROVENANCES}, got {value!r}"
+        )
+    return value  # narrowed to the Literal by the membership check
 
 
 def _need_opt_str(payload: dict[str, object], key: str) -> str:

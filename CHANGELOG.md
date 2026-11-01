@@ -8,6 +8,34 @@ does not ship releases yet.
 
 ### Added
 
+- Application path, decision core + store (ticket #24): the write
+  composition and its audit record, at the library level (the daemon
+  CLI is #25, `apply` is #26).
+  - `gmail_client` write surface (the Protocol's first writes):
+    `apply_labels` — the wire body is a literal with the ONE key
+    `addLabelIds`, structurally incapable of carrying a removal
+    (invariant #1); `ensure_label` — get-or-create for the configured
+    Tier Label names (startup-only; a System Label name-sake is never
+    a hit). FakeGmailClient records successful writes with full body
+    snapshots (the shadow zero-write pin catches a read-path write by
+    name).
+  - `appdb` schema v2: the `applications` table (message id, label,
+    label id, score, band, tier, applied-at, source CHECK
+    `daemon|apply`; no bodies; no PK — a re-earned label is NEW
+    Application history; indexes on message_id AND label for the
+    corrections/status join). The v1→v2 migration is a single-row
+    restamp: UPDATE the version row first, then create-all-if-missing
+    — both crash directions pinned (self-healing vs. named refusal);
+    the hard version gate stays the forward-compat story.
+  - `applications.py` (pure): `plan_message_write` — the fail-safe
+    composition on the tiers core (imported, never re-derived): adds =
+    would-apply Managed Label ids + umbrella + best band tier (sorted
+    total order); skip-present earns no row and no Tier Labels (empty
+    plan → no API call — invariant #2, crash-retry idempotent); ANY
+    compose error means no write for that message plus a counted
+    id-only warning (invariant #1); every resolved id is screened
+    through `is_system_label_id` (the composition-level guard on top
+    of tiers' name guard).
 - Shadow Pass (ticket #23): the Phase 1 exit — `shadow run` scores the
   recent Backlog through the sidecar-validated checkpoint, the
   Graduation Table, and the Threshold Bands and APPLIES NOTHING;
@@ -45,8 +73,8 @@ does not ship releases yet.
     doctrine) -> Backlog fetch (`list_messages` pageToken loop honoring
     `--limit` across pages; `q = in:inbox after:<epoch-seconds>` —
     `--since` ISO date -> UTC midnight of that day -> epoch, default
-    now - 90d with the time kept, `--query` escape hatch) -> `get_message` per
-    id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
+    now - 90d with the time kept, `--query` escape hatch) -> `get_message`
+    per id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
     seam) -> `tiers.would_apply` -> store. Degraded (body fetch
     failure) = per-message SKIP + stderr warning + count (the
     documented posture choice vs eval's refusal — shadow is a read-only

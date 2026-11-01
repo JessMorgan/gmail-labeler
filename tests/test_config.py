@@ -279,12 +279,17 @@ def test_bands_per_label_override_parses(tmp_path: Path) -> None:
 
 
 def test_bands_override_unknown_key_rejected(tmp_path: Path) -> None:
+    # a typo'd-key-only subtable reports the unknown-key CAUSE — not
+    # the empty-override consequence (the subtable is empty BECAUSE of
+    # the typo; the cause comes first)
     p = _write(
         tmp_path,
         '[bands."Money/Bills"]\nmin_high = 0.9\n',
     )
-    with pytest.raises(ConfigError, match="min_high"):
+    with pytest.raises(ConfigError) as ei:
         load_config(str(p))
+    assert "min_high" in str(ei.value)
+    assert "at least one target" not in str(ei.value)
 
 
 def test_bands_non_tenth_target_rejected(tmp_path: Path) -> None:
@@ -354,11 +359,18 @@ def test_bands_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
             load_config(str(p))
 
 
-def test_bands_empty_raw_per_label_table_refused(tmp_path: Path) -> None:
-    # per_label = {} (an EMPTY dict) is refused like every other raw
-    # form: all() over an empty mapping is vacuously true, so the typed
-    # check alone would accept it (the inherited #21-surface bug)
+def test_bands_empty_raw_per_label_is_the_typed_default(tmp_path: Path) -> None:
+    # per_label = {} (an EMPTY dict) is the typed DEFAULT — accepted,
+    # because the Config.model_validate(cfg.model_dump()) round-trip
+    # produces exactly this raw form; a NON-EMPTY raw dict with untyped
+    # values is the back door and is refused
     p = _write(tmp_path, "[bands]\nper_label = {}\n")
+    cfg = load_config(str(p))
+    assert cfg.bands.per_label == {}
+    p = _write(
+        tmp_path,
+        '[bands]\nper_label = { "Bills" = { min_high_precision = 0.9 } }\n',
+    )
     with pytest.raises(ConfigError, match="reserved field name"):
         load_config(str(p))
 
@@ -568,12 +580,17 @@ def test_graduation_non_tenth_precision_is_allowed(tmp_path: Path) -> None:
 
 
 def test_graduation_override_unknown_key_rejected(tmp_path: Path) -> None:
+    # a typo'd-key-only subtable reports the unknown-key CAUSE — not
+    # the empty-override consequence (the subtable is empty BECAUSE of
+    # the typo; the cause comes first)
     p = _write(
         tmp_path,
         '[graduation."Money/Bills"]\nmin_example = 10\n',
     )
-    with pytest.raises(ConfigError, match="min_example"):
+    with pytest.raises(ConfigError) as ei:
         load_config(str(p))
+    assert "min_example" in str(ei.value)
+    assert "at least one gate" not in str(ei.value)
 
 
 def test_graduation_out_of_range_rejected(tmp_path: Path) -> None:
@@ -647,13 +664,46 @@ def test_graduation_raw_per_label_key_is_reserved(tmp_path: Path) -> None:
             load_config(str(p))
 
 
-def test_graduation_empty_raw_per_label_table_refused(tmp_path: Path) -> None:
-    # per_label = {} (an EMPTY dict) is refused like every other raw
-    # form: all() over an empty mapping is vacuously true, so the typed
-    # check alone would accept it (the inherited #21-surface bug)
+def test_graduation_empty_raw_per_label_is_the_typed_default(
+    tmp_path: Path,
+) -> None:
+    # per_label = {} (an EMPTY dict) is the typed DEFAULT — accepted,
+    # because the Config.model_validate(cfg.model_dump()) round-trip
+    # produces exactly this raw form; a NON-EMPTY raw dict with untyped
+    # values is the back door and is refused
     p = _write(tmp_path, "[graduation]\nper_label = {}\n")
+    cfg = load_config(str(p))
+    assert cfg.graduation.per_label == {}
+    p = _write(
+        tmp_path,
+        '[graduation]\nper_label = { "Bills" = { min_examples = 5 } }\n',
+    )
     with pytest.raises(ConfigError, match="reserved field name"):
         load_config(str(p))
+
+
+def test_full_config_model_dump_round_trip() -> None:
+    # the Config.model_validate(cfg.model_dump()) round-trip must hold
+    # for a FULL config — the dump produces a raw per_label dict ({}
+    # where unset), and the wrap validators must accept exactly that
+    # form (the typed default). The programmatic API for per-label
+    # entries is typed construction (BandOverride / GateOverride
+    # values), not raw dicts — a non-empty raw per_label stays the
+    # refused back door
+    from gmail_labeler.config import Config
+
+    cfg = Config.model_validate(
+        {
+            "gmail": {"history_poll_seconds": 120},
+            "labels": {"managed": ["Shipping", "Money/Bills"]},
+            "bands": {"min_high_precision": 0.8},
+            "graduation": {"min_examples": 5},
+        }
+    )
+    assert cfg.bands.per_label == {}
+    assert cfg.graduation.per_label == {}
+    round_tripped = Config.model_validate(cfg.model_dump())
+    assert round_tripped == cfg
 
 
 def test_graduation_handler_failure_still_collects_all_problems(

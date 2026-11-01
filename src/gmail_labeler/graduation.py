@@ -125,10 +125,16 @@ _EXPECTED_IDENTITY_KEYS: frozenset[str] = frozenset(
         "bands_content_hash",
     }
 )
-assert set(IDENTITY_FIELDS) == _EXPECTED_IDENTITY_KEYS, (
-    "IDENTITY_FIELDS drifted from verify_graduation's expected-identity "
-    "keys — add the field to BOTH (the expected-value builder included)"
-)
+# a raise, not an assert: `python -O` strips asserts, and a stripped
+# guard would turn the drift into a KeyError/exit-1 at a consumer
+# (pyright sees the two literals as equal today — the guard is for
+# FUTURE drift, so the comparison is deliberate)
+if set(IDENTITY_FIELDS) != _EXPECTED_IDENTITY_KEYS:  # pyright: ignore[reportUnnecessaryComparison]
+    raise RuntimeError(
+        "IDENTITY_FIELDS drifted from verify_graduation's expected-"
+        "identity keys — add the field to BOTH (the expected-value "
+        "builder included)"
+    )
 
 #: The default gate targets (the config defaults mirror these — the
 #: equality is pinned by test_config, not by an import: config.py stays
@@ -247,17 +253,29 @@ class GraduationTable:
             "candidate_thresholds": list(self.candidate_thresholds),
             "default_targets": {
                 "min_examples": self.default_targets.min_examples,
-                "min_precision": self.default_targets.min_precision,
+                # float-NORMALIZED in the canonical payload: int 1 and
+                # 1.0 are ONE meaning, and json.dumps(1) is "1" while
+                # json.dumps(1.0) is "1.0" — without the normalization
+                # one meaning would have two identities (from_json
+                # normalizes to float, so a directly constructed int
+                # table would hash differently from its own round-trip)
+                "min_precision": float(self.default_targets.min_precision),
             },
             "labels": [
                 {
                     "label": entry.label,
                     "examples": entry.examples,
-                    "precision_at_high": entry.precision_at_high,
+                    # float-normalized (same one-meaning-one-identity
+                    # rule as default_targets.min_precision)
+                    "precision_at_high": (
+                        float(entry.precision_at_high)
+                        if entry.precision_at_high is not None
+                        else None
+                    ),
                     "high": entry.high,
                     "med": entry.med,
                     "min_examples": entry.min_examples,
-                    "min_precision": entry.min_precision,
+                    "min_precision": float(entry.min_precision),
                     "graduated": entry.graduated,
                     # CANONICAL order (sorted): validate() compares
                     # reasons sorted — the hash must serialize the same
@@ -334,6 +352,14 @@ class GraduationTable:
         ``from_json`` and ``build_table`` — so a table object passed
         directly is refused exactly like a parsed one: stale hash,
         unknown version, naive dates, violated invariants."""
+        # type() symmetry with from_json's _need_int: True == 1 would
+        # pass a bare `!=` comparison, and a bool format_version is
+        # exactly what the parse path refuses
+        if type(self.format_version) is not int:
+            raise ValueError(
+                f"graduation format_version must be an integer, got "
+                f"{self.format_version!r}"
+            )
         if self.format_version != GRADUATION_FORMAT_VERSION:
             raise ValueError(
                 f"graduation format_version {self.format_version} "
@@ -356,7 +382,15 @@ class GraduationTable:
             0
         ):
             raise ValueError("graduation split_date must be timezone-aware UTC")
-        if isinstance(self.test_examples, bool) or self.test_examples < 0:
+        # type() symmetry with from_json's _need_int: a float
+        # test_examples (18.0) would pass a bare `< 0` check, and the
+        # parse path refuses it
+        if type(self.test_examples) is not int:
+            raise ValueError(
+                "graduation test_examples must be an integer, got "
+                f"{self.test_examples!r}"
+            )
+        if self.test_examples < 0:
             raise ValueError(
                 "graduation test_examples must be a non-negative integer, got "
                 f"{self.test_examples!r}"
@@ -868,12 +902,27 @@ def identity_disagreement(
 def _state(entry: GraduationEntry | None) -> str:
     if entry is None:
         return "(absent)"
+    # the line carries the EFFECTIVE gate targets + the measured
+    # values: a gate change (min_examples 10 → 5) must be VISIBLE in
+    # the old → new diff — a bare "graduated -> graduated" with a
+    # changed content_hash would be blind to it (the human-confirm
+    # surface must show what the human is confirming)
+    precision = (
+        f"{entry.precision_at_high:.2f}"
+        if entry.precision_at_high is not None
+        else "none"
+    )
+    detail = (
+        f"examples={entry.examples}, precision@high={precision}, "
+        f"min_examples={entry.min_examples}, "
+        f"min_precision={entry.min_precision}"
+    )
     if entry.graduated:
-        return "graduated"
+        return f"graduated ({detail})"
     # CANONICAL order (sorted): the hash serializes reasons sorted, so
     # the same identity must render the same human text — a reversed
     # reasons tuple is the same meaning, not a different one
-    return f"not graduated ({', '.join(sorted(entry.reasons))})"
+    return f"not graduated ({', '.join(sorted(entry.reasons))}) ({detail})"
 
 
 def render_graduation_diff(
@@ -881,26 +930,36 @@ def render_graduation_diff(
     new: GraduationTable,
     *,
     path: str,
-    identity_disagreement: tuple[str, ...] = (),
+    disagreeing_fields: tuple[str, ...] = (),
+    unparseable_existing: bool = False,
 ) -> str:
     """The human-confirm diff (ADR-0005): old → new per label, in
     label-sorted order over the union of both tables' labels. A label
     missing from the old table is named ``(absent)`` (the
-    everything-vs-nothing baseline), and a foreign-bound old table
-    (identity drift) is named in the header — the human sees they are
-    comparing a table bound to a different checkpoint/eval/bands.
-    Deterministic: same inputs → byte-identical text. This is the
-    surface the human confirms BEFORE anything live changes; the write
-    itself is CLI-gated (``--confirm-graduation``)."""
+    everything-vs-nothing baseline); an existing target that does not
+    parse as a Graduation Table is named as such (NOT "no existing
+    table" — the file exists, it is just not a table); and a
+    foreign-bound old table (identity drift) is named in the header —
+    the human sees they are comparing a table bound to a different
+    checkpoint/eval/bands. Deterministic: same inputs → byte-identical
+    text. This is the surface the human confirms BEFORE anything live
+    changes; the write itself is CLI-gated
+    (``--confirm-graduation``)."""
     lines: list[str] = []
-    if identity_disagreement:
+    if disagreeing_fields:
         lines.append(
             f"graduation: WARNING: existing table at {path} is bound to a "
-            f"different identity ({', '.join(identity_disagreement)}) — the "
+            f"different identity ({', '.join(disagreeing_fields)}) — the "
             "diff compares a foreign-bound table"
         )
     if old is None:
-        lines.append(f"graduation: no existing table at {path} — baseline is empty")
+        if unparseable_existing:
+            lines.append(
+                f"graduation: existing file at {path} does not parse as a "
+                "Graduation Table — baseline is empty"
+            )
+        else:
+            lines.append(f"graduation: no existing table at {path} — baseline is empty")
     old_entries = {entry.label: entry for entry in (old.labels if old else ())}
     new_entries = {entry.label: entry for entry in new.labels}
     for label in sorted(set(new_entries) | set(old_entries)):

@@ -346,8 +346,18 @@ def test_eval_graduation_diff_shows_old_to_new(
         tmp_path, "--graduation", str(out), monkeypatch=monkeypatch, cfg=cfg_strict
     )
     assert r2.exit_code == 0, r2.stderr
-    assert "Money/Bills: graduated -> not graduated (below-min-examples)" in r2.stderr
-    assert "Shipping: graduated -> not graduated (below-min-examples)" in r2.stderr
+    assert (
+        "Money/Bills: graduated (examples=3, precision@high=1.00, "
+        "min_examples=3, min_precision=0.9) -> not graduated "
+        "(below-min-examples) (examples=3, precision@high=1.00, "
+        "min_examples=4, min_precision=0.9)" in r2.stderr
+    )
+    assert (
+        "Shipping: graduated (examples=3, precision@high=1.00, "
+        "min_examples=3, min_precision=0.9) -> not graduated "
+        "(below-min-examples) (examples=3, precision@high=1.00, "
+        "min_examples=4, min_precision=0.9)" in r2.stderr
+    )
     assert out.read_bytes() == bytes_graduated  # nothing applied itself
     # confirm: the file moves to the demoted table
     r3, _f3 = _run_eval(
@@ -681,15 +691,34 @@ def test_eval_out_empty_path_is_a_usage_error(
 ) -> None:
     # an empty --out would resolve to the cwd (and write a stray
     # staging file there) — a usage error (exit 2) up front, before
-    # any corpus work
+    # any corpus work; BOTH spellings are pinned (the literal "" and
+    # whitespace)
     import os
 
     cwd_files = set(os.listdir(Path.cwd()))
-    result, _factory = _run_eval(tmp_path, "--out", " ", monkeypatch=monkeypatch)
-    assert result.exit_code == 2
-    assert "non-empty" in result.stderr
-    assert "test examples=6" not in result.stdout  # pre-report refusal
+    for empty in ("", " "):
+        result, _factory = _run_eval(tmp_path, "--out", empty, monkeypatch=monkeypatch)
+        assert result.exit_code == 2
+        assert "non-empty" in result.stderr
+        assert "test examples=6" not in result.stdout  # pre-report refusal
     assert set(os.listdir(Path.cwd())) == cwd_files  # no stray file in cwd
+
+
+def test_eval_out_same_path_as_config_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --out naming the config file would destroy the identity material
+    # this very run just read (the same exact-path refusal as the
+    # artifact targets) — exit 2 up front, the config intact
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path)
+    result, _factory = _run_eval(
+        tmp_path, "--out", str(cfg), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert result.exit_code == 2
+    assert "config file" in result.stderr
+    assert cfg.is_file() and "checkpoint_dir" in cfg.read_text()
 
 
 def test_eval_graduation_sibling_bands_target_refused(
@@ -794,6 +823,62 @@ def test_eval_graduation_refusal_names_partial_bands_effect(
     assert "--graduation refused" in r2.stderr
     assert "bands_content_hash" in r2.stderr  # the named disagreeing field
     assert "the --bands artifact was already written" in r2.stderr  # the partial effect
+
+
+def test_eval_graduation_gate_refusal_does_not_publish_bands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the reorder: evaluate_graduation (pure) runs BEFORE the --bands
+    # write, so a gate evaluation refusal can no longer leave the bands
+    # artifact published (the partial-effect class is closed at the
+    # source)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(
+        tmp_path,
+        graduation="min_examples = 3\n",
+        labels='managed = ["Money/Bills", "Ghost"]',
+    )
+    bands_out = tmp_path / "bands.json"
+    grad_out = tmp_path / "graduation.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--bands",
+        str(bands_out),
+        "--graduation",
+        str(grad_out),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    assert "graduation gate evaluation refused" in result.stderr
+    assert "Ghost" in result.stderr
+    assert not bands_out.exists()  # the bands artifact was NOT published
+    assert not grad_out.exists()
+
+
+def test_eval_graduation_unparseable_existing_named_in_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # diff honesty: an existing target that does not parse as a
+    # Graduation Table is named as such — NOT "no existing table"
+    # (the file exists, it is just not a table)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    out.write_text("not a table", encoding="utf-8")
+    result, _factory = _run_eval(
+        tmp_path, "--graduation", str(out), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "existing file at" in result.stderr
+        and "does not parse as a Graduation Table" in result.stderr
+    )
+    assert "no existing table" not in result.stderr
+    assert "NOTICE" not in result.stderr  # no replace NOTICE on a read
 
 
 def test_eval_graduation_json_out_refusal(

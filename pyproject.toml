@@ -107,4 +107,5 @@ strict = [
     "src/gmail_labeler/model.py",
     "src/gmail_labeler/eval.py",
     "src/gmail_labeler/thresholds.py",
+    "src/gmail_labeler/graduation.py",
 ]

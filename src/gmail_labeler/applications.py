@@ -79,9 +79,12 @@ class ApplicationRow:
     GLOSSARY's "exactly one band Tier Label" is per-Application — a
     later Application on a message that already carries an earlier band
     tier adds ITS OWN best band tier (additive-only forbids correcting
-    the old one). Whether the daemon counts Tier Labels in the
-    message's ``present`` set (making a carried tier skip-present) is
-    #25's policy line; the composition is identical either way."""
+    the old one). NOTE for #25: putting Tier Label names in ``present``
+    changes NOTHING — tiers consults ``present`` only for the graduated
+    content labels, and the tier ids are composed unconditionally here.
+    A skip-present-tier policy (do not add a band tier when one is
+    already on the message) must be implemented IN THIS MODULE (the
+    caller has no lever); the manager's #25 brief should say so."""
 
     message_id: str
     label: str

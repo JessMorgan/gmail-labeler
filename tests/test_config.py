@@ -27,11 +27,13 @@ def test_empty_config_is_all_defaults(
     # directory (never the invocation cwd).
     assert loaded.corpus.dir == tmp_path / "corpus"
     assert loaded.model.checkpoint_dir == tmp_path / "checkpoints/latest"
+    assert loaded.store.db_path == tmp_path / "gmail-labeler.db"
     bare = Config()
     assert loaded.model_dump() == bare.model_dump() | {
         "corpus": bare.corpus.model_dump() | {"dir": loaded.corpus.dir},
         "model": bare.model.model_dump()
         | {"checkpoint_dir": loaded.model.checkpoint_dir},
+        "store": bare.store.model_dump() | {"db_path": loaded.store.db_path},
     }
 
 

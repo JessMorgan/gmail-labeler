@@ -782,6 +782,22 @@ class GraduationConfig(BaseModel):
         return self
 
 
+class StoreConfig(BaseModel):
+    """State DB location (ticket #23): the SQLite file holding the
+    shadow_results table (and, with the daemon phase, the applications
+    table — #24). A PLAIN path field on purpose: the [store] section
+    carries no label-key surface, so the heavy [bands]/[graduation]
+    per-label doctrine does not apply here. Relative paths anchor to
+    the config file's directory (the corpus/model dir rule); the
+    default is ``<config dir>/gmail-labeler.db``. The DB is
+    attachable-public material by construction (invariant #5): ids,
+    probabilities, labels, and run timestamps only — never bodies."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    db_path: Path = Path("./gmail-labeler.db")
+
+
 class ModelConfig(BaseModel):
     model_config = {"extra": "forbid", "frozen": True}
 
@@ -808,6 +824,7 @@ _PATH_FIELDS: tuple[tuple[str, str], ...] = (
     ("gyb", "path"),
     ("model", "encoder_path"),
     ("model", "checkpoint_dir"),
+    ("store", "db_path"),
 )
 
 
@@ -825,6 +842,7 @@ class Config(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     bands: BandsConfig = Field(default_factory=BandsConfig)
     graduation: GraduationConfig = Field(default_factory=GraduationConfig)
+    store: StoreConfig = Field(default_factory=StoreConfig)
 
 
 def _anchor_relative(cfg: Config, base_dir: Path) -> Config:
@@ -838,6 +856,10 @@ def _anchor_relative(cfg: Config, base_dir: Path) -> Config:
     if not cfg.model.checkpoint_dir.is_absolute():
         updates["model"] = cfg.model.model_copy(
             update={"checkpoint_dir": base_dir / cfg.model.checkpoint_dir}
+        )
+    if not cfg.store.db_path.is_absolute():
+        updates["store"] = cfg.store.model_copy(
+            update={"db_path": base_dir / cfg.store.db_path}
         )
     if not updates:
         return cfg

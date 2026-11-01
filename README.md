@@ -260,7 +260,8 @@ the named day is INCLUDED (mail from that day onward); default 90 days
 ago with the time kept (now − 90d, not midnight); the default window
 includes recent arrivals as
 well as the older history — GLOSSARY: Backlog; `--limit` max messages,
-default 100; `--query` replaces the default wholesale; `--db PATH`
+default 100; `--query` replaces the whole backlog window — the default
+and `--since` alike; `--db PATH`
 overrides `[store] db_path` — `~` is expanded, and a relative `--db`
 anchors to the CWD (like `--bands` / `--graduation`), unlike the
 config's `[store] db_path`, which anchors to the config dir). A message

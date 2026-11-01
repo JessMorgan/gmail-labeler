@@ -111,8 +111,14 @@ class AppDB:
         """Connect + create-all-if-missing. A fresh path creates the
         schema (0600 from creation — the secret-tight discipline, even
         though the rows are attachable-public); an existing file is
-        verified (a non-SQLite file is a corrupt DB, named; a foreign
-        schema_version is refused, named)."""
+        verified BEFORE any write (the ownership gate: a SQLite file
+        that carries foreign tables and NONE of ours is refused, named
+        — a foreign DB is not silently adopted; a foreign
+        schema_version is refused, named). Cause naming (the #22
+        doctrine): a directory / unwritable / unreadable path is "state
+        DB cannot be opened (I/O failure)"; genuinely non-SQLite bytes
+        are "state DB corrupt (not a SQLite file)" — the two are not
+        conflated."""
         if self._conn is not None:
             return
         if not self.path.parent.is_dir():
@@ -120,27 +126,43 @@ class AppDB:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 raise AppDBError(
-                    f"state DB dir unusable: {self.path.parent}: {e}"
+                    f"state DB cannot be opened (I/O failure): "
+                    f"dir unusable {self.path.parent}: {e}"
                 ) from e
         existed = self.path.exists()
         try:
             self._conn = sqlite3.connect(str(self.path))
             # connect is LAZY: a non-SQLite file is not read until the
-            # first query, so force it here — a corrupt file is named at
-            # the failure site that actually raises (not a generic
-            # "unusable" later)
+            # first query, so force it here — the failure is named at
+            # the site that actually raises (not a generic "unusable"
+            # later). A directory / unwritable path fails at connect
+            # ("unable to open database file" → I/O failure); non-SQLite
+            # bytes fail at the forced read ("file is not a database" →
+            # corrupt).
             self._conn.execute("SELECT 1").fetchone()
         except sqlite3.DatabaseError as e:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            if "file is not a database" in str(e):
+                raise AppDBError(
+                    f"state DB corrupt (not a SQLite file): {self.path}: {e}"
+                ) from e
             raise AppDBError(
-                f"state DB corrupt (not a SQLite file): {self.path}: {e}"
+                f"state DB cannot be opened (I/O failure): {self.path}: {e}"
             ) from e
         if not existed:
             with contextlib.suppress(OSError):
                 os.chmod(self.path, 0o600)  # foreign fs: best-effort
         try:
+            # the OWNERSHIP gate BEFORE any write: a SQLite file that
+            # already carries tables, NONE of which are ours, is a
+            # foreign DB — refusing it (named) keeps the "checked
+            # before any write" claim true (a foreign DB is not
+            # silently adopted with our schema_version stamped on it).
+            # An empty file (no tables) is fresh; a file with our
+            # tables proceeds to the version check.
+            self._check_ownership()
             self._conn.executescript(_SCHEMA)
             # a fresh DB (no version row) gets stamped; an existing DB
             # is NOT written before the version check — a foreign
@@ -158,14 +180,38 @@ class AppDB:
                 self._conn.commit()
             self._verify_version()
         except (sqlite3.DatabaseError, AppDBError) as e:
-            # BOTH the I/O failure and the version refusal close the
-            # connection (open()'s lifecycle contract — a refused open
-            # leaves no open conn behind)
+            # BOTH the I/O failure and the ownership/version refusal
+            # close the connection (open()'s lifecycle contract — a
+            # refused open leaves no open conn behind)
             self._conn.close()
             self._conn = None
             if isinstance(e, AppDBError):
                 raise
-            raise AppDBError(f"state DB unusable: {self.path}: {e}") from e
+            raise AppDBError(
+                f"state DB cannot be opened (I/O failure): {self.path}: {e}"
+            ) from e
+
+    def _check_ownership(self) -> None:
+        # the ownership gate (S1): read sqlite_master BEFORE any write.
+        # A file that carries existing tables and NONE of ours is a
+        # foreign DB — refused, named (the foreign table names are
+        # listed). An empty file (no tables) is fresh; a file with at
+        # least one of our tables is ours (the version check follows).
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        tables = {
+            row[0]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        ours = {"schema_version", "shadow_results"}
+        if tables and not (tables & ours):
+            raise AppDBError(
+                f"state DB is not a gmail-labeler state DB (foreign "
+                f"tables: {sorted(tables)}) — refusing to adopt it: "
+                f"{self.path}"
+            )
 
     def _verify_version(self) -> None:
         # a foreign version is refused, named (the SplitManifest
@@ -315,6 +361,8 @@ class AppDB:
             )
         try:
             run_ts = datetime.fromisoformat(rows[0][4])
+        except AppDBError:
+            raise  # already a named refusal — never double-wrap
         except (ValueError, TypeError) as e:
             # a tampered/hand-edited DB with a non-ISO (or NULL) run_ts is
             # a corrupt row, named — not a bare ValueError/TypeError
@@ -323,6 +371,16 @@ class AppDB:
                 f"state DB corrupt (run_ts {rows[0][4]!r} is not ISO-8601): "
                 f"{self.path}: {e}"
             ) from e
+        # one run, one stamp: every row in a run carries the SAME run_ts
+        # (record_run stamps the run-level timestamp on every row). A
+        # tampered DB with mixed stamps is corrupt, named.
+        distinct_ts = {r[4] for r in rows}
+        if len(distinct_ts) != 1:
+            raise AppDBError(
+                f"state DB corrupt (run {run_id!r} carries {len(distinct_ts)} "
+                f"distinct run_ts stamps {sorted(distinct_ts)} — one run, "
+                f"one stamp): {self.path}"
+            )
         out: list[ShadowRow] = []
         for r in rows:
             row = ShadowRow(
@@ -337,6 +395,8 @@ class AppDB:
                 # arbitrary band string / out-of-range probability / a NULL
                 # column — refused, named, not rendered)
                 _check_row(row)
+            except AppDBError:
+                raise  # already a named refusal — never double-wrap
             except (ValueError, TypeError, AttributeError) as e:
                 # a NULL column (a hand-edited DB without the shipped
                 # NOT NULL constraints) raises AttributeError/TypeError in

@@ -244,3 +244,119 @@ def test_applications_table_seam_is_documented() -> None:
     source = Path(appdb_module.__file__).read_text(encoding="utf-8")
     assert "ticket #24" in source
     assert "applications" in source
+
+
+def test_directory_is_io_failure_not_corrupt(tmp_path: Path) -> None:
+    # S2 cause split: a DIRECTORY at the db path is "cannot be opened
+    # (I/O failure)" — NOT "corrupt (not a SQLite file)" (the two causes
+    # are not conflated, the #22 doctrine)
+    db_path = tmp_path / "state.db"
+    db_path.mkdir()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="cannot be opened \\(I/O failure\\)"):
+        db.open()
+
+
+def test_foreign_sqlite_db_is_refused_by_ownership(tmp_path: Path) -> None:
+    # S1: a SQLite file that carries foreign tables and NONE of ours is
+    # refused, named (the foreign table names are listed) — a foreign DB
+    # is not silently adopted with our schema stamped on it
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE other_app_data (id INTEGER PRIMARY KEY)")
+    conn.execute("INSERT INTO other_app_data (id) VALUES (1)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="not a gmail-labeler state DB"):
+        db.open()
+    # the foreign table is untouched (no schema_version stamped on it)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "schema_version" not in tables
+        assert "shadow_results" not in tables
+        assert "other_app_data" in tables
+    finally:
+        conn.close()
+
+
+def test_record_run_empty_is_refused(tmp_path: Path) -> None:
+    # S2 pin: record_run refuses an empty row list at the only writer
+    # (load_run's docstring assumes an empty run was never committed)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="no rows"):
+        db.record_run("run-1", TS, [])
+    db.close()
+
+
+def _tampered_db(db_path: Path) -> None:
+    # a hand-edited DB: the shadow_results table WITHOUT the shipped
+    # NOT NULL constraints (so NULL rows can exist) + a valid
+    # schema_version (so the ownership/version checks pass and the
+    # read-back validation is the gate that fires)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+    conn.execute(
+        "CREATE TABLE shadow_results ("
+        "run_id TEXT, message_id TEXT, label TEXT, probability REAL, "
+        "band TEXT, run_ts TEXT, "
+        "PRIMARY KEY (run_id, message_id, label))"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_load_run_tampered_rows_are_refused(tmp_path: Path) -> None:
+    # S2 pin: a tampered DB (hand-edited rows) is refused, named — not
+    # an exit-1 traceback. Covers: NULL label, NULL message_id, and a
+    # mixed run_ts stamp (one run, one stamp)
+    db_path = tmp_path / "state.db"
+    _tampered_db(db_path)
+    cols = "run_id, message_id, label, probability, band, run_ts"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        f"INSERT INTO shadow_results ({cols}) "
+        "VALUES ('run-1', 'aa', NULL, 0.9, 'high', '2026-11-01T12:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    with pytest.raises(AppDBError, match="fails validation"):
+        db.load_run("run-1")
+    db.close()
+    # NULL message_id
+    _tampered_db(tmp_path / "state2.db")
+    conn = sqlite3.connect(str(tmp_path / "state2.db"))
+    conn.execute(
+        f"INSERT INTO shadow_results ({cols}) "
+        "VALUES ('run-1', NULL, 'Shipping', 0.9, 'high', '2026-11-01T12:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    db2 = AppDB(tmp_path / "state2.db")
+    db2.open()
+    with pytest.raises(AppDBError, match="fails validation"):
+        db2.load_run("run-1")
+    db2.close()
+    # mixed run_ts stamps (one run, one stamp)
+    _tampered_db(tmp_path / "state3.db")
+    conn = sqlite3.connect(str(tmp_path / "state3.db"))
+    conn.execute(
+        f"INSERT INTO shadow_results ({cols}) VALUES ("
+        "'run-2', 'bb', 'Shipping', 0.8, 'med', '2026-11-01T12:00:00+00:00'),"
+        "('run-2', 'cc', 'Money/Bills', 0.7, 'med', '2026-11-02T00:00:00+00:00')"
+    )
+    conn.commit()
+    conn.close()
+    db3 = AppDB(tmp_path / "state3.db")
+    db3.open()
+    with pytest.raises(AppDBError, match="distinct run_ts"):
+        db3.load_run("run-2")
+    db3.close()

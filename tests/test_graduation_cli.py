@@ -1504,6 +1504,44 @@ def test_eval_graduation_readback_mismatch_exits_5(
     assert "test examples=6" in result.stdout  # the report is not lost
 
 
+def test_eval_graduation_readback_read_failure_is_post_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the post-replace readback's OWN read can fail (an I/O error):
+    # that is a post-replace failure, not a write failure — the
+    # message must say the write failed AFTER the target was replaced
+    # (the "cannot write" wording is dead; the outer except OSError
+    # would print exactly that if the OSError escaped the wrap)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    orig_read_text = Path.read_text
+
+    def _read_text_boom(
+        self: Path, encoding: str | None = None, errors: str | None = None
+    ) -> str:
+        if self == out:
+            raise OSError("simulated readback read failure")
+        return orig_read_text(self, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", _read_text_boom)
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(out),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    assert "--graduation write failed AFTER the target was replaced" in result.stderr
+    assert "readback fault" in result.stderr
+    assert "failed to read back" in result.stderr
+    assert "cannot write --graduation" not in result.stderr
+    assert "test examples=6" in result.stdout  # the report is not lost
+
+
 def test_eval_graduation_replaces_existing_with_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

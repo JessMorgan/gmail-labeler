@@ -286,9 +286,11 @@ class BandsConfig(BaseModel):
         are gone for exactly this reason) and a handler/coercion
         failure both raise with the full problem list. The tenth-grid
         stance (#20) applies to the defaults AND every per-label
-        override; a raw ``per_label`` key is a reserved field name (an
-        EMPTY raw table included — a vacuous all() would accept it);
-        a label key is stripped, refused blank-after-strip, and
+        override; a raw ``per_label`` key is a reserved field name —
+        an EMPTY raw table is accepted (it equals the typed default
+        {}, the model_dump round-trip form), while ANY non-empty raw
+        table is refused; a label key is stripped, refused
+        blank-after-strip, and
         acceptance-bounded at _MAX_LABEL_LENGTH (the echo bound
         _MAX_LOC_SEGMENT only truncates error messages — a long
         slash-nested Label Path is accepted, not refused)."""
@@ -616,8 +618,10 @@ class GraduationConfig(BaseModel):
         coercion failure both raise with the full problem list. The
         ranges apply to the defaults AND every per-label override (no
         tenth-grid — see the class docstring); a raw ``per_label`` key
-        is a reserved field name (an EMPTY raw table included — a
-        vacuous all() would accept it); a label key is stripped,
+        is a reserved field name — an EMPTY raw table is accepted (it
+        equals the typed default {}, the model_dump round-trip form),
+        while ANY non-empty raw table is refused; a label key is
+        stripped,
         refused blank-after-strip, and acceptance-bounded at
         _MAX_LABEL_LENGTH (the echo bound _MAX_LOC_SEGMENT only
         truncates error messages — a long slash-nested Label Path is

@@ -138,8 +138,14 @@ def _write_out_report(out: str, file_text: str) -> None:
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")  # owns fd from here
     except OSError:
-        os.close(fd)  # fdopen failed — the fd is ours to close
-        staging.unlink(missing_ok=True)
+        # fdopen failed — the fd is ours to close; both cleanups are
+        # best-effort (a close/unlink failure must not replace the
+        # primary error), and any stray-staging litter is silent BY
+        # DESIGN (the primary error outranks cleanup visibility)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
     try:
         with fh:
@@ -259,8 +265,14 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")  # owns fd from here
     except OSError:
-        os.close(fd)  # fdopen failed — the fd is ours to close
-        staging.unlink(missing_ok=True)
+        # fdopen failed — the fd is ours to close; both cleanups are
+        # best-effort (a close/unlink failure must not replace the
+        # primary error), and any stray-staging litter is silent BY
+        # DESIGN (the primary error outranks cleanup visibility)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
     try:
         with fh:
@@ -397,8 +409,14 @@ def _write_graduation_table(path: Path, table: GraduationTable, text: str) -> No
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")  # owns fd from here
     except OSError:
-        os.close(fd)  # fdopen failed — the fd is ours to close
-        staging.unlink(missing_ok=True)
+        # fdopen failed — the fd is ours to close; both cleanups are
+        # best-effort (a close/unlink failure must not replace the
+        # primary error), and any stray-staging litter is silent BY
+        # DESIGN (the primary error outranks cleanup visibility)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            staging.unlink(missing_ok=True)
         raise
     try:
         with fh:

@@ -16,9 +16,9 @@ from gmail_labeler.appdb import (
     SCHEMA_VERSION,
     AppDB,
     AppDBError,
-    ApplicationRow,
     ShadowRow,
 )
+from gmail_labeler.applications import ApplicationRow
 
 TS = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
 

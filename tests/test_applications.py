@@ -179,8 +179,10 @@ def test_fail_safe_warning_carries_no_body(caplog: pytest.LogCaptureFixture) -> 
     # was unfalsifiable — bodies are structurally absent from the plan's
     # inputs): the warning is exactly "{id}: {type}: {tiers message}",
     # built from ids/labels/scores ONLY
-    assert plan.warning.startswith("aa: ValueError: tiers for ")
-    assert "1.5" in plan.warning  # the lying score, named
+    assert plan.warning == (
+        "aa: ValueError: tiers for 'Shipping': score 1.5 is out of [0, 1] "
+        "— a lying model row"
+    )
     logging.getLogger("gmail_labeler.test").warning("skipped message: %s", plan.warning)
     assert "aa" in caplog.text
 

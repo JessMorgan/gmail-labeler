@@ -3,9 +3,12 @@
 # freshness checks around them. Required pre-push gate (AGENTS.md).
 # Coverage and the live-test exclusion come from pyproject addopts; a
 # targeted local run may pass --no-cov.
+# NOTE: cannot run from a git-archive export tree — the uv.lock git checks
+# at the bottom need a .git directory.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 unset UV_FROZEN  # hermeticity: ambient value would break --locked and downgrade uv lock --check
+export PYTHONTZPATH=/nonexistent/tzdb  # mirror CI's tz-db-less env (ci.yml); pinned by tests/test_tzenv.py
 
 echo "== uv.lock freshness"
 uv lock --check

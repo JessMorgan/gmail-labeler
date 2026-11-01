@@ -25,7 +25,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
-from .corpus_record import CorpusRecord, body_hash, utc_datetime
+from .corpus_record import (
+    CorpusRecord,
+    DateProvenance,
+    body_hash,
+    utc_datetime,
+)
 from .corpus_store import CorpusError, CorpusStore
 from .corpus_store import _fsync_dir as _fsync_dir
 from .gmail_client import FilterInfo, GmailClient
@@ -185,14 +190,24 @@ def _export_one(
         # binascii.Error and UnicodeEncodeError are ValueError subclasses)
         stats.failed.append((message_id, f"raw decode: {type(e).__name__}"))
         return "failed"
-    # Date provenance: server internalDate when present; the MIME Date
-    # header is SENDER-CLAIMED (a forged/future header can move a message
-    # across the temporal split — a per-record provenance flag is
-    # daemon/eval-phase work, see follow-up). No header => no guess.
-    date = _ms_to_utc(msg.internal_date_ms) or (
-        utc_datetime(parsed.date) if parsed.date is not None else None
-    )
-    if date is None:
+    # Date Provenance (GLOSSARY): the stamp must say where the date ACTUALLY
+    # came from. Server internalDate is authoritative; the MIME Date header
+    # is SENDER-CLAIMED — a forged/future header can move a message across
+    # the temporal split (invariant #7), so the fallback is stamped
+    # "mime_date", never blended. (A present-but-unconvertible internalDate
+    # falls through to the header and is stamped accordingly.) No header =>
+    # no guess.
+    server_date = _ms_to_utc(msg.internal_date_ms)
+    provenance: DateProvenance
+    if server_date is not None:
+        date = server_date
+        provenance = "internal_date"
+    elif parsed.date is not None:
+        date = utc_datetime(parsed.date)
+        provenance = "mime_date"
+    else:
+        # no authoritative timestamp: fail here, never stored — a record's
+        # provenance is always one of the two real sources
         stats.failed.append((message_id, "no authoritative timestamp"))
         return "failed"
     try:
@@ -205,6 +220,7 @@ def _export_one(
             labels=tuple(normalize_label_names(list(msg.label_ids), id_to_name)),
             body_hash=body_hash(parsed.body_text),
             source="api",
+            date_provenance=provenance,
             thread_id=msg.thread_id,
         )
     except ValueError as e:

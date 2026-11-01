@@ -58,6 +58,66 @@ def test_export_writes_records_with_normalized_fields(tmp_path: Path) -> None:
     assert body == "body of One"  # stored body == hashed body
 
 
+def test_date_provenance_stamps_fallback_distinctly_from_internal_date(
+    tmp_path: Path,
+) -> None:
+    # mutation pin (invariant #7): the MIME-Date fallback path must stamp
+    # DIFFERENTLY from the server-internalDate path, and split-boundary
+    # consumers must be able to filter on the flag as round-tripped record
+    # data — not derive it. A forged/future Date header can no longer
+    # silently move a record across the temporal split.
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=_eml("Server"),
+                internal_date_ms=1761818400000,  # authoritative
+            ),
+            FakeMessage(id="bbb", eml=_eml("Header")),  # no internalDate
+        ],
+    )
+    store = store_at(tmp_path)
+    export_corpus(fake, store, id_to_name=NAMES)
+    records = {r.id: r for r in store.iter_records()}
+    assert records["aaa"].date_provenance == "internal_date"
+    assert records["bbb"].date_provenance == "mime_date"
+    fallback = [r.id for r in records.values() if r.date_provenance == "mime_date"]
+    assert fallback == ["bbb"]  # the flag is filterable, per-record
+
+
+def test_unconvertible_internal_date_falls_back_to_header_stamp(
+    tmp_path: Path,
+) -> None:
+    # present-but-unconvertible internalDate (epoch overflow): the record
+    # keeps the header date AND stamps mime_date — the stamp follows the
+    # date actually used, not the field that was merely present (mutation
+    # pin: _ms_to_utc's try/except — without it the OverflowError escapes)
+    eml = _eml("Overflow", date="Sun, 30 Oct 2026 10:00:00 +0000")
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=eml, internal_date_ms=10**30)]
+    )
+    store = store_at(tmp_path)
+    export_corpus(fake, store, id_to_name=NAMES)
+    rec = next(iter(store.iter_records()))
+    assert rec.date.isoformat().startswith("2026-10-30")  # header date kept
+    assert rec.date_provenance == "mime_date"  # stamped by the actual source
+
+
+def test_forged_future_date_header_cannot_shift_provenance(tmp_path: Path) -> None:
+    # internalDate present + a forged FUTURE Date header: the record keeps
+    # the server date AND stamps internal_date — the header is not even
+    # consulted, so it cannot move the record across the split
+    eml = _eml("Forged", date="Sun, 30 Oct 2099 10:00:00 +0000")
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=eml, internal_date_ms=1761818400000)]
+    )
+    store = store_at(tmp_path)
+    export_corpus(fake, store, id_to_name=NAMES)
+    rec = next(iter(store.iter_records()))
+    assert rec.date.isoformat().startswith("2025-10-30")  # server date kept
+    assert rec.date_provenance == "internal_date"
+
+
 def test_export_resume_skips_present(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     store = store_at(tmp_path)
@@ -214,6 +274,7 @@ def test_max_messages_bound_holds_on_warm_resume(tmp_path: Path) -> None:
                 labels=("Shipping",),
                 body_hash=body_hash(f"b{i}"),
                 source="api",
+                date_provenance="internal_date",
             ),
             f"b{i}",
         )
@@ -415,6 +476,7 @@ def test_resume_gate_is_case_insensitive(tmp_path: Path) -> None:
             labels=("Shipping",),
             body_hash=body_hash("whatever"),
             source="api",
+            date_provenance="internal_date",
         ),
         "whatever",
     )

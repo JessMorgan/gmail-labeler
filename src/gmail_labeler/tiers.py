@@ -36,10 +36,18 @@ Consequences pinned by the same golden tests:
 - the decisions are in label-sorted order (a total order — the input
   mapping order never leaks into the output).
 
-The Tier Label constants are pinned to the GLOSSARY's spellings
-(``ai-applied`` umbrella, ``ai-high``, ``ai-med``); the ``[labels]``
-config defaults mirror them (the equality is pinned by test_config,
-not by an import — config.py stays import-light).
+The Tier Label constants are the DOCUMENTED DEFAULTS (the GLOSSARY's
+spellings: ``ai-applied`` umbrella, ``ai-high``, ``ai-med``); the
+``[labels]`` config defaults mirror them (the equality is pinned by
+test_config, not by an import — config.py stays import-light). This
+module is the PURE core: it names the DEFAULT spellings, NOT the
+operator's configured ``[labels] applied/high/med`` names. The CLI
+maps a band verdict to the CONFIGURED name (the ``[labels]`` surface
+drives the shadow report's tier names — a custom spelling is honored,
+not silently ignored). The daemon (#24) will resolve those configured
+names to Gmail label ids before any live Application (the contract for
+#24: tiers names the default spellings, the config names the operator's
+labels, the daemon bridges the two to the wire).
 """
 
 from __future__ import annotations

@@ -431,7 +431,17 @@ def test_nan_none_score_is_refused(score) -> None:
 
 def test_tier_constants_are_pinned_to_the_glossary_spellings() -> None:
     # the GLOSSARY's Tier Label spellings (the [labels] config defaults
-    # mirror these — the equality is pinned by test_config)
+    # mirror these — the equality is pinned by test_config). This pin is
+    # REAL: it parses GLOSSARY.md and asserts the three spellings appear
+    # (a GLOSSARY drift turns this red, not just the constant check)
+    from pathlib import Path
+
+    glossary = (Path(__file__).resolve().parent.parent / "GLOSSARY.md").read_text(
+        encoding="utf-8"
+    )
     assert TIER_APPLIED == "ai-applied"
     assert TIER_HIGH == "ai-high"
     assert TIER_MED == "ai-med"
+    assert "ai-applied" in glossary
+    assert "ai-high" in glossary
+    assert "ai-med" in glossary

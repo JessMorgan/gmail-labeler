@@ -256,8 +256,13 @@ field). The Backlog query defaults to `in:inbox newer_than:YYYY/MM/DD`
 default 100; `--query` replaces the default wholesale). A message
 whose body cannot be fetched is skipped (per-message fail-safe:
 warning + count, the run continues) — the documented posture choice
-vs `eval`'s whole-run refusal: shadow is a read-only survey. The
-summary goes to stderr; `--json` emits one parseable object. `shadow
+vs `eval`'s whole-run refusal: shadow is a read-only survey. A run
+that produces no verdicts (the Graduation Table graduated no labels)
+refuses with exit 5 ("no verdicts to record" — nothing is recorded, so
+a `shadow report` would say "no runs recorded"), and a would-apply
+refusal (a lying score/band, a graduated System Label, a missing bands
+entry) refuses with exit 5 ("would-apply refused"). The summary goes
+to stderr; `--json` emits one parseable object. `shadow
 report` diffs a run's stored verdicts against the mailbox's ACTUAL
 labels (re-fetched via the read path — the labels may have changed
 since the run): a deterministic per-message diff of message id + label

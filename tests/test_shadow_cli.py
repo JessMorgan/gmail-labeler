@@ -253,6 +253,18 @@ def _backlog_scores() -> dict[str, tuple[float, ...]]:
     }
 
 
+def _db_has_rows(db_path: Path) -> bool:
+    import sqlite3
+
+    if not db_path.is_file():
+        return False
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM shadow_results").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
 def _run_shadow(
     tmp_path: Path,
     *extra: str,
@@ -434,6 +446,96 @@ def test_shadow_run_limit_honored_across_pages(
     assert len(list_calls) == 2  # paged across the 3-message window
 
 
+def test_shadow_run_repeated_page_is_deduped_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the pageToken loop dedupes ids and breaks on a no-progress page
+    # (a server repeating the same ids with a token would loop forever
+    # without the break): a bounded fake that repeats page 1 on page 2
+    # then yields new ids on page 3 → the run scores the deduped set and
+    # stops (no hang, no duplicate rows)
+    from gmail_labeler.gmail_client import MessagePage, MessageStub
+
+    _prepare(tmp_path, monkeypatch)
+
+    class RepeatingClient(FakeGmailClient):
+        def __init__(self) -> None:
+            super().__init__(messages=_backlog_messages(), labels=_shadow_labels())
+            self._page = 0
+
+        def list_messages(self, query, page_token=None):
+            self.calls.append(f"list_messages:{query}:{page_token or ''}")
+            self._page += 1
+            if self._page == 1:
+                # page 1: aa11, aa22 (token 1)
+                return MessagePage(
+                    stubs=(
+                        MessageStub(id="aa11", thread_id="t1"),
+                        MessageStub(id="aa22", thread_id="t2"),
+                    ),
+                    next_page_token="1",
+                )
+            if self._page == 2:
+                # page 2: the SAME ids again (no progress, token 2)
+                return MessagePage(
+                    stubs=(
+                        MessageStub(id="aa11", thread_id="t1"),
+                        MessageStub(id="aa22", thread_id="t2"),
+                    ),
+                    next_page_token="2",
+                )
+            # page 3: new ids, no more pages
+            return MessagePage(
+                stubs=(
+                    MessageStub(id="aa33", thread_id="t3"),
+                    MessageStub(id="aa44", thread_id="t4"),
+                ),
+                next_page_token=None,
+            )
+
+    fake = RepeatingClient()
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_shadow_client", lambda cfg_: fake)
+    monkeypatch.setattr(
+        cli, "_shadow_model_factory", _shadow_factory(_backlog_scores())
+    )
+    result = runner.invoke(
+        app,
+        [
+            "shadow",
+            "run",
+            "--config",
+            str(_shadow_cfg(tmp_path)),
+            "--bands",
+            str(tmp_path / "bands.json"),
+            "--graduation",
+            str(tmp_path / "graduation.json"),
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    # the no-progress break stops at page 2 (page 2 repeats page 1's
+    # ids — continuing would loop forever), so 2 list_messages calls and
+    # the 2 deduped messages scored (page 3 is never reached)
+    list_calls = [c for c in fake.calls if c.startswith("list_messages")]
+    assert len(list_calls) == 2
+    assert "scored=2" in result.stderr
+    # no duplicate rows (aa11/aa22 appear once each — 2 x 2 labels)
+    assert _db_row_count(tmp_path / "gmail-labeler.db") == 4
+
+
+def _db_row_count(db_path: Path) -> int:
+    import sqlite3
+
+    if not db_path.is_file():
+        return 0
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM shadow_results").fetchone()[0]
+    finally:
+        conn.close()
+
+
 def test_shadow_run_usage_refusals_exit_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -534,20 +636,27 @@ def test_shadow_run_graduation_refused_identity_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # the FIRST real consumer of verify_graduation: a graduation table
-    # bound to a DIFFERENT identity is refused, exit 5, naming the
-    # field
+    # whose bands_content_hash binding disagrees is refused, exit 5,
+    # naming the field. The bands artifact is kept VALID (matching the
+    # checkpoint) so ONLY the table drifts — the bands gate passes and
+    # the graduation gate is the one that fires (deleting the
+    # verify_graduation call would leave this test red).
+    from dataclasses import replace
+
+    from gmail_labeler.graduation import GraduationTable
+
     _prepare(tmp_path, monkeypatch)
-    # retrain with a LATER split date → the table's split identity
-    # differs
-    assert (
-        _run_train(tmp_path, monkeypatch, split_date="2026-02-01", force=True).exit_code
-        == 0
-    )
+    table_path = tmp_path / "graduation.json"
+    table = GraduationTable.from_json(table_path.read_text(encoding="utf-8"))
+    # a lying bands binding: the table claims a bands artifact it was
+    # not computed from (the bands_content_hash field is the binding)
+    lying = replace(table, bands_content_hash="f" * 64)
+    lying = replace(lying, content_hash=lying.compute_hash())
+    table_path.write_text(lying.to_json(), encoding="utf-8")
     result, _fake = _run_shadow(tmp_path, monkeypatch=monkeypatch)
-    # the bands artifact is checked FIRST (it also drifts) — the
-    # refusal names the bands field
     assert result.exit_code == 5
-    assert "refused" in result.stderr
+    assert "graduation table refused" in result.stderr
+    assert "bands_content_hash" in result.stderr  # the named field
 
 
 def test_shadow_run_bands_absent_unreadable_unparseable(
@@ -725,6 +834,50 @@ def test_shadow_run_json_single_object(
     # in --json mode the payload IS the output — the human summary is
     # suppressed (stdout stays exactly one parseable JSON object)
     assert "shadow run: run=" not in result.stdout
+
+
+def test_shadow_run_zero_graduated_labels_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a run whose Graduation Table graduated NO labels produces zero
+    # verdicts — it is refused (exit 5, nothing recorded), not reported
+    # as a success that records nothing (a `shadow report` on an empty
+    # DB would say "no runs recorded" — a silent loss of the run)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _shadow_cfg(tmp_path)
+    bands = tmp_path / "bands.json"
+    assert (
+        _run_eval(
+            tmp_path, "--bands", str(bands), monkeypatch=monkeypatch, cfg=cfg
+        ).exit_code
+        == 0
+    )
+    # min_examples = 999 → NO label graduates (a realistic early state)
+    grad_cfg = _shadow_cfg(tmp_path)
+    grad_cfg.write_text(
+        grad_cfg.read_text(encoding="utf-8").replace(
+            "[store]", "[graduation]\nmin_examples = 999\n[store]"
+        ),
+        encoding="utf-8",
+    )
+    graduation = tmp_path / "graduation.json"
+    assert (
+        _run_eval(
+            tmp_path,
+            "--graduation",
+            str(graduation),
+            "--confirm-graduation",
+            monkeypatch=monkeypatch,
+            cfg=grad_cfg,
+        ).exit_code
+        == 0
+    )
+    result, _fake = _run_shadow(tmp_path, monkeypatch=monkeypatch, cfg=grad_cfg)
+    assert result.exit_code == 5
+    assert "no verdicts to record" in result.stderr
+    # nothing was recorded
+    assert not _db_has_rows(tmp_path / "gmail-labeler.db")
 
 
 def test_shadow_run_no_checkpoint_exits_5(

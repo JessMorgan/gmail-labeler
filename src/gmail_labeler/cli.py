@@ -2413,10 +2413,18 @@ def shadow_run(
     q = _backlog_query(since_date, query)
     try:
         stubs: list[MessageStub] = []
+        seen_ids: set[str] = set()
         token: str | None = None
         while len(stubs) < limit:
             page = client.list_messages(q, token)
-            stubs.extend(page.stubs)
+            new = [s for s in page.stubs if s.id not in seen_ids]
+            # a page that yields NO new ids (a repeated/empty-with-token
+            # page) would loop forever — break on no progress
+            if not new and token is not None:
+                break
+            for s in new:
+                seen_ids.add(s.id)
+                stubs.append(s)
             token = page.next_page_token
             if token is None:
                 break
@@ -2495,14 +2503,25 @@ def shadow_run(
     already_present = 0
     not_applied = 0
     for (message_id, present), row in zip(fetched, rows, strict=True):
+        # the zip/dict bookkeeping is OUTSIDE the try: a vocabulary/
+        # score-width defect there is a genuine bug (exit 1), not a
+        # would-apply refusal
         scores = dict(zip(model.vocabulary, row, strict=True))
-        decisions = would_apply(
-            scores=scores,
-            bands=bands_map,
-            graduated=graduated,
-            present=present,
-            system_labels=system_names,
-        )
+        try:
+            decisions = would_apply(
+                scores=scores,
+                bands=bands_map,
+                graduated=graduated,
+                present=present,
+                system_labels=system_names,
+            )
+        except ValueError as e:
+            # would_apply's documented refusals (a lying score/band, a
+            # graduated System Label, a missing bands entry) are named
+            # operation failures (exit 5) — not an unhandled traceback
+            # (exit 1, which the README defines as "a bug")
+            typer.echo(f"shadow run failed: would-apply refused: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         for d in decisions:
             all_rows.append(
                 ShadowRow(
@@ -2529,6 +2548,18 @@ def shadow_run(
                 already_present += 1
             else:
                 not_applied += 1
+
+    if not all_rows:
+        # a run that produces ZERO verdicts (e.g. the Graduation Table
+        # graduated no labels) records nothing — refusing with exit 5
+        # keeps the run representable (a `shadow report` on an empty DB
+        # would say "no runs recorded", a silent loss of the run)
+        typer.echo(
+            "shadow run failed: no verdicts to record (the Graduation "
+            "Table graduated no labels) \u2014 nothing recorded",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     # the store (transaction per run — a crash mid-run leaves no half
     # rows; the DB carries ids/probabilities/labels/timestamps ONLY —
@@ -2601,7 +2632,7 @@ def shadow_report(
     from .auth import AuthError
     from .gmail_errors import GmailAuthError, GmailError
     from .labels import normalize_label_names
-    from .tiers import TIER_HIGH, TIER_MED
+    from .tiers import BAND_HIGH, BAND_MED, tier_for_band
     from .tokens import TokenStoreError
 
     # usage refusal up front (exit 2): an empty --run would degenerate
@@ -2691,15 +2722,18 @@ def shadow_report(
             # the message was skipped (fetch failure) — its rows are
             # omitted from the diff (the skip is counted + warned)
             continue
+        # the band→tier mapping + skip-present live in tiers.tier_for_band
+        # (the single decision core — no second implementation)
+        is_present = row.label in present
         if row.band is None:
             outcome = "not-applied"
             tier: str | None = None
-        elif row.label in present:
+        elif is_present:
             outcome = "already-present"
             tier = None  # skip-present: no Tier Label
         else:
             outcome = "added"
-            tier = TIER_HIGH if row.band == "high" else TIER_MED
+            tier = tier_for_band(row.band, present=False)
         outcomes[outcome.replace("-", "_")] += 1
         per_message.setdefault(row.message_id, []).append(
             {
@@ -2721,9 +2755,11 @@ def shadow_report(
             },
         )
         label_summary[outcome.replace("-", "_")] += 1
-        if row.band == "high":
+        # the band constants come from tiers (the single decision core —
+        # the report summary cannot drift from the band verdict names)
+        if row.band == BAND_HIGH:
             label_summary["would_be_high"] += 1
-        elif row.band == "med":
+        elif row.band == BAND_MED:
             label_summary["would_be_med"] += 1
 
     if as_json:

@@ -53,6 +53,7 @@ __all__ = [
     "TIER_MED",
     "TierDecision",
     "best_tier",
+    "tier_for_band",
     "would_apply",
 ]
 
@@ -136,6 +137,20 @@ def _check_bands(label: str, high: object, med: object) -> None:
         )
 
 
+def tier_for_band(band: str | None, *, present: bool) -> str | None:
+    """The Tier Label for a band verdict (the SINGLE home for the
+    band→tier mapping — #24/#26 reuse it, no second implementation):
+    ``high`` → ``TIER_HIGH``, ``med`` → ``TIER_MED``, ``None`` (no band)
+    → ``None``. Skip-present (invariant #2): an already-present label
+    earns NO Tier Label (``present=True`` → ``None``) — the band stays
+    visible, the tier does not."""
+    if band == BAND_HIGH and not present:
+        return TIER_HIGH
+    if band == BAND_MED and not present:
+        return TIER_MED
+    return None
+
+
 def would_apply(
     *,
     scores: Mapping[str, float],
@@ -205,11 +220,7 @@ def would_apply(
         applied = band is not None and not is_present
         # skip-present (invariant #2): an already-present label is not
         # proposed and earns NO Tier Label — the band stays visible
-        tier = (
-            TIER_HIGH
-            if applied and band == BAND_HIGH
-            else (TIER_MED if applied and band == BAND_MED else None)
-        )
+        tier = tier_for_band(band, present=is_present)
         decisions.append(
             TierDecision(
                 label=label,

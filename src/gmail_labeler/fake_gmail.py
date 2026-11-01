@@ -148,7 +148,11 @@ class FakeGmailClient:
     def list_labels(self) -> list[LabelInfo]:
         self.calls.append("list_labels")
         self._maybe_fail("list_labels")
-        return self.labels_list
+        # a COPY (F3): the REST adapter builds fresh objects per call;
+        # handing out the live list let a caller corrupt the fake's
+        # mailbox behind its back (the ctor aliasing trap, other
+        # direction — #25's exact-call tests ride this fake)
+        return list(self.labels_list)
 
     def list_filters(self) -> list[FilterInfo]:
         self.calls.append("list_filters")
@@ -286,8 +290,10 @@ class FakeGmailClient:
         """Get-or-create a USER label by exact name (idempotent when
         present — exact-case match, no create recorded). A System
         Label name-sake (casefolded) is REFUSED, named (the REST
-        mirror, F1/F2). The fake performs the
-        same WIRE calls as the adapter — list_labels first (recorded in
+        mirror, F1/F2) — unless a USER label of exactly that name
+        already exists: it is used as-is (the refusal guards minting
+        only). The fake performs the same WIRE calls as the adapter —
+        list_labels first (recorded in
         the call log; a READ, so the shadow zero-write pin is
         unaffected), create only when the name is absent — so #25's
         exact-call tests read one sequence, not two. (The

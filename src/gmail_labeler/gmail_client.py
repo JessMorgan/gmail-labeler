@@ -332,10 +332,10 @@ class GmailRestClient:
         label is always reused): NO create call is made. A System Label
         whose name casefold-matches the requested name is REFUSED,
         named (F1/F2, pass 2): minting a USER label named like a System
-        Label would make the tier
-        visually indistinguishable from system state, and the plan's id
-        screen cannot catch a fresh Label_* id — the operator must
-        rename [labels]. A concurrent create (another client won the
+        Label would make the tier visually indistinguishable from
+        system state, and the plan's id screen cannot catch a fresh
+        Label_* id — the operator must rename [labels]. A concurrent
+        create (another client won the
         name between our list and our create; Gmail answers 409) is
         self-healed: re-list ONCE and adopt the winner's id — if the
         name is STILL not ours to see, the original refusal stands (no

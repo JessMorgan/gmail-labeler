@@ -7,7 +7,7 @@ import pytest
 
 from gmail_labeler.corpus_record import CorpusRecord, body_hash
 from gmail_labeler.corpus_store import CorpusStore
-from gmail_labeler.export import export_corpus
+from gmail_labeler.export import DEFAULT_QUERY, export_corpus
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import classify_status
@@ -116,6 +116,76 @@ def test_forged_future_date_header_cannot_shift_provenance(tmp_path: Path) -> No
     rec = next(iter(store.iter_records()))
     assert rec.date.isoformat().startswith("2025-10-30")  # server date kept
     assert rec.date_provenance == "internal_date"
+
+
+def test_export_scope_pins_both_layers(tmp_path: Path) -> None:
+    # Two layers (maintainer decision 2026-11-01, ticket #17):
+    # QUERY layer — documented tokens only: -in:draft is Google-
+    # documented; NO documented chat token exists (is:chat retired;
+    # -in:chat undocumented + word-degradation hazard), so chat is NOT in
+    # the query. Pinned through the FakeGmailClient's recorded request
+    # params as an EXACT token list (a -in:drafts/-in:chats plural
+    # variant would silently word-degrade), with every page carrying the
+    # same scope.
+    # INGEST layer — raw-wire DRAFT/CHAT labelIds rejection, the
+    # load-bearing layer (see test_ingest_rejects_draft_and_chat_label_ids).
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("A")),
+            FakeMessage(id="bbb", eml=_eml("B")),
+        ],
+        page_size=1,  # two pages: EVERY page must carry the same scope
+    )
+    export_corpus(fake, store_at(tmp_path), id_to_name=NAMES)
+    list_calls = [c for c in fake.calls if c.startswith("list_messages")]
+    assert len(list_calls) == 2  # the two-page claim is self-verifying
+    queries = {c.removeprefix("list_messages:").rsplit(":", 1)[0] for c in list_calls}
+    assert queries == {DEFAULT_QUERY}  # every page carries the same scope
+    assert DEFAULT_QUERY.split() == [
+        "in:anywhere",
+        "-in:spam",
+        "-in:trash",
+        "-in:draft",
+    ]
+
+
+def test_ingest_rejects_draft_and_chat_label_ids(tmp_path: Path) -> None:
+    # ingest layer (load-bearing): RAW wire labelIds exact-id rejection,
+    # BEFORE labels.py normalization strips System Labels from the record
+    # vocabulary. Skipped messages are COUNTED (no silent vanish), never
+    # stored, and are not failures.
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("D"), label_ids=("INBOX", "DRAFT")),
+            FakeMessage(id="bbb", eml=_eml("C"), label_ids=("CHAT",)),
+            FakeMessage(id="ccc", eml=_eml("Ok"), label_ids=("INBOX",)),
+        ]
+    )
+    store = store_at(tmp_path)
+    stats = export_corpus(fake, store, id_to_name=NAMES)
+    assert [r.id for r in store.iter_records()] == ["ccc"]
+    assert stats.skipped_draft_chat == 2
+    assert stats.written == 1
+    assert not stats.failed  # a policy skip is a decision, not a defect
+
+
+def test_ingest_rejection_is_id_exact_not_name_match(tmp_path: Path) -> None:
+    # a USER label named "chat" (id "L3") and a path "Chat/Work" (id "L4")
+    # must NOT be skipped: the check is exact on the raw wire id — never
+    # name-matched, never path-matched
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("U1"), label_ids=("L3",)),
+            FakeMessage(id="bbb", eml=_eml("U2"), label_ids=("L4",)),
+        ]
+    )
+    store = store_at(tmp_path)
+    stats = export_corpus(fake, store, id_to_name={"L3": "chat", "L4": "Chat/Work"})
+    assert stats.skipped_draft_chat == 0
+    assert stats.written == 2
+    records = {r.id: r for r in store.iter_records()}
+    assert records["aaa"].labels == ("chat",)
+    assert records["bbb"].labels == ("Chat/Work",)
 
 
 def test_export_resume_skips_present(tmp_path: Path) -> None:

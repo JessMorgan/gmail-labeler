@@ -115,6 +115,32 @@ def test_dataset_export_writes_and_reports(
     assert sidecar[0]["criteria"] == {"from": "shipper@x.com"}
 
 
+def test_export_stats_echo_includes_skipped_draft_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # user-visible stats line: the ingest policy-skip count must not
+    # regress silently (deepseek nit)
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    eml = b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb"
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=eml, label_ids=("INBOX",)),
+            FakeMessage(id="bbb", eml=eml, label_ids=("DRAFT",)),
+        ]
+    )
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    result = runner.invoke(
+        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert (
+        "scanned=2 written=1 skipped_present=0 skipped_draft_chat=1 "
+        "retried=0 failed=0" in result.stdout
+    )
+
+
 def test_dataset_export_incomplete_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -119,7 +119,7 @@ gmail-labeler dataset sync-labels --also-import-gmail  # sync labels, then the f
 gmail-labeler dataset import-gmail --also-sync-labels  # import, then the Label Sync delta
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
-gmail-labeler shadow run              # score the recent Backlog, apply NOTHING (Shadow Pass)
+gmail-labeler shadow run --bands bands.json --graduation graduation.json    # score the recent Backlog, apply NOTHING (Shadow Pass)
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 ```
 

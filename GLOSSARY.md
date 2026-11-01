@@ -96,6 +96,14 @@ split-boundary filtering. The unit the model trains on; the corpus →
 examples transform is one shared pure function.
 _Avoid_: sample, data point
 
+**Split Manifest**:
+The versioned, hashable artifact materializing the temporal train/test
+split: format version, split date, train/test id sets, the label
+vocabulary, the split-boundary trust filter, and a content hash over all
+of it. `train`/`eval` rebuild against it — same records + manifest →
+same examples, no re-split (invariant #7).
+_Avoid_: split config, train/test file
+
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`
 (`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB

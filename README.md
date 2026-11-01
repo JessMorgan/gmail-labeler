@@ -305,10 +305,13 @@ Message bodies never enter the DB, the report, or any log path
 PREVIEW, not an Application: it renders the band tier NAME (the
 configured `[labels] high`/`med`) for would-be rows and attaches no
 labels — the `applied` umbrella is validated at config NOW (stripped,
-distinct from `high`/`med`) and consumed by the write phase later: the
-umbrella + one band-tier composition (and the name→label-id resolution)
-is a WRITE-time concern the daemon will implement in the Application
-phase (#24/#25); GLOSSARY: Application, Tier Label.
+distinct from `high`/`med`) and consumed by the Application write
+composition (ticket #24): `applications.plan_message_write` adds the
+umbrella plus the best band tier to every write, and the daemon/apply
+startup resolves the configured names to Gmail label ids
+(get-or-create, never a System Label name-sake); the live write itself
+lands with the daemon / `apply` CLI (#25/#26); GLOSSARY: Application,
+Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
 

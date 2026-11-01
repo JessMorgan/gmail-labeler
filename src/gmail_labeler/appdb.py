@@ -6,19 +6,22 @@ table (the Application path's recorded writes — ticket #24; the join
 corrections and ``status`` read later).
 
 UPGRADE STORY (paid #23's recorded debt): ``SCHEMA_VERSION`` is 2. The
-v1→v2 migration is a SINGLE-ROW restamp: opening a live v1 DB (exactly
-``{1}``, no applications table — the state #23 shipped) runs the
-migration INSIDE open(): the version row is UPDATEd to 2 FIRST, then
-create-all-if-missing appends the applications table. The order is the
-crash story: a crash after the UPDATE leaves ``{2}`` without the
-applications table, which the next open heals (create-all-if-missing);
-the reverse order would leave ``{1}`` WITH an applications table — an
-inconsistent state no v1 tool ever wrote, which the gate refuses, named
-(recovery: stamp the row manually or delete the DB, the empty-version
-doctrine). The forward-compat story is the HARD version gate, stated
-honestly: a v1 tool opening the migrated file refuses ``{2} != {1}``
-(our own v2 is the tool that just migrated it — re-opening in-process
-is v2-clean).
+v1→v2 migration is a SINGLE-ROW restamp, and EVERY schema transition —
+fresh create+stamp, v1→v2 restamp+append, self-heal of a missing table —
+runs in ONE explicit transaction (``_apply_schema``; the F1 fix). A
+crash leaves the file fully prior-state or fully new-state, NEVER the
+intermediate: the old executescript-then-stamp order could strand a
+fresh DB empty-version-corrupt and a migration half-restamped, both
+needing hand-recovery. ``executescript`` is banned from the transition
+(it commits any pending transaction first) and python-sqlite3's legacy
+isolation mode does NOT auto-wrap DDL — hence the explicit BEGIN (the
+mode is pinned by test). The tamper guards (``{1}`` WITH an
+applications table; our-shape-but-EMPTY version) stay — unreachable by
+crash now, reachable only by hand-editing — and each refusal message
+names the recovery (manual stamp to the right version, or delete). The
+forward-compat story is the HARD version gate, stated honestly: a v1
+tool opening the migrated file refuses ``{2} != {1}`` (our own v2 is
+the tool that just migrated it — re-opening in-process is v2-clean).
 
 Invariants:
 
@@ -130,40 +133,56 @@ class ShadowRow:
     run_ts: datetime | None = None
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS schema_version (
-    version INTEGER NOT NULL PRIMARY KEY
-);
-CREATE TABLE IF NOT EXISTS shadow_results (
-    run_id TEXT NOT NULL,
-    message_id TEXT NOT NULL,
-    label TEXT NOT NULL,
-    probability REAL NOT NULL,
-    band TEXT,
-    run_ts TEXT NOT NULL,
-    PRIMARY KEY (run_id, message_id, label)
-);
--- The Applications table (ticket #24): one row per applied label of an
--- Application (GLOSSARY: Application). NO PK on (message_id, label): a
--- manually-removed label re-earned later is a NEW Application — the
--- audit history is the operator's. The two indexes serve the
--- corrections/status join (#27) on message_id AND label. The source
--- CHECK is the vocabulary's authority at the DB level; the writer
--- validates the same set in Python (named refusals, not raw CHECK
--- tracebacks). NO BODIES (invariant #5).
-CREATE TABLE IF NOT EXISTS applications (
-    message_id TEXT NOT NULL,
-    label TEXT NOT NULL,
-    label_id TEXT NOT NULL,
-    score REAL NOT NULL,
-    band TEXT NOT NULL,
-    tier TEXT NOT NULL,
-    applied_at TEXT NOT NULL,
-    source TEXT NOT NULL CHECK (source IN ('daemon', 'apply'))
-);
-CREATE INDEX IF NOT EXISTS idx_applications_message_id ON applications(message_id);
-CREATE INDEX IF NOT EXISTS idx_applications_label ON applications(label);
-"""
+# The schema as INDIVIDUAL statements: _apply_schema runs them inside ONE
+# explicit transaction (executescript is banned there — it commits any
+# pending transaction first, which is what made the old transition
+# crash-unsafe). The inline comment lives with the applications DDL.
+_SCHEMA_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS schema_version (
+        version INTEGER NOT NULL PRIMARY KEY
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadow_results (
+        run_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        probability REAL NOT NULL,
+        band TEXT,
+        run_ts TEXT NOT NULL,
+        PRIMARY KEY (run_id, message_id, label)
+    )
+    """,
+    """
+    -- The Applications table (ticket #24): one row per applied label of an
+    -- Application (GLOSSARY: Application). NO PK on (message_id, label): a
+    -- manually-removed label re-earned later is a NEW Application — the
+    -- audit history is the operator's. The two indexes serve the
+    -- corrections/status join (#27) on message_id AND label. The source
+    -- CHECK is the vocabulary's authority at the DB level; the writer
+    -- validates the same set in Python (named refusals, not raw CHECK
+    -- tracebacks). NO BODIES (invariant #5).
+    CREATE TABLE IF NOT EXISTS applications (
+        message_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        label_id TEXT NOT NULL,
+        score REAL NOT NULL,
+        band TEXT NOT NULL,
+        tier TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        source TEXT NOT NULL CHECK (source IN ('daemon', 'apply'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_applications_message_id "
+    "ON applications(message_id)",
+    "CREATE INDEX IF NOT EXISTS idx_applications_label ON applications(label)",
+)
+
+#: The joined script text — kept ONLY for the tamper-state test fixtures
+#: (their executescript is a fixture convenience, never a production
+#: path); the production single source is _SCHEMA_STATEMENTS above.
+_SCHEMA = ";\n".join(_SCHEMA_STATEMENTS) + ";"
 
 
 class AppDB:
@@ -181,9 +200,11 @@ class AppDB:
     # -- lifecycle ------------------------------------------------------
 
     def open(self) -> None:
-        """Connect + create-all-if-missing. A fresh path creates the
-        schema (0600 from creation — the secret-tight discipline, even
-        though the rows are attachable-public); an existing file is
+        """Connect + create-all-if-missing (the schema transition is
+        ONE explicit transaction — module docstring's UPGRADE STORY). A
+        fresh path creates the schema (0600 from creation — the
+        secret-tight discipline, even though the rows are
+        attachable-public); an existing file is
         verified BEFORE any write (the ownership gate: a SQLite file
         that carries foreign tables and NONE of ours is refused, named
         — a foreign DB is not silently adopted; a foreign
@@ -236,40 +257,7 @@ class AppDB:
             # versioned-foreign DB does not gain a shadow_results table
             # pre-refusal). An empty file (no tables) is fresh.
             needs_v1_migration = self._check_ownership()
-            if needs_v1_migration:
-                # the v1→v2 single-row restamp (module docstring's crash
-                # story): UPDATE FIRST — a crash after it leaves {2}
-                # without the applications table, which the next open
-                # HEALS via create-all-if-missing; the reverse order
-                # would leave {1} WITH applications — an inconsistent
-                # state no v1 tool ever wrote, which the gate refuses.
-                with self._conn:
-                    cur = self._conn.execute(
-                        "UPDATE schema_version SET version = ? WHERE version = 1",
-                        (SCHEMA_VERSION,),
-                    )
-                    if cur.rowcount != 1:
-                        # the gate saw exactly {1}; a different row count
-                        # mid-migration is a concurrent tamper, named —
-                        # the with-block rolls the UPDATE back
-                        raise AppDBError(
-                            f"state DB v1→v2 restamp touched {cur.rowcount} "
-                            f"rows, expected 1 (single-row model) — "
-                            f"refusing: {self.path}"
-                        )
-            self._conn.executescript(_SCHEMA)
-            # a fresh DB (no version row) gets stamped; an existing
-            # ours-DB is NOT re-stamped (the version is already
-            # {SCHEMA_VERSION} — verified in the ownership gate above)
-            versions = self._conn.execute(
-                "SELECT DISTINCT version FROM schema_version"
-            ).fetchall()
-            if not versions:
-                self._conn.execute(
-                    "INSERT INTO schema_version (version) VALUES (?)",
-                    (SCHEMA_VERSION,),
-                )
-                self._conn.commit()
+            self._apply_schema(needs_v1_migration)
         except (sqlite3.DatabaseError, AppDBError) as e:
             # BOTH the I/O failure and the ownership/version refusal
             # close the connection (open()'s lifecycle contract — a
@@ -281,6 +269,65 @@ class AppDB:
             raise AppDBError(
                 f"state DB cannot be opened (I/O failure): {self.path}: {e}"
             ) from e
+
+    def _apply_schema(self, needs_v1_migration: bool) -> None:
+        """create-all-if-missing + the version stamp / v1→v2 restamp in
+        ONE explicit transaction (the F1 atomicity fix): a crash leaves
+        the file fully prior-state (SQLite journal recovery) or fully
+        new-state — never the intermediate the old executescript-then-
+        stamp order exposed (fresh DBs stranded empty-version-corrupt,
+        migrations stranded half-restamped). Legacy isolation mode does
+        NOT auto-wrap DDL in the implicit transaction and executescript
+        commits any pending transaction first — hence the explicit
+        BEGIN/COMMIT over individual execute() calls (both the mode and
+        the ban are pinned by test). The rowcount guard keeps the
+        single-row model honest INSIDE the transaction: a disagreement
+        rolls the whole transition back."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            self._conn.execute("BEGIN")
+            for statement in _SCHEMA_STATEMENTS:
+                self._conn.execute(statement)
+            if needs_v1_migration:
+                cur = self._conn.execute(
+                    "UPDATE schema_version SET version = ? WHERE version = 1",
+                    (SCHEMA_VERSION,),
+                )
+                if cur.rowcount != 1:
+                    # the gate saw exactly {1}; a different row count is
+                    # a concurrent tamper — the ROLLBACK below undoes
+                    # the whole transition, the file stays clean v1
+                    raise AppDBError(
+                        f"state DB v1→v2 restamp touched {cur.rowcount} "
+                        f"rows, expected 1 (single-row model) — "
+                        f"refusing: {self.path}"
+                    )
+            else:
+                # a fresh DB (no version row) gets stamped; an existing
+                # ours-DB is NOT re-stamped (the version is already
+                # {SCHEMA_VERSION} — verified in the ownership gate)
+                versions = self._conn.execute(
+                    "SELECT DISTINCT version FROM schema_version"
+                ).fetchall()
+                if not versions:
+                    self._conn.execute(
+                        "INSERT INTO schema_version (version) VALUES (?)",
+                        (SCHEMA_VERSION,),
+                    )
+            self._conn.execute("COMMIT")
+        except BaseException:
+            # the guarantee is the UNCOMMITTED transaction: a dead
+            # process recovers via the journal, a live one via the
+            # connection close in open()'s handler (the crash tests pin
+            # the FILE state, which is prior-state either way — mutant
+            # probe: suppressing this ROLLBACK alone stays green because
+            # the close carries it). The explicit ROLLBACK is hygiene
+            # for any future caller that survives the failure with the
+            # connection open
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.execute("ROLLBACK")
+            raise
 
     def _check_ownership(self) -> bool:
         """Verify the file is ours (shape + version) BEFORE any write.
@@ -374,14 +421,16 @@ class AppDB:
                 # a raw TypeError out of open() (the shape check does not
                 # constrain column types)
                 if not versions:
-                    # our-shape but EMPTY (no version row) — corrupt, named.
-                    # This state is also REACHABLE by a crash between
-                    # executescript (tables created) and the version stamp
-                    # (row never inserted). Re-opening KEEPS refusing —
-                    # the ownership gate raises HERE, before the re-stamp
-                    # branch in open() — and recovery is NOT re-running:
-                    # it is DELETE the state DB file (a fresh open then
-                    # re-creates + stamps) or stamp the row manually.
+                    # our-shape but EMPTY (no version row) — corrupt,
+                    # named. UNREACHABLE by crash since the atomic
+                    # transition (F1 — the stamp and the DDL commit as
+                    # one); reachable only by hand-editing (or the
+                    # pre-F1 crash state a live file may still carry).
+                    # Re-opening KEEPS refusing — the ownership gate
+                    # raises HERE, before _apply_schema — and the
+                    # refusal message names the recovery: stamp the row
+                    # manually or DELETE the state DB file (a fresh open
+                    # then re-creates + stamps).
                     # Deleting discards recorded shadow runs — none can
                     # exist in the crash state (the run that crashed
                     # never committed), though the branch is also reached
@@ -392,7 +441,10 @@ class AppDB:
                     # (3x refusal + both recoveries).
                     raise AppDBError(
                         f"state DB schema_version is empty (our shape, no "
-                        f"version row) — corrupt: {self.path}"
+                        f"version row) — corrupt: {self.path} — recovery: "
+                        f"stamp the row manually (INSERT version "
+                        f"{SCHEMA_VERSION}) or delete the file (recorded "
+                        f"runs are lost)"
                     )
                 if (
                     versions == {1}
@@ -406,14 +458,17 @@ class AppDB:
                     needs_v1_migration = True
                 elif versions == {1} and SCHEMA_VERSION == 2:
                     # {1} WITH an applications table is inconsistent: no
-                    # v1 tool ever wrote one. The safe crash direction
-                    # ({2} without the table) self-heals; this direction
-                    # refuses — recovery is stamping the row manually or
-                    # deleting the DB (the empty-version doctrine).
+                    # v1 tool ever wrote one, and no crash reaches it
+                    # since the atomic transition (F1) — this is a
+                    # TAMPER guard. The refusal message names the
+                    # recovery (manual stamp to 2, or delete).
                     raise AppDBError(
                         f"state DB schema_version [1] is stamped v1 but "
                         f"carries an applications table (a v1 tool never "
-                        f"wrote one) — inconsistent, refusing: {self.path}"
+                        f"wrote one) — inconsistent, refusing: {self.path} "
+                        f"— recovery: UPDATE the row to {SCHEMA_VERSION} "
+                        f"manually or delete the file (shadow history is "
+                        f"lost)"
                     )
                 else:
                     # a foreign version ({99}), a polluted set ({1,99}),
@@ -440,11 +495,14 @@ class AppDB:
             # version row without its tables, so this admits only
             # hand-made or hand-emptied files — the same surface #23
             # accepted, now including the restamp. The branch is
-            # UNREACHABLE for any self-produced state (the schema
-            # script creates both tables before the stamp), so
+            # UNREACHABLE for any self-produced state (the atomic
+            # transition creates the tables and the stamp together), so
             # requiring one ours-shaped table would change no
             # legitimate file — but that tightening is a #23 decision
-            # change, not this ticket's scope.
+            # change, not this ticket's scope. The atomic transition
+            # did NOT narrow this posture (F1 note, per the manager
+            # ruling): a stamp-only file is still adopted and written
+            # to (the transition appends the missing tables).
             return needs_v1_migration
         if tables:
             raise AppDBError(

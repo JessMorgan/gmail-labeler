@@ -24,9 +24,12 @@ does not ship releases yet.
     `daemon|apply`; no bodies; no PK — a re-earned label is NEW
     Application history; indexes on message_id AND label for the
     corrections/status join). The v1→v2 migration is a single-row
-    restamp: UPDATE the version row first, then create-all-if-missing
-    — both crash directions pinned (self-healing vs. named refusal);
-    the hard version gate stays the forward-compat story.
+    restamp, and EVERY schema transition (fresh create+stamp, the
+    migration, self-heals) runs in ONE explicit transaction — a crash
+    leaves the file fully prior-state or fully new-state, never the
+    intermediate; the tamper guards ({1}+applications, empty-version)
+    refuse named with the recovery in the message; the hard version
+    gate stays the forward-compat story.
   - `applications.py` (pure): `plan_message_write` — the fail-safe
     composition on the tiers core (imported, never re-derived): adds =
     would-apply Managed Label ids + umbrella + best band tier (sorted
@@ -99,11 +102,13 @@ does not ship releases yet.
     refuse-never-drop); `tiers.py` keeps the DEFAULT spellings as the
     pure-core constants. The `applied` umbrella is
     validated at config NOW (stripped, distinct from `high`/`med`) and
-    consumed by the write phase later — the name→Gmail-label-id
-    resolution and the umbrella application are a WRITE-time concern the
-    daemon WILL implement in the Application phase (#24/#25) — unshipped
-    here (the report attaches no labels; it renders the band tier name
-    only).
+    CONSUMED by the Application write composition (ticket #24):
+    `applications.plan_message_write` adds the umbrella plus the best
+    band tier to every write, and the daemon/apply startup resolves the
+    configured names to Gmail label ids (get-or-create, never a System
+    Label name-sake); the live write itself lands with the daemon /
+    `apply` CLI (#25/#26) — the report attaches no labels (it renders
+    the band tier name only).
   - A `--db PATH` flag is a usage-level override of `[store] db_path`
     (the opt-in live demo redirects the state DB to a tmp path).
   - The Backlog query is `in:inbox after:<epoch-seconds>` (the EPOCH

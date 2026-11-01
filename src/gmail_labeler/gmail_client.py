@@ -117,9 +117,19 @@ class GmailClient(Protocol):
         self, start_history_id: int, page_token: str | None = None
     ) -> HistoryPage: ...
 
-    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None: ...
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None:
+        """Add labels to one message — the ONLY label write the product
+        performs. The wire body carries addLabelIds ONLY (invariant #1:
+        structurally incapable of carrying a removal); the caller's
+        no-call-on-empty rule keeps an empty plan off the wire."""
+        ...
 
-    def ensure_label(self, name: str) -> str: ...
+    def ensure_label(self, name: str) -> str:
+        """Get-or-create a USER label by exact name (daemon/apply
+        startup only — never the Shadow Pass). Idempotent when present;
+        a System Label name collision is refused, named; a concurrent-
+        create 409 self-heals by re-listing once."""
+        ...
 
 
 class GmailRestClient:
@@ -290,7 +300,17 @@ class GmailRestClient:
         #24/#26) never calls this with an empty list — an empty plan is
         no API call at all (pinned at the plan level, not here). Wire
         errors surface through the SAME taxonomy as every read (the
-        ``_call`` path: transient blips retry, auth is human-gated)."""
+        ``_call`` path: transient blips retry, auth is human-gated).
+
+        ``Sequence[str]`` admits a bare str at the TYPE level (a str is
+        a Sequence of its characters — the wire would carry one-char
+        label ids), so the guard is RUNTIME: a str (or bytes) is refused
+        as a caller bug before anything reaches the transport."""
+        if isinstance(add_label_ids, (str, bytes)):
+            raise ValueError(
+                "apply_labels: add_label_ids must be a sequence of label "
+                f"ids, not a bare string (got {add_label_ids!r})"
+            )
         body: dict[str, object] = {"addLabelIds": list(add_label_ids)}
         self._call(
             self._svc().users().messages().modify(userId="me", id=message_id, body=body)
@@ -302,15 +322,36 @@ class GmailRestClient:
         names to Gmail label ids ONCE — pure thereafter; never called
         from the Shadow Pass, which is zero-write). Idempotent when the
         name is present: NO create call is made. A System Label that
-        name-sakes the requested name is NOT a hit — the match is
-        user-type only, so a tier name can never resolve its write at a
-        System Label id (the never-target companion of invariant #1);
-        Gmail then either creates the user label or rejects the name,
-        loudly."""
-        for label in self.list_labels():
-            if label.name == name and label.type == "user":
-                return label.id
-        data = self._call(self._svc().labels().create(userId="me", body={"name": name}))
+        name-sakes the requested name is REFUSED, named (F1): minting a
+        USER label named like a System Label would make the tier
+        visually indistinguishable from system state, and the plan's id
+        screen cannot catch a fresh Label_* id — the operator must
+        rename [labels]. A concurrent create (another client won the
+        name between our list and our create; Gmail answers 409) is
+        self-healed: re-list ONCE and adopt the winner's id — if the
+        name is STILL not ours to see, the original refusal stands (no
+        retry loop)."""
+        labels = self.list_labels()
+        for label in labels:
+            if label.name == name:
+                if label.type == "user":
+                    return label.id
+                raise ValueError(
+                    f"ensure_label: {name!r} collides with a System Label "
+                    "name in the mailbox — rename [labels] applied/high/med "
+                    "(System Labels are never write targets)"
+                )
+        try:
+            data = self._call(
+                self._svc().labels().create(userId="me", body={"name": name})
+            )
+        except GmailPermanentError as e:
+            if e.status != 409:
+                raise
+            for label in self.list_labels():  # the ONE re-list
+                if label.name == name and label.type == "user":
+                    return label.id
+            raise  # still absent after the race: the original refusal
         return _s(data, "id")
 
 

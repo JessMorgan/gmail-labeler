@@ -294,7 +294,10 @@ def test_shadow_report_usage_empty_db_exits_2(
     _prepare(tmp_path, monkeypatch)
     report, _fake = _run_report(tmp_path, "--db", "", monkeypatch=monkeypatch)
     assert report.exit_code == 2
-    assert "--db PATH must be non-empty" in report.stderr
+    # exact full message: a loose substring survived the reviewer's
+    # probe that swapped the caller label to "shadow run" (the
+    # exact-string precedent, c4d6076)
+    assert "shadow report failed: --db PATH must be non-empty" in report.stderr
 
 
 def test_shadow_report_auth_gate_exits_4(

@@ -439,9 +439,12 @@ class AppDB:
             # a {1} stamp also restamps). Our tool never produces a
             # version row without its tables, so this admits only
             # hand-made or hand-emptied files — the same surface #23
-            # accepted, now including the restamp. Tightening it
-            # (requiring at least one ours-shaped table) is a #23
-            # decision change, not this ticket
+            # accepted, now including the restamp. The branch is
+            # UNREACHABLE for any self-produced state (the schema
+            # script creates both tables before the stamp), so
+            # requiring one ours-shaped table would change no
+            # legitimate file — but that tightening is a #23 decision
+            # change, not this ticket's scope.
             return needs_v1_migration
         if tables:
             raise AppDBError(

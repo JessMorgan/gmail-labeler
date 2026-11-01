@@ -8,6 +8,91 @@ does not ship releases yet.
 
 ### Added
 
+- Shadow Pass (ticket #23): the Phase 1 exit — `shadow run` scores the
+  recent Backlog through the sidecar-validated checkpoint, the
+  Graduation Table, and the Threshold Bands and APPLIES NOTHING;
+  `shadow report` diffs the stored would-apply verdicts against the
+  mailbox's ACTUAL labels (the human go/no-go review before anything
+  goes live, ADR-0005).
+  - `tiers.py` (pure core, pyright strict): the SINGLE would-apply
+    decision core. Tier Label constants pinned to the GLOSSARY
+    spellings (`ai-applied` umbrella, `ai-high`, `ai-med`); band
+    verdicts `score >= high -> high`, `>= med -> med` (inclusive `>=`
+    per #21's threshold doctrine); graduated labels only (a label
+    without a graduated entry is never proposed); skip-present (an
+    already-present label is not proposed and earns NO Tier Label —
+    invariant #2's posture, defined here so #24/#26 reuse it); System
+    Labels never targeted (refused, named); deterministic total order.
+    `best_tier` derives the per-message Tier Label from the applied
+    decisions.
+  - `[store] db_path` config: a PLAIN path field (no label-key surface
+    — the heavy [bands]/[graduation] per-label doctrine does not
+    apply), relative anchored to the config dir (the corpus/model dir
+    rule), default `<config dir>/gmail-labeler.db`.
+  - `appdb.py`: the SQLite state DB adapter — create-all-if-missing,
+    `schema_version` row, the `shadow_results` table (run id, message
+    id, label, probability, band, run_ts — NO bodies, invariant #5),
+    transaction-per-run (a crash mid-run leaves no half rows), the #24
+    applications-table seam (same file; the v1->v2 restamp/migration is
+    UNRESOLVED pending #24's schema design — the HARD version gate is
+    the stopgap that refuses a foreign/future schema_version at read).
+  - `shadow run` CLI: auth gate (exit 4) -> sidecar-validated
+    checkpoint load (the eval `ExpectedIdentity` pattern) ->
+    `verify_bands` AND `verify_graduation` against the run's identity
+    (the FIRST real consumers of both verify_* helpers — the artifact
+    identity gates become real; refusal exit 5 naming fields;
+    unreadable-vs-unparseable-vs-absent cause naming per #22's
+    doctrine) -> Backlog fetch (`list_messages` pageToken loop honoring
+    `--limit` across pages; `q = in:inbox after:<epoch-seconds>` —
+    `--since` ISO date -> UTC midnight of that day -> epoch, default
+    now - 90d with the time kept, `--query` escape hatch) -> `get_message` per
+    id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
+    seam) -> `tiers.would_apply` -> store. Degraded (body fetch
+    failure) = per-message SKIP + stderr warning + count (the
+    documented posture choice vs eval's refusal — shadow is a read-only
+    survey). Summary to stderr, not stdout; `--json` one parseable
+    object (its `cutoff_epoch`/`cutoff` window fields are present except under
+    the `--query` override, which replaces the window entirely — no
+    phantom-window fields).
+  - `shadow report` CLI: reads the run's rows from the state DB (latest
+    run by default, `--run` to pick), re-fetches each message's ACTUAL
+    labels via the read path, and renders a deterministic per-message
+    diff (message id + label + score + tier ONLY — subjects OUT, bodies
+    out by construction, invariant #5): ADDED / ALREADY-PRESENT
+    (skip-present visible) / NOT-APPLIED outcomes + a per-label summary
+    with the would-be tier mix. `--json` one parseable object.
+  - Zero-Gmail-writes AC: `FakeGmailClient` call-recording pin asserts
+    the recorded calls are a subset of the read surface
+    (list_messages, get_message, list_labels, list_filters) — no write
+    method of any shape (the Protocol has none in this ticket; the
+    write surface lands #24/#25).
+  - The `[labels]` `high`/`med` config drives the report's tier names
+    (a custom spelling is honored, not silently ignored —
+    refuse-never-drop); `tiers.py` keeps the DEFAULT spellings as the
+    pure-core constants. The `applied` umbrella is
+    validated at config NOW (stripped, distinct from `high`/`med`) and
+    consumed by the write phase later — the name→Gmail-label-id
+    resolution and the umbrella application are a WRITE-time concern the
+    daemon WILL implement in the Application phase (#24/#25) — unshipped
+    here (the report attaches no labels; it renders the band tier name
+    only).
+  - A `--db PATH` flag is a usage-level override of `[store] db_path`
+    (the opt-in live demo redirects the state DB to a tmp path).
+  - The Backlog query is `in:inbox after:<epoch-seconds>` (the EPOCH
+    form — unambiguous; calendar dates in API queries are interpreted
+    as MIDNIGHT PST, and `newer_than:` is relative-duration only);
+    `--since` → UTC midnight of that date → epoch; default → UTC now
+    minus 90 days.
+  - Exit-code contract at tip: 2 usage (empty/whitespace `--bands`/
+    `--graduation`/`--db`, empty `--query`, bad `--since`, `--limit
+    <= 0`, empty `--run`, the state DB path — `--db PATH` or `[store]
+    db_path` — inside the checkpoint dir or corpus store, named by its
+    source — containment); 4 auth; 5 operation
+    (checkpoint/bands/graduation identity refusal, would-apply
+    refusal, no-verdicts run, no-evidence report refusal, state DB
+    ownership/corrupt/foreign-version refusal, DB failure, transport
+    failure). Bodies-absent pinned across DB rows + report
+    stdout/stderr + caplog.
 - Per-label threshold calibration (ticket #21): the pure core
   (`thresholds.py`, pyright strict) turns the eval metric table into
   per-label Threshold Bands — "confident" becomes a measured per-label

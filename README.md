@@ -5,14 +5,17 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 confident, reviewably when it isn't.
 
 > **Status: pre-alpha — Phase 0 (corpus acquisition) and Phase 1's
-> `train` and `eval` have landed.** The architecture decisions, domain
-> language, and development standards are committed; the CLI installs
-> (`uv sync`, then `gmail-labeler --help`) with a working OAuth flow,
+> `train`, `eval`, and the Shadow Pass (`shadow run` / `shadow report`)
+> have landed.** The architecture decisions, domain language, and
+> development standards are committed; the CLI installs (`uv sync`,
+> then `gmail-labeler --help`) with a working OAuth flow,
 > `dataset export` / `import-gyb` / `analyze`, `train` (fine-tune on
-> your own machine, checkpoint + identity sidecar), and `eval`
-> (per-label precision/recall on the temporal test split). Graduation,
-> the shadow pass, and the daemon arrive in later phases — follow the
-> phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> your own machine, checkpoint + identity sidecar), `eval` (per-label
+> precision/recall on the temporal test split), and the Shadow Pass —
+> `shadow run` scores the recent Backlog and applies nothing, and
+> `shadow report` diffs the verdicts against your actual labels (the
+> Phase 1 exit review). The daemon arrives in a later phase — follow
+> the phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -86,6 +89,8 @@ gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
+gmail-labeler shadow run --bands bands.json --graduation graduation.json    # score the recent Backlog, apply NOTHING (Shadow Pass)
+gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -236,15 +241,106 @@ file lands before the serving-gate acts in TEXT mode and at the
 payload emit (after the acts) in `--json` mode — in both, a run that
 later refuses still replaces a previous report file.
 `train`/`eval` remain the only recomputers, and
-only the confirm path writes the table.
+only the confirm path writes the table. The Shadow Pass (GLOSSARY:
+Shadow Pass) is the Phase 1 exit path: `shadow run` scores the recent
+Backlog through the sidecar-validated checkpoint, the Graduation
+Table, and the Threshold Bands and APPLIES NOTHING — the verdicts are
+recorded in the state DB (`[store] db_path`) as one transaction per
+run (a crash mid-run leaves no half rows) — and the HUMAN review of
+`shadow report` IS the Phase 1 exit (choosing the graduates,
+ADR-0005). `shadow run` requires `--bands` and
+`--graduation` (the calibrated Bands Artifact and the Graduation
+Table — both are verified against the run's identity, the FIRST real
+consumers of the `verify_bands`/`verify_graduation` gates; a
+foreign-bound artifact refuses with exit 5, naming every disagreeing
+field). The Backlog query defaults to `in:inbox after:<epoch-seconds>`
+(the EPOCH form — calendar dates in API queries are interpreted as
+MIDNIGHT PST; `--since` ISO date → UTC midnight of that date → epoch —
+the named day is INCLUDED (mail from that day onward); default 90 days
+ago with the time kept (now − 90d, not midnight); the default window
+includes recent arrivals as
+well as the older history — GLOSSARY: Backlog; `--limit` max messages,
+default 100; `--query` replaces the whole backlog window — the default
+and `--since` alike; `--db PATH`
+overrides `[store] db_path` — `~` is expanded, and a relative `--db`
+anchors to the CWD (like `--bands` / `--graduation`), unlike the
+config's `[store] db_path`, which anchors to the config dir). A message
+whose body cannot be fetched is skipped (per-message fail-safe:
+warning + count, the run continues) — the documented posture choice
+vs `eval`'s whole-run refusal: shadow is a read-only survey. A run
+that produces no verdicts (the Graduation Table graduated no labels)
+refuses with exit 5 ("no verdicts to record" — nothing is recorded, so
+a `shadow report` would say "no runs recorded"), and a would-apply
+refusal (a lying score/band, a graduated System Label, a missing bands
+entry) refuses with exit 5 ("would-apply refused"). Refusals up front
+(exit 2, before any work): an empty `--bands` / `--graduation` /
+`--query` / `--db`, a non-ISO `--since`, `--limit <= 0`, and the state
+DB path — `--db PATH` or `[store] db_path` — inside the checkpoint dir
+or the corpus store (by resolved path, named by its source — the state
+DB must not live beside identity files). The summary goes to stderr;
+`--json` emits one parseable object (its `cutoff_epoch`/`cutoff` window
+fields are present except under the `--query` override, which replaces the
+window entirely). `shadow
+report` diffs a run's stored verdicts against the mailbox's ACTUAL
+labels (re-fetched via the read path — the labels may have changed
+since the run): a deterministic per-message diff of message id + label
++ score + tier ONLY (subjects out, bodies out by construction —
+invariant #5), with ADDED / ALREADY-PRESENT (skip-present visible) /
+NOT-APPLIED outcomes and a per-label summary carrying the would-be
+tier mix. `--run` picks a specific run (default: the latest); `--db
+PATH` overrides `[store] db_path` the same way as for `shadow run`
+(`~` expanded, a relative `--db` anchors to the CWD). Refusals up front
+(exit 2, before any work): an empty `--run` / `--db`, and the state DB
+path — `--db PATH` or `[store] db_path` — inside the checkpoint dir or
+the corpus store (by resolved path, named by its source).
+Config error -> exit 4; a no-DB / unknown-run / transport failure ->
+exit 5.
+Message bodies never enter the DB, the report, or any log path
+(invariant #5) — the DB is publicly attachable. The report is a
+PREVIEW, not an Application: it renders the band tier NAME (the
+configured `[labels] high`/`med`) for would-be rows and attaches no
+labels — the `applied` umbrella is validated at config NOW (stripped,
+distinct from `high`/`med`) and consumed by the write phase later: the
+umbrella + one band-tier composition (and the name→label-id resolution)
+is a WRITE-time concern the daemon will implement in the Application
+phase (#24/#25); GLOSSARY: Application, Tier Label.
+
+### Reviewing the shadow report (Phase 1 exit demo)
+
+The Phase 1 exit is a human reviewing the shadow report and choosing
+the graduates (ADR-0005). The offline spine is `FakeModel` +
+`FakeGmailClient` (CI, invariant #9); the opt-in REAL-checkpoint run
+is the demo, behind the `live` + `smoke` markers (never run in CI —
+it needs the `train` extra for the real encoder, a signed-in Gmail
+account, a corpus, and the human-step artifacts below). The test is
+READ-ONLY against Gmail (no write), costs API quota, writes ONLY a
+tmp-redirected state DB (`--db`), and SKIPS (with a reason) when the
+config / corpus / checkpoint / `bands.json` / `graduation.json` are
+absent — it never trains and never confirms a Graduation Table
+(those stay the human actions below):
+
+```sh
+uv run pytest -m "live and smoke" tests/test_shadow_cli.py::test_live_shadow_run_real_checkpoint
+```
+
+By hand, on a signed-in install (the human steps — a test never runs
+these):
+
+```sh
+gmail-labeler train --split-date YYYY-MM-DD --force
+gmail-labeler eval --bands bands.json
+gmail-labeler eval --graduation graduation.json --confirm-graduation
+gmail-labeler shadow run --bands bands.json --graduation graduation.json --limit 10
+gmail-labeler shadow report
+```
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`shadow`, `apply`, `daemon`, and `status` are frozen command names
-that arrive in later phases (not wired yet) — until they are, they
-exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
-commands and currently unreachable. Scripts can branch on 0/2/4/5
-today; a `1` means an unhandled crash — that's a bug, please report it.
+`apply`, `daemon`, and `status` are frozen command names that arrive
+in later phases (not wired yet) — until they are, they exit `2` as
+unknown commands; `3` is reserved for wired-but-stubbed commands and
+currently unreachable. Scripts can branch on 0/2/4/5 today; a `1`
+means an unhandled crash — that's a bug, please report it.
 
 ## Docs
 

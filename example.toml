@@ -62,6 +62,14 @@ min_precision = 0.9
 # min_examples = 20
 # min_precision = 0.95
 
+[store]
+# State DB path (ticket #23): the SQLite file holding the shadow
+# results (and, with the daemon phase, the applications table). It
+# carries ids, probabilities, labels, and run timestamps ONLY — never
+# bodies (invariant #5), so it is publicly attachable. Relative paths
+# resolve against THIS FILE's directory.
+# db_path = "./gmail-labeler.db"
+
 [model]
 # Encoder identifier — the Checkpoint Sidecar's encoder_id field.
 encoder = "deberta-v3-base"

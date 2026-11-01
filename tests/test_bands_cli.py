@@ -165,11 +165,11 @@ def _run_eval(
 # ---- the golden bands (hand-computed, independent of the code) ----
 #
 # Money/Bills precision (positives i=7: 0.8, i=9: 0.6, i=11: 0.4):
-#   0.1: 3/6 = 0.5   0.2: 3/5 = 0.6   0.3: 3/4 = 0.75   0.4: 0.75
+#   0.1: 3/6 = 0.5   0.2: 3/5 = 0.6   0.3: 3/4 = 0.75   0.4: 3/3 = 1.0
 #   0.5: 2/2 = 1.0   0.6: 1.0   0.7: 1.0   0.8: 1.0   0.9: UNDEFINED
 # Shipping precision (positives i=6: 0.9, i=8: 0.7, i=10: 0.4):
-#   0.1: 0.5   0.2: 0.6   0.3: 0.75   0.4: 0.75   0.5: 1.0   0.6: 1.0
-#   0.7: 1.0   0.8: 1.0   0.9: 1.0
+#   0.1: 0.5   0.2: 0.6   0.3: 0.75   0.4: 3/3 = 1.0   0.5: 1.0
+#   0.6: 1.0   0.7: 1.0   0.8: 1.0   0.9: 1.0
 #
 # Defaults (high 0.9 / med 0.7):
 #   Money/Bills: high = 0.8 (0.9 undefined), med = 0.7 (highest < 0.8
@@ -387,6 +387,125 @@ def test_eval_bands_same_path_as_out_is_a_usage_error(
     assert not same.exists()
 
 
+def test_eval_bands_same_path_as_sidecar_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a destructive collision: the artifact write would destroy the
+    # checkpoint's identity sidecar (exit 2 up front, no corpus work)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    sidecar = tmp_path / "ckpt" / "sidecar.json"
+    assert sidecar.is_file()
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(sidecar), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "checkpoint sidecar" in result.stderr
+    # the sidecar is intact (still the checkpoint's identity, not an
+    # artifact)
+    sidecar_json = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "vocabulary_hash" in sidecar_json
+
+
+def test_eval_bands_same_path_as_config_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a destructive collision: the artifact write would destroy the
+    # config file (exit 2 up front, no corpus work)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path)
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(cfg), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert result.exit_code == 2
+    assert "config file" in result.stderr
+    assert cfg.is_file() and "checkpoint_dir" in cfg.read_text()
+
+
+def test_eval_bands_degraded_corpus_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serving-gate hardening: a corpus with missing body shards is
+    # scored on subject + trailing newline only — degraded scores must
+    # not mint the artifact that gates the daemon's shadow path.
+    # Refusal: exit 5 (the operation-failure convention the other
+    # post-report eval refusals use), the report is preserved on
+    # stdout, and NO artifact (or staging) is written anywhere.
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    # orphan one TEST-side body shard (i=6 → id 0000000000000006)
+    shard = tmp_path / "corpus" / "bodies" / "00" / "0000000000000006.txt"
+    assert shard.is_file()
+    shard.unlink()
+    # the degraded text for i=6 is subject + trailing newline
+    scores = dict(_test_side_scores())
+    scores["subject 6\n"] = scores.pop("subject 6\nbody 6")
+    out = tmp_path / "bands.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--bands",
+        str(out),
+        monkeypatch=monkeypatch,
+        scores=scores,
+    )
+    assert result.exit_code == 5
+    assert "--bands refused" in result.stderr
+    assert "1 test record(s) had no body shard" in result.stderr
+    assert "test examples=6" in result.stdout  # the report is not lost
+    assert not out.exists()  # no artifact
+    assert not list(tmp_path.glob("*.json*"))  # no staging residue
+
+
+def test_eval_bands_with_json_stdout_is_single_json_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json path: stdout is EXACTLY one parseable JSON object
+    # (the human summary is suppressed — json.loads over the whole
+    # stdout must succeed), and the artifact is still written
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    out = tmp_path / "bands.json"
+    result, _factory = _run_eval(
+        tmp_path, "--bands", str(out), "--json", monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)  # the whole stdout is one object
+    assert payload["test_examples"] == 6
+    assert [row["label"] for row in payload["rows"]] == [
+        "Money/Bills",
+        "Shipping",
+    ]
+    assert out.is_file()
+    artifact = BandsArtifact.from_json(out.read_text(encoding="utf-8"))
+    assert artifact.labels  # validates
+
+
+def test_eval_bands_with_distinct_out_writes_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # --bands plus a DISTINCT --out: both files exist complete — the
+    # artifact validates, the report file is non-empty, nothing lost
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    out = tmp_path / "report.txt"
+    bands = tmp_path / "bands.json"
+    result, _factory = _run_eval(
+        tmp_path,
+        "--out",
+        str(out),
+        "--bands",
+        str(bands),
+        monkeypatch=monkeypatch,
+    )
+    assert result.exit_code == 0, result.stderr
+    assert out.is_file() and out.read_text(encoding="utf-8").strip()
+    assert "test examples=6" in out.read_text(encoding="utf-8")
+    assert bands.is_file()
+    artifact = BandsArtifact.from_json(bands.read_text(encoding="utf-8"))
+    assert [e.label for e in artifact.labels] == ["Money/Bills", "Shipping"]
+
+
 def test_eval_bands_override_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -510,6 +629,19 @@ def test_only_eval_writes_the_bands_artifact() -> None:
         if "_write_secret_tight" in py.read_text(encoding="utf-8")
     ]
     assert writers == ["cli.py"]
+    # and the Bands Artifact write helper is named in exactly one
+    # module — cli.py — and the --bands write path in cli.py goes
+    # THROUGH it (a second band-file write path that bypassed the
+    # helper would be a second writer, and this scan would name it)
+    band_writers = [
+        py.name
+        for py in sorted(package_dir.glob("*.py"))
+        if "_write_bands_artifact" in py.read_text(encoding="utf-8")
+    ]
+    assert band_writers == ["cli.py"]
+    assert "_write_bands_artifact(Path(bands)" in (package_dir / "cli.py").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_eval_bands_is_on_the_frozen_surface() -> None:

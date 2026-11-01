@@ -1560,6 +1560,7 @@ def test_eval_graduation_readback_read_failure_is_post_replace(
         cfg=cfg,
     )
     assert result.exit_code == 5
+    assert out.is_file()  # the target was genuinely replaced (the "AFTER")
     assert "--graduation write failed AFTER the target was replaced" in result.stderr
     assert "readback fault" in result.stderr
     assert "failed to read back" in result.stderr
@@ -1589,11 +1590,43 @@ def test_eval_bands_readback_read_failure_is_post_replace(
     monkeypatch.setattr(Path, "read_text", _read_text_boom)
     result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
     assert result.exit_code == 5
+    assert out.is_file()  # the target was genuinely replaced (the "AFTER")
     assert "--bands write failed AFTER the target was replaced" in result.stderr
     assert "readback fault" in result.stderr
     assert "failed to read back" in result.stderr
     assert "cannot write --bands" not in result.stderr
     assert "test examples=6" in result.stdout  # the report is not lost
+
+
+def test_eval_out_fdopen_failure_cleanup_does_not_mask_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the fdopen-failure handler's cleanups (os.close + staging.unlink)
+    # are best-effort: a cleanup failure must not replace the primary
+    # fdopen error (it would surface as a new "cannot write --out"
+    # cause that masks the real one) — pinned on the eval --out report
+    # writer (the bands/graduation writers' handlers are byte-identical)
+    import os
+
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    report = tmp_path / "report.txt"
+
+    def _fdopen_boom(*args: object, **kwargs: object) -> object:
+        raise OSError("simulated fdopen failure")
+
+    def _unlink_boom(self: Path, missing_ok: bool = False) -> None:
+        raise OSError("simulated unlink failure")
+
+    monkeypatch.setattr(os, "fdopen", _fdopen_boom)
+    monkeypatch.setattr(Path, "unlink", _unlink_boom)
+    result, _factory = _run_eval(
+        tmp_path, "--out", str(report), monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 5
+    assert "cannot write --out" in result.stderr
+    assert "simulated fdopen failure" in result.stderr  # the primary
+    assert "simulated unlink failure" not in result.stderr  # no mask
 
 
 def test_eval_graduation_replaces_existing_with_notice(

@@ -54,11 +54,44 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from .appdb import ApplicationRow
 from .labels import is_system_label_id
 from .tiers import TIER_APPLIED, best_tier, would_apply
 
-__all__ = ["SOURCES", "WritePlan", "plan_message_write"]
+__all__ = ["SOURCES", "ApplicationRow", "WritePlan", "plan_message_write"]
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationRow:
+    """One applied-label row (NO bodies — invariant #5): the message
+    id, the Managed Label NAME, its Gmail label id, the sigmoid score,
+    the band verdict (``"high"`` / ``"med"`` — an applied row always has
+    a band), the Tier Label name the Application carried (the tiers-core
+    spelling: the configured ``[labels]`` wire spelling is config-
+    derivable), the UTC applied-at stamp, and the source (``"daemon"``
+    or ``"apply"`` — the literal that entered the write path). One row
+    per applied label; the Application's tier is the per-message best
+    band tier, repeated on the message's rows (the audit join reads
+    either way). Lives in the PURE module (the corpus_record/corpus_store
+    direction: the adapter imports the row shape from the core, never
+    the reverse); ``appdb`` validates and stores it.
+
+    Band-tier ACCUMULATION semantics (pinned here, decided by #25): the
+    GLOSSARY's "exactly one band Tier Label" is per-Application — a
+    later Application on a message that already carries an earlier band
+    tier adds ITS OWN best band tier (additive-only forbids correcting
+    the old one). Whether the daemon counts Tier Labels in the
+    message's ``present`` set (making a carried tier skip-present) is
+    #25's policy line; the composition is identical either way."""
+
+    message_id: str
+    label: str
+    label_id: str
+    score: float
+    band: str
+    tier: str
+    applied_at: datetime
+    source: str
+
 
 #: The Application source literals — mirrored import-light from the
 #: store's CHECK vocabulary (appdb._SOURCES); the equality is pinned by

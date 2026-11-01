@@ -541,7 +541,10 @@ def build_artifact(
     run's default targets are DERIVED from the bands' provenance —
     never trusted from the caller (a caller-told identity is a lying
     identity). Refusals: a vocabulary that does not match the bands'
-    (a lying identity) and a naive split_date raise ValueError. The
+    (a lying identity), a naive split_date, and a labels/targets
+    alignment mismatch (the entries zip positionally — a swapped
+    targets tuple would mint per-label targets for the wrong labels;
+    a length mismatch fails the strict zip) raise ValueError. The
     minted artifact passes its own invariants (the manifest
     symmetry)."""
     if tuple(vocabulary) != bands.vocabulary:

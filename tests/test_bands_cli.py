@@ -533,6 +533,87 @@ def test_eval_bands_readback_is_hash_based(
     assert out.is_file()
 
 
+def test_eval_bands_readback_fault_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the REJECTION path: a readback fault (from_json refuses the
+    # on-disk bytes — a torn/corrupt write) is a named exit-5
+    # operation failure, never an uncaught ValueError traceback (exit
+    # 1), and the report is preserved
+    from gmail_labeler.thresholds import BandsArtifact
+
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    monkeypatch.setattr(
+        BandsArtifact,
+        "from_json",
+        classmethod(
+            lambda cls, text: (_ for _ in ()).throw(
+                ValueError("bands field invalid: simulated torn write")
+            )
+        ),
+    )
+    out = tmp_path / "bands.json"
+    result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
+    assert result.exit_code == 5
+    assert "cannot write --bands" in result.stderr
+    assert "readback fault" in result.stderr
+    assert "test examples=6" in result.stdout  # the report is not lost
+
+
+def test_eval_bands_readback_mismatch_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the true mismatch: the readback parses but its content_hash
+    # differs from the minted artifact — exit 5, named
+    import dataclasses
+
+    from gmail_labeler.thresholds import BandsArtifact
+
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    # any parseable artifact with a DIFFERENT stored hash
+    from gmail_labeler.dataset_build import TrainingExample
+    from gmail_labeler.eval import eval_metrics
+    from gmail_labeler.thresholds import build_artifact, calibrate_bands
+
+    examples = [
+        TrainingExample(
+            id=f"{i:016x}",
+            date=datetime.now(UTC),
+            labels=(),
+            weight=1.0,
+            date_provenance="internal_date",
+        )
+        for i in range(2)
+    ]
+    table = eval_metrics(
+        examples,
+        {f"{i:016x}": (0.0, 0.0) for i in range(2)},
+        vocabulary=("Bills", "Shipping"),
+    )
+    other = build_artifact(
+        calibrate_bands(table),
+        vocabulary=("Bills", "Shipping"),
+        corpus_fingerprint="f" * 64,
+        split_manifest_hash="0" * 64,
+        encoder_id="tiny-encoder",
+        split_date=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    lying = dataclasses.replace(other, content_hash="1" * 64)
+    monkeypatch.setattr(
+        BandsArtifact,
+        "from_json",
+        classmethod(lambda cls, text: lying),
+    )
+    out = tmp_path / "bands.json"
+    result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
+    assert result.exit_code == 5
+    assert "cannot write --bands" in result.stderr
+    assert "readback mismatch" in result.stderr
+    assert "test examples=6" in result.stdout  # the report is not lost
+
+
 def test_eval_bands_same_path_as_config_is_a_usage_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

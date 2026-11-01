@@ -89,7 +89,7 @@ gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 gmail-labeler train --split-date …    # fine-tune the encoder on your corpus (fully local)
 gmail-labeler eval                    # per-label P/R at candidate thresholds on the test split
-gmail-labeler shadow run              # score the recent Backlog, apply NOTHING (Shadow Pass)
+gmail-labeler shadow run --bands bands.json --graduation graduation.json    # score the recent Backlog, apply NOTHING (Shadow Pass)
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 ```
 

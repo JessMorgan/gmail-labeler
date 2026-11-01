@@ -33,7 +33,9 @@ does not ship releases yet.
     `schema_version` row, the `shadow_results` table (run id, message
     id, label, probability, band, run_ts — NO bodies, invariant #5),
     transaction-per-run (a crash mid-run leaves no half rows), the #24
-    applications-table seam (same file, same versioning story).
+    applications-table seam (same file; the v1->v2 restamp/migration is
+    UNRESOLVED pending #24's schema design — the HARD version gate is
+    the stopgap that refuses a foreign/future schema_version at read).
   - `shadow run` CLI: auth gate (exit 4) -> sidecar-validated
     checkpoint load (the eval `ExpectedIdentity` pattern) ->
     `verify_bands` AND `verify_graduation` against the run's identity
@@ -41,8 +43,9 @@ does not ship releases yet.
     identity gates become real; refusal exit 5 naming fields;
     unreadable-vs-unparseable-vs-absent cause naming per #22's
     doctrine) -> Backlog fetch (`list_messages` pageToken loop honoring
-    `--limit` across pages; `q = in:inbox newer_than:YYYY/MM/DD` from
-    `--since` default 90d, `--query` escape hatch) -> `get_message` per
+    `--limit` across pages; `q = in:inbox after:<epoch-seconds>` —
+    `--since` ISO date -> UTC midnight of that day -> epoch, default
+    now - 90d with the time kept, `--query` escape hatch) -> `get_message` per
     id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
     seam) -> `tiers.would_apply` -> store. Degraded (body fetch
     failure) = per-message SKIP + stderr warning + count (the

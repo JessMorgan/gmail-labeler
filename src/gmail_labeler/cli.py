@@ -133,8 +133,12 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     stderr (the #20 ``--out`` NOTICE — a silent clobber of a typo'd
     path would be a lie). After the replace, the on-disk bytes are read
     back through ``BandsArtifact.from_json`` (train's sidecar readback
-    symmetry): a torn write is an operation failure, never a silently
-    corrupt artifact. The ONLY writer of the artifact in the package
+    symmetry) and compared by CONTENT HASH, not dataclass equality —
+    the canonical payload serializes reasons sorted, so equality must
+    be order-insensitive too (a reasons-order difference is the same
+    meaning, not a torn write). A torn write is an operation failure,
+    never a silently corrupt artifact. The ONLY writer of the artifact
+    in the package
     (recompute posture, AC4 — pinned by
     ``test_only_eval_writes_the_bands_artifact``)."""
     from .thresholds import BandsArtifact
@@ -168,15 +172,22 @@ def _write_bands_artifact(path: Path, artifact: BandsArtifact, text: str) -> Non
     fd, staging_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
     staging = Path(staging_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:  # owns fd
+        fh = os.fdopen(fd, "w", encoding="utf-8")  # owns fd from here
+    except OSError:
+        os.close(fd)  # fdopen failed — the fd is ours to close
+        staging.unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(staging, str(path))  # atomic on POSIX
         # readback symmetry (train's sidecar pattern): the on-disk
-        # bytes must parse back to the minted artifact — a torn write
-        # is an operation failure, never a silently corrupt artifact
-        if BandsArtifact.from_json(path.read_text(encoding="utf-8")) != artifact:
+        # bytes must parse back to the minted artifact, compared by
+        # CONTENT HASH (order-insensitive — see the docstring)
+        readback = BandsArtifact.from_json(path.read_text(encoding="utf-8"))
+        if readback.content_hash != artifact.content_hash:
             raise OSError(
                 f"artifact readback mismatch: {path} does not parse "
                 "back to the minted artifact"
@@ -1010,7 +1021,6 @@ def eval(
     from .eval import eval_metrics, render_report
     from .model import (
         MANIFEST_FILENAME,
-        SIDECAR_FILENAME,
         THRESHOLDS_SOURCE_NONE,
         CheckpointRefusedError,
         ExpectedIdentity,
@@ -1022,9 +1032,12 @@ def eval(
     # an empty --bands would degenerate to Path("") and fail awkwardly
     # mid-run; --bands and --out naming the same file would let the
     # artifact write silently destroy the report; --bands naming the
-    # checkpoint's sidecar or the config file would destroy identity
-    # material this very run just read (a destructive collision, not a
-    # regenerable-report NOTICE)
+    # config file would destroy identity material this very run just
+    # read; --bands INSIDE the checkpoint dir (manifest, sidecar,
+    # weights) or the corpus store (records index, labels/filters
+    # sidecars, bodies) would clobber identity files the garbage-
+    # tolerance NOTICE branch cannot see — a destructive collision,
+    # not a regenerable-report NOTICE
     if bands is not None:
         if not bands.strip():
             typer.echo("eval failed: --bands PATH must be non-empty", err=True)
@@ -1048,17 +1061,31 @@ def eval(
             raise typer.Exit(code=2) from None
         from .config import find_config
 
-        for protected, what in (
-            (cfg.model.checkpoint_dir / SIDECAR_FILENAME, "the checkpoint sidecar"),
-            (find_config(config).resolve(), "the config file"),
+        # the artifact must not live beside identity files: ANY target
+        # inside the checkpoint dir or the corpus store is refused
+        # (both sides RESOLVED — a symlink whose name sits outside but
+        # points inside is caught). The canonical artifact location
+        # lands with the daemon phase; until then, any other path.
+        for root, what in (
+            (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
+            (Path(cfg.corpus.dir).resolve(), "the corpus store"),
         ):
-            if bands_path == protected:
+            if bands_path == root or root in bands_path.parents:
                 typer.echo(
-                    f"eval failed: --bands {bands!r} names {what} "
-                    f"({protected}) \u2014 refusing to destroy it",
+                    f"eval failed: --bands {bands!r} lives inside {what} "
+                    f"({root}) \u2014 the artifact must not live beside "
+                    "identity files; use any other path",
                     err=True,
                 )
                 raise typer.Exit(code=2) from None
+        if bands_path == find_config(config).resolve():
+            typer.echo(
+                f"eval failed: --bands {bands!r} names the config file "
+                f"({find_config(config).resolve()}) \u2014 refusing to "
+                "destroy it",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         typer.echo(
@@ -1348,6 +1375,9 @@ def eval(
             calibrate_bands,
         )
 
+        # the effective-targets merge (config defaults + per-label
+        # overrides) lives here for now — it moves into thresholds
+        # when the daemon consumer lands (one site, not two)
         overrides = {
             label: BandTargets(
                 min_high_precision=(

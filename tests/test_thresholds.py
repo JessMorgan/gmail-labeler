@@ -879,6 +879,17 @@ def test_build_artifact_requires_aware_split_date() -> None:
         )
 
 
+def test_build_artifact_targets_labels_misaligned_refused() -> None:
+    # the entries zip bands.labels and bands.targets POSITIONALLY — a
+    # swapped targets tuple would mint per-label targets for the
+    # WRONG labels, and validate() cannot see it (an entry's targets
+    # are never re-checked against its label) — refuse the alignment
+    bands = calibrate_bands(_golden_table())
+    swapped = dataclasses.replace(bands, targets=tuple(reversed(bands.targets)))
+    with pytest.raises(ValueError, match="align"):
+        _artifact(swapped)
+
+
 def test_build_artifact_derives_provenance_from_bands() -> None:
     # the eval identity (test_examples) and the default targets are
     # DERIVED from the calibration's provenance (calibrate_bands'

@@ -120,6 +120,16 @@ normalized inputs (callers should pass `now` in UTC for cross-host
 stability); whether an eval applies the weight is the consumer's choice.
 _Avoid_: decay factor, age weight
 
+**Model (seam)**:
+The `Model` Protocol — batch predict → per-label sigmoid scores over the
+checkpoint's Label-Path vocabulary (row i ↔ text i, column j ↔
+`vocabulary[j]`), plus vocabulary exposure. The ONE new test seam
+(spec #13): `FakeModel` (hand-authored score vectors) is the offline
+spine mirroring `FakeGmailClient`'s role; the real encoder (torch,
+ADR-0001) sits behind a lazy import in the `train/` recipe code only,
+so CI stays torch-free.
+_Avoid_: classifier interface, predictor API
+
 **Filter-Authored exclusion (builder doctrine)**:
 The dataset builder excludes Filter-Authored evidence from training
 examples — per-message for a simulatable filter, the whole label for an

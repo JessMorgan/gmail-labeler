@@ -3,6 +3,9 @@
 corpus/
 *.eml
 
+# Checkpoints (HF-style dirs + sidecars; trained on secret mail)
+checkpoints/
+
 # Local configuration and state
 config.toml
 credentials.json

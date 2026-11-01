@@ -4,8 +4,10 @@ The Phase 0 read surface (labels, filters, message list/get, history) plus
 the application path's FIRST write methods (ticket #24): ``apply_labels``
 (the ONLY label write the product ever performs — addLabelIds ONLY,
 structurally incapable of carrying a removal — invariant #1) and
-``ensure_label`` (get-or-create for the configured Tier Label names,
-invoked from the daemon/apply startup only — never from the Shadow Pass).
+``ensure_label`` (get-or-create for the configured Tier Label names —
+exact-case user hits win, casefolded System Label name-sakes are refused
+named — invoked from the daemon/apply startup only, never the Shadow
+Pass).
 Both live behind the same Protocol (FakeGmailClient is the test spine —
 invariant #9). Errors surface via gmail_errors taxonomy only.
 
@@ -326,9 +328,11 @@ class GmailRestClient:
         startup resolves the configured ``[labels] applied/high/med``
         names to Gmail label ids ONCE — pure thereafter; never called
         from the Shadow Pass, which is zero-write). Idempotent when the
-        name is present: NO create call is made. A System Label that
-        name-sakes the requested name is REFUSED, named (F1): minting a
-        USER label named like a System Label would make the tier
+        name is present (EXACT-case match, pass 1 — an existing user
+        label is always reused): NO create call is made. A System Label
+        whose name casefold-matches the requested name is REFUSED,
+        named (F1/F2, pass 2): minting a USER label named like a System
+        Label would make the tier
         visually indistinguishable from system state, and the plan's id
         screen cannot catch a fresh Label_* id — the operator must
         rename [labels]. A concurrent create (another client won the
@@ -338,9 +342,13 @@ class GmailRestClient:
         retry loop)."""
         labels = self.list_labels()
         wanted = name.casefold()
-        for label in labels:
+        for label in labels:  # pass 1: the exact-case get-or-create hit
             if label.name == name and label.type == "user":
-                return label.id  # the exact-case get-or-create hit
+                return label.id
+        for label in labels:  # pass 2 (F2 review): the collision guard
+            # runs AFTER the user-hit pass — an EXISTING exact-case user
+            # label is always reused (deterministic regardless of the
+            # list order); the guard only prevents MINTING a look-alike
             if label.type == "system" and label.name.casefold() == wanted:
                 # CASEFOLDED (F2): the Gmail REST reference documents the
                 # 409 duplicate-name refusal but not a case rule, and CI

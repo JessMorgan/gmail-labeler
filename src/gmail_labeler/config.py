@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import tomllib
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, cast
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
+
+from .dataset_build import is_tenth
 
 _CONFIG_FILENAME = "config.toml"
 # Bounds (does NOT redact — a short secret pasted as a KEY still echoes) the
@@ -106,6 +108,128 @@ class GybConfig(BaseModel):
     path: Path | None = None
 
 
+class BandOverride(BaseModel):
+    """One per-label min-precision target override (ticket #21): the
+    floor a candidate column's measured precision must meet to earn the
+    band. ``None`` = keep the run's default for that band. Values are
+    tenths (the tenth-grid stance, #20) — checked by the parent
+    validator, which collects every problem."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    min_high_precision: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_med_precision: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class BandsConfig(BaseModel):
+    """Per-label Threshold Band calibration (ticket #21): the run's
+    default min-precision targets + per-label overrides. The per-label
+    entries are the [bands."<label>"] subtables (label names may carry
+    slashes — quoted TOML keys); they are collected from the extra
+    fields into ``per_label`` by the validator, which refuses an
+    override that is not a table of targets (fail loud — a typo'd
+    label must not silently calibrate nothing). The config carries NO
+    path: the artifact path is the CLI's ``eval --bands`` argument, so
+    the config-file relative-path rule has nothing to anchor here."""
+
+    model_config = {"extra": "allow", "frozen": True}
+
+    min_high_precision: float = Field(default=0.9, ge=0.0, le=1.0)
+    min_med_precision: float = Field(default=0.7, ge=0.0, le=1.0)
+    per_label: dict[str, BandOverride] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _band_target_bools_refused(cls, data: object) -> object:
+        """A TOML bool is not a target: pydantic's lax float coercion
+        would turn ``true`` into 1.0 (and ``false`` into 0.0) — the
+        core's "a bool is not a target" refusal must not be silently
+        bypassed at the config layer. Checked on the RAW values (after
+        coercion the bool is indistinguishable from a literal 1.0)."""
+        if not isinstance(data, dict):
+            return data
+        payload = cast("dict[str, object]", data)
+        problems: list[str] = []
+        for name in ("min_high_precision", "min_med_precision"):
+            if isinstance(payload.get(name), bool):
+                problems.append(f"bands.{name}: a target is a number, not a bool")
+        for label, raw in payload.items():
+            if label in ("min_high_precision", "min_med_precision", "per_label"):
+                continue
+            if isinstance(raw, dict):
+                nested = cast("dict[str, object]", raw)
+                for name in ("min_high_precision", "min_med_precision"):
+                    if isinstance(nested.get(name), bool):
+                        problems.append(
+                            f"bands.{label}.{name}: a target is a number, not a bool"
+                        )
+        if problems:
+            raise ValueError("; ".join(problems))
+        return data
+
+    @model_validator(mode="after")
+    def _band_target_problems_together(self) -> Self:
+        """One validator collecting EVERY band-target problem (the
+        LabelsConfig doctrine): the tenth-grid stance (#20 — a target
+        between grid points would render mislabeled in any report of
+        the bands) applies to the defaults AND every per-label
+        override; an override that is not a table of targets is a
+        typo, refused, not dropped."""
+        problems: list[str] = []
+        for name, value in (
+            ("min_high_precision", self.min_high_precision),
+            ("min_med_precision", self.min_med_precision),
+        ):
+            if not is_tenth(value):
+                problems.append(
+                    f"bands.{name} {value} is not a tenth — the bands ride "
+                    "the candidate grid (the tenth-grid stance, #20)"
+                )
+        per_label: dict[str, BandOverride] = {}
+        for label, raw in (self.__pydantic_extra__ or {}).items():
+            if not isinstance(raw, dict):
+                problems.append(
+                    f"bands.{label}: a per-label override must be a table "
+                    'of targets ([bands."<label>"])'
+                )
+                continue
+            try:
+                override = BandOverride.model_validate(raw)
+            except ValidationError as e:
+                problems.extend(
+                    f"bands.{label}.{_shorten_loc(err['loc'])}: {err['msg']}"
+                    for err in e.errors()
+                )
+                continue
+            for name, target in (
+                ("min_high_precision", override.min_high_precision),
+                ("min_med_precision", override.min_med_precision),
+            ):
+                if target is not None and not is_tenth(target):
+                    problems.append(
+                        f"bands.{label}.{name} {target} is not a tenth — "
+                        "the bands ride the candidate grid (the "
+                        "tenth-grid stance, #20)"
+                    )
+            if (
+                override.min_high_precision is None
+                and override.min_med_precision is None
+            ):
+                # an empty table sets nothing — a no-op that would
+                # silently calibrate with the defaults (the docstring's
+                # "a typo'd label must not silently calibrate nothing")
+                problems.append(
+                    f"bands.{label}: an override must set at least one "
+                    "target (min_high_precision / min_med_precision)"
+                )
+            per_label[label] = override
+        if problems:
+            raise ValueError("; ".join(problems))
+        if per_label:
+            object.__setattr__(self, "per_label", per_label)
+        return self
+
+
 class ModelConfig(BaseModel):
     model_config = {"extra": "forbid", "frozen": True}
 
@@ -147,6 +271,7 @@ class Config(BaseModel):
     corpus: CorpusConfig = Field(default_factory=CorpusConfig)
     gyb: GybConfig = Field(default_factory=GybConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
+    bands: BandsConfig = Field(default_factory=BandsConfig)
 
 
 def _anchor_relative(cfg: Config, base_dir: Path) -> Config:

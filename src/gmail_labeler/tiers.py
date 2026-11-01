@@ -30,7 +30,9 @@ Consequences pinned by the same golden tests:
 - System Labels are never targeted: a System Label carrying a
   graduated entry is refused, named (fail-loud — the graduated set is
   trusted from the Graduation Table, and the table's vocabulary is
-  content labels only, so this is a lying input);
+  content labels only, so this is a lying input). The ``system_labels``
+  argument is REQUIRED (no fail-open default) so no caller can forget
+  to supply the mailbox's System Label set;
 - the decisions are in label-sorted order (a total order — the input
   mapping order never leaks into the output).
 
@@ -157,7 +159,7 @@ def would_apply(
     bands: Mapping[str, tuple[float | None, float | None]],
     graduated: frozenset[str],
     present: frozenset[str],
-    system_labels: frozenset[str] = frozenset(),
+    system_labels: frozenset[str],
 ) -> tuple[TierDecision, ...]:
     """The per-label would-apply verdicts for one message (the Shadow
     Pass decision, GLOSSARY: Shadow Pass).
@@ -168,6 +170,14 @@ def would_apply(
     ``graduated`` is the Graduation Table's graduated label set;
     ``present`` is the label names already on the message;
     ``system_labels`` is the System Label set (never targeted).
+
+    ``system_labels`` is REQUIRED (keyword-only, no default) on purpose:
+    this module is the single safety authority for the live Application
+    path (#24/#26), and a fail-open default (``frozenset()``) would let
+    a caller that forgets the argument propose System Labels. Every
+    caller must pass the mailbox's System Label set (the ``type ==
+    "system"`` names from ``list_labels``) — no caller setup can be
+    forgotten.
 
     Refusals (fail-loud doctrine — the verdicts are a measured claim,
     never a guess): a score outside [0, 1] (a bool is not a score), a
@@ -209,7 +219,20 @@ def would_apply(
     decisions: list[TierDecision] = []
     for label in sorted(graduated):  # label-sorted — a total order
         score = _check_score(label, scores[label])
-        high, med = bands[label]
+        band_pair = bands[label]
+        # a band entry must be a (high, med) pair — a bare number (wrong
+        # arity) is refused, named, not a silent unpack TypeError. The
+        # isinstance is a runtime defense against a type-violating
+        # caller (the annotation says tuple; a float slips past it).
+        is_pair = isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            band_pair, (tuple, list)
+        )
+        if not is_pair or len(band_pair) != 2:
+            raise ValueError(
+                f"tiers for {label!r}: bands must be a (high, med) pair, "
+                f"got {band_pair!r}"
+            )
+        high, med = band_pair
         _check_bands(label, high, med)
         band: str | None = None
         if high is not None and score >= high:

@@ -19,6 +19,7 @@ from gmail_labeler.cli import app
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_errors import GmailTransientError
 from test_shadow_cli import (
+    READ_SURFACE,
     _backlog_messages,
     _prepare,
     _run_shadow,
@@ -258,10 +259,17 @@ def test_shadow_report_json_single_object(
         "tier",
     }
     assert len(payload["per_label"]) == 2
-    # the per-label would-be tier mix
+    # the per-label would-be tier mix reflects ONLY labels that would
+    # ACTUALLY be added (skip-present labels are not applied, so not
+    # counted): Money/Bills added=m2 (high); its m3 is already-present
+    # (med band, NOT counted). Shipping added=m4 (med); its m1 is
+    # already-present (high band, NOT counted).
     mb = next(p for p in payload["per_label"] if p["label"] == "Money/Bills")
     assert mb["would_be_high"] == 1  # m2
-    assert mb["would_be_med"] == 1  # m3
+    assert mb["would_be_med"] == 0  # m3 is already-present (not added)
+    sh = next(p for p in payload["per_label"] if p["label"] == "Shipping")
+    assert sh["would_be_high"] == 0  # m1 is already-present (not added)
+    assert sh["would_be_med"] == 1  # m4
 
 
 def test_shadow_report_usage_empty_run_exits_2(
@@ -299,3 +307,79 @@ def test_shadow_report_auth_gate_exits_4(
     )
     assert result.exit_code == 4
     assert "auth:" in result.stderr
+
+
+def test_shadow_report_all_skipped_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T2: if EVERY message is skipped (labels can't be re-fetched), the
+    # report has no evidence — refuse with exit 5 (mirroring shadow
+    # run's zero-verdict posture). Partial-skip still exits 0.
+    _prepare(tmp_path, monkeypatch)
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    # a client whose get_message ALWAYS fails → every message skipped
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_shadow_labels())
+    for _ in _backlog_messages():
+        fake.fail("get_message", GmailTransientError("network blip"))
+    report, _f2 = _run_report(tmp_path, monkeypatch=monkeypatch, fake=fake)
+    assert report.exit_code == 5
+    assert "no evidence to report" in report.stderr
+    assert "all 4 message(s) were skipped" in report.stderr
+
+
+def test_shadow_report_determinism_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the report is deterministic: rendering the same run twice yields
+    # byte-identical stdout (text) and payload (--json)
+    _prepare(tmp_path, monkeypatch)
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    r1, _a = _run_report(tmp_path, monkeypatch=monkeypatch)
+    r2, _b = _run_report(tmp_path, monkeypatch=monkeypatch)
+    assert r1.exit_code == 0 and r2.exit_code == 0
+    assert r1.stdout == r2.stdout  # byte-identical text
+    r3, _c = _run_report(tmp_path, "--json", monkeypatch=monkeypatch)
+    r4, _d = _run_report(tmp_path, "--json", monkeypatch=monkeypatch)
+    assert r3.stdout == r4.stdout  # byte-identical json
+
+
+def test_shadow_report_zero_gmail_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the report is read-only: the recorded calls are a subset of the
+    # READ surface (no write method of any shape)
+    _prepare(tmp_path, monkeypatch)
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    report, fake = _run_report(tmp_path, monkeypatch=monkeypatch)
+    assert report.exit_code == 0, report.stderr
+    methods = {call.split(":", 1)[0] for call in fake.calls}
+    assert methods <= READ_SURFACE, f"write call recorded: {methods - READ_SURFACE}"
+    assert "get_message" in methods
+    assert "list_labels" in methods
+
+
+def test_shadow_report_json_refusal_combos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json path shares the same refusal exits as text mode:
+    # empty store (no runs) and unknown --run both exit 5 with a named
+    # cause (stdout stays empty — no partial payload)
+    _prepare(tmp_path, monkeypatch)
+    # empty store: a fresh config dir with no runs
+    empty_cfg = _shadow_cfg(tmp_path, store='db_path = "empty.db"\n')
+    report, _f = _run_report(tmp_path, "--json", monkeypatch=monkeypatch, cfg=empty_cfg)
+    assert report.exit_code == 5
+    assert "no shadow runs recorded" in report.stderr
+    assert report.stdout == ""  # no partial payload
+    # unknown --run
+    result, _f1 = _run_shadow(tmp_path, monkeypatch=monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    report2, _f2 = _run_report(
+        tmp_path, "--json", "--run", "nonexistent", monkeypatch=monkeypatch
+    )
+    assert report2.exit_code == 5
+    assert "no shadow run" in report2.stderr
+    assert report2.stdout == ""

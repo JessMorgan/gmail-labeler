@@ -17,9 +17,10 @@ history_poll_seconds = 30          # daemon polling cadence (ADR-0003)
 [labels]
 # Tier Labels attached to every Application (GLOSSARY.md). A name that
 # casefold-matches a System Label name is refused, named, by the
-# name→Gmail-label-id resolution (gmail_client.ensure_label) — never
-# minted as a look-alike label (the live startup call site lands with
-# the daemon / apply CLI, #25/#26):
+# name→Gmail-label-id resolution (gmail_client.ensure_label) — unless a
+# USER label of exactly that name already exists; it is then used as-is
+# (the refusal guards minting only). The live startup call site lands
+# with the daemon / apply CLI, #25/#26:
 applied = "ai-applied"             # umbrella: "the AI contributed something"
 high = "ai-high"                   # high-confidence band
 med = "ai-med"                     # review-me band

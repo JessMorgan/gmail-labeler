@@ -4,9 +4,11 @@
 fine-tunes a multi-label classifier on the user's own Gmail history and applies
 labels to arriving mail as it lands. Anyone can use it on their own inbox;
 nothing leaves the user's machines; nothing is centralized on the maintainer.
-Docs live where you expect: `GLOSSARY.md`, `CODING-STANDARDS.md`, `docs/adr/`.
-Phase 0 (corpus) has landed; the layout and command sections below mark
-what is wired vs. planned, and each gains detail as its phase lands.
+Docs live where you expect: `GLOSSARY.md`, `CODING-STANDARDS.md`,
+`docs/adr/`, and `docs/ROADMAP.md` (the phase plan of record).
+Phase 0 (corpus) lands with the open PR stack; the layout and command
+sections below mark what is wired vs. planned, and each gains detail as
+its phase lands.
 
 ## Design spine (read the ADRs before questioning these)
 
@@ -32,7 +34,8 @@ what is wired vs. planned, and each gains detail as its phase lands.
   `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
-- `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.
+- `docs/adr/`, `docs/ROADMAP.md`, `GLOSSARY.md`, `CODING-STANDARDS.md`,
+  `example.toml`.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {export,import-gyb,analyze}` are wired; `train`, `eval`,
   `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the

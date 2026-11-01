@@ -34,6 +34,7 @@ def test_score_exactly_at_high_earns_high_band() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert len(decisions) == 1
     d = decisions[0]
@@ -53,6 +54,7 @@ def test_score_exactly_at_med_earns_med_band() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     d = decisions[0]
     assert d.band == "med"
@@ -67,6 +69,7 @@ def test_score_below_med_earns_no_band() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     d = decisions[0]
     assert d.band is None
@@ -82,6 +85,7 @@ def test_high_band_outranks_med_band() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert decisions[0].band == "high"
     assert decisions[0].tier == TIER_HIGH
@@ -95,6 +99,7 @@ def test_no_high_band_falls_through_to_med() -> None:
         bands={"Money/Bills": (None, 0.7)},
         graduated=frozenset({"Money/Bills"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     d = decisions[0]
     assert d.band == "med"
@@ -110,6 +115,7 @@ def test_skip_present_not_proposed_and_no_tier() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset({"Shipping"}),
+        system_labels=frozenset(),
     )
     d = decisions[0]
     assert d.band == "high"  # the verdict is visible
@@ -126,6 +132,7 @@ def test_labels_without_graduated_entry_never_proposed() -> None:
         bands={"Shipping": (0.9, 0.8), "Money/Bills": (0.8, 0.7)},
         graduated=frozenset({"Shipping"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert [d.label for d in decisions] == ["Shipping"]
     assert decisions[0].applied is True
@@ -139,6 +146,7 @@ def test_empty_graduated_proposes_nothing() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset(),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert decisions == ()
 
@@ -170,12 +178,14 @@ def test_deterministic_total_order() -> None:
         bands=bands,
         graduated=frozenset(scores),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     d2 = would_apply(
         scores=dict(reversed(list(scores.items()))),
         bands=dict(reversed(list(bands.items()))),
         graduated=frozenset(scores),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert d1 == d2
     assert [d.label for d in d1] == ["Money/Bills", "Shipping", "Zeta"]
@@ -189,6 +199,7 @@ def test_score_out_of_range_is_refused() -> None:
             bands={"Shipping": (0.9, 0.8)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
     with pytest.raises(ValueError, match="Shipping"):
         would_apply(
@@ -196,6 +207,7 @@ def test_score_out_of_range_is_refused() -> None:
             bands={"Shipping": (0.9, 0.8)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -207,6 +219,7 @@ def test_bool_score_is_refused() -> None:
             bands={"Shipping": (0.9, 0.8)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -218,6 +231,7 @@ def test_band_out_of_range_is_refused() -> None:
             bands={"Shipping": (1.0, 0.8)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
     with pytest.raises(ValueError, match="Shipping"):
         would_apply(
@@ -225,6 +239,7 @@ def test_band_out_of_range_is_refused() -> None:
             bands={"Shipping": (0.9, 0.0)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -237,6 +252,7 @@ def test_inverted_bands_are_refused() -> None:
             bands={"Shipping": (0.8, 0.9)},
             graduated=frozenset({"Shipping"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -249,6 +265,7 @@ def test_graduated_label_without_score_is_refused() -> None:
             bands={"Shipping": (0.9, 0.8), "Money/Bills": (0.8, 0.7)},
             graduated=frozenset({"Shipping", "Money/Bills"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -261,6 +278,7 @@ def test_graduated_label_without_bands_is_refused() -> None:
             bands={"Shipping": (0.9, 0.8)},
             graduated=frozenset({"Shipping", "Money/Bills"}),
             present=frozenset(),
+            system_labels=frozenset(),
         )
 
 
@@ -273,6 +291,7 @@ def test_best_tier_prefers_high_over_med() -> None:
         bands={"Shipping": (0.9, 0.8), "Money/Bills": (0.8, 0.7)},
         graduated=frozenset({"Shipping", "Money/Bills"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert best_tier(decisions) == TIER_HIGH
     med_only = would_apply(
@@ -280,6 +299,7 @@ def test_best_tier_prefers_high_over_med() -> None:
         bands={"Money/Bills": (0.8, 0.7)},
         graduated=frozenset({"Money/Bills"}),
         present=frozenset(),
+        system_labels=frozenset(),
     )
     assert best_tier(med_only) == TIER_MED
     # nothing applied (all skip-present) → no tier
@@ -288,6 +308,7 @@ def test_best_tier_prefers_high_over_med() -> None:
         bands={"Shipping": (0.9, 0.8)},
         graduated=frozenset({"Shipping"}),
         present=frozenset({"Shipping"}),
+        system_labels=frozenset(),
     )
     assert best_tier(skip) is None
     assert best_tier(()) is None
@@ -310,6 +331,102 @@ def test_tier_for_band_golden(band, present, expected) -> None:
     # the band→tier mapping (the single home #24/#26 reuse): high →
     # ai-high, med → ai-med, no band → None; skip-present → None
     assert tier_for_band(band, present=present) == expected
+
+
+def test_system_labels_is_required_keyword_only() -> None:
+    # T1: system_labels has NO fail-open default — calling would_apply
+    # without it is a TypeError (keyword-only enforced), so no caller
+    # setup can be forgotten (the module is the single safety authority
+    # for #24/#26)
+    with pytest.raises(TypeError, match="system_labels"):
+        would_apply(  # pyright: ignore[reportCallIssue] — deliberate
+            scores={"Shipping": 0.9},
+            bands={"Shipping": (0.9, 0.8)},
+            graduated=frozenset({"Shipping"}),
+            present=frozenset(),
+        )
+
+
+def test_high_only_band_golden() -> None:
+    # (high, None): a label whose band has no med threshold — the high
+    # band is still earned at/above high
+    decisions = would_apply(
+        scores={"Shipping": 0.9},
+        bands={"Shipping": (0.9, None)},
+        graduated=frozenset({"Shipping"}),
+        present=frozenset(),
+        system_labels=frozenset(),
+    )
+    assert decisions[0].band == "high"
+    assert decisions[0].tier == TIER_HIGH
+    # just below high with no med → no band
+    below = would_apply(
+        scores={"Shipping": 0.89},
+        bands={"Shipping": (0.9, None)},
+        graduated=frozenset({"Shipping"}),
+        present=frozenset(),
+        system_labels=frozenset(),
+    )
+    assert below[0].band is None
+    assert below[0].tier is None
+
+
+def test_no_band_golden() -> None:
+    # (None, None): a label with no band at all — never proposed
+    decisions = would_apply(
+        scores={"Shipping": 0.99},
+        bands={"Shipping": (None, None)},
+        graduated=frozenset({"Shipping"}),
+        present=frozenset(),
+        system_labels=frozenset(),
+    )
+    assert decisions[0].band is None
+    assert decisions[0].tier is None
+    assert decisions[0].applied is False
+
+
+def test_med_only_skip_present_gate() -> None:
+    # med-only band (high=None) + skip-present: the med band is earned
+    # but the label is present → not applied, NO Tier Label (the
+    # mutation case: flipping the skip-present gate would propose it)
+    decisions = would_apply(
+        scores={"Money/Bills": 0.75},
+        bands={"Money/Bills": (None, 0.7)},
+        graduated=frozenset({"Money/Bills"}),
+        present=frozenset({"Money/Bills"}),
+        system_labels=frozenset(),
+    )
+    d = decisions[0]
+    assert d.band == "med"  # the verdict is visible
+    assert d.present is True
+    assert d.applied is False  # NOT proposed (skip-present)
+    assert d.tier is None  # NO Tier Label
+
+
+def test_wrong_arity_band_is_named() -> None:
+    # a band entry with the wrong arity (a bare number, not a
+    # (high, med) pair) is refused, named — not a silent unpack
+    with pytest.raises(ValueError, match="Shipping"):
+        would_apply(
+            scores={"Shipping": 0.9},
+            bands={"Shipping": 0.9},  # type: ignore[dict-item]
+            graduated=frozenset({"Shipping"}),
+            present=frozenset(),
+            system_labels=frozenset(),
+        )
+
+
+@pytest.mark.parametrize("score", [float("nan"), None])
+def test_nan_none_score_is_refused(score) -> None:
+    # a NaN or None score is refused, named (a lying/absent model row)
+    with pytest.raises(ValueError, match="Shipping"):
+        would_apply(
+            scores={"Shipping": score},  # type: ignore[dict-item]
+            bands={"Shipping": (0.9, 0.8)},
+            graduated=frozenset({"Shipping"}),
+            present=frozenset(),
+            system_labels=frozenset(),
+        )
 
 
 def test_tier_constants_are_pinned_to_the_glossary_spellings() -> None:

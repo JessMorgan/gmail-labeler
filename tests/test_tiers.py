@@ -17,6 +17,7 @@ from gmail_labeler.tiers import (
     TIER_HIGH,
     TIER_MED,
     best_tier,
+    tier_for_band,
     would_apply,
 )
 
@@ -290,6 +291,25 @@ def test_best_tier_prefers_high_over_med() -> None:
     )
     assert best_tier(skip) is None
     assert best_tier(()) is None
+
+
+@pytest.mark.parametrize(
+    ("band", "present", "expected"),
+    [
+        ("high", False, TIER_HIGH),
+        ("med", False, TIER_MED),
+        (None, False, None),
+        # skip-present (invariant #2): an already-present label earns NO
+        # Tier Label — the band stays visible, the tier does not
+        ("high", True, None),
+        ("med", True, None),
+        (None, True, None),
+    ],
+)
+def test_tier_for_band_golden(band, present, expected) -> None:
+    # the band→tier mapping (the single home #24/#26 reuse): high →
+    # ai-high, med → ai-med, no band → None; skip-present → None
+    assert tier_for_band(band, present=present) == expected
 
 
 def test_tier_constants_are_pinned_to_the_glossary_spellings() -> None:

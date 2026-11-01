@@ -18,7 +18,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -2066,14 +2066,71 @@ def _shadow_model_factory(checkpoint_dir: Path, vocabulary: tuple[str, ...]) -> 
     return load_hf_model(checkpoint_dir, vocabulary)
 
 
-def _backlog_query(since: date, query: str | None) -> str:
+def _check_store_db_path(cfg: Config, command: str) -> None:
+    """S3: the [store] db_path must not live inside the checkpoint dir
+    or the corpus store (both sides RESOLVED — a link named outside
+    pointing inside is caught). A state DB in there is silently
+    destroyable: ``train --force`` destroys the checkpoint dir (a state
+    DB in it dies with it), and a corpus re-export rewrites the store.
+    Usage refusal exit 2 (the eval containment loop shape)."""
+    db_path = cfg.store.db_path.resolve()
+    for root, what in (
+        (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
+        (Path(cfg.corpus.dir).resolve(), "the corpus store"),
+    ):
+        if db_path == root or root in db_path.parents:
+            typer.echo(
+                f"{command} failed: [store] db_path {db_path} lives inside "
+                f"{what} ({root}) \u2014 a state DB there is destroyable by "
+                "train --force / a corpus re-export; use any other path",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
+
+
+def _validate_store_db(cfg: Config) -> None:
+    """S5: validate the state DB FAIL-FAST (open + ownership + version)
+    before any network work — a foreign/corrupt/foreign-version DB is
+    refused (exit 5) before we pay for list_labels/list_messages. The
+    connection is closed immediately (validation only); the write
+    re-opens it at the store step."""
+    from .appdb import AppDB, AppDBError
+
+    db = AppDB(cfg.store.db_path)
+    try:
+        db.open()
+    except (AppDBError, OSError) as e:
+        typer.echo(f"shadow run failed: state DB unusable: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        db.close()
+
+
+def _backlog_cutoff(since_date: date | None, now: datetime) -> datetime:
+    """The UTC-aware cutoff datetime for the Backlog query (S4): a
+    --since date → UTC MIDNIGHT of that date (the operator's "newer than
+    this day" boundary); the default (``None``) → ``now - 90 days`` (the
+    time component kept — the boundary is "90 days ago", not "90 days
+    ago at midnight"). Pure (takes ``now``) so the epoch math is
+    testable with a fixed instant."""
+    if since_date is not None:
+        return datetime(since_date.year, since_date.month, since_date.day, tzinfo=UTC)
+    return now - timedelta(days=90)
+
+
+def _backlog_query(cutoff_dt: datetime, query: str | None) -> str:
     """The Backlog query (the recent inbox, GLOSSARY: Backlog): the
-    default is ``in:inbox newer_than:YYYY/MM/DD`` (the --since window);
-    an explicit --query is the escape hatch (it replaces the default
-    wholesale — the operator's query, the operator's risk)."""
+    default is ``in:inbox after:<epoch-seconds>`` — the EPOCH form is
+    unambiguous. The Gmail API guide warns that calendar dates in API
+    queries are interpreted as MIDNIGHT PST (so a calendar string like
+    ``after:2026-10-01`` is NOT the UTC boundary we want), and
+    documents epoch seconds for exact boundaries; ``newer_than:`` is
+    documented as RELATIVE-DURATION only (d/m/y units), not an absolute
+    date. An explicit --query is the escape hatch (it replaces the
+    default wholesale — the operator's query, the operator's risk)."""
     if query is not None:
         return query
-    return f"in:inbox newer_than:{since:%Y/%m/%d}"
+    return f"in:inbox after:{int(cutoff_dt.timestamp())}"
 
 
 @shadow_app.command("run")
@@ -2121,7 +2178,7 @@ def shadow_run(
     posture choice vs ``eval``'s whole-run refusal: shadow is a
     read-only survey, not a serving-gate artifact mint.
     """
-    from datetime import UTC, date, datetime, timedelta
+    from datetime import UTC, datetime, timedelta
 
     from .appdb import AppDB, AppDBError, ShadowRow
     from .auth import AuthError
@@ -2156,18 +2213,28 @@ def shadow_run(
         typer.echo("shadow run failed: --query must be non-empty", err=True)
         raise typer.Exit(code=2) from None
     if since is not None:
+        # strict ISO (YYYY-MM-DD) — strptime, not date.fromisoformat
+        # (3.11+ fromisoformat is lenient and would accept "20261001")
         try:
-            since_date = date.fromisoformat(since)
+            since_date = datetime.strptime(since, "%Y-%m-%d").date()
         except ValueError:
             typer.echo(
                 f"shadow run failed: --since {since!r} is not an ISO date (YYYY-MM-DD)",
                 err=True,
             )
             raise typer.Exit(code=2) from None
+        cutoff_dt = None  # computed below (the --since midnight)
     else:
         since_date = datetime.now(UTC).date() - timedelta(days=90)
+        cutoff_dt = None
+    # the cutoff (S4): --since → UTC midnight of that date; default →
+    # now - 90 days (the time component kept)
+    cutoff_dt = _backlog_cutoff(since_date, datetime.now(UTC))
 
     cfg = _load_config(config)
+    # S3: the [store] db_path must not live inside the checkpoint dir or
+    # the corpus store (usage refusal exit 2, before any work)
+    _check_store_db_path(cfg, "shadow run")
     # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
     # pay the corpus-scale work below
     try:
@@ -2175,6 +2242,13 @@ def shadow_run(
     except (AuthError, TokenStoreError) as e:
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+
+    # S5: the state DB is validated FAIL-FAST (open + ownership +
+    # version) BEFORE any network work — a foreign/corrupt/foreign-
+    # version DB is refused before we pay for list_labels/list_messages.
+    # The connection is closed immediately (validation only); the write
+    # re-opens it at the store step (idempotent create-all-if-missing).
+    _validate_store_db(cfg)
 
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
@@ -2411,7 +2485,7 @@ def shadow_run(
     # the Backlog fetch (the read path — list_messages only): the
     # pageToken loop honors --limit across pages (#17's historyId
     # wire-fidelity precedent)
-    q = _backlog_query(since_date, query)
+    q = _backlog_query(cutoff_dt, query)
     try:
         stubs: list[MessageStub] = []
         seen_ids: set[str] = set()
@@ -2564,7 +2638,8 @@ def shadow_run(
 
     # the store (transaction per run — a crash mid-run leaves no half
     # rows; the DB carries ids/probabilities/labels/timestamps ONLY —
-    # invariant #5)
+    # invariant #5). The DB was validated fail-fast before the network
+    # work (S5); it is opened here for the single write point.
     db = AppDB(cfg.store.db_path)
     try:
         db.open()
@@ -2670,6 +2745,9 @@ def shadow_report(
         raise typer.Exit(code=2) from None
 
     cfg = _load_config(config)
+    # S3: the [store] db_path must not live inside the checkpoint dir or
+    # the corpus store (usage refusal exit 2, before any work)
+    _check_store_db_path(cfg, "shadow report")
     # auth gate FIRST (exit 4 precedent): the report re-fetches the
     # actual labels via the read path
     try:
@@ -2679,7 +2757,8 @@ def shadow_report(
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
 
     # the state DB (create-all-if-missing — a report on an empty DB is
-    # a named "no runs" refusal, not a crash)
+    # a named "no runs" refusal, not a crash). The open (ownership +
+    # version) is BEFORE the network work (S5 fail-fast).
     db = AppDB(cfg.store.db_path)
     try:
         db.open()

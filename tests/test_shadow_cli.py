@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -399,18 +399,71 @@ def test_shadow_run_zero_gmail_writes(
     assert "list_labels" in methods
 
 
-def test_shadow_run_default_query_is_inbox_newer_than(
+def test_shadow_run_default_query_is_inbox_after_epoch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # the default Backlog query: in:inbox newer_than:YYYY/MM/DD (the
-    # --since window, default 90 days)
+    # S4: the default Backlog query is in:inbox after:<epoch-seconds> —
+    # the EPOCH form (unambiguous; calendar dates in API queries are
+    # interpreted as MIDNIGHT PST, and newer_than: is relative-duration
+    # only). --since 2026-10-01 → UTC midnight of that date → epoch.
+    from datetime import UTC, datetime
+
     _prepare(tmp_path, monkeypatch)
     result, fake = _run_shadow(
         tmp_path, "--since", "2026-10-01", monkeypatch=monkeypatch
     )
     assert result.exit_code == 0, result.stderr
+    expected_epoch = int(datetime(2026, 10, 1, tzinfo=UTC).timestamp())
     list_calls = [c for c in fake.calls if c.startswith("list_messages")]
-    assert list_calls[0] == "list_messages:in:inbox newer_than:2026/10/01:"
+    assert list_calls[0] == f"list_messages:in:inbox after:{expected_epoch}:"
+
+
+def test_backlog_cutoff_epoch_math_is_pinned() -> None:
+    # S4: the epoch math is pinned with a FIXED UTC now (no clock in the
+    # test): --since → UTC midnight of that date; default → now - 90d
+    # (the time component kept)
+    from gmail_labeler.cli import _backlog_cutoff
+
+    fixed_now = datetime(2026, 11, 1, 12, 30, 0, tzinfo=UTC)
+    # --since 2026-10-01 → UTC midnight of that date
+    cutoff = _backlog_cutoff(date(2026, 10, 1), fixed_now)
+    assert cutoff == datetime(2026, 10, 1, tzinfo=UTC)
+    assert int(cutoff.timestamp()) == int(datetime(2026, 10, 1, tzinfo=UTC).timestamp())
+    # default → now - 90 days (time component kept: 12:30)
+    default_cutoff = _backlog_cutoff(None, fixed_now)
+    assert default_cutoff == datetime(2026, 8, 3, 12, 30, 0, tzinfo=UTC)
+
+
+def test_shadow_run_db_path_containment_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S3: a [store] db_path inside the checkpoint dir OR the corpus store
+    # is a usage refusal (exit 2) — a state DB there is destroyable by
+    # train --force / a corpus re-export (both sides resolved)
+    _prepare(tmp_path, monkeypatch)
+    # inside the checkpoint dir
+    cfg_ckpt = _shadow_cfg(tmp_path, store='db_path = "ckpt/state.db"\n')
+    result, _fake = _run_shadow(tmp_path, monkeypatch=monkeypatch, cfg=cfg_ckpt)
+    assert result.exit_code == 2
+    assert "lives inside the checkpoint directory" in result.stderr
+    # inside the corpus store
+    cfg_corpus = _shadow_cfg(tmp_path, store='db_path = "corpus/state.db"\n')
+    result2, _fake2 = _run_shadow(tmp_path, monkeypatch=monkeypatch, cfg=cfg_corpus)
+    assert result2.exit_code == 2
+    assert "lives inside the corpus store" in result2.stderr
+
+
+def test_shadow_run_since_strict_iso(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S5: --since accepts ISO STRICTLY (YYYY-MM-DD) — the lenient
+    # "20261001" (accepted by 3.11+ date.fromisoformat) is refused
+    _prepare(tmp_path, monkeypatch)
+    result, _fake = _run_shadow(
+        tmp_path, "--since", "20261001", monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 2
+    assert "not an ISO date" in result.stderr
 
 
 def test_shadow_run_query_escape_hatch(

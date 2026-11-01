@@ -45,7 +45,8 @@ tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
 ships the name→id resolution; the daemon's startup calls it once per
 configured name (#25), `apply` will too (#26)). The Application is ALL-OR-NOTHING
 per message: a data-path compose error means NO write for that message
-plus a counted id-only warning (caller bugs and internal guards raise
+plus a counted warning carrying the message id, label, and score
+(structurally body-free — invariant #5; caller bugs and internal guards raise
 — and still write nothing; invariant #1's fail-safe), and nothing new
 earned — skip-present included — means an empty plan and no API call at
 all (invariant #2). Band tiers ACCUMULATE across Applications (accepted

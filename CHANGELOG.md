@@ -15,9 +15,10 @@ does not ship releases yet.
     `apply_labels` — the wire body is a literal with the ONE key
     `addLabelIds`, structurally incapable of carrying a removal
     (invariant #1); `ensure_label` — get-or-create for the configured
-    Tier Label names (startup-only; exact-case user hits win,
-    casefolded System Label name-sakes are REFUSED named — never
-    silently minted as duplicate user labels). FakeGmailClient records
+    Tier Label names (startup-only: an existing USER label of exactly
+    that name is used as-is; a casefolded System Label name-sake is
+    REFUSED named — the refusal guards minting a look-alike only).
+    FakeGmailClient records
     successful writes with full body snapshots (the shadow zero-write
     pin catches a read-path write by name).
   - `appdb` schema v2: the `applications` table (message id, label,
@@ -115,8 +116,8 @@ does not ship releases yet.
     label of exactly that name is used as-is; a casefolded System
     Label name-sake is refused named — the refusal guards minting a
     look-alike only; the daemon / `apply` startup of #25/#26 calls it
-    once per configured name); the live write itself
-    lands with the daemon / `apply` CLI (#25/#26) — the report attaches
+    once per configured name); the live write itself lands with the
+    daemon / `apply` CLI (#25/#26) — the report attaches
     no labels (it renders the band tier name only).
   - A `--db PATH` flag is a usage-level override of `[store] db_path`
     (the opt-in live demo redirects the state DB to a tmp path).

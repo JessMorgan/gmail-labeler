@@ -1070,12 +1070,44 @@ def test_fake_list_labels_returns_a_copy() -> None:
 def test_fake_list_filters_returns_a_copy() -> None:
     # F3 review MINOR: the same trap, ONE METHOD BELOW — list_filters
     # handed out the live filters_list (the REST adapter builds fresh
-    # FilterInfo per call; the copy rationale holds word-for-word).
-    # #25/#26 ride this fake; the read surfaces must be symmetric
+    # FilterInfo per call; the copy rationale holds word-for-word AT
+    # LIST LEVEL — the FilterInfo NESTED criteria/action dicts remain
+    # shared, REST parity does not extend to them).
+    # #25/#26 ride this fake; the read surfaces must be list-level copies
     fake = FakeGmailClient(filters=[FilterInfo(id="f1", criteria={"from": "x"})])
     returned = fake.list_filters()
     returned.clear()
     assert fake.filters_list == [FilterInfo(id="f1", criteria={"from": "x"})]
+
+
+def test_protocol_ensure_label_docstring_carries_the_startup_contract() -> None:
+    # #25 C0 (the F3 residual cell, folded into this ticket's opener):
+    # the PROTOCOL docstring is the load-bearing surface #25's startup
+    # resolution codes against standalone — it must state the RETURN
+    # (the Gmail label id), the RAISE TYPE (a BARE ValueError, not the
+    # gmail_errors taxonomy — the exit-4 mapping excepts ValueError
+    # explicitly), and the precedence word ("otherwise": the refusal
+    # guards MINTING a look-alike only). Whitespace-normalized: the
+    # prose wraps lines, the contract does not.
+    doc = " ".join((GmailClient.ensure_label.__doc__ or "").split())
+    assert "Gmail label id" in doc
+    assert "BARE ValueError" in doc
+    assert "otherwise," in doc
+
+
+def test_fake_read_surface_comment_says_list_level_copy() -> None:
+    # #25 C0 (the F3 residual cell): the fake's list_filters comment
+    # claimed the read surfaces stay "symmetric" — overstated: the copy
+    # is LIST-LEVEL (the FilterInfo nested criteria/action dicts remain
+    # shared; safety rests on the documented nested-mutation ban). The
+    # word must not survive in the fake's source (the direct-assertion
+    # precedent: test_executescript_is_banned_from_appdb_production_source).
+    from pathlib import Path
+
+    import gmail_labeler.fake_gmail as fake_module
+
+    source = Path(fake_module.__file__).read_text(encoding="utf-8")
+    assert "symmetric" not in source
 
 
 def test_fake_ensure_label_refuses_system_namesakes() -> None:

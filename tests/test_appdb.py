@@ -690,8 +690,10 @@ def test_migrated_db_refused_by_the_v1_gate(tmp_path: Path, monkeypatch) -> None
 def test_v1_stamp_with_applications_table_is_refused(tmp_path: Path) -> None:
     # the single-row model's inconsistent state: a v1 tool never writes
     # an applications table — {1} + applications is corrupt, refused
-    # named (the crash between the restamp UPDATE and the table creation
-    # is self-healing; THIS direction is not, and refuses)
+    # named. TAMPER pin: unreachable by crash since the F1 atomic
+    # transition (pre-F1 this was the unsafe "crash direction"; the safe
+    # direction was {2}-without-tables — both are now hand-made states,
+    # the self-heal of that one is pinned separately below)
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -1044,14 +1046,17 @@ def test_fresh_db_crash_mid_transition_leaves_clean_fresh(
 def test_v1_migration_crash_mid_transition_leaves_clean_v1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # F1 MAJOR pin (2): kill mid-migration (here: the applications DDL —
-    # the old order had already COMMITTED the restamp by this point, so
-    # the file could land in {2}-without-applications; and any ordering
-    # that commits the DDL separately could land in the
-    # {1}+applications dead-end). ONE transaction: the file stays CLEAN
-    # v1 and the retry migrates successfully — shadow history survives,
-    # no delete-recovery, no manual stamp.
-    _arm_crash_on(monkeypatch, "CREATE TABLE IF NOT EXISTS applications")
+    # F1 MAJOR pin (2): kill mid-migration, PAST the restamp UPDATE —
+    # the applications DDL and indexes have already been attempted when
+    # the marker statement fires, so this is the window where a
+    # non-transactional transition could land the file in
+    # {1}+applications (dead-end refusal) or {2}-without-tables. ONE
+    # transaction: the file stays CLEAN v1 and the retry migrates
+    # successfully — shadow history survives, no delete-recovery, no
+    # manual stamp. (Marker position matters: on the applications CREATE
+    # itself the test stays green under the split-transaction mutant —
+    # the UPDATE has not run yet at that point — F1 review MAJOR.)
+    _arm_crash_on(monkeypatch, "CREATE INDEX IF NOT EXISTS idx_applications_message_id")
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     db = AppDB(db_path)

@@ -22,15 +22,20 @@ The composition (per message):
   earns no row and no Tier Labels — nothing new added means an EMPTY
   plan, and the caller's rule is no API call at all (the crash-retry
   idempotency: the retry sees the label present and composes empty);
-- fail-safe (invariant #1): ANY exception inside the per-message
-  compose — a tiers refusal, a missing id in the resolution maps, a
-  lying input surface — turns into NO WRITE for that message (empty
-  adds) plus a counted warning naming the message id. The caller logs
-  the warning (stderr, counted) and moves on; a legitimate empty plan
-  carries NO warning, so the two empty states are distinguishable. The
-  compose inputs are ids/labels/scores ONLY — bodies never enter the
-  plan, so the warning text structurally cannot carry one (invariant
-  #5);
+- fail-safe (invariant #1): a THREE-CLASS error model (the F1 review
+  made it explicit — this paragraph is #25's contract): (1) PRE-COMPOSE
+  CALLER BUGS (a source outside SOURCES, a naive applied_at) RAISE —
+  programming defects must crash, never warn every message into
+  silence; (2) INTERNAL CONTRADICTIONS (the unreachable-by-construction
+  AssertionError guards) RE-RAISE — a systematic break must surface
+  loudly, not degrade to per-message warnings; (3) DATA-PATH FAILURES —
+  a tiers refusal, a missing id in the resolution maps, a lying input
+  surface — turn into NO WRITE for that message (empty adds) plus a
+  counted warning naming the message id. The caller logs the warning
+  (stderr, counted) and moves on; a legitimate empty plan carries NO
+  warning, so the two empty states are distinguishable. The compose
+  inputs are ids/labels/scores ONLY — bodies never enter the plan, so
+  the warning text structurally cannot carry one (invariant #5);
 - System Labels are never targeted, at TWO levels: tiers refuses a
   graduated System Label NAME, and this module screens every resolved
   id through ``labels.is_system_label_id`` — a lying resolution map
@@ -40,12 +45,11 @@ The composition (per message):
   the input mapping order never leaks), rows are sorted by
   (message_id, label).
 
-The caller bug vs data error line: a bad ``source`` literal or a naive
-``applied_at`` is a CALLER bug (the daemon's clock seam is ``cli._now``
-— aware by construction) and RAISES — silently warning every message
-would turn a programming defect into silent label starvation.
-Everything the message's own data says (scores, bands, ids) goes
-through the fail-safe net.
+The three classes (module docstring's fail-safe bullet, the F1 review
+asymmetry): caller bugs RAISE before the compose; internal-contradiction
+AssertionError guards RE-RAISE through the net; everything the
+message's own data says (scores, bands, ids) goes through the
+fail-safe net as a warning.
 """
 
 from __future__ import annotations

@@ -62,7 +62,14 @@ would-apply decision core (the single home #24/#26 reuse), the
 `shadow run` (scores the recent Backlog, applies nothing; the FIRST
 real consumers of `verify_bands`/`verify_graduation`), and `shadow
 report` (diffs the verdicts against the mailbox's actual labels — the
-Phase 1 exit review; #23).
+Phase 1 exit review; #23); and the application-path decision core +
+store at the LIBRARY level — the pure `applications.py` write-plan
+composition (the tiers core reused, never re-derived; fail-safe
+all-or-nothing per message, skip-present consequence), the
+`gmail_client` write surface (`apply_labels` addLabelIds-only,
+`ensure_label` get-or-create), and the Applications store (schema v2,
+the atomic single-row v1→v2 migration; #24 — the daemon #25 / `apply`
+#26 perform the live write).
 
 Scope:
 

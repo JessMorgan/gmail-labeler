@@ -284,12 +284,16 @@ class FakeGmailClient:
     def ensure_label(self, name: str) -> str:
         """Get-or-create a USER label by exact name (idempotent when
         present — no create recorded). A System Label name-sake is
-        REFUSED, named (the REST mirror, F1). The list_labels wire call
-        the REST adapter makes is recorded too (F1 call-log fidelity —
-        #25's exact-call tests see one sequence, not two); it is a READ,
-        so the shadow zero-write pin is unaffected. The 409 concurrent-
-        create self-heal is REST-only: the fake's single-threaded
-        list+create has no race window (documented divergence)."""
+        REFUSED, named (the REST mirror, F1). The fake performs the
+        same WIRE calls as the adapter — list_labels first (recorded in
+        the call log; a READ, so the shadow zero-write pin is
+        unaffected), create only when the name is absent — so #25's
+        exact-call tests read one sequence, not two. (The
+        ``ensure_label:<name>`` entry itself is this fake's own
+        convention — the adapter logs nothing; the fidelity claim is
+        about the wire calls.) The 409 concurrent-create self-heal is
+        REST-only: the fake's single-threaded list+create has no race
+        window (documented divergence)."""
         self.calls.append(f"ensure_label:{name}")
         self._maybe_fail("ensure_label")
         labels = self.list_labels()  # the wire call the adapter makes

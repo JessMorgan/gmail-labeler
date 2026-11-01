@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal
 
 import typer
 
+from .analyze import filter_label_ids_strict
 from .export import DEFAULT_QUERY, SIDECAR_FILTERS, SIDECAR_LABELS
 
 # summary.filters_posture values, pinned for --json consumers
@@ -342,25 +343,12 @@ def _load_attribution(
         id_to_name = {str(k): str(v) for k, v in raw_map.items()}
     needed: set[str] = set()
     for f in filters:
-        action = f.get("action")
-        if action is not None and not isinstance(action, dict):
-            # unreadable label bindings must not contribute zero `needed`
-            # ids and let the posture claim 'snapshot' — the same failure
-            # direction the non-str/non-list guards closed (deepseek r3)
-            raise ValueError("action must be an object")
-        ids = action.get("addLabelIds") if isinstance(action, dict) else None
-        if ids is not None and not isinstance(ids, list):
-            # present-but-wrong-shaped is as untrusted as a non-str entry:
-            # silently skipping would let a filter's labels surface
-            # CANDIDATE un-attributed (qwen MINOR)
-            raise ValueError("addLabelIds must be a list of strings")
-        if isinstance(ids, list):
-            if any(not isinstance(i, str) for i in ids):
-                # a type-corrupt id list would bypass the bridge check and
-                # silently un-attribute its label — the CRITICAL's failure
-                # mode, so it raises like every other wrong-shape field
-                raise ValueError("addLabelIds entries must be strings")
-            needed.update(ids)
+        # the shape rule lives in analyze.filter_label_ids_strict (shared
+        # with the dataset builder): unreadable label bindings must not
+        # contribute zero `needed` ids and let the posture claim
+        # 'snapshot' — the same failure direction the non-str/non-list
+        # guards closed (deepseek r3 / qwen MINOR)
+        needed.update(filter_label_ids_strict(f))
     if needed - set(id_to_name):
         return "bridge-incomplete", None, {}
     return "snapshot", filters, id_to_name

@@ -98,11 +98,24 @@ _Avoid_: sample, data point
 
 **Split Manifest**:
 The versioned, hashable artifact materializing the temporal train/test
-split: format version, split date, train/test id sets, the label
-vocabulary, the split-boundary trust filter, and a content hash over all
-of it. `train`/`eval` rebuild against it — same records + manifest →
-same examples, no re-split (invariant #7).
+split: format version (v2 adds the bridge pin), split date, train/test
+id sets, the label vocabulary, the split-boundary trust filter, a
+canonical hash of the effective filters/labels bridge the build consumed
+(insensitive to filter order and unreferenced label entries), and a
+content hash over all of it. `train`/`eval` rebuild against it — same
+records + manifest → same examples, no re-split (invariant #7); a
+drifted bridge, a shrunken corpus, or a violated format invariant
+refuses the rebuild.
 _Avoid_: split config, train/test file
+
+**Filter-Authored exclusion (builder doctrine)**:
+The dataset builder excludes Filter-Authored evidence from training
+examples — per-message for a simulatable filter, the whole label for an
+unverifiable/malformed one (exclusion, not guessing, analyze's shared
+doctrine). A missing, incomplete, or malformed filters/labels snapshot
+aborts the build loudly (`BuildAbortedError`) rather than silently
+training on filter-covered signal (invariant #6).
+_Avoid_: filter filtering, auto-excluded
 
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`

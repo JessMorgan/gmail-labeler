@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import TYPE_CHECKING, cast
 
+from .analyze import filter_label_ids_strict, simulates_filter
 from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES, DateProvenance
 from .labels import label_path, path_is_at_or_under
 
@@ -39,8 +40,28 @@ if TYPE_CHECKING:
     from .corpus_record import CorpusRecord
 
 #: Split Manifest format version (GLOSSARY: Split Manifest). Bump on any
-#: change to the manifest's field set or semantics.
-FORMAT_VERSION = 1
+#: change to the manifest's field set or semantics. v2 adds bridge_hash
+#: (the pinned filters/labels bridge input).
+FORMAT_VERSION = 2
+
+
+class BuildAbortedError(ValueError):
+    """The build refuses to run (invariant #6): filter attribution is
+    impossible, so Filter-Authored evidence cannot be excluded.
+    ``reason``: 'no-filter-snapshot' (no snapshot provided),
+    'bridge-incomplete' (a filter's label ids not all resolvable through
+    the id→name map — a blank mapped name is unresolvable), or
+    'bridge-malformed' (a filter element is not a Mapping, or its
+    action/addLabelIds is present but wrong-shaped — unreadable bindings
+    must not contribute zero ids).
+
+    Subclasses ``ValueError`` so a CLI mapping (ticket #19/#25) can catch
+    the whole build-refusal family with one ``except ValueError`` — the
+    same class the manifest's ``validate()``/``from_json`` raise."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +94,8 @@ class SplitManifest:
     train_ids: tuple[str, ...]  # sorted
     test_ids: tuple[str, ...]  # sorted
     server_authoritative_only: bool  # split-boundary trust filter (invariant #7)
+    bridge_hash: str  # sha256 of the canonical form of the effective bridge:
+    # pinned so a drifted filters/labels snapshot refuses the rebuild loudly
     content_hash: str
 
     def _canonical_payload(self) -> dict[str, object]:
@@ -83,6 +106,7 @@ class SplitManifest:
             "train_ids": list(self.train_ids),
             "test_ids": list(self.test_ids),
             "server_authoritative_only": self.server_authoritative_only,
+            "bridge_hash": self.bridge_hash,
         }
 
     def compute_hash(self) -> str:
@@ -127,6 +151,7 @@ class SplitManifest:
                 server_authoritative_only=_need_bool(
                     payload, "server_authoritative_only"
                 ),
+                bridge_hash=_need_str(payload, "bridge_hash"),
                 content_hash=_need_str(payload, "content_hash"),
             )
         except ValueError as e:
@@ -165,10 +190,20 @@ class SplitManifest:
 @dataclass(frozen=True, slots=True)
 class BuildResult:
     """The build's output: the split manifest + examples sorted by record
-    id — a total order, input-order invariant."""
+    id — a total order, input-order invariant.
+
+    Exclusion observability (NOT in the manifest/hash — these describe the
+    build's exclusion decisions, not the split identity):
+    ``excluded_classes`` is the sorted (label, reason) pairs for classes
+    whose evidence was wholly excluded (reason 'unverifiable' or
+    'malformed'), so a filter-heavy mailbox's vanished classes leave a
+    trace; ``emptied_examples`` counts the records that had labels but
+    came out all-negative (mass-negative targets are visible, not silent)."""
 
     manifest: SplitManifest
     examples: tuple[TrainingExample, ...]
+    excluded_classes: tuple[tuple[str, str], ...] = ()
+    emptied_examples: int = 0
 
     def members_of(self, class_name: str) -> tuple[str, ...]:
         """Record ids carrying ``class_name`` exactly. Its label path is
@@ -202,13 +237,23 @@ class BuildResult:
 def build_dataset(
     records: Sequence[CorpusRecord],
     *,
+    filters: Sequence[Mapping[str, object]] | None,
+    id_to_name: Mapping[str, str],
     now: datetime,
     split_date: datetime,
     manifest: SplitManifest | None = None,
     server_authoritative_only: bool = False,
 ) -> BuildResult:
-    """Turn CorpusRecords into training examples + a versioned split
-    manifest.
+    """Turn CorpusRecords + the filters/labels bridge into training
+    examples + a versioned split manifest.
+
+    Invariant #6 first: ``filters is None`` (no snapshot), a filter whose
+    label ids are not all resolvable through ``id_to_name``
+    (bridge-incomplete — a blank mapped name is unresolvable, the
+    labels.py rule), a non-Mapping filter element, or a filter
+    action/addLabelIds present but wrong-shaped (bridge-malformed, the
+    cli.py guard) aborts with ``BuildAbortedError`` — the build never
+    trains on Filter-Authored evidence it cannot exclude.
 
     Invariant #7: the split is temporal only — records with
     ``date < split_date`` are train, the rest test. ``manifest`` pins a
@@ -216,11 +261,12 @@ def build_dataset(
     records it does not know are excluded, and the manifest — split
     date, trust filter — is authoritative over the caller's arguments.
     The manifest's full format invariants are re-validated (an in-memory
-    manifest is refused exactly like a parsed one), and a two-way drift
-    check refuses the rebuild when a declared member is absent or the
-    labels over the members no longer equal the declared vocabulary
-    (a record whose date moved across the split is NOT refused —
-    membership, not dates, is authoritative).
+    manifest is refused exactly like a parsed one), a bridge whose hash
+    does not match the provided filters/labels snapshot refuses the
+    rebuild, and a two-way drift check refuses the rebuild when a
+    declared member is absent or the labels over the members no longer
+    equal the declared vocabulary (a record whose date moved across the
+    split is NOT refused — membership, not dates, is authoritative).
 
     ``server_authoritative_only`` drops fallback-sourced records
     (``mime_date``/``unknown`` Date Provenance) out of the split before
@@ -240,10 +286,45 @@ def build_dataset(
         raise ValueError("split_date must be timezone-aware")
     split_date = split_date.astimezone(UTC)  # canonical instant in the manifest
 
+    if filters is None:
+        raise BuildAbortedError("no-filter-snapshot")
+    # single pass: collect the strict ids once, shared by the bridge check
+    # and the exclusion below. The input is untrusted at runtime (a
+    # non-Mapping element is possible despite the annotation) — scan it as
+    # object and narrow. A non-Mapping filter element, or a wrong-shaped
+    # action/addLabelIds (the shape rule lives in
+    # analyze.filter_label_ids_strict, shared with the CLI), is
+    # bridge-malformed — unreadable bindings must not contribute zero ids.
+    filter_ids: list[list[str]] = []
+    needed: set[str] = set()
+    for filter_ in cast("Sequence[object]", filters):
+        if not isinstance(filter_, Mapping):
+            raise BuildAbortedError("bridge-malformed")
+        try:
+            ids = filter_label_ids_strict(cast(Mapping[str, object], filter_))
+        except ValueError:
+            raise BuildAbortedError("bridge-malformed") from None
+        filter_ids.append(ids)
+        needed.update(ids)
+    # a blank/whitespace mapped name is as unusable as an unresolved id
+    # (labels.normalize_label_names namespaces it id: — it must never
+    # enter the vocabulary)
+    resolvable = {lid for lid, name in id_to_name.items() if name.strip()}
+    if needed - resolvable:
+        raise BuildAbortedError("bridge-incomplete")
+
+    bridge_hash = _bridge_hash(filters, filter_ids, id_to_name)
+
     if manifest is not None:
         # the full format validation, not just the version — an in-memory
         # manifest is refused exactly like a parsed one
         manifest.validate()
+        if manifest.bridge_hash != bridge_hash:
+            raise ValueError(
+                "manifest bridge_hash does not match the provided "
+                "filters/labels bridge — the snapshot drifted, rebuild "
+                "the manifest"
+            )
         # the manifest's parameters are authoritative — same records +
         # manifest → same examples, no re-split, no re-trust-filtering
         server_authoritative_only = manifest.server_authoritative_only
@@ -261,17 +342,71 @@ def build_dataset(
             if record.date_provenance in SERVER_AUTHORITATIVE_PROVENANCES
         ]
 
+    # Filter-Authored exclusion (invariant #6): per (filter, label) pair,
+    # simulate against the label's member records — a simulatable filter
+    # excludes the messages it covers; an unverifiable one (non-
+    # simulatable criteria, malformed shape) excludes the WHOLE label's
+    # evidence. Exclusion, not guessing (analyze's doctrine, shared).
+    # The member index is built once (analyze's shape): O(N), not
+    # O(filters x N).
+    members_by_label: dict[str, list[CorpusRecord]] = {}
+    for record in records:
+        for name in record.labels:
+            members_by_label.setdefault(name, []).append(record)
+
+    covered: dict[str, set[str]] = {}
+    unverifiable_labels: set[str] = set()  # non-simulatable criteria
+    malformed_labels: set[str] = set()  # malformed criteria shape
+    for filter_, ids in zip(filters, filter_ids, strict=True):
+        # id_to_name via .get + explicit abort (no latent KeyError — the
+        # bridge check above guarantees resolvability, this is defensive)
+        names: list[str] = []
+        for label_id in ids:
+            name = id_to_name.get(label_id)
+            if name is None:
+                raise BuildAbortedError("bridge-incomplete")
+            names.append(name)
+        raw_criteria = filter_.get("criteria")
+        malformed = raw_criteria is not None and not isinstance(raw_criteria, Mapping)
+        criteria: Mapping[str, object] = (
+            {}
+            if raw_criteria is None or not isinstance(raw_criteria, Mapping)
+            else cast(Mapping[str, object], raw_criteria)
+        )
+        for name in names:
+            members = members_by_label.get(name, [])
+            if not members:
+                continue
+            if malformed:
+                malformed_labels.add(name)
+                continue
+            verdicts = [simulates_filter(criteria, record) for record in members]
+            if None in verdicts:
+                unverifiable_labels.add(name)
+            else:
+                for record, hit in zip(members, verdicts, strict=True):
+                    if hit:
+                        covered.setdefault(name, set()).add(record.id)
+
     # manifest-input mode: membership comes from the manifest (no
     # re-split) — records it does not know are excluded, not re-split
     membership: set[str] | None = (
         None if manifest is None else set(manifest.train_ids) | set(manifest.test_ids)
     )
 
+    excluded = unverifiable_labels | malformed_labels
     examples = tuple(
         TrainingExample(
             id=record.id,
             date=record.date,
-            labels=tuple(sorted(record.labels)),
+            labels=tuple(
+                sorted(
+                    name
+                    for name in record.labels
+                    if name not in excluded
+                    and not (name in covered and record.id in covered[name])
+                )
+            ),
             weight=1.0,
             date_provenance=record.date_provenance,
         )
@@ -280,6 +415,21 @@ def build_dataset(
     )
     vocabulary = tuple(
         sorted({name for example in examples for name in example.labels})
+    )
+    # exclusion observability (NOT in the manifest/hash): wholly-excluded
+    # classes with their reason, and the count of records that had labels
+    # but came out all-negative (mass-negative targets stay visible)
+    excluded_classes = tuple(
+        sorted(
+            [(label, "unverifiable") for label in unverifiable_labels]
+            + [(label, "malformed") for label in malformed_labels]
+        )
+    )
+    original_labels = {record.id: record.labels for record in records}
+    emptied_examples = sum(
+        1
+        for example in examples
+        if example.labels == () and original_labels.get(example.id)
     )
 
     if manifest is None:
@@ -296,6 +446,7 @@ def build_dataset(
             train_ids=train_ids,
             test_ids=test_ids,
             server_authoritative_only=server_authoritative_only,
+            bridge_hash=bridge_hash,
             content_hash="",
         )
         manifest = replace(manifest, content_hash=manifest.compute_hash())
@@ -326,7 +477,12 @@ def build_dataset(
                 "labels over the member examples do not match the manifest "
                 "vocabulary — the corpus drifted, rebuild the manifest"
             )
-    return BuildResult(manifest=manifest, examples=examples)
+    return BuildResult(
+        manifest=manifest,
+        examples=examples,
+        excluded_classes=excluded_classes,
+        emptied_examples=emptied_examples,
+    )
 
 
 def _need_str(payload: dict[str, object], key: str) -> str:
@@ -362,3 +518,41 @@ def _need_str_list(payload: dict[str, object], key: str) -> tuple[str, ...]:
     if not all(isinstance(v, str) for v in items):
         raise ValueError(f"field {key!r} must be a list of strings")
     return tuple(cast("list[str]", items))  # narrowed by the all() above
+
+
+def _bridge_hash(
+    filters: Sequence[Mapping[str, object]],
+    filter_ids: Sequence[list[str]],
+    id_to_name: Mapping[str, str],
+) -> str:
+    """The sha256 of the canonical form of the EFFECTIVE bridge — pinned
+    in the manifest so a drifted filters/labels snapshot refuses the
+    rebuild loudly (a stricter snapshot silently emptying a
+    manifest-declared class is drift, not a valid variant).
+
+    Canonical so it is insensitive to non-semantic variation: filters are
+    hashed in sorted order (Gmail's filters.list order is not contractual,
+    so an ordinary re-export must not invalidate the manifest), and only
+    the id→name entries referenced by a filter action count (renaming an
+    unreferenced label, or adding an unreferenced id, is not drift). A
+    referenced label RENAME does change the hash — the id→name value is
+    part of the effective bridge, so the hash owns that drift class.
+
+    ``filter_ids`` is the already-collected strict id list (one per
+    filter) — reused here, not re-parsed (the strict pre-pass already
+    validated the shapes, so no re-parse / no latent ValueError path)."""
+    canonical_filters = sorted(
+        json.dumps(dict(f), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        for f in filters
+    )
+    referenced: set[str] = set()
+    for ids in filter_ids:
+        referenced.update(ids)
+    canonical_id_to_name = {lid: id_to_name[lid] for lid in sorted(referenced)}
+    canonical = json.dumps(
+        {"filters": canonical_filters, "id_to_name": canonical_id_to_name},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

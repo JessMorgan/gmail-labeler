@@ -271,23 +271,34 @@ that produces no verdicts (the Graduation Table graduated no labels)
 refuses with exit 5 ("no verdicts to record" — nothing is recorded, so
 a `shadow report` would say "no runs recorded"), and a would-apply
 refusal (a lying score/band, a graduated System Label, a missing bands
-entry) refuses with exit 5 ("would-apply refused"). The summary goes
-to stderr; `--json` emits one parseable object. `shadow
+entry) refuses with exit 5 ("would-apply refused"). Refusals up front
+(exit 2, before any work): an empty `--bands` / `--graduation` /
+`--query` / `--db`, a non-ISO `--since`, and a `--db` path inside the
+checkpoint dir or the corpus store (by resolved path — the state DB
+must not live beside identity files). The summary goes to stderr;
+`--json` emits one parseable object. `shadow
 report` diffs a run's stored verdicts against the mailbox's ACTUAL
 labels (re-fetched via the read path — the labels may have changed
 since the run): a deterministic per-message diff of message id + label
 + score + tier ONLY (subjects out, bodies out by construction —
 invariant #5), with ADDED / ALREADY-PRESENT (skip-present visible) /
 NOT-APPLIED outcomes and a per-label summary carrying the would-be
-tier mix. `--run` picks a specific run (default: the latest). Config
-error -> exit 4; a no-DB / unknown-run / transport failure -> exit 5.
+tier mix. `--run` picks a specific run (default: the latest); `--db
+PATH` overrides `[store] db_path` the same way as for `shadow run`
+(`~` expanded, a relative `--db` anchors to the CWD). Refusals up front
+(exit 2, before any work): an empty `--run` / `--db`, and a `--db`
+path inside the checkpoint dir or the corpus store (by resolved path).
+Config error -> exit 4; a no-DB / unknown-run / transport failure ->
+exit 5.
 Message bodies never enter the DB, the report, or any log path
 (invariant #5) — the DB is publicly attachable. The report is a
 PREVIEW, not an Application: it renders the band tier NAME (the
 configured `[labels] high`/`med`) for would-be rows and attaches no
-labels — the umbrella + one band-tier composition (and the name→label-id
-resolution) is a WRITE-time concern the daemon will implement in the
-Application phase (#24/#25); GLOSSARY: Application, Tier Label.
+labels — the `applied` umbrella is validated at config NOW (stripped,
+distinct from `high`/`med`) and consumed by the write phase later: the
+umbrella + one band-tier composition (and the name→label-id resolution)
+is a WRITE-time concern the daemon will implement in the Application
+phase (#24/#25); GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
 

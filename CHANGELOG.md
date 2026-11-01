@@ -64,10 +64,13 @@ does not ship releases yet.
   - The `[labels]` `high`/`med` config drives the report's tier names
     (a custom spelling is honored, not silently ignored —
     refuse-never-drop); `tiers.py` keeps the DEFAULT spellings as the
-    pure-core constants. The `applied` umbrella and the name→Gmail-label-id
-    resolution are a WRITE-time concern the daemon WILL implement in the
-    Application phase (#24/#25) — unshipped here (the report attaches no
-    labels; it renders the band tier name only).
+    pure-core constants. The `applied` umbrella is
+    validated at config NOW (stripped, distinct from `high`/`med`) and
+    consumed by the write phase later — the name→Gmail-label-id
+    resolution and the umbrella application are a WRITE-time concern the
+    daemon WILL implement in the Application phase (#24/#25) — unshipped
+    here (the report attaches no labels; it renders the band tier name
+    only).
   - A `--db PATH` flag is a usage-level override of `[store] db_path`
     (the opt-in live demo redirects the state DB to a tmp path).
   - The Backlog query is `in:inbox after:<epoch-seconds>` (the EPOCH

@@ -39,6 +39,15 @@ does not ship releases yet.
   path is a distinct class; a parent may scope its subtree), examples
   sorted by id with canonical sorted label tuples and Date Provenance
   stamped, required `now`, input-order invariant.
+- Dataset builder bridge (invariant #6): Filter-Authored evidence is
+  excluded from training examples (per-message for simulatable filters,
+  whole-label for unverifiable/malformed ones); a missing, incomplete,
+  or malformed filters/labels snapshot aborts the build loudly
+  (`BuildAbortedError`, a `ValueError`). The effective bridge is pinned
+  in the Split Manifest (`bridge_hash`, canonical — insensitive to filter
+  order and unreferenced label entries) so a drifted snapshot refuses the
+  rebuild. The filter-shape rule is shared with `dataset analyze`
+  (`filter_label_ids` / `filter_label_ids_strict`).
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).

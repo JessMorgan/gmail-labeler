@@ -2128,10 +2128,12 @@ def _validate_store_db(db_path: Path) -> None:
 
 def _now() -> datetime:
     """The injectable clock seam (fold-4 item 2): the single
-    ``datetime.now(UTC)`` read per command. ``shadow run``'s window math
-    and run_ts go through it, so a test can monkeypatch it to a fixed
-    aware datetime and pin the EXACT shipped default (now - 90d, time
-    kept) at the CLI level (the recorded ``list_messages`` query)."""
+    ``datetime.now(UTC)`` read per ``shadow run`` command (its window math
+    and run_ts both go through it — ONE read; the train/eval sites still
+    read the clock directly, which is #24's clock-seam reuse item, not
+    this ticket's scope). A test can monkeypatch it to a fixed aware
+    datetime and pin the EXACT shipped default (now - 90d, time kept) at
+    the CLI level (the recorded ``list_messages`` query)."""
     return datetime.now(UTC)
 
 
@@ -2697,16 +2699,15 @@ def shadow_run(
         store_db.close()
 
     if as_json:
-        # fold-4 item 3: the window in the payload is derived from the
-        # SAME cutoff_dt that built the query (the epoch the query uses +
-        # its ISO datetime) — the date-only `since` is retired (it
-        # diverged from the shipped default, which keeps the time)
+        # fold-4 item 3 + fold-5 A1: the window fields are derived from
+        # the SAME cutoff_dt that built the query — but ONLY when the
+        # default window was used. When --query overrides the default
+        # wholesale, cutoff_epoch/cutoff would describe a window the
+        # query never used, so they are OMITTED (no phantom window).
         payload = {
             "run_id": run_id,
             "run_ts": run_ts.isoformat(),
             "query": q,
-            "cutoff_epoch": int(cutoff_dt.timestamp()),
-            "cutoff": cutoff_dt.isoformat(),
             "limit": limit,
             "scored": len(fetched),
             "skipped": skipped,
@@ -2715,6 +2716,13 @@ def shadow_run(
             "not_applied": not_applied,
             "rows": json_rows,
         }
+        if query is None:
+            # default window active: the cutoff fields describe the SAME
+            # cutoff_dt that built the query (epoch + its ISO datetime —
+            # the date-only `since` is retired, it diverged from the
+            # shipped default, which keeps the time)
+            payload["cutoff_epoch"] = int(cutoff_dt.timestamp())
+            payload["cutoff"] = cutoff_dt.isoformat()
         typer.echo(json.dumps(payload, sort_keys=True))
     else:
         # the summary is STATUS, not report content — on stderr (the

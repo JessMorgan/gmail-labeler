@@ -235,8 +235,14 @@ def test_our_shape_shadow_results_with_foreign_version_is_refused(
     conn = sqlite3.connect(str(db_path))
     try:
         assert conn.execute("SELECT version FROM schema_version").fetchall() == [(99,)]
+        # the foreign shadow_results table is untouched (no rows written)
+        assert conn.execute("SELECT COUNT(*) FROM shadow_results").fetchone() == (0,)
     finally:
         conn.close()
+    # fold-5 A6: NOT opened, literal — a write attempt is refused (the
+    # connection was never established, so record_run raises "not open")
+    with pytest.raises(AppDBError, match="not open"):
+        db.record_run("run-1", TS, [_row()])
 
 
 def test_our_shape_empty_schema_version_is_corrupt(tmp_path: Path) -> None:
@@ -336,6 +342,10 @@ def test_versioned_foreign_db_gains_no_table_pre_refusal(tmp_path: Path) -> None
         assert tables == {"schema_version"}
     finally:
         conn.close()
+    # fold-5 A6: NOT opened, literal — a write attempt is refused (the
+    # connection was never established, so record_run raises "not open")
+    with pytest.raises(AppDBError, match="not open"):
+        db.record_run("run-1", TS, [_row()])
 
 
 def test_schema_version_row_is_stable_across_opens(tmp_path: Path) -> None:
@@ -373,8 +383,10 @@ def test_not_open_is_refused(tmp_path: Path) -> None:
 
 
 def test_applications_table_seam_is_documented() -> None:
-    # the #24 seam: the applications table lands in the same file, under
-    # the same versioning story — the seam is obvious and tested
+    # the #24 seam: the applications table lands in the same file under a
+    # v2 restamp (the v1->v2 restamp/migration is UNSOLVED pending #24 —
+    # see the appdb module docstring's UPGRADE STORY) — the seam is
+    # obvious and tested
     import gmail_labeler.appdb as appdb_module
 
     source = Path(appdb_module.__file__).read_text(encoding="utf-8")

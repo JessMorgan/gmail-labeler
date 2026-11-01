@@ -191,18 +191,22 @@ published a different artifact). `eval --graduation PATH` recomputes
 the Graduation Table — the per-label gates (minimum examples +
 minimum precision at the calibrated high band, from the config's
 `[graduation]` section) applied to the Managed Labels — and prints
-the human-confirm diff (old → new per label) to stderr; it writes
-NOTHING without `--confirm-graduation` (ADR-0005: no pipeline run
-ever mutates what is live by itself). The table is bound to the
+the human-confirm diff (old → new per label, with the effective gate
+targets + measured values, so a gate change is visible) to stderr; it
+writes NOTHING without `--confirm-graduation` (ADR-0005: no pipeline
+run ever mutates what is live by itself). The pure gate computation
+runs before the `--bands` write, so a gate refusal can no longer leave
+the bands artifact published. The table is bound to the
 checkpoint + eval identity + the Bands Artifact's content hash
 (refused on any disagreement), byte-identical for the same eval; the
 write is the CLI-gated confirm act (0600 from creation, staging +
 atomic replace, post-write readback compared by content hash).
 Refusals: up front (exit 2) `--confirm-graduation` without
 `--graduation`, an empty `--out`/`--bands`/`--graduation` path, a path
-equal to `--out` or `--bands`, an existing directory, the config file,
-and any target inside the checkpoint dir or the corpus store (by
-resolved path — the table must not live beside identity files); at run
+equal to `--out` or `--bands`, an existing directory, the config file
+(for `--bands`, `--graduation`, or `--out`), and any target inside the
+checkpoint dir or the corpus store (by resolved path — the table must
+not live beside identity files); at run
 time (exit 5, the report preserved) a degraded corpus (test records
 missing body shards — the table feeds the serving gate, same posture
 as `--bands`), a band calibration refusal, a gate evaluation refusal

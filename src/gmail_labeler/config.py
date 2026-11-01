@@ -178,7 +178,16 @@ def _band_raw_value_problems(
                 f"{loc_prefix}.{name} {target} is not a tenth — the bands "
                 "ride the candidate grid (the tenth-grid stance, #20)"
             )
-    if check_empty and all(sub.get(name) is None for name in _TARGET_NAMES):
+    # the empty-override consequence is reported only when the
+    # subtable carries NO other keys: a typo'd-key-only subtable
+    # (e.g. min_high = 0.9) is empty BECAUSE of the typo — the
+    # unknown-key cause (reported by the model_validate step) must
+    # come first, not the consequence
+    if (
+        check_empty
+        and not (set(sub) - set(_TARGET_NAMES))
+        and all(sub.get(name) is None for name in _TARGET_NAMES)
+    ):
         problems.append(
             f"{loc_prefix}: an override must set at least one target "
             "(min_high_precision / min_med_precision)"
@@ -286,13 +295,13 @@ class BandsConfig(BaseModel):
         problems: list[str] = []
         raw = cast("dict[str, object]", data) if isinstance(data, dict) else {}
         raw_pl = raw.get("per_label")
-        # an EMPTY raw dict is refused too: all() over an empty
-        # mapping is vacuously true, so the typed check alone would
-        # accept per_label = {} (the inherited #21-surface bug)
-        pl_is_typed = (
-            isinstance(raw_pl, dict)
-            and len(raw_pl) > 0
-            and all(isinstance(v, BandOverride) for v in raw_pl.values())
+        # an EMPTY raw dict is the typed DEFAULT ({}), accepted — the
+        # Config.model_validate(cfg.model_dump()) round-trip produces
+        # exactly this form; a NON-EMPTY raw dict with untyped values
+        # is the back door and is refused (all() over the typed values
+        # is the check)
+        pl_is_typed = isinstance(raw_pl, dict) and all(
+            isinstance(v, BandOverride) for v in raw_pl.values()
         )
         if "per_label" in raw and not pl_is_typed:
             # the back door: a raw per_label table bypassed every
@@ -492,7 +501,16 @@ def _gate_raw_value_problems(
         and not 0.0 <= mp <= 1.0
     ):
         problems.append(f"{loc_prefix}.min_precision {mp} must be in [0.0, 1.0]")
-    if check_empty and all(sub.get(name) is None for name in _GATE_NAMES):
+    # the empty-override consequence is reported only when the
+    # subtable carries NO other keys: a typo'd-key-only subtable
+    # (e.g. min_example = 10) is empty BECAUSE of the typo — the
+    # unknown-key cause (reported by the model_validate step) must
+    # come first, not the consequence
+    if (
+        check_empty
+        and not (set(sub) - set(_GATE_NAMES))
+        and all(sub.get(name) is None for name in _GATE_NAMES)
+    ):
         problems.append(
             f"{loc_prefix}: an override must set at least one gate "
             "(min_examples / min_precision)"
@@ -607,13 +625,13 @@ class GraduationConfig(BaseModel):
         problems: list[str] = []
         raw = cast("dict[str, object]", data) if isinstance(data, dict) else {}
         raw_pl = raw.get("per_label")
-        # an EMPTY raw dict is refused too: all() over an empty
-        # mapping is vacuously true, so the typed check alone would
-        # accept per_label = {} (the inherited #21-surface bug)
-        pl_is_typed = (
-            isinstance(raw_pl, dict)
-            and len(raw_pl) > 0
-            and all(isinstance(v, GateOverride) for v in raw_pl.values())
+        # an EMPTY raw dict is the typed DEFAULT ({}), accepted — the
+        # Config.model_validate(cfg.model_dump()) round-trip produces
+        # exactly this form; a NON-EMPTY raw dict with untyped values
+        # is the back door and is refused (all() over the typed values
+        # is the check)
+        pl_is_typed = isinstance(raw_pl, dict) and all(
+            isinstance(v, GateOverride) for v in raw_pl.values()
         )
         if "per_label" in raw and not pl_is_typed:
             # the back door: a raw per_label table bypassed every

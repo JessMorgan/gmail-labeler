@@ -1256,6 +1256,8 @@ def eval(
     )
 
     cfg = _load_config(config)
+    from .config import find_config
+
     # usage refusals up front (exit 2, before any corpus-scale work):
     # --confirm-graduation without --graduation has nothing to confirm;
     # an empty --bands/--graduation would degenerate to Path("") and
@@ -1264,11 +1266,12 @@ def eval(
     # report; --bands and --graduation naming the same file would let
     # the second write silently destroy the first; an artifact naming
     # the config file would destroy identity material this very run
-    # just read; an artifact INSIDE the checkpoint dir (manifest,
-    # sidecar, weights) or the corpus store (records index,
-    # labels/filters sidecars, bodies) would clobber identity files the
-    # garbage-tolerance NOTICE branch cannot see — a destructive
-    # collision, not a regenerable-report NOTICE
+    # just read (an artifact OR --out naming the config file); an
+    # artifact INSIDE the checkpoint dir (manifest, sidecar, weights)
+    # or the corpus store (records index, labels/filters sidecars,
+    # bodies) would clobber identity files the garbage-tolerance NOTICE
+    # branch cannot see — a destructive collision, not a
+    # regenerable-report NOTICE
     if confirm_graduation and graduation is None:
         typer.echo(
             "eval failed: --confirm-graduation requires --graduation",
@@ -1317,8 +1320,6 @@ def eval(
                 err=True,
             )
             raise typer.Exit(code=2) from None
-        from .config import find_config
-
         # the artifact must not live beside identity files: ANY target
         # inside the checkpoint dir or the corpus store is refused
         # (both sides RESOLVED — a symlink whose name sits outside but
@@ -1344,6 +1345,17 @@ def eval(
                 err=True,
             )
             raise typer.Exit(code=2) from None
+    # --out naming the config file would destroy the identity material
+    # this very run just read (the same exact-path refusal as the
+    # artifact targets — the report write is no exception)
+    if out is not None and Path(out).resolve() == find_config(config).resolve():
+        typer.echo(
+            f"eval failed: --out {out!r} names the config file "
+            f"({find_config(config).resolve()}) \u2014 refusing to "
+            "destroy it",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         typer.echo(
@@ -1712,44 +1724,11 @@ def eval(
             if as_json:
                 _emit_json_payload()  # the report is never lost
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-        if bands is not None:
-            try:
-                _write_bands_artifact(Path(bands), artifact, artifact.to_json())
-            except BandsTargetRefusedError as e:
-                # the serving-gate hardening: the existing target is a
-                # verifiably-different artifact — exit 5, before any
-                # staging, the previous bytes intact; the refusal
-                # reason prints BEFORE the json emit (an emit failure
-                # must not swallow the cause)
-                typer.echo(f"eval failed: --bands refused: {e}", err=True)
-                if as_json:
-                    _emit_json_payload()  # the report is never lost
-                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-            except OSError as e:
-                # the helper already cleaned up its (mkstemp-named)
-                # staging; the refusal reason prints BEFORE the json
-                # emit (an emit failure must not swallow the cause)
-                typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
-                if as_json:
-                    _emit_json_payload()  # the report is never lost
-                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-            # the human-readable summary (the text-report mode only —
-            # the --json payload is the machine-readable output, and
-            # the artifact file is the machine-readable bands). On
-            # STDERR, so the --out file stays "the same bytes as
-            # stdout" (the documented --out contract — the summary is
-            # status, not report content)
-            if not as_json:
-                typer.echo(
-                    "bands: "
-                    + "; ".join(
-                        f"{lb.label} high={lb.high if lb.high is not None else 'none'} "
-                        f"med={lb.med if lb.med is not None else 'none'}"
-                        + (f" ({', '.join(lb.reasons)})" if lb.reasons else "")
-                        for lb in calibrated.labels
-                    ),
-                    err=True,
-                )
+        # the PURE gate computation (evaluate + build_table) runs
+        # BEFORE the --bands write: a gate evaluation refusal must not
+        # leave the bands artifact published (the partial-effect class
+        # is closed at the source; a write refusal AFTER a prior write
+        # remains possible and is named in the message)
         if graduation is not None:
             from .graduation import (
                 GateTargets,
@@ -1809,6 +1788,45 @@ def eval(
             # ONCE, shared by the success emit and the write-failure
             # emits (no re-parse of the just-serialized text)
             proposal = json.loads(new_table.to_json())
+        if bands is not None:
+            try:
+                _write_bands_artifact(Path(bands), artifact, artifact.to_json())
+            except BandsTargetRefusedError as e:
+                # the serving-gate hardening: the existing target is a
+                # verifiably-different artifact — exit 5, before any
+                # staging, the previous bytes intact; the refusal
+                # reason prints BEFORE the json emit (an emit failure
+                # must not swallow the cause)
+                typer.echo(f"eval failed: --bands refused: {e}", err=True)
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
+                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+            except OSError as e:
+                # the helper already cleaned up its (mkstemp-named)
+                # staging; the refusal reason prints BEFORE the json
+                # emit (an emit failure must not swallow the cause)
+                typer.echo(f"eval failed: cannot write --bands: {e}", err=True)
+                if as_json:
+                    _emit_json_payload()  # the report is never lost
+                raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+            # the human-readable summary (the text-report mode only —
+            # the --json payload is the machine-readable output, and
+            # the artifact file is the machine-readable bands). On
+            # STDERR, so the --out file stays "the same bytes as
+            # stdout" (the documented --out contract — the summary is
+            # status, not report content)
+            if not as_json:
+                typer.echo(
+                    "bands: "
+                    + "; ".join(
+                        f"{lb.label} high={lb.high if lb.high is not None else 'none'} "
+                        f"med={lb.med if lb.med is not None else 'none'}"
+                        + (f" ({', '.join(lb.reasons)})" if lb.reasons else "")
+                        for lb in calibrated.labels
+                    ),
+                    err=True,
+                )
+        if graduation is not None:
             # the human-confirm diff (ADR-0005): old → new per label,
             # on STDERR (the report/--out byte-identity stays literally
             # true — the diff is status, not report content). The
@@ -1817,13 +1835,19 @@ def eval(
             # baseline.
             graduation_path = Path(graduation)
             existing: GraduationTable | None = None
+            unparseable_existing = False
             if graduation_path.is_file():
                 try:
                     existing = GraduationTable.from_json(
                         graduation_path.read_text(encoding="utf-8")
                     )
                 except (ValueError, OSError):
-                    existing = None  # a garbage target is the baseline
+                    # a garbage target is the baseline — but the file
+                    # EXISTS: the diff says "does not parse", not
+                    # "no existing table" (honesty about what is on
+                    # disk)
+                    existing = None
+                    unparseable_existing = True
             disagreeing: tuple[str, ...] = ()
             if existing is not None:
                 # the identity fields are named in ONE place
@@ -1835,7 +1859,8 @@ def eval(
                     existing,
                     new_table,
                     path=str(graduation),
-                    identity_disagreement=disagreeing,
+                    disagreeing_fields=disagreeing,
+                    unparseable_existing=unparseable_existing,
                 ),
                 err=True,
                 nl=False,

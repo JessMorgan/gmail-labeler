@@ -187,7 +187,35 @@ any staging — the previous bytes stay intact), a write failure; a
 post-write readback fault — the on-disk bytes do not parse back to
 a valid artifact (a torn/corrupt write); and a readback mismatch —
 a valid artifact whose content hash differs (a concurrent writer
-published a different artifact).
+published a different artifact). `eval --graduation PATH` recomputes
+the Graduation Table — the per-label gates (minimum examples +
+minimum precision at the calibrated high band, from the config's
+`[graduation]` section) applied to the Managed Labels — and prints
+the human-confirm diff (old → new per label) to stderr; it writes
+NOTHING without `--confirm-graduation` (ADR-0005: no pipeline run
+ever mutates what is live by itself). The table is bound to the
+checkpoint + eval identity + the Bands Artifact's content hash
+(refused on any disagreement), byte-identical for the same eval; the
+write is the CLI-gated confirm act (0600 from creation, staging +
+atomic replace, post-write readback compared by content hash).
+Refusals: up front (exit 2) `--confirm-graduation` without
+`--graduation`, an empty path, a path equal to `--out` or `--bands`,
+an existing directory, the config file, and any target inside the
+checkpoint dir or the corpus store (by resolved path — the table must
+not live beside identity files); at run time (exit 5, the report
+preserved) a degraded corpus (test records missing body shards — the
+table feeds the serving gate, same posture as `--bands`), a band
+calibration refusal, a gate evaluation refusal (an empty/duplicate
+Managed Label list, a Managed Label the vocabulary does not carry, an
+unknown gate override label, a lying identity), confirming over an
+existing table bound to a different identity (refused before any
+staging — the previous bytes stay intact), a write failure; a
+post-write readback fault — the on-disk bytes do not parse back to a
+valid table (a torn/corrupt write); and a readback mismatch — a valid
+table whose content hash differs (a concurrent writer published a
+different table). Config error → exit 4 (an out-of-range gate value,
+a raw bool/string). `train`/`eval` remain the only recomputers, and
+only the confirm path writes the table.
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.

@@ -34,6 +34,11 @@ does not ship releases yet.
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
+- Phase 1 dataset builder core (`dataset_build.py`): the shared pure
+  Corpus → Training Example transform — Label Path vocabulary (a leaf
+  path is a distinct class; a parent may scope its subtree), examples
+  sorted by id with canonical sorted label tuples and Date Provenance
+  stamped, required `now`, input-order invariant.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).

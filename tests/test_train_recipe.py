@@ -105,6 +105,74 @@ def test_cpu_smoke_trains_and_serves(tmp_path: Path) -> None:
 
 
 @pytest.mark.smoke
+def test_cpu_smoke_batched_predict_alignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Batched predict (ticket #20 — eval is the first bulk caller):
+    predict over more texts than one batch tokenizes in per-batch
+    chunks and concatenates — row i MUST still correspond to text i
+    (a concat misalignment would silently serve shifted scores). The
+    pin: a small forced batch size (2) over 5 texts gives the SAME rows
+    as the default single-batch call, and row i equals the SOLO call
+    for text i. The texts vary in length ON PURPOSE (1/3/5/7/13
+    words): equal-length near-identical texts get equal scores on the
+    tiny encoder, which would make any permutation pin vacuous
+    (probed)."""
+    import train.recipe as recipe
+    from train.recipe import load_hf_model
+
+    encoder_dir = _tiny_encoder(tmp_path / "tiny", num_labels=len(VOCAB))
+    model = load_hf_model(encoder_dir, VOCAB)
+    texts = [
+        "a",
+        "three words here",
+        "six words in this one",
+        "ten words in this longer text indeed",
+        "twenty words in this much longer text to tokenize here and now extra",
+    ]
+    default_rows = model.predict(texts)
+    _assert_serving_shape(default_rows, 5)
+    assert len({row for row in default_rows}) == 5  # non-degenerate:
+    # every text scores distinct, so a permutation is observable
+    monkeypatch.setattr(recipe, "_PREDICT_BATCH_SIZE", 2)  # 3 batches over 5
+    batched_rows = model.predict(texts)
+    _assert_serving_shape(batched_rows, 5)
+    # approx, not bit-exact: on a GPU host the batched GEMM kernel
+    # selection can differ by shape, so the last bits may move — the
+    # alignment claim is carried by the non-degenerate permutation pin
+    # above and the solo-call check below
+    assert all(
+        batched == pytest.approx(solo, rel=1e-5, abs=1e-6)
+        for batched, solo in zip(batched_rows, default_rows, strict=True)
+    )
+    for i, text in enumerate(texts):
+        assert batched_rows[i] == pytest.approx(
+            model.predict([text])[0], rel=1e-5, abs=1e-6
+        )  # row i ↔ text i
+
+
+@pytest.mark.smoke
+def test_cpu_smoke_predict_crosses_default_batch(tmp_path: Path) -> None:
+    """The REAL default batch size (32) exercised once: 33 texts → 2
+    batches, row 32 crosses the boundary — row i still corresponds to
+    text i. The production constant is what serves eval; a test-only
+    override would leave it unexercised."""
+    from train.recipe import load_hf_model
+
+    encoder_dir = _tiny_encoder(tmp_path / "tiny", num_labels=len(VOCAB))
+    model = load_hf_model(encoder_dir, VOCAB)
+    # 33 texts, 1..14 words each (varied lengths: equal-length
+    # near-identical texts score equal on the tiny encoder)
+    texts = [" ".join(f"w{i}_{j}" for j in range(1 + (i % 14))) for i in range(33)]
+    rows = model.predict(texts)
+    _assert_serving_shape(rows, 33)
+    for i, text in enumerate(texts):
+        assert rows[i] == pytest.approx(
+            model.predict([text])[0], rel=1e-5, abs=1e-6
+        )  # row i ↔ text i, across the default batch boundary
+
+
+@pytest.mark.smoke
 def test_weighted_loss_is_order_sensitive(tmp_path: Path) -> None:
     """The recency weight must actually weight: per-example BCE
     weighted mean. A scalar loss x weight vector is inert (loss x

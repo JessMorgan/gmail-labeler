@@ -157,9 +157,12 @@ class FakeGmailClient:
     def list_filters(self) -> list[FilterInfo]:
         self.calls.append("list_filters")
         self._maybe_fail("list_filters")
-        # a COPY too (F3 review): the read surfaces stay symmetric —
-        # the REST adapter builds fresh FilterInfo per call; #25/#26
-        # ride this fake
+        # a LIST-LEVEL COPY too (F3 review): the read surfaces stay
+        # list-level-copy safe — the REST adapter builds fresh
+        # FilterInfo per call; #25/#26 ride this fake. The NESTED
+        # criteria/action dicts REMAIN SHARED (REST rebuilds them per
+        # call; safety rests on the documented nested-mutation ban —
+        # FilterInfo.__post_init__)
         return list(self.filters_list)
 
     def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:

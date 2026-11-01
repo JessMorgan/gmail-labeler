@@ -137,11 +137,14 @@ class GmailClient(Protocol):
 
     def ensure_label(self, name: str) -> str:
         """Get-or-create a USER label by exact name (daemon/apply
-        startup only — never the Shadow Pass). An existing USER label of
-        exactly that name is used as-is; a casefolded System Label
-        name-sake is refused named — the refusal guards minting a
-        look-alike only; a concurrent-create 409 self-heals by
-        re-listing once."""
+        startup only — never the Shadow Pass). Returns the Gmail label
+        id. An existing USER label of exactly that name is used as-is;
+        otherwise, a casefolded System Label name-sake is refused named
+        — the refusal guards minting a look-alike only, and the raise
+        is a BARE ValueError (not the gmail_errors taxonomy: a caller
+        mapping startup refusals to an exit code must except ValueError
+        explicitly); a concurrent-create 409 self-heals by re-listing
+        once."""
         ...
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from gmail_labeler.appdb import (
+    _SCHEMA,
     SCHEMA_VERSION,
     AppDB,
     AppDBError,
@@ -246,28 +247,65 @@ def test_our_shape_shadow_results_with_foreign_version_is_refused(
 
 
 def test_our_shape_empty_schema_version_is_corrupt(tmp_path: Path) -> None:
-    # fold-4 item 1: an our-shape schema_version (single-column `version`)
-    # that is EMPTY (no version row) is named corrupt — NOT silently
-    # adopted (the version HARD gate: an empty stamp is not our version)
+    # fold-4 item 1 + fold-7 item 1: an our-shape schema_version that is
+    # EMPTY (no version row) is named corrupt — NOT silently adopted —
+    # and this is the EXECUTABLE proof of the appdb "corrupt" comment's
+    # claims: the exact crash state (executescript done, both tables,
+    # version row never inserted) keeps REFUSING on every re-open (the
+    # ownership gate raises before open()'s re-stamp branch), and
+    # recovery is NOT re-running: delete the file (a fresh open
+    # re-creates + stamps) or stamp the row manually.
+    def _build_crash_state(path: Path) -> None:
+        # what a crash between executescript and the stamp commit leaves
+        conn = sqlite3.connect(str(path))
+        conn.executescript(_SCHEMA)
+        conn.commit()
+        conn.close()
+
     db_path = tmp_path / "state.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-    conn.commit()
-    conn.close()
-    db = AppDB(db_path)
-    with pytest.raises(AppDBError, match="schema_version is empty"):
-        db.open()
-    # NOT adopted: no shadow_results table was created on the foreign DB
+    _build_crash_state(db_path)
+    # THREE open() attempts all refuse with the SAME named message
+    messages: list[str] = []
+    for _attempt in range(3):
+        with pytest.raises(AppDBError, match="schema_version is empty") as exc:
+            AppDB(db_path).open()
+        messages.append(str(exc.value))
+    assert len(set(messages)) == 1  # repeat refusal, same named cause
+    # the refusal never writes: the state survives exactly as crashed
     conn = sqlite3.connect(str(db_path))
     try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == []
         tables = {
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert "shadow_results" not in tables
-        assert "schema_version" in tables  # the foreign table, untouched
+        assert "shadow_results" in tables  # from the executescript, not a re-stamp
     finally:
         conn.close()
+    # recovery A: DELETE the file — a fresh open re-creates + stamps
+    db_path.unlink()
+    db = AppDB(db_path)
+    db.open()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [
+            (SCHEMA_VERSION,)
+        ]
+    finally:
+        conn.close()
+        db.close()
+    # recovery B: rebuild the crash state (from a clean file — _SCHEMA's
+    # CREATE TABLE IF NOT EXISTS would otherwise keep recovery A's stamp),
+    # stamp the row MANUALLY — open OK (the gate passes on the stamp)
+    db_path.unlink()
+    _build_crash_state(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()  # no refusal
+    db.close()
 
 
 def test_wrong_shape_shadow_results_is_refused(tmp_path: Path) -> None:

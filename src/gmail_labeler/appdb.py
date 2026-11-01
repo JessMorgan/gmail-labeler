@@ -288,16 +288,19 @@ class AppDB:
                     # our-shape but EMPTY (no version row) — corrupt, named.
                     # This state is also REACHABLE by a crash between
                     # executescript (tables created) and the version stamp
-                    # (row never inserted). EXECUTED probe (fold-6): the
-                    # state survives closed refusing — re-running open()
-                    # keeps refusing, because the ownership gate raises
-                    # HERE, before the re-stamp branch in open() (3/3
-                    # attempts refused). Recovery is NOT re-running: it
-                    # is DELETE the state DB file (a fresh open then
-                    # re-creates + stamps — executed: open OK, version
-                    # row (1,) restored) or stamp the row manually
-                    # (executed: open OK). The fail-safe direction is
-                    # correct (refuse, never adopt).
+                    # (row never inserted). Re-opening KEEPS refusing —
+                    # the ownership gate raises HERE, before the re-stamp
+                    # branch in open() — and recovery is NOT re-running:
+                    # it is DELETE the state DB file (a fresh open then
+                    # re-creates + stamps) or stamp the row manually.
+                    # Deleting discards recorded shadow runs — none can
+                    # exist in the crash state (the run that crashed
+                    # never committed), though the branch is also reached
+                    # by a hand-emptied populated DB, where they would
+                    # be lost. The fail-safe direction is correct
+                    # (refuse, never adopt). All of the above is pinned
+                    # by test_our_shape_empty_schema_version_is_corrupt
+                    # (3x refusal + both recoveries).
                     raise AppDBError(
                         f"state DB schema_version is empty (our shape, no "
                         f"version row) — corrupt: {self.path}"

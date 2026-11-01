@@ -2132,9 +2132,9 @@ def _now() -> datetime:
     and run_ts both go through it — ONE read; the other commands
     (train/eval/analyze) still read the clock directly, which is #24's
     clock-seam reuse item, not this ticket's scope). A test can
-    monkeypatch it to a fixed aware
-    datetime and pin the EXACT shipped default (now - 90d, time kept) at
-    the CLI level (the recorded ``list_messages`` query)."""
+    monkeypatch it to a fixed aware datetime and pin the EXACT shipped
+    default (now - 90d, time kept) at the CLI level (the recorded
+    ``list_messages`` query)."""
     return datetime.now(UTC)
 
 
@@ -2161,7 +2161,8 @@ def _backlog_query(cutoff_dt: datetime, query: str | None) -> str:
     documents epoch seconds for exact boundaries; ``newer_than:`` is
     documented as RELATIVE-DURATION only (d/m/y units), not an absolute
     date. An explicit --query is the escape hatch (it replaces the
-    default wholesale — the operator's query, the operator's risk)."""
+    whole backlog window — the default query and any --since alike — the
+    operator's query, the operator's risk)."""
     if query is not None:
         return query
     return f"in:inbox after:{int(cutoff_dt.timestamp())}"
@@ -2725,9 +2726,9 @@ def shadow_run(
         if query is None:
             # no --query override (default OR --since window): the cutoff
             # fields describe the SAME cutoff_dt that built the query
-            # (epoch + its ISO datetime — the date-only `since` is
-            # retired, it diverged from the shipped default, which keeps
-            # the time)
+            # (epoch + its ISO datetime — the payload's legacy date-only
+            # `since` KEY is retired, it diverged from the shipped
+            # default, which keeps the time; the --since FLAG is not)
             payload["cutoff_epoch"] = int(cutoff_dt.timestamp())
             payload["cutoff"] = cutoff_dt.isoformat()
         typer.echo(json.dumps(payload, sort_keys=True))

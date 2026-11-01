@@ -565,6 +565,91 @@ def test_predict_failure_holds_cursor(
     assert db.get_history_cursor() == 777
     assert fake.writes == []
     assert "delta failed" in caplog.text
+    # the review round's MAJOR pin: the leak fix itself. FakeModel's
+    # unprogrammed-text refusal QUOTES THE SCORED TEXT (which carries
+    # the body) — the warning must name the exception CLASS only,
+    # never the message. (Mutant: reverting to log(..., e) reddens the
+    # body-absence assertion below.)
+    assert "prediction failed (ValueError)" in caplog.text
+    assert "body two" not in caplog.text
+    db.close()
+
+
+def test_prediction_shape_defect_holds_and_names(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the self-authored shape defects (row count / row width) are
+    # body-free by construction and log their MESSAGE (operator-
+    # diagnosable), while still holding the cursor
+    caplog.set_level(logging.WARNING)
+
+    class _ShortModel(FakeModel):
+        def predict(self, texts: Any) -> Any:
+            self.calls.append(tuple(texts))
+            return ((0.9, 0.1),)  # ONE row for a two-message delta
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_ShortModel(VOCAB, scores={})) == 0
+    assert db.get_history_cursor() == 777  # held
+    assert "score rows for 2 texts" in caplog.text
+    db.close()
+
+
+def test_prediction_width_defect_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # a lying checkpoint with the right row COUNT but a misaligned row
+    # WIDTH must not escape the guarded arm and kill the loop (the
+    # daemon is long-lived: hold and warn, unlike shadow's one-shot
+    # exit-1 posture for width defects)
+    caplog.set_level(logging.WARNING)
+
+    class _WideModel(FakeModel):
+        def predict(self, texts: Any) -> Any:
+            self.calls.append(tuple(texts))
+            return tuple((0.9, 0.1, 0.5) for _ in tuple(texts))
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_WideModel(VOCAB, scores={})) == 0
+    assert db.get_history_cursor() == 777  # held, loop alive
+    assert "does not align" in caplog.text
+    db.close()
+
+
+def test_history_response_without_history_id_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the wire owes the mailbox's CURRENT id on every response; a
+    # response without it cannot establish the advance — hold, never
+    # invent a cursor (the arm had no node before the review round)
+    caplog.set_level(logging.WARNING)
+
+    class _NoIdClient(FakeGmailClient):
+        def history(
+            self, start_history_id: int, page_token: str | None = None
+        ) -> HistoryPage:
+            return HistoryPage(history_id=None, next_page_token=None, records=())
+
+    fake = _NoIdClient(messages=_messages(), labels=_labels(), current_history_id=900)
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777  # held
+    assert "no historyId" in caplog.text
     db.close()
 
 
@@ -917,7 +1002,7 @@ def test_crash_mid_page_after_write_replay_converges(tmp_path: Path) -> None:
     db.close()
 
 
-def test_crash_mid_transaction_rolls_back_both_and_converges(
+def test_crash_mid_transaction_holds_and_converges(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # crash row (b) mid-transaction: the commit dies. The store-side
@@ -1163,7 +1248,10 @@ def test_real_os_exit_kill_after_write_converges(tmp_path: Path) -> None:
             "ticks": 1,
         }
     )
-    assert r1.returncode == 137, r1.stderr  # the REAL kill (os._exit code)
+    # the REAL kill: os._exit(137) is an exit STATUS chosen to resemble
+    # SIGKILL (no signal is delivered) — what matters is that the
+    # process died with no finally, no cleanup, and no rollback
+    assert r1.returncode == 137, r1.stderr
     mailbox_at_death = json.loads(mbox_path.read_text(encoding="utf-8"))
     assert "L2" in mailbox_at_death["aa22"]  # the write LANDED server-side
     conn = sqlite3.connect(str(db_path))

@@ -203,11 +203,15 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
 )
 
-# The cursor UPSERT (the single-row model at the writer): always rowid
-# 1 — set replaces, never appends (SQLite upsert, ≥3.24).
+# The cursor write (the single-row model at the writer): always rowid
+# 1 — set replaces, never appends. INSERT OR REPLACE with the explicit
+# rowid is the DOCUMENTED form (the upsert conflict-target is specified
+# for UNIQUE/PRIMARY-Key constraints; the implicit rowid is outside
+# that wording — the review round's finding). A replace at rowid 1
+# leaves any hand-made extra row untouched, and the read gate refuses
+# the multi-row state either way.
 _CURSOR_UPSERT = (
-    "INSERT INTO daemon_state (rowid, history_cursor) VALUES (1, ?) "
-    "ON CONFLICT(rowid) DO UPDATE SET history_cursor = excluded.history_cursor"
+    "INSERT OR REPLACE INTO daemon_state (rowid, history_cursor) VALUES (1, ?)"
 )
 
 #: The joined script text — kept ONLY for the tamper-state test fixtures
@@ -696,39 +700,12 @@ class AppDB:
                 "record_applications: no rows — an empty write batch is "
                 "never committed (an empty plan is no Application)"
             )
-        for row in rows:
-            _check_application_row(row)
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            key = (row.message_id, row.label)
-            if key in seen:
-                raise AppDBError(
-                    f"duplicate row for {row.message_id} / {row.label} in "
-                    "one batch — one Application carries one row per label"
-                )
-            seen.add(key)
+        _check_application_batch(rows)
         try:
             # ONE transaction (the record_run precedent): the context
             # manager commits on success and rolls back on ANY exception
             with self._conn:
-                self._conn.executemany(
-                    "INSERT INTO applications "
-                    "(message_id, label, label_id, score, band, tier, "
-                    "applied_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            row.message_id,
-                            row.label,
-                            row.label_id,
-                            row.score,
-                            row.band,
-                            row.tier,
-                            row.applied_at.astimezone(UTC).isoformat(),
-                            row.source,
-                        )
-                        for row in rows
-                    ],
-                )
+                _insert_applications(self._conn, rows)
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
         return len(rows)
@@ -747,7 +724,7 @@ class AppDB:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT history_cursor FROM daemon_state"
+                "SELECT rowid, history_cursor FROM daemon_state"
             ).fetchall()
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
@@ -759,7 +736,20 @@ class AppDB:
                 f"single-row model: the writer UPSERTS rowid 1) — corrupt: "
                 f"{self.path}"
             )
-        return _check_cursor_value(rows[0][0])
+        rowid, value = rows[0]
+        if rowid != 1:
+            # the writer only ever touches rowid 1: a lone row elsewhere
+            # is hand-made (and the next legitimate write would make the
+            # table two rows) — refused NAMED with the recovery, not
+            # silently adopted (review finding)
+            raise AppDBError(
+                f"state DB daemon_state row carries rowid {rowid!r} (the "
+                f"single-row model: the writer UPSERTS rowid 1) — corrupt: "
+                f"{self.path} — recovery: run DELETE FROM daemon_state "
+                f"WHERE rowid != 1 manually, or delete the file (the "
+                f"cursor is re-established by bootstrap)"
+            )
+        return _check_cursor_value(value)
 
     def set_history_cursor(self, history_cursor: int) -> None:
         """Establish/replace the history cursor OUTSIDE a page commit
@@ -791,17 +781,7 @@ class AppDB:
         (daemon.py, the pinned comment there). Returns the row count."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
-        for row in rows:
-            _check_application_row(row)
-        seen: set[tuple[str, str]] = set()
-        for row in rows:
-            key = (row.message_id, row.label)
-            if key in seen:
-                raise AppDBError(
-                    f"duplicate row for {row.message_id} / {row.label} in "
-                    "one batch — one Application carries one row per label"
-                )
-            seen.add(key)
+        _check_application_batch(rows)
         _check_cursor_value(history_cursor)
         try:
             # ONE transaction (the record_run precedent): the context
@@ -811,24 +791,10 @@ class AppDB:
             # atomicity pin: test_commit_page_rolls_back_rows_and_cursor)
             with self._conn:
                 if rows:
-                    self._conn.executemany(
-                        "INSERT INTO applications "
-                        "(message_id, label, label_id, score, band, tier, "
-                        "applied_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        [
-                            (
-                                row.message_id,
-                                row.label,
-                                row.label_id,
-                                row.score,
-                                row.band,
-                                row.tier,
-                                row.applied_at.astimezone(UTC).isoformat(),
-                                row.source,
-                            )
-                            for row in rows
-                        ],
-                    )
+                    # the ONE applications-insert authority (shared with
+                    # record_applications — a column added to the table
+                    # changes in exactly one place)
+                    _insert_applications(self._conn, rows)
                 self._conn.execute(_CURSOR_UPSERT, (history_cursor,))
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
@@ -1037,6 +1003,49 @@ def _check_row(row: ShadowRow) -> None:
         )
 
 
+def _check_application_batch(rows: Sequence[ApplicationRow]) -> None:
+    # the ONE batch-validation authority (record_applications and
+    # commit_page share it — the dup message is pinned verbatim): every
+    # row validated, then the within-batch (message_id, label)
+    # uniqueness (one Application carries one row per label)
+    for row in rows:
+        _check_application_row(row)
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (row.message_id, row.label)
+        if key in seen:
+            raise AppDBError(
+                f"duplicate row for {row.message_id} / {row.label} in "
+                "one batch — one Application carries one row per label"
+            )
+        seen.add(key)
+
+
+def _insert_applications(
+    conn: sqlite3.Connection, rows: Sequence[ApplicationRow]
+) -> None:
+    # the ONE applications-INSERT column authority (the caller owns the
+    # transaction — record_applications and commit_page both ride it)
+    conn.executemany(
+        "INSERT INTO applications "
+        "(message_id, label, label_id, score, band, tier, "
+        "applied_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                row.message_id,
+                row.label,
+                row.label_id,
+                row.score,
+                row.band,
+                row.tier,
+                row.applied_at.astimezone(UTC).isoformat(),
+                row.source,
+            )
+            for row in rows
+        ],
+    )
+
+
 def _check_cursor_value(value: object) -> int:
     # The cursor vocabulary (the _opt_int64 wire doctrine: unsigned
     # int64 — a negative historyId must never silently advance
@@ -1049,6 +1058,15 @@ def _check_cursor_value(value: object) -> int:
     if value < 1:
         raise AppDBError(
             f"history_cursor {value} is not a valid cursor (>= 1, unsigned)"
+        )
+    if value > 2**63 - 1:
+        # the wire type (uint64) is WIDER than SQLite's signed INTEGER:
+        # an unbounded value would escape as a raw sqlite3 OverflowError
+        # at bind time (past the DatabaseError wrapper, past the CLI's
+        # exit-5 mapping) — refused NAMED here instead (review finding)
+        raise AppDBError(
+            f"history_cursor {value} exceeds the SQLite INTEGER range "
+            "(2**63 - 1) — no real historyId reaches this bound; refusing"
         )
     return value
 

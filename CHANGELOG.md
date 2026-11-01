@@ -29,8 +29,9 @@ does not ship releases yet.
     the history 404 re-bootstraps via the export prior-art path
     (`list_messages` + `get_message` → the newest message's
     per-message `historyId`, the sync guide's full-sync cursor
-    source), naming the un-processed gap; other page errors HOLD the
-    cursor counted; a per-message 404 (deleted mail) skips counted —
+    source), naming the un-processed gap; other per-page errors HOLD
+    the cursor (counted warnings cover the per-message events); a
+    per-message 404 (deleted mail) skips counted —
     the cursor never wedges on a ghost. Model predict failures log
     the exception CLASS only (a model error may quote the scored
     text, which carries the body — invariant #5).

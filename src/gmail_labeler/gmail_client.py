@@ -10,7 +10,10 @@ System Label name-sake is refused named — the refusal guards minting a
 look-alike only — invoked from the daemon/apply startup only, never the
 Shadow Pass).
 Both live behind the same Protocol (FakeGmailClient is the test spine —
-invariant #9). Errors surface via gmail_errors taxonomy only.
+invariant #9). Errors surface via the gmail_errors taxonomy — the ONE
+documented exception is ``ensure_label``'s config refusal, a bare
+``ValueError`` (see its docstring; the daemon/apply exit-4 mapping
+excepts ValueError explicitly).
 
 Wire-shape rule (verified against the Gmail v1 discovery schema): int64 /
 uint64 fields (internalDate, historyId) arrive as STRINGS — googleapiclient

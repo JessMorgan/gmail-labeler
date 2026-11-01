@@ -186,8 +186,8 @@ measured table (high/med per label, per-label min-precision targets
 from the config's `[bands]` section) and writes the versioned Bands
 Artifact — bound to the checkpoint + eval identity (verifiable
 against the checkpoint sidecar's identity fields), byte-identical
-for the same eval; its consumers (the daemon's shadow path, later
-phases) will refuse it on any identity disagreement once they land.
+for the same eval; its consumers (the Shadow Pass and the daemon)
+refuse it on any identity disagreement.
 It is opt-in: a bare `eval` never writes it
 (human-gated, ADR-0005), and it is the only writer — `train`/`eval`
 remain the only recomputers. Refusals: up front (exit 2) an empty
@@ -195,7 +195,7 @@ path, a path equal to `--out`, an existing directory, the config
 file, and any target inside the checkpoint dir or the corpus store
 (by resolved path — a link named inside pointing outside is allowed
 and replaces the link; the artifact must not live beside identity
-files; the canonical location lands with the daemon phase); at run
+files; the canonical location is the operator's choice today); at run
 time (exit 5, the report preserved) a degraded corpus (test records
 missing body shards — the artifact feeds the daemon's serving gate),
 a calibration refusal (an unknown override label, a lying identity),
@@ -318,9 +318,9 @@ umbrella plus the best band tier to every write, and
 `gmail_client.ensure_label` ships the name→Gmail-label-id resolution
 (get-or-create: an existing USER label of exactly that name is used
 as-is; a casefolded System Label name-sake is refused named — the
-refusal guards minting a look-alike only; the daemon / `apply` startup
-of #25/#26 calls it once per configured name); the live write itself
-lands with the daemon / `apply` CLI (#25/#26);
+refusal guards minting a look-alike only; the daemon calls it once per
+configured name at startup, `apply` will too); the daemon's live write
+landed with #25, the `apply` bulk path lands with #26;
 GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
@@ -354,16 +354,17 @@ gmail-labeler shadow report
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`apply`, `daemon`, and `status` are frozen command names that arrive
-in later phases (not wired yet) — until they are, they exit `2` as
-unknown commands; `3` is reserved for wired-but-stubbed commands and
+`apply` and `status` are frozen command names that arrive in later
+phases (not wired yet) — until they are, they exit `2` as unknown
+commands; `3` is reserved for wired-but-stubbed commands and
 currently unreachable. Scripts can branch on 0/2/4/5 today; a `1`
 means an unhandled crash — that's a bug, please report it.
 
 ### Running the daemon (Phase 2)
 
 `daemon` is the live application path (ticket #25). It polls the Gmail
-History API every `[gmail] history_poll_seconds` (default 30, floor 5),
+History API every `[gmail] history_poll_seconds` (default 30, bounds
+5–3600),
 scores arriving mail in-process through the sidecar-validated
 checkpoint, and applies only GRADUATED labels — every Application
 carries the umbrella Tier Label plus its best band tier, additive-only
@@ -381,37 +382,45 @@ corpus/checkpoint identity — any disagreement refuses with exit 5,
 naming the fields. Then the three configured Tier Label names
 (`[labels] applied` / `high` / `med`) resolve ONCE via get-or-create:
 an existing USER label of exactly that name is reused; a brand-new name
-is created in your mailbox. **If a configured name case-insensitively
-matches a System Label name in your mailbox (e.g. `INBOX`, `STARRED`),
-the daemon refuses to start with exit 4 and names the offending
-`[labels]` key** — minting a look-alike would make the tier visually
-indistinguishable from Gmail's own system state, so the fix is yours:
-rename that `[labels]` entry and restart.
+is created in your mailbox. **If a configured name casefold-matches a
+System Label name in your mailbox (e.g. `INBOX`, `STARRED`) AND no USER
+label of exactly that name already exists, the daemon refuses to start
+with exit 4 and names the offending `[labels]` key** — MINTING a
+look-alike would make the tier visually indistinguishable from Gmail's
+own system state, so the fix is yours: rename that `[labels]` entry and
+restart.
 
 The **history cursor** (the mailbox `historyId` the daemon syncs from)
 lives in the state DB — the `daemon_state` single-row table at
-`[store] db_path` (schema v3). It is persisted ONLY after the page's
-events are durably handled (invariant #3): the Gmail write lands
-first, then ONE database transaction carries the page's Application
-rows AND the cursor advance — commit = handled. A `kill -9` anywhere
-before that commit replays the page on restart, and the replay is
-harmless: labels already written are now present, so skip-present
-composes an empty plan — zero double-writes, zero duplicate audit
-rows (the crash matrix in `tests/test_daemon.py` pins this, including
-a real process kill). If the daemon was down longer than Gmail
-retains history (typically at least a week, occasionally far less),
-the cursor expires: the daemon re-establishes it from the newest
-message (the documented full-sync bootstrap), warns loudly, and the
-mail that arrived during the gap was NOT labeled — review it with
-`shadow run` (or `apply` when it lands).
+`[store] db_path` (schema v3). It is established by the full-sync
+bootstrap (the newest message's `historyId`) and advanced ONLY after
+the poll's delta is durably handled (invariant #3): the Gmail writes
+land first, then ONE database transaction carries the delta's
+Application rows AND the cursor advance — commit = handled. A
+`kill -9` anywhere before that commit replays the delta on restart,
+and the replay is harmless: labels already written are now present, so
+skip-present composes an empty plan — zero double-writes, zero
+duplicate audit rows (the crash matrix in `tests/test_daemon.py` pins
+this, including a real process kill). The mirrored face of the same
+design: a write that landed just before the kill leaves its audit row
+uncommitted — the Gmail truth stands, the row is not re-added, so
+the Applications table plus the mailbox together are the audit truth,
+not the table alone. If the daemon was down longer than Gmail retains
+history (records are typically available for at least a week, and the
+retention can be significantly shorter), the cursor expires: the
+daemon re-establishes it from the newest message (the documented
+full-sync bootstrap), warns loudly, and the mail that arrived during
+the gap was NOT labeled — review it with `shadow run` (or `apply`
+when it lands).
 
-Shutdown is graceful: `SIGTERM` / `SIGINT` finish the current page to
+Shutdown is graceful: `SIGTERM` / `SIGINT` finish the current delta to
 its commit point (cursor written) and exit 0; a signal during the
 inter-poll sleep exits immediately with the cursor untouched. A
 transient API failure never advances the cursor — the next tick
-retries the page. A per-message failure (a deleted message, a lying
-model row) means NO write for that message (invariant #1's fail-safe)
-with a counted id-only warning; the page's cursor still advances.
+re-walks the delta from the held cursor. A per-message failure (a
+deleted message, a lying model row) means NO write for that message
+(invariant #1's fail-safe) with a counted id-only warning; the
+delta's cursor still advances.
 Message bodies never enter the database, the warnings, or any log
 (invariant #5) — the state DB stays publicly attachable.
 

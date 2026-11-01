@@ -863,6 +863,23 @@ def test_ensure_label_refuses_a_system_label_name_collision() -> None:
     assert service.create_calls == []  # no duplicate-named user label minted
 
 
+def test_ensure_label_casefold_catches_lowercase_collision() -> None:
+    # F2 (deepseek MINOR): the collision guard casefolds — a configured
+    # lowercase variant (high = "inbox") must NOT slip past == and mint
+    # the visually-system user label. The Gmail v1 REST reference
+    # documents the 409 duplicate-name refusal but NOT a case rule, and
+    # CI cannot ask the live API (invariant #9) — casefold is the
+    # belt-and-braces posture: an "inbox"-named user label beside the
+    # system INBOX is the same visual trap the guard exists to refuse
+    client, service = _write_rest(
+        labels={"labels": [{"id": "INBOX", "name": "INBOX", "type": "system"}]},
+        create={"id": "Label_new", "name": "inbox", "type": "user"},
+    )
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        client.ensure_label("inbox")
+    assert service.create_calls == []
+
+
 def test_ensure_label_409_race_self_heals_by_relisting() -> None:
     # F1 (qwen MINOR): a concurrent create (another client won the name
     # between our list and our create — Gmail answers 409) is NOT a hard
@@ -991,6 +1008,14 @@ def test_fake_ensure_label_refuses_system_namesakes() -> None:
     fake = FakeGmailClient(labels=[LabelInfo(id="INBOX", name="INBOX", type="system")])
     with pytest.raises(ValueError, match="collides with a System Label name"):
         fake.ensure_label("INBOX")
+    assert fake.writes == []
+
+
+def test_fake_ensure_label_casefold_catches_lowercase_collision() -> None:
+    # the fake mirrors the casefold guard (F1/F2 fidelity)
+    fake = FakeGmailClient(labels=[LabelInfo(id="INBOX", name="INBOX", type="system")])
+    with pytest.raises(ValueError, match="collides with a System Label name"):
+        fake.ensure_label("inbox")
     assert fake.writes == []
 
 

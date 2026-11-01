@@ -42,8 +42,9 @@ composition (umbrella + one band tier) SHIPS at the library level
 tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
 ships the name→id resolution; the daemon / `apply` startup of #25/#26
 calls it once per configured name). The Application is ALL-OR-NOTHING
-per message: any compose error means NO write for that message plus a
-counted id-only warning (invariant #1's fail-safe), and nothing new
+per message: a data-path compose error means NO write for that message
+plus a counted id-only warning (caller bugs and internal guards raise
+— and still write nothing; invariant #1's fail-safe), and nothing new
 earned — skip-present included — means an empty plan and no API call at
 all (invariant #2). Band tiers ACCUMULATE across Applications (accepted
 v1 policy): "exactly one band Tier Label" is PER-APPLICATION — a later

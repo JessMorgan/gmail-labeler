@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .gmail_client import (
+    BARE_ADD_IDS_REFUSAL,
     FilterInfo,
     HistoryPage,
     LabelInfo,
@@ -249,10 +250,7 @@ class FakeGmailClient:
         mirrors the REST adapter (a caller bug raises BEFORE even the
         call-log entry — no wire call happened)."""
         if isinstance(add_label_ids, (str, bytes)):
-            raise ValueError(
-                "apply_labels: add_label_ids must be a sequence of label "
-                f"ids, not a bare string (got {add_label_ids!r})"
-            )
+            raise ValueError(f"{BARE_ADD_IDS_REFUSAL} (got {add_label_ids!r})")
         self.calls.append(f"apply_labels:{message_id}")
         self._maybe_fail("apply_labels")
         try:
@@ -297,10 +295,12 @@ class FakeGmailClient:
         self.calls.append(f"ensure_label:{name}")
         self._maybe_fail("ensure_label")
         labels = self.list_labels()  # the wire call the adapter makes
+        wanted = name.casefold()
         for label in labels:
-            if label.name == name:
-                if label.type == "user":
-                    return label.id
+            if label.name == name and label.type == "user":
+                return label.id
+            if label.type == "system" and label.name.casefold() == wanted:
+                # the casefolded collision guard, mirrored (F2)
                 raise ValueError(
                     f"ensure_label: {name!r} collides with a System Label "
                     "name in the mailbox — rename [labels] applied/high/med "

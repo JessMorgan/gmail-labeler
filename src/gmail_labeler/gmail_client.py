@@ -36,6 +36,14 @@ from .gmail_errors import (
 # ignores per-request timeouts, so the bound lives on the httplib2 transport.
 _REQUEST_TIMEOUT_S = 30.0
 
+#: The bare-str/bare-bytes refusal for apply_labels — Sequence[str]
+#: admits a str at the type level (a str is a Sequence of its
+#: characters, the wire would carry one-char label ids). ONE message
+#: for both surfaces (F2: FakeGmailClient imports this, never a copy).
+BARE_ADD_IDS_REFUSAL = (
+    "apply_labels: add_label_ids must be a sequence of label ids, not a bare string"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class LabelInfo:
@@ -307,10 +315,7 @@ class GmailRestClient:
         label ids), so the guard is RUNTIME: a str (or bytes) is refused
         as a caller bug before anything reaches the transport."""
         if isinstance(add_label_ids, (str, bytes)):
-            raise ValueError(
-                "apply_labels: add_label_ids must be a sequence of label "
-                f"ids, not a bare string (got {add_label_ids!r})"
-            )
+            raise ValueError(f"{BARE_ADD_IDS_REFUSAL} (got {add_label_ids!r})")
         body: dict[str, object] = {"addLabelIds": list(add_label_ids)}
         self._call(
             self._svc().users().messages().modify(userId="me", id=message_id, body=body)
@@ -332,10 +337,18 @@ class GmailRestClient:
         name is STILL not ours to see, the original refusal stands (no
         retry loop)."""
         labels = self.list_labels()
+        wanted = name.casefold()
         for label in labels:
-            if label.name == name:
-                if label.type == "user":
-                    return label.id
+            if label.name == name and label.type == "user":
+                return label.id  # the exact-case get-or-create hit
+            if label.type == "system" and label.name.casefold() == wanted:
+                # CASEFOLDED (F2): the Gmail REST reference documents the
+                # 409 duplicate-name refusal but not a case rule, and CI
+                # cannot ask the live API — a user label named "inbox"
+                # beside the system INBOX is the same visual trap the
+                # guard exists to refuse, so the comparison does not
+                # depend on Gmail's answer (the get-or-create HIT above
+                # stays exact-case: the labels.py space contract)
                 raise ValueError(
                     f"ensure_label: {name!r} collides with a System Label "
                     "name in the mailbox — rename [labels] applied/high/med "

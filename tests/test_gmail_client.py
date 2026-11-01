@@ -899,6 +899,20 @@ def test_ensure_label_user_hit_wins_regardless_of_list_order() -> None:
     assert service.create_calls == []
 
 
+def test_fake_ensure_label_user_hit_wins_regardless_of_list_order() -> None:
+    # the mirrored pin (F2 review NIT): #25's exact-call tests ride the
+    # FAKE, so its two-pass split needs its own order-determinism pin —
+    # a single-pass revert in the fake must not stay green
+    fake = FakeGmailClient(
+        labels=[
+            LabelInfo(id="INBOX", name="INBOX", type="system"),
+            LabelInfo(id="Label_user", name="inbox", type="user"),
+        ]
+    )
+    assert fake.ensure_label("inbox") == "Label_user"
+    assert fake.writes == []
+
+
 def test_ensure_label_case_variant_of_a_user_label_creates_not_refuses() -> None:
     # F2 review NIT: the guard's negative direction — a case variant of
     # a USER label (no system collision) must proceed to create, not

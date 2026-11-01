@@ -331,6 +331,29 @@ def test_bands_programmatic_per_label_gets_the_same_checks() -> None:
             BandsConfig(per_label={"Bills": bad})
 
 
+def test_bands_same_label_named_twice_refused(tmp_path: Path) -> None:
+    # the same label named more than once — a typed per_label entry
+    # AND a [bands."<key>"] subtable, or padded keys that strip to
+    # one — is refused, not silently shadowed (the LabelsConfig
+    # uniqueness precedent, post-clean)
+    from gmail_labeler.config import BandOverride, BandsConfig
+
+    with pytest.raises(ValueError, match="duplicate"):
+        BandsConfig.model_validate(
+            {
+                "per_label": {"Bills": BandOverride(min_high_precision=0.5)},
+                "Bills": {"min_high_precision": 0.9},
+            }
+        )
+    p = _write(
+        tmp_path,
+        '[bands."Foo"]\nmin_high_precision = 0.9\n'
+        '[bands."Foo "]\nmin_med_precision = 0.8\n',
+    )
+    with pytest.raises(ConfigError, match="duplicate"):
+        load_config(str(p))
+
+
 def test_bands_label_key_stripped_and_bounded(tmp_path: Path) -> None:
     # a whitespace-padded key is stored stripped (the LabelsConfig
     # stripping precedent — a padded key must not survive to

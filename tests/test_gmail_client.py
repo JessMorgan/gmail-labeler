@@ -568,6 +568,40 @@ def test_opt_history_id_caps_at_the_persistable_bound() -> None:
         _opt_history_id({"h": MAX_PERSISTABLE_HISTORY_ID + 1}, "h")
 
 
+def test_get_message_refuses_an_unpersistable_history_id_at_the_wire() -> None:
+    # F2 round-2 MAJOR (the reviewer's executed probe): the RawMessage
+    # site is the ONLY source of the bootstrap cursor seed — the cap
+    # must ride it too, or a wire-legal 2**63 historyId parses clean,
+    # bootstrap returns it, and the CLI lands on exit 5 at the store
+    # (the shipped docstring promised the 'cannot establish' hold
+    # instead). The F2 swap silently no-opped here (a replace without
+    # an assert); this node is the falsifier.
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    client = _rest(
+        payload={
+            "id": "aa",
+            "threadId": "t",
+            "labelIds": ["INBOX"],
+            "raw": "aGk",
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID + 1),
+        }
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        client.get_message("aa")
+    # the top persistable value still parses (the boundary, wire-side)
+    ok = _rest(
+        payload={
+            "id": "aa",
+            "threadId": "t",
+            "labelIds": ["INBOX"],
+            "raw": "aGk",
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID),
+        }
+    )
+    assert ok.get_message("aa").history_id == MAX_PERSISTABLE_HISTORY_ID
+
+
 def test_history_id_parse_bound_equals_the_store_bound(tmp_path: Path) -> None:
     # the anti-drift pin: the parse ceiling and the store ceiling are
     # the SAME number, stated in two modules (layering keeps them
@@ -590,9 +624,7 @@ def test_fake_refuses_retention_floor_above_the_mailbox() -> None:
     # F2 NIT: a floor above current_history_id makes EVERY poll an
     # out-of-date 404 (endless resync) — the fake refuses the scripted
     # lie at construction (the review probe hit exactly this state)
-    import pytest as _pytest
-
-    with _pytest.raises(ValueError, match="above current_history_id"):
+    with pytest.raises(ValueError, match="above current_history_id"):
         FakeGmailClient(current_history_id=100, retention_floor=500)
 
 

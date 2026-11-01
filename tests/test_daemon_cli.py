@@ -419,6 +419,25 @@ def test_daemon_counter_line_reaches_stderr(
     assert "cursor=900" in result.stderr
 
 
+def test_daemon_log_handler_removed_after_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 round-2 MINOR: the no-leak property had no DIRECT node (the
+    # leak mutant only surfaced as cross-test contamination). After a
+    # clean run the daemon logger carries no handler and its level is
+    # restored, whatever the process looked like before.
+    import logging
+
+    daemon_log = logging.getLogger("gmail_labeler.daemon")
+    before_handlers = list(daemon_log.handlers)
+    before_level = daemon_log.level
+    _prepare(tmp_path, monkeypatch)
+    result, _ = _run_daemon(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    assert daemon_log.handlers == before_handlers
+    assert daemon_log.level == before_level
+
+
 def test_daemon_apply_auth_error_exit_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

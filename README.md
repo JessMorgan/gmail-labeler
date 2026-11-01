@@ -258,7 +258,10 @@ field). The Backlog query defaults to `in:inbox after:<epoch-seconds>`
 MIDNIGHT PST; `--since` ISO date → UTC midnight of that date → epoch,
 default 90 days ago; the default window includes recent arrivals as
 well as the older history — GLOSSARY: Backlog; `--limit` max messages,
-default 100; `--query` replaces the default wholesale). A message
+default 100; `--query` replaces the default wholesale; `--db PATH`
+overrides `[store] db_path` — `~` is expanded, and a relative `--db`
+anchors to the CWD (like `--bands` / `--graduation`), unlike the
+config's `[store] db_path`, which anchors to the config dir). A message
 whose body cannot be fetched is skipped (per-message fail-safe:
 warning + count, the run continues) — the documented posture choice
 vs `eval`'s whole-run refusal: shadow is a read-only survey. A run
@@ -277,7 +280,12 @@ NOT-APPLIED outcomes and a per-label summary carrying the would-be
 tier mix. `--run` picks a specific run (default: the latest). Config
 error -> exit 4; a no-DB / unknown-run / transport failure -> exit 5.
 Message bodies never enter the DB, the report, or any log path
-(invariant #5) — the DB is publicly attachable.
+(invariant #5) — the DB is publicly attachable. The report is a
+PREVIEW, not an Application: it renders the band tier NAME (the
+configured `[labels] high`/`med`) for would-be rows and attaches no
+labels — the umbrella + one band-tier composition (and the name→label-id
+resolution) is a WRITE-time concern the daemon will implement in the
+Application phase (#24/#25); GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
 

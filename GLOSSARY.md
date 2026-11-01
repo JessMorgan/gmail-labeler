@@ -16,18 +16,26 @@ which they were applied, so every AI application is visible and reviewable.
 Three spellings (the `tiers.py` defaults, mirrored by the `[labels]` config
 keys `applied` / `high` / `med`): the `ai-applied` umbrella ("the AI
 contributed something"), `ai-high` (the high-confidence band), and `ai-med`
-(the review-me band). The operator's configured `[labels]` names drive the
-shadow report's tier names; the daemon resolves them to Gmail label ids before
-any live Application.
+(the review-me band). The configured `high` / `med` names drive the shadow
+report's tier names NOW (the report renders the band tier name for would-be
+rows); the `applied` umbrella and the name→Gmail-label-id resolution are a
+WRITE-time concern the daemon WILL implement in the Application phase (#24/#25)
+— unshipped here (the report attaches no labels).
 _Avoid_: confidence label, meta label
 
 **Application**:
-A single act of applying one or more Managed Labels plus one Tier Label to one
-message, performed only when at least one predicted Managed Label is genuinely
-absent from the message (present labels are never re-applied). The unit that
-corrections and audits are counted against. The per-message Tier Label is the
-BEST band among the applied labels (high beats med); a skip-present label
-earns no Tier Label (it is not applied), so it never raises the tier.
+A single act of applying one or more Managed Labels to one message, performed
+only when at least one predicted Managed Label is genuinely absent from the
+message (present labels are never re-applied). The unit that corrections and
+audits are counted against. The REAL contract: every Application carries the
+umbrella Tier Label (`[labels] applied`) AND exactly one band Tier Label
+(`[labels] high` or `med` — the BEST band among the applied labels, high beats
+med; a skip-present label earns no band tier, it is not applied). That
+composition (umbrella + one band tier) is done at WRITE time by the (future)
+daemon/apply phase (#24/#25), which also resolves the configured names to
+Gmail label ids. The shadow report is a PREVIEW, not an Application: it renders
+the band tier NAME for would-be rows and attaches no labels (no umbrella, no
+band tier on the wire).
 _Avoid_: auto-label (the event, not the label)
 
 **Additive-only**:

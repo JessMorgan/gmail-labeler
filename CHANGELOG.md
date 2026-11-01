@@ -61,12 +61,13 @@ does not ship releases yet.
     (list_messages, get_message, list_labels, list_filters) — no write
     method of any shape (the Protocol has none in this ticket; the
     write surface lands #24/#25).
-  - The `[labels]` applied/high/med config drives the report's tier
-    names (a custom spelling is honored, not silently ignored —
+  - The `[labels]` `high`/`med` config drives the report's tier names
+    (a custom spelling is honored, not silently ignored —
     refuse-never-drop); `tiers.py` keeps the DEFAULT spellings as the
-    pure-core constants, and the daemon (#24) resolves the configured
-    names to Gmail label ids (the contract is recorded in the tiers
-    module docstring).
+    pure-core constants. The `applied` umbrella and the name→Gmail-label-id
+    resolution are a WRITE-time concern the daemon WILL implement in the
+    Application phase (#24/#25) — unshipped here (the report attaches no
+    labels; it renders the band tier name only).
   - A `--db PATH` flag is a usage-level override of `[store] db_path`
     (the opt-in live demo redirects the state DB to a tmp path).
   - The Backlog query is `in:inbox after:<epoch-seconds>` (the EPOCH
@@ -76,8 +77,9 @@ does not ship releases yet.
     minus 90 days.
   - Exit-code contract at tip: 2 usage (empty/whitespace `--bands`/
     `--graduation`/`--db`, empty `--query`, bad `--since`, `--limit
-    <= 0`, empty `--run`, `[store]` db_path inside the checkpoint dir
-    or corpus store — containment); 4 auth; 5 operation
+    <= 0`, empty `--run`, the state DB path — `--db PATH` or `[store]
+    db_path` — inside the checkpoint dir or corpus store, named by its
+    source — containment); 4 auth; 5 operation
     (checkpoint/bands/graduation identity refusal, would-apply
     refusal, no-verdicts run, no-evidence report refusal, state DB
     ownership/corrupt/foreign-version refusal, DB failure, transport

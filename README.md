@@ -10,7 +10,7 @@ confident, reviewably when it isn't.
 > working OAuth flow and `dataset import-gmail` / `import-gyb` /
 > `sync-labels` / `analyze`.
 > Training, graduation, and the daemon arrive in later phases — follow the
-> phase plan in [AGENTS.md](AGENTS.md).
+> phase plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -205,7 +205,8 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 
 ## Docs
 
-- [AGENTS.md](AGENTS.md) — architecture spine and phase plan
+- [AGENTS.md](AGENTS.md) — architecture spine
+- [docs/ROADMAP.md](docs/ROADMAP.md) — phase plan of record
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
 - [docs/adr/](docs/adr/) — the eight shape-defining decisions

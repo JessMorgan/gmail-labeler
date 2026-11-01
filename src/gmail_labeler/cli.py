@@ -42,9 +42,6 @@ if TYPE_CHECKING:
     from .graduation import GraduationTable
     from .label_sync import FullResyncStats, SyncStats
     from .thresholds import BandsArtifact
-    from .graduation import GraduationTable
-    from .label_sync import FullResyncStats, SyncStats
-    from .thresholds import BandsArtifact
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",

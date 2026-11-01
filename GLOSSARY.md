@@ -11,16 +11,18 @@ All other labels are untouchable.
 _Avoid_: target label, predicted label
 
 **Tier Label**:
-A label attached alongside the content labels marking the confidence band under
+A label attached alongside the content labels marking the band under
 which they were applied, so every AI application is visible and reviewable.
 Three spellings (the `tiers.py` defaults, mirrored by the `[labels]` config
 keys `applied` / `high` / `med`): the `ai-applied` umbrella ("the AI
 contributed something"), `ai-high` (the high-confidence band), and `ai-med`
 (the review-me band). The configured `high` / `med` names drive the shadow
 report's tier names NOW (the report renders the band tier name for would-be
-rows); the `applied` umbrella and the name→Gmail-label-id resolution are a
-WRITE-time concern the daemon WILL implement in the Application phase (#24/#25)
-— unshipped here (the report attaches no labels).
+rows); the `applied` umbrella is VALIDATED at config NOW (stripped, and
+distinct from `high` / `med`) and CONSUMED by the write phase later — the
+name→Gmail-label-id resolution and the umbrella application are a WRITE-time
+concern the daemon WILL implement in the Application phase (#24/#25) —
+unshipped here (the report attaches no labels).
 _Avoid_: confidence label, meta label
 
 **Application**:
@@ -31,8 +33,8 @@ audits are counted against. The REAL contract: every Application carries the
 umbrella Tier Label (`[labels] applied`) AND exactly one band Tier Label
 (`[labels] high` or `med` — the BEST band among the applied labels, high beats
 med; a skip-present label earns no band tier, it is not applied). That
-composition (umbrella + one band tier) is done at WRITE time by the (future)
-daemon/apply phase (#24/#25), which also resolves the configured names to
+composition (umbrella + one band tier) is done at WRITE time by the
+daemon phase (#24/#25), which also resolves the configured names to
 Gmail label ids. The shadow report is a PREVIEW, not an Application: it renders
 the band tier NAME for would-be rows and attaches no labels (no umbrella, no
 band tier on the wire).
@@ -56,7 +58,7 @@ changes (ADR-0005); the confirmed result is the Graduation Table.
 _Avoid_: go-live, enablement
 
 **Threshold Band**:
-The per-(message, Managed Label) verdict — high, medium, or none — derived
+The per-(message, Managed Label) verdict — high, med, or none — derived
 from the label's calibrated probability and its threshold. The persisted
 verdict values are `high` / `med` / `none` (the `tiers.py` `BAND_HIGH` /
 `BAND_MED` constants; "none" is the explicit no-band state).

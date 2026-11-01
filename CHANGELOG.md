@@ -31,3 +31,6 @@ does not ship releases yet.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).
+- `docs/ROADMAP.md` — the phase plan of record (Phase 0 remnants →
+  Phase 1 → Phase 2 → explicitly-parked Phase 3); the README's
+  phase-plan pointer now links there.

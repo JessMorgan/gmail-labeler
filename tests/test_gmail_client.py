@@ -240,6 +240,37 @@ def test_rest_history_page_history_id_is_string_on_wire() -> None:
     assert h.history_id == 42 and len(h.records) == 1
 
 
+def test_rest_get_message_parses_history_id() -> None:
+    # #25 C2 (the sync-guide bootstrap source): the Message resource's
+    # historyId — the per-message history record id the daemon stores as
+    # its starting cursor — parsed as int64 (string on the wire, the
+    # _opt_int64 doctrine)
+    client = _rest(
+        {"id": "a1", "threadId": "t", "labelIds": [], "raw": "abc", "historyId": "777"}
+    )
+    assert client.get_message("a1").history_id == 777
+
+
+def test_rest_get_message_history_id_absent_or_malformed() -> None:
+    # absence is TOLERATED (the internalDate doctrine: never trust
+    # presence — the consumer's bootstrap-failure branch is the point);
+    # present-and-malformed is loud permanent (a corrupt cursor value
+    # must never reach the poll loop)
+    client = _rest({"id": "a1", "threadId": "t", "labelIds": [], "raw": "abc"})
+    assert client.get_message("a1").history_id is None
+    bad = _rest(
+        {
+            "id": "a1",
+            "threadId": "t",
+            "labelIds": [],
+            "raw": "abc",
+            "historyId": "-5",
+        }
+    )
+    with pytest.raises(GmailPermanentError):
+        bad.get_message("a1")
+
+
 def test_rest_filters_keep_bool_and_int_criteria() -> None:
     # invariant #6: dropping hasAttachment/size would over-match filters
     client = _rest(

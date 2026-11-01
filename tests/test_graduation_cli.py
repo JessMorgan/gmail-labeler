@@ -62,12 +62,14 @@ def _eval_cfg(
     *,
     encoder: str = "tiny-encoder",
     graduation: str = "",
+    bands: str = "",
     labels: str = 'managed = ["Money/Bills", "Shipping"]',
 ) -> Path:
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         f'[corpus]\ndir = "{tmp_path / "corpus"}"\n'
         f"[labels]\n{labels}\n"
+        f"[bands]\n{bands}\n"
         f"[graduation]\n{graduation}\n"
         f'[model]\nencoder = "{encoder}"\n'
         f'checkpoint_dir = "{tmp_path / "ckpt"}"\n',
@@ -508,6 +510,170 @@ def test_eval_graduation_json_write_failure_preserves_report(
     assert payload["test_examples"] == 6
     assert payload["graduation"]["test_examples"] == 6  # the proposal rides
     assert "cannot write --graduation" in result.stderr
+
+
+def test_eval_graduation_json_calibration_refusal_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a calibration refusal
+    # (an unknown band override label): exit 5, the base payload on
+    # stdout (the report), the proposal absent (the computation never
+    # ran)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(
+        tmp_path,
+        graduation="min_examples = 3\n",
+        bands='[bands."Ghost"]\nmin_high_precision = 0.9\n',
+    )
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(tmp_path / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert "graduation" not in payload
+    assert "band calibration refused" in result.stderr
+    assert "Ghost" in result.stderr
+
+
+def test_eval_graduation_json_bands_refused_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a --bands refusal
+    # (an existing bands artifact bound to a different identity): exit
+    # 5, the base payload on stdout
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0  # checkpoint A
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    bands_out = tmp_path / "bands.json"
+    r1, _f1 = _run_eval(
+        tmp_path, "--bands", str(bands_out), monkeypatch=monkeypatch, cfg=cfg
+    )
+    assert r1.exit_code == 0, r1.stderr
+    # checkpoint B: a LATER split date — the bands identity differs
+    assert (
+        _run_train(tmp_path, monkeypatch, split_date="2026-02-01", force=True).exit_code
+        == 0
+    )
+    result, _factory = _run_eval(
+        tmp_path,
+        "--bands",
+        str(bands_out),
+        "--graduation",
+        str(tmp_path / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert "graduation" not in payload
+    assert "--bands refused" in result.stderr
+
+
+def test_eval_graduation_json_bands_write_failure_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a --bands write
+    # failure: exit 5, the base payload on stdout
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    result, _factory = _run_eval(
+        tmp_path,
+        "--bands",
+        str(tmp_path / "no" / "such" / "dir" / "bands.json"),
+        "--graduation",
+        str(tmp_path / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert "graduation" not in payload
+    assert "cannot write --bands" in result.stderr
+
+
+def test_eval_graduation_json_gate_refusal_preserves_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a gate evaluation
+    # refusal (a Managed Label the vocabulary does not carry): exit 5,
+    # the base payload on stdout, the proposal absent
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    cfg = _eval_cfg(
+        tmp_path,
+        graduation="min_examples = 3\n",
+        labels='managed = ["Money/Bills", "Ghost"]',
+    )
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(tmp_path / "graduation.json"),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert "graduation" not in payload
+    assert "graduation gate evaluation refused" in result.stderr
+    assert "Ghost" in result.stderr
+
+
+def test_eval_graduation_json_refused_confirm_preserves_report_with_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the --json report-preservation doctrine on a foreign-bound
+    # confirm refusal: exit 5, the payload on stdout CARRIES THE
+    # PROPOSAL (the computation succeeded — only the write refused)
+    _seed_corpus(tmp_path)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0  # checkpoint A
+    cfg = _eval_cfg(tmp_path, graduation="min_examples = 3\n")
+    out = tmp_path / "graduation.json"
+    r1, _f1 = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(out),
+        "--confirm-graduation",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert r1.exit_code == 0, r1.stderr
+    # checkpoint B: a LATER split date — the table identity differs
+    assert (
+        _run_train(tmp_path, monkeypatch, split_date="2026-02-01", force=True).exit_code
+        == 0
+    )
+    result, _factory = _run_eval(
+        tmp_path,
+        "--graduation",
+        str(out),
+        "--confirm-graduation",
+        "--json",
+        monkeypatch=monkeypatch,
+        cfg=cfg,
+    )
+    assert result.exit_code == 5
+    payload = json.loads(result.stdout)  # the report is on stdout
+    assert payload["test_examples"] == 6
+    assert payload["graduation"]["test_examples"] == 6  # the proposal rides
+    assert "--graduation refused" in result.stderr
 
 
 def test_eval_graduation_out_file_lands_before_refusal(

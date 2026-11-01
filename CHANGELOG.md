@@ -117,12 +117,20 @@ does not ship releases yet.
   a gate passes, pinned by golden boundary tests). Unearned labels
   carry named reasons (`below-min-examples`, `precision-below-gate`,
   `no-high-band`); a label whose band has no high threshold cannot
-  graduate, and the med band never graduates anything by itself.
+  graduate, and the med band never graduates anything by itself. The
+  bands artifact is a separate input: if it was calibrated on a
+  DIFFERENT eval table (same vocabulary + grid), the cell at the high
+  band may have no measured predictions on the current table
+  (tp=fp=0, undefined precision) — refused with `ValueError` (the
+  refusal family), never a `ZeroDivisionError`.
   Gate targets are NOT tenth-grid (documented asymmetry with `[bands]`):
   a band target must match the candidate grid (looked up in it), a gate
   precision target is compared against measured values (any rational
-  tp/(tp+fp)) — range + bool refusals do apply. Deterministic total
-  order (label-sorted entries — same eval → byte-identical table, AC5).
+  tp/(tp+fp)) — range + bool refusals do apply; `min_examples` must be
+  an exact `int` (a bool is an int subclass, a float is not a count —
+  `type(...) is int`, the from_json two-entry-path symmetry).
+  Deterministic total order (label-sorted entries — same eval →
+  byte-identical table, AC5).
 - Graduation Table (`graduation.py`): the versioned JSON artifact
   (format version + content hash over every field — the
   `dataset_build.SplitManifest` discipline: canonical dump, UTC
@@ -141,7 +149,13 @@ does not ship releases yet.
   human-confirm diff (old → new per label, on stderr — the report/
   `--out` byte-identity stays literally true; with `--json` the
   proposal rides in the payload under the `graduation` key and stdout
-  stays exactly one parseable JSON object). Nothing applies itself:
+  stays exactly one parseable JSON object — on a post-report refusal
+  the BASE payload (the report, without the proposal) is emitted
+  first, so the report is never lost on stdout; on a graduation write
+  failure the proposal rides, since the computation succeeded). The
+  `--out` file lands BEFORE the serving-gate acts, so a run that later
+  refuses still replaces a previous report file (the refusal is about
+  the artifacts, not the report). Nothing applies itself:
   without `--confirm-graduation` the run writes NOTHING (ADR-0005 —
   no pipeline run ever mutates what is live by itself); the write is
   the CLI-gated confirm act (0600 from creation, staging + atomic
@@ -169,7 +183,8 @@ does not ship releases yet.
   override label, a lying identity); a gate evaluation refusal (an
   empty/duplicate Managed Label list, a Managed Label the vocabulary
   does not carry — named, an unknown gate override label, a lying
-  bands/table identity); confirming over an existing table whose
+  bands/table identity, a bands artifact whose high band has no
+  measured predictions on the table); confirming over an existing table whose
   identity fields disagree with the current run (refused BEFORE any
   staging, the previous bytes intact); a write failure; a post-write
   readback fault — the on-disk bytes do not parse back to a valid

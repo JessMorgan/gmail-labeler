@@ -45,12 +45,14 @@ sidecar doctrine).
 
 Trust boundary (stated, per the SplitManifest discipline): the
 measured values (``examples``, ``precision_at_high``) are trusted from
-the Eval Table + Bands Artifact at mint time — the content hash
-authenticates the table AS A WHOLE, and ``verify_graduation`` binds it
-to the identity it was measured against; a hand-forged table with a
-recomputed hash is caught by the identity check, not by field
-recomputation (the table carries no tp/fp — the eval table is the
-measurement authority, and the bands/table cross-check in
+the Eval Table + Bands Artifact at mint time. The content hash is a
+CORRUPTION CHECK, not a signature (an unkeyed sha256 over the fields —
+it catches torn/stale bytes, not a forger), and ``verify_graduation``
+binds the table to the checkpoint/eval/bands identity it claims to be
+from — it does NOT authenticate the measured values: a hand-forged
+table with the correct identity verifies cleanly, so a consumer that
+needs the measurement must recompute it from the Eval Table (the eval
+table is the measurement authority; the bands/table cross-check in
 ``evaluate_graduation`` refuses a bands artifact whose high band has no
 measured predictions on the table). The Bands Artifact itself is
 computed IN-MEMORY per run (deterministically — the same eval + config
@@ -79,6 +81,7 @@ __all__ = [
     "DEFAULT_MIN_EXAMPLES",
     "DEFAULT_MIN_PRECISION",
     "GRADUATION_FORMAT_VERSION",
+    "IDENTITY_FIELDS",
     "GateTargets",
     "Graduation",
     "GraduationEntry",
@@ -765,21 +768,29 @@ def verify_graduation(
             "datetime — a date/naive datetime is a caller bug, not "
             "identity drift"
         )
-    mismatches: list[str] = []
-    if table.vocabulary_hash != vocabulary_hash(vocabulary):
-        mismatches.append("vocabulary")
-    if table.corpus_fingerprint != corpus_fingerprint:
-        mismatches.append("corpus_fingerprint")
-    if table.split_manifest_hash != split_manifest_hash:
-        mismatches.append("split_manifest_hash")
-    if table.encoder_id != encoder_id:
-        mismatches.append("encoder_id")
-    if table.split_date != split_date:
-        mismatches.append("split_date")
-    if table.test_examples != test_examples:
-        mismatches.append("test_examples")
-    if table.bands_content_hash != bands_content_hash:
-        mismatches.append("bands_content_hash")
+    # the expected identity, keyed by the SAME field names
+    # IDENTITY_FIELDS carries (one home — a future field addition
+    # updates this mapping, and every comparison site sees it): the
+    # vocabulary check compares the table's hash against the hash of
+    # the expected vocabulary (the manifest is the authority, the
+    # table must agree with it — the sidecar rule)
+    expected: dict[str, object] = {
+        "vocabulary_hash": vocabulary_hash(vocabulary),
+        "corpus_fingerprint": corpus_fingerprint,
+        "split_manifest_hash": split_manifest_hash,
+        "encoder_id": encoder_id,
+        "split_date": split_date,
+        "test_examples": test_examples,
+        "bands_content_hash": bands_content_hash,
+    }
+    # the report name for the vocabulary field is "vocabulary" (the
+    # verify_bands precedent — the consumer-facing name, not the
+    # stored field name)
+    mismatches: list[str] = [
+        ("vocabulary" if field == "vocabulary_hash" else field)
+        for field in IDENTITY_FIELDS
+        if getattr(table, field) != expected[field]
+    ]
     if mismatches:
         raise GraduationRefusedError(
             mismatches,

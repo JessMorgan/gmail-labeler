@@ -46,6 +46,22 @@ min_med_precision = 0.7
 # min_high_precision = 0.9
 # min_med_precision = 0.8
 
+[graduation]
+# Per-label Graduation gates (ticket #22): the minimum examples on the
+# test split and the minimum measured precision at the label's
+# calibrated high band it must earn to graduate (GLOSSARY: Graduation).
+# `eval --graduation` recomputes the Graduation Table; the write is
+# human-gated (--confirm-graduation). min_precision is NOT tenth-grid
+# (unlike [bands] — a gate target is compared against measured values,
+# never looked up in the candidate grid).
+min_examples = 10
+min_precision = 0.9
+# A per-label override is a subtable (label names may carry slashes —
+# quoted keys):
+# [graduation."Money/Bills"]
+# min_examples = 20
+# min_precision = 0.95
+
 [model]
 # Encoder identifier — the Checkpoint Sidecar's encoder_id field.
 encoder = "deberta-v3-base"

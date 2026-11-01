@@ -51,11 +51,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .applications import ApplicationRow
+
 __all__ = [
     "SCHEMA_VERSION",
     "AppDB",
     "AppDBError",
-    "ApplicationRow",
     "RunNotFoundError",
     "ShadowRow",
 ]
@@ -129,29 +130,6 @@ class ShadowRow:
     run_ts: datetime | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class ApplicationRow:
-    """One applied-label row (NO bodies — invariant #5): the message
-    id, the Managed Label NAME, its Gmail label id, the sigmoid score,
-    the band verdict (``"high"`` / ``"med"`` — an applied row always has
-    a band), the Tier Label name the Application carried (the tiers-core
-    spelling: the configured ``[labels]`` wire spelling is config-
-    derivable), the UTC applied-at stamp, and the source (``"daemon"``
-    or ``"apply"`` — the literal that entered the write path). One row
-    per applied label; the Application's tier is the per-message best
-    band tier, repeated on the message's rows (the audit join reads
-    either way)."""
-
-    message_id: str
-    label: str
-    label_id: str
-    score: float
-    band: str
-    tier: str
-    applied_at: datetime
-    source: str
-
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL PRIMARY KEY
@@ -192,8 +170,9 @@ class AppDB:
     """The state DB adapter (bounded I/O, CODING-STANDARDS). One
     connection per instance (single-process contract, ADR-0002);
     ``open`` creates the schema if missing and verifies the version;
-    ``record_run`` is the ONLY writer (transaction-per-run); the
-    ``latest_run``/``load_run`` reads serve the report."""
+    ``record_run`` and ``record_applications`` are the only writers
+    (transaction-per-write); the ``latest_run``/``load_run`` reads serve
+    the report and the ``applications_for_*`` reads serve the join."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -452,7 +431,17 @@ class AppDB:
             return needs_v1_migration
         if schema_version_present:
             # ours (our-shape schema_version stamped with our version,
-            # or the migratable v1 stamp with no tables to adopt)
+            # or the migratable v1 stamp with no tables to adopt).
+            # DOCUMENTED PRE-EXISTING POSTURE (#23's disposition-2
+            # branch, unchanged in shape by v2): a file carrying ONLY
+            # our-stamped version evidence is adopted as ours and
+            # WRITTEN TO (the schema script appends the missing tables;
+            # a {1} stamp also restamps). Our tool never produces a
+            # version row without its tables, so this admits only
+            # hand-made or hand-emptied files — the same surface #23
+            # accepted, now including the restamp. Tightening it
+            # (requiring at least one ours-shaped table) is a #23
+            # decision change, not this ticket
             return needs_v1_migration
         if tables:
             raise AppDBError(
@@ -847,7 +836,15 @@ def _check_application_row(row: ApplicationRow) -> None:
             f"application row for {row.message_id} / {row.label}: tier must "
             "be non-empty"
         )
-    if row.applied_at is None or row.applied_at.tzinfo is None:
+    if not isinstance(row.applied_at, datetime):
+        # a str/None applied_at is a caller bug — refused NAMED here, not
+        # as a bare AttributeError from the tzinfo check (the read path
+        # wraps, the write path must too)
+        raise AppDBError(
+            f"application row for {row.message_id} / {row.label}: applied_at "
+            f"must be a datetime, got {row.applied_at!r}"
+        )
+    if row.applied_at.tzinfo is None:
         raise AppDBError(
             f"application row for {row.message_id} / {row.label}: applied_at "
             "must be timezone-aware (a naive timestamp is a caller bug — the "

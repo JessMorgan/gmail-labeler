@@ -61,7 +61,13 @@ class FakeGmailClient:
       catches a write from a read-only path by NAME — and successful
       writes are recorded in ``writes`` with the FULL body snapshot, so
       the wire-shape assertions (addLabelIds ONLY) pin the composition,
-      not just the call.
+      not just the call;
+    - documented divergence: apply_labels ACCEPTS label ids the mailbox
+      never listed (the real messages.modify answers 400 on an unknown
+      id). Enforcement here would force every write test to program the
+      label list; a stale resolution that the REST path would hard-fail
+      stays green in CI — the live opt-in seam is where that class of
+      bug dies (the query-not-evaluated precedent above).
     """
 
     def __init__(

@@ -426,10 +426,9 @@ def test_not_open_is_refused(tmp_path: Path) -> None:
 
 
 def test_applications_table_seam_is_documented() -> None:
-    # the #24 seam: the applications table lands in the same file under a
-    # v2 restamp (the v1->v2 restamp/migration is UNSOLVED pending #24 —
-    # see the appdb module docstring's UPGRADE STORY) — the seam is
-    # obvious and tested
+    # the #24 seam PAID: the applications table landed in the same file
+    # under the v2 single-row restamp (the migration story is the appdb
+    # module docstring's UPGRADE STORY) — the seam marker stays tested
     import gmail_labeler.appdb as appdb_module
 
     source = Path(appdb_module.__file__).read_text(encoding="utf-8")
@@ -845,6 +844,19 @@ def test_record_applications_row_validation(tmp_path: Path) -> None:
         (_app_row(source="shadow"), "source"),
         (_app_row(source="DAEMON"), "source"),
         (_app_row(applied_at=TS.replace(tzinfo=None)), "timezone-aware"),
+        (
+            ApplicationRow(  # a str applied_at: named refusal, not AttributeError
+                message_id="aa",
+                label="Shipping",
+                label_id="Label_1",
+                score=0.9,
+                band="high",
+                tier="ai-high",
+                applied_at="yesterday",  # pyright: ignore[reportArgumentType]
+                source="daemon",
+            ),
+            "must be a datetime",
+        ),
     ]
     for row, cause in bad:
         with pytest.raises(AppDBError, match=cause):

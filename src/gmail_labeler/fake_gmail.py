@@ -223,12 +223,16 @@ class FakeGmailClient:
         an empty delta carrying its CURRENT historyId (cursor advance), and
         so do we — never an echo of the caller's start id.
 
-        RE-WALK (crash-recovery replay, #25): a token-less call with the
-        SAME start id as the previous walk RESETS the script — the real
-        API is stateless per request: polling again from a HELD cursor
-        re-serves the retained window (ADR-0003's "the next poll replays
-        the gap"). The token guard still fires for every other mismatch
-        (a skip, a stale token, a chain resumed under a new cursor)."""
+        RE-WALK (crash-recovery replay, #25): a token-less call is a
+        walk — with the SAME start id as the previous walk it REPLAYS
+        from that walk's first page (the real API is stateless per
+        request: polling again from a HELD cursor re-serves the retained
+        window, ADR-0003's "the next poll replays the gap"); with a
+        DIFFERENT start id it is a FRESH poll from a different cursor
+        (a re-bootstrap) and the script continues from its current
+        position. The typed 400 guard stays for every TOKEN mismatch
+        (a stale or wrong pageToken, a chain resumed under a different
+        token) — the skip/replay catch the guard exists for."""
         self.calls.append(f"history:{start_history_id}:{page_token or ''}")
         self._maybe_fail("history")
         if start_history_id < 1:
@@ -245,15 +249,15 @@ class FakeGmailClient:
                 f"window (current: {self.current_history_id})",
                 status=404,
             )
-        if (
-            page_token is None
-            and start_history_id == self._walk_start
-            and self._history_index > self._walk_start_index
-        ):
-            # re-walk from the held cursor: the window re-serves from the
-            # walk's first page (see the docstring)
-            self._history_index = self._walk_start_index
-            self._history_expected = None
+        if page_token is None:
+            if (
+                start_history_id == self._walk_start
+                and self._history_index > self._walk_start_index
+            ):
+                # re-walk from the held cursor: the window re-serves from
+                # the walk's first page (see the docstring)
+                self._history_index = self._walk_start_index
+                self._history_expected = None
         elif page_token != self._history_expected:
             raise GmailPermanentError(
                 f"history page token {page_token!r} != expected "

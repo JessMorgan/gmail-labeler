@@ -19,11 +19,12 @@ import signal
 import tempfile
 import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from types import FrameType
+from typing import TYPE_CHECKING, Any, Literal
 
 import typer
 
@@ -3090,24 +3091,36 @@ def _sleep_until_stopped(flag: threading.Event, seconds: float) -> None:
     flag.wait(timeout=seconds)
 
 
-def _install_shutdown_handlers(flag: threading.Event) -> dict[int, object]:
+_PreviousHandlers = dict[
+    signal.Signals, Callable[[int, FrameType | None], Any] | int | None
+]
+
+
+def _install_shutdown_handlers(flag: threading.Event) -> _PreviousHandlers:
     """SIGTERM + SIGINT set the stop flag (the loop consults it between
     messages, between pages, and around the sleep; the current delta
     still runs to its commit point). Returns the previous dispositions
     for the finally-restore (a daemon run must not leak handlers)."""
 
-    def handler(signum: int, frame: object) -> None:
+    def handler(signum: int, frame: FrameType | None) -> None:
         flag.set()
 
-    previous: dict[int, object] = {}
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        previous[sig] = signal.signal(sig, handler)
+    previous: _PreviousHandlers = {}
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, handler)
+    except BaseException:
+        # a mid-install failure (a non-main thread, a platform
+        # refusal) must not leave the earlier handler installed
+        for sig, prior in previous.items():
+            signal.signal(sig, prior)
+        raise
     return previous
 
 
-def _restore_shutdown_handlers(previous: dict[int, object]) -> None:
+def _restore_shutdown_handlers(previous: _PreviousHandlers) -> None:
     for sig, handler in previous.items():
-        signal.signal(sig, handler)  # type: ignore[arg-type]
+        signal.signal(sig, handler)
 
 
 @app.command("daemon")
@@ -3143,10 +3156,13 @@ def daemon(
     Graduation Table, Bands Artifact), then the three configured Tier
     Label names resolve ONCE via ensure_label (a System-Label name
     collision refuses at exit 4, naming the [labels] key). SIGTERM/
-    SIGINT shut down gracefully: the current page completes to its
-    commit point, exit 0. Bodies never enter the DB or any log (
-    invariant #5). Exit codes: 0 clean stop · 2 usage · 4 auth/config
-    (incl. the tier-name collision) · 5 artifact/store failure."""
+    SIGINT shut down gracefully: the current delta completes to its
+    commit point, exit 0 (the handlers wrap the LOOP only: Ctrl-C
+    during the startup gates/corpus read keeps the default
+    disposition — nothing is open yet, so nothing needs unwinding).
+    Bodies never enter the DB or any log (invariant #5). Exit
+    codes: 0 clean stop · 2 usage · 4 auth/config (incl. the tier-name
+    collision) · 5 artifact/store failure."""
     from .appdb import AppDB, AppDBError
     from .auth import AuthError
     from .corpus_record import corpus_fingerprint
@@ -3421,6 +3437,18 @@ def daemon(
                 err=True,
             )
             raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailAuthError as e:
+            # ensure_label's own round-trips (list + create) are WIRE
+            # calls: they take the SAME arms as every other client call
+            # site (the review round's blocker — they escaped the
+            # ValueError-only arm to exit 1); auth is human-gated (4)
+            typer.echo(f"auth: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailError as e:
+            # transient/permanent wire failure at startup resolution:
+            # operation failure (5), named, never a traceback
+            typer.echo(f"daemon failed: tier label resolution failed: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     # the Managed Label name→id map for the would-apply names (the
     # bridge, user labels only, exact-case first hit wins — the plan's
     # _resolve_id fail-safes any name absent here)
@@ -3467,10 +3495,16 @@ def daemon(
         # traceback; the cursor stands where it was — the loop holds it)
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except (AppDBError, OSError) as e:
+    except AppDBError as e:
         # the store refusal family (a tampered cursor row, an I/O
         # failure at the serve-time open): operation failure, named
         typer.echo(f"daemon failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except OSError as e:
+        # a bare I/O failure from anywhere in the loop (not necessarily
+        # the state DB): the cause is named neutrally — a "state DB"
+        # diagnosis over a network fault would be a lie (review finding)
+        typer.echo(f"daemon failed: I/O failure: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     finally:
         _restore_shutdown_handlers(previous_handlers)

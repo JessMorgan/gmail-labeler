@@ -7,13 +7,13 @@ score each message, compose the write through ``applications.
 plan_message_write`` (the plan is called, never re-derived), and per
 message with a non-empty plan: ``apply_labels`` FIRST (the Gmail
 write), then — after the whole delta — ONE DB transaction carrying the
-page's Application rows AND the cursor advance
+delta's Application rows AND the cursor advance
 (``appdb.commit_page``). COMMIT = handled.
 
 THE SAFETY PROOF IS THE SKIP-PRESENT PIN, NOT THE TRANSACTION. The
 Gmail write cannot ride the DB transaction — there is no two-phase
 commit with Google — so the ordering is deliberate: write first, commit
-last. A crash between the two replays the page from the held cursor;
+last. A crash between the two replays the delta from the held cursor;
 the replay re-composes each message's plan against the mailbox's
 PRESENT labels, and every already-written label now reads present →
 skip-present (invariant #2) → an EMPTY plan → NO second write and no
@@ -37,9 +37,13 @@ GmailPermanentError(status=404) — the taxonomy's documented subclass
 relationship) means the cursor fell outside the retained window:
 re-bootstrap via the export prior-art path (below), named warning, the
 gap mail NOT processed (the operator reviews it with shadow/apply);
-any other per-page GmailError HOLDS the cursor (counted id-only
-warning, next tick retries); per-message 404s (a deleted message) skip
-that message counted — the cursor must not wedge on a ghost; any
+any other per-page GmailError HOLDS the cursor (a warning naming the
+cursor and the typed error — page-level holds increment NO counter: the
+counters cover per-message events of a committed delta; next tick
+retries, and a PERMANENT non-404 therefore retries forever — the
+intentional v1 posture: loud hold beats silent advance, escalation to a
+stop path is out of #25's scope); per-message 404s (a deleted message)
+skip that message counted — the cursor must not wedge on a ghost; any
 application-path error means NO write for that message (the plan's
 fail-safe net, invariant #1).
 
@@ -54,7 +58,7 @@ retry next tick) — never a guessed cursor.
 
 GRACEFUL SHUTDOWN: ``should_stop`` is consulted between messages and
 between pages; once seen, the current delta still runs to its commit
-point (AC: mid-page SIGTERM → page completes, cursor written, exit 0);
+point (AC: mid-delta SIGTERM → the delta completes, cursor written, exit 0);
 mid-sleep SIGTERM exits immediately with the cursor untouched (the
 CLI's sleep is the interruptible one — this module never sleeps by
 itself).
@@ -69,7 +73,7 @@ cli._now seam doctrine, #23/#24).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sized
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -279,8 +283,10 @@ def _run_tick(
             except GmailError as e:
                 if isinstance(e, GmailPermanentError) and e.status == 404:
                     # the message is gone (deleted mid-window): the
-                    # per-message fail-safe — skip + counted id-only
-                    # warning. The cursor must NOT wedge on a ghost.
+                    # per-message fail-safe — skip + a counted warning
+                    # naming the id and the typed error (body-free by the
+                    # taxonomy, invariant #5). The cursor must NOT wedge
+                    # on a ghost.
                     skipped += 1
                     log.warning("daemon: skipped message %s: %s", message_id, e)
                     continue
@@ -336,11 +342,18 @@ def _run_tick(
         # kill the loop. Divergence from shadow's one-shot posture (cli.py
         # treats a width defect as exit-1 'a bug'): the daemon is a
         # long-lived service — hold, warn, keep the cursor.
+        # Sized checks FIRST (F2 MINOR 1): a flat vector served as the
+        # whole batch (len == texts but rows are floats) would raise
+        # TypeError from len(row) — outside the caught tuple, exit 1.
+        # Every shape defect must land in _PredictionShapeError territory.
         vocab_len = len(model.vocabulary)
-        if any(len(row) != vocab_len for row in score_rows):
+        if any(
+            not isinstance(row, Sized) or len(row) != vocab_len for row in score_rows
+        ):
             raise _PredictionShapeError(
                 f"a score row does not align to the {vocab_len}-label "
-                f"vocabulary — checkpoint/recipe defect"
+                f"vocabulary (an unsized row counts as misaligned) — "
+                f"checkpoint/recipe defect"
             )
     except _PredictionShapeError as e:
         # self-authored, counts-only message: safe to log verbatim
@@ -415,10 +428,16 @@ def _run_tick(
                     e,
                 )
                 continue
-            # transient/rate-limited: the page retries — the messages
-            # already written this delta skip-present on the replay
-            # (the safety proof again), and their rows are NOT
-            # committed (this transaction is the only writer)
+            # ANY non-404 GmailError reaches HERE (transient, rate-
+            # limited, OR permanent — the F2 pin: the label below used
+            # to say 'transient/rate-limited' while a 400 'invalid label
+            # id' fell through just the same). The DELTA retries: the
+            # messages already written skip-present on the replay (the
+            # safety proof again), and their rows are NOT committed
+            # (this transaction is the only writer). A permanent error
+            # therefore retries forever — intentional posture: loud
+            # hold beats the silent advance that starves the mailbox;
+            # escalation to a stop path is out of #25's scope
             log.warning(
                 "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
                 cursor,

@@ -182,8 +182,18 @@ def test_bootstrap_establishes_cursor_from_most_recent_message(
     # list_messages, get_message(the FIRST stub = the most recent
     # message), store its per-message historyId. Exact-call pin: the
     # bootstrap pair, then the poll from the new cursor.
+    # F2 MINOR 6: the fake MODELS the documented newest-first order
+    # (documented_order=True sorts by the programmed internal_date_ms,
+    # the stand-in for server-side ordering) so the NAME matches the
+    # SHAPE: the first stub really is the most recent message
+    msgs = _messages()
+    msgs[0].internal_date_ms = 2_000  # aa11 newest
+    msgs[1].internal_date_ms = 1_000
     fake = FakeGmailClient(
-        messages=_messages(), labels=_labels(), current_history_id=777
+        messages=msgs,
+        labels=_labels(),
+        current_history_id=777,
+        documented_order=True,
     )
     db = _db(tmp_path)
     # tick 1 establishes the cursor (bootstrap pair), tick 2 polls from
@@ -316,9 +326,9 @@ def test_multi_message_page_one_predict_one_commit_batch_homogeneity(
     tmp_path: Path,
 ) -> None:
     # the #24 batch-homogeneity contract AT THE DAEMON CALL SITE (a
-    # contract, not an accident): the page's rows share the ONE clock
-    # read taken at page-handling time; ONE predict batch over the
-    # page's texts; ONE commit for the delta
+    # contract, not an accident): the delta's rows share the ONE clock
+    # read taken at delta-handling time; ONE predict batch over the
+    # delta's texts; ONE commit for the delta
     import gmail_labeler.daemon as daemon_module
 
     class _CountingModel(FakeModel):
@@ -398,8 +408,9 @@ def test_multi_message_page_one_predict_one_commit_batch_homogeneity(
 def test_transient_history_failure_holds_cursor_counted_warning(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # per-page GmailError: cursor does NOT advance, counted id-only
-    # warning, next tick retries (fail-once consumed → tick 2 commits)
+    # per-page GmailError: cursor does NOT advance; the warning names
+    # the cursor and the typed error (page holds increment NO counter),
+    # next tick retries (fail-once consumed → tick 2 commits)
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
         messages=_messages(),
@@ -411,7 +422,7 @@ def test_transient_history_failure_holds_cursor_counted_warning(
     db = _db(tmp_path)
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, stop_after_ticks=2) == 0
-    assert "cursor 777" in caplog.text  # the held cursor is NAMED (id-only)
+    assert "cursor 777" in caplog.text  # the held cursor is NAMED (+ typed error)
     assert db.get_history_cursor() == 900  # tick 2 retried and committed
     assert len(fake.writes) == 1
     db.close()
@@ -507,8 +518,9 @@ def test_get_message_permanent_404_skips_message_counted(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # a message the mailbox no longer has (deleted mid-window): the
-    # per-message fail-safe — skip + counted id-only warning, the page
-    # still commits (the cursor must not wedge on a gone message)
+    # per-message fail-safe — skip + a counted warning naming the id
+    # and the typed error; the delta still commits (the cursor must not
+    # wedge on a gone message)
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
         messages=_messages(),
@@ -520,7 +532,7 @@ def test_get_message_permanent_404_skips_message_counted(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db) == 0
     assert "skipped message dead00" in caplog.text
-    assert db.get_history_cursor() == 900  # NOT held — the page was handled
+    assert db.get_history_cursor() == 900  # NOT held — the delta was handled
     assert len(fake.writes) == 1  # aa22 still applied
     db.close()
 
@@ -528,7 +540,7 @@ def test_get_message_permanent_404_skips_message_counted(
 def test_get_message_transient_holds_page_and_rewalks(
     tmp_path: Path,
 ) -> None:
-    # a transient fetch failure: the page is NOT committed (cursor
+    # a transient fetch failure: the delta is NOT committed (cursor
     # held); the next tick RE-WALKS from the held cursor (the cursor IS
     # the resume point — ADR-0003's "the next poll replays the gap";
     # the fake re-serves its scripted window for the same start id)
@@ -800,7 +812,7 @@ def test_undecodable_raw_skips_message_and_delta_commits(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # F1 MINOR 1: corrupt raw is the per-message fail-safe (skipped,
-    # counted, id-only warning) — the delta still commits (one ghost
+    # counted, id + typed-error warning) — the delta still commits (one ghost
     # body must not wedge the cursor)
     caplog.set_level(logging.WARNING)
 
@@ -855,11 +867,171 @@ def test_bootstrap_anchors_on_the_documented_newest_first_order() -> None:
         FakeGmailClient(messages=[FakeMessage(id="x", eml=b"x")], documented_order=True)
 
 
+def test_apply_permanent_non_404_holds_cursor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 MAJOR (deepseek-B5, the fourth apply flavor): a PERMANENT
+    # non-404 (a 400 'invalid label id') reaches the HOLD arm only by
+    # FALLING THROUGH the 404 guard — unpinned, the guard could be
+    # broadened to 'any permanent: skip' and the suite stayed green
+    # while labels vanished silently. The intentional posture: a
+    # permanent error retries LOUDLY forever (escalation is out of
+    # #25's scope) — never a silent advance.
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailPermanentError("invalid label id", status=400))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777  # HOLDS (the silent-advance ban)
+    assert fake.writes == []
+    assert db.applications_for_message("aa22") == ()
+    assert "delta failed" in caplog.text
+    db.close()
+
+
+def test_get_message_permanent_non_404_holds_cursor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 MAJOR sibling (mutant G class): the fetch arm's 404 guard has
+    # the same fall-through — a permanent non-404 must HOLD, never skip
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("get_message", GmailPermanentError("400 lying wire", status=400))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777
+    assert "delta failed" in caplog.text
+    db.close()
+
+
+def test_history_permanent_non_404_holds_cursor(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 MAJOR sibling: the page arm's 404 guard too (same idiom at the
+    # history call) — a 400 from history() is NOT the expiry arm
+    caplog.set_level(logging.WARNING)
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("history", GmailPermanentError("400 malformed request", status=400))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777
+    assert "delta failed" in caplog.text
+    db.close()
+
+
+def test_prediction_unsized_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F2 MINOR 1: a flat vector served as the WHOLE batch (len == the
+    # text count, but the rows are floats) made len(row) raise TypeError
+    # OUTSIDE the caught tuple — exit 1 (executed in review). Every
+    # shape defect lands in the _PredictionShapeError territory: hold.
+    caplog.set_level(logging.WARNING)
+
+    class _FlatModel(FakeModel):
+        def predict(self, texts):
+            self.calls.append(tuple(texts))
+            return (0.9, 0.1)  # 2 "rows" for 2 texts — but unsized rows
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_FlatModel(VOCAB, scores={})) == 0
+    assert db.get_history_cursor() == 777  # held, loop alive
+    assert "does not align" in caplog.text
+    db.close()
+
+
+def test_stop_flag_during_write_capture_drains_and_commits(tmp_path: Path) -> None:
+    # F2 NIT (ds probe: correct behavior, no node): the stop flag lands
+    # while the write loop runs — the delta completes to its commit
+    # point, the loop exits before any sleep
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    calls = {"n": 0}
+
+    def should_stop() -> bool:
+        calls["n"] += 1
+        return calls["n"] > 1  # loop-top False (tick runs), post-tick True
+
+    driver = _LoopRun()
+    rc = daemon_loop(
+        client=fake,
+        db=db,
+        model=FakeModel(VOCAB, scores=_scores()),
+        ctx=_ctx(),
+        poll_seconds=30,
+        clock=lambda: TS,
+        sleep=driver.sleep,
+        should_stop=should_stop,
+    )
+    assert rc == 0
+    assert driver.sleeps == []
+    assert db.get_history_cursor() == 900  # committed, not held
+    assert [w["message_id"] for w in fake.writes] == ["aa22"]
+    db.close()
+
+
+def test_two_consecutive_transient_ticks_hold_then_recover(tmp_path: Path) -> None:
+    # F2 NIT: TWO transient write failures scripted explicitly (the
+    # fail-once queue consumed once per tick) — every held tick leaves
+    # the cursor exactly where it was; the third tick lands the write
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailTransientError("blip one"))
+    fake.fail("apply_labels", GmailTransientError("blip two"))
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777
+    assert _run(tmp_path, fake, db=db) == 0
+    assert db.get_history_cursor() == 777  # still held after the SECOND
+    assert fake.writes == []
+    assert _run(tmp_path, fake, db=db) == 0  # queue empty: the third lands
+    assert db.get_history_cursor() == 900
+    assert [w["message_id"] for w in fake.writes] == ["aa22"]
+    db.close()
+
+
 def test_predict_failure_holds_cursor(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # a model defect (unprogrammed text) is systematic, not per-message:
-    # the page is held (cursor does NOT advance), the warning is counted
+    # the delta is held (cursor does NOT advance); the fail-safe warning
+    # is counted
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
         messages=_messages(),
@@ -993,7 +1165,7 @@ def test_fail_safe_warning_shape_and_end_of_page_count(
     )
     assert "warnings=1" in caplog.text  # the end-of-page report count
     assert fake.writes == []  # no write for the failed message
-    assert db.get_history_cursor() == 900  # the page WAS handled (no write)
+    assert db.get_history_cursor() == 900  # the delta WAS handled (no write)
     db.close()
 
 
@@ -1118,7 +1290,7 @@ def test_shutdown_mid_page_completes_to_commit_point(tmp_path: Path) -> None:
         )
         == 0
     )
-    # the page completed: aa22 written, rows + cursor committed
+    # the delta completed: aa22 written, rows + cursor committed
     assert [w["message_id"] for w in fake.writes] == ["aa22"]
     assert db.get_history_cursor() == 900
     assert len(db.applications_for_message("aa22")) == 1

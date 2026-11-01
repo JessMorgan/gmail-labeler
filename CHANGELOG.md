@@ -19,7 +19,7 @@ does not ship releases yet.
     enforced in the store since the review round: `commit_page` refuses
     a mixed-stamp batch), compose through `plan_message_write`
     (called, never re-derived), and per nonempty plan `apply_labels`
-    FIRST, then ONE `commit_page` transaction carrying the page's
+    FIRST, then ONE `commit_page` transaction carrying the delta's
     Application rows AND the cursor advance — COMMIT = handled
     (invariant #3). The crash-before-commit replay converges via
     skip-present: that pin IS the safety proof, and the crash matrix
@@ -104,7 +104,8 @@ does not ship releases yet.
     total order); skip-present earns no row and no Tier Labels (empty
     plan → no API call — invariant #2, crash-retry idempotent); a
     DATA-PATH compose error means no write for that message plus a
-    counted id-only warning — caller bugs and internal-contradiction
+    counted warning carrying the message id, label, and score (body-free
+    by construction) — caller bugs and internal-contradiction
     guards RAISE instead (the three-class model; the no-write holds
     for all three, invariant #1); every resolved id is screened
     through `is_system_label_id` (the composition-level guard on top

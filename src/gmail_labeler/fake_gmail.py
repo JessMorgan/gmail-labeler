@@ -140,6 +140,14 @@ class FakeGmailClient:
             ]
             current_history_id = max(ids, default=1)
         self.current_history_id = current_history_id
+        if retention_floor is not None and retention_floor > current_history_id:
+            # a floor above the mailbox's own id makes EVERY poll an
+            # out-of-date 404 (endless resync) — a scripted lie the fake
+            # refuses to tell (F2 NIT: the review probe hit exactly this)
+            raise ValueError(
+                f"retention_floor {retention_floor} is above current_history_id "
+                f"{current_history_id}: every start id would be out of date"
+            )
         self._history_index = 0
         self._history_expected: str | None = None
         # the re-walk tracker (#25): which start id owns the current walk
@@ -216,7 +224,10 @@ class FakeGmailClient:
         order by default (export fixtures pin it); pass
         ``documented_order=True`` to have the fake APPLY that order
         (sort by internal_date_ms desc) — the #25 bootstrap pins ride
-        it to prove the seed anchors on the newest message."""
+        it to prove the seed anchors on the newest message. The sort
+        key is a STAND-IN for the recency the list response itself does
+        not carry: stubs are id + threadId only, the real API orders
+        server-side by internalDate."""
         self.calls.append(f"list_messages:{query}:{page_token or ''}")
         self._maybe_fail("list_messages")
         if page_token is None:

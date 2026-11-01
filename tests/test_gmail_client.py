@@ -546,6 +546,56 @@ def test_fake_history_404s_both_expiry_directions() -> None:
     plain.history(1)
 
 
+def test_opt_history_id_caps_at_the_persistable_bound() -> None:
+    # F2 MINOR 5 (the wire->store seam): a wire-LEGAL uint64 historyId
+    # beyond SQLite's signed max would make the daemon write a delta's
+    # mail and then hold that cursor FOREVER on the store-side refusal.
+    # The parse site refuses it NAMED instead; the store never sees it
+    # (bootstrap rides the same arm: the 'cannot establish' hold names
+    # it, never exit 5).
+    from gmail_labeler.gmail_client import (
+        MAX_PERSISTABLE_HISTORY_ID,
+        _opt_history_id,
+    )
+
+    assert (
+        _opt_history_id({"h": str(MAX_PERSISTABLE_HISTORY_ID)}, "h")
+        == MAX_PERSISTABLE_HISTORY_ID
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        _opt_history_id({"h": str(MAX_PERSISTABLE_HISTORY_ID + 1)}, "h")
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        _opt_history_id({"h": MAX_PERSISTABLE_HISTORY_ID + 1}, "h")
+
+
+def test_history_id_parse_bound_equals_the_store_bound(tmp_path: Path) -> None:
+    # the anti-drift pin: the parse ceiling and the store ceiling are
+    # the SAME number, stated in two modules (layering keeps them
+    # separate — the store must not import the adapter and vice versa);
+    # drift here would reopen the F2 seam from one side. The boundary
+    # is EXERCISED wire-side to store-side: the top parsed value must
+    # round-trip through set_history_cursor.
+    from gmail_labeler.appdb import _MAX_SQLITE_INTEGER, AppDB
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    assert MAX_PERSISTABLE_HISTORY_ID == _MAX_SQLITE_INTEGER
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.set_history_cursor(MAX_PERSISTABLE_HISTORY_ID)
+    assert db.get_history_cursor() == MAX_PERSISTABLE_HISTORY_ID
+    db.close()
+
+
+def test_fake_refuses_retention_floor_above_the_mailbox() -> None:
+    # F2 NIT: a floor above current_history_id makes EVERY poll an
+    # out-of-date 404 (endless resync) — the fake refuses the scripted
+    # lie at construction (the review probe hit exactly this state)
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="above current_history_id"):
+        FakeGmailClient(current_history_id=100, retention_floor=500)
+
+
 def test_fake_history_idle_never_regresses_cursor() -> None:
     fake = FakeGmailClient(
         history_pages=[HistoryPage(history_id=98765, next_page_token=None, records=())]

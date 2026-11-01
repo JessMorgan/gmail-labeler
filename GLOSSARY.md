@@ -89,6 +89,13 @@ than pulling through the Gmail API. Optional fast path; the API export is the
 canonical source.
 _Avoid_: backup restore (this reads, never restores)
 
+**Training Example**:
+One corpus record turned for training: its id, date, label names, a
+recency weight, and the record's Date Provenance stamped for
+split-boundary filtering. The unit the model trains on; the corpus →
+examples transform is one shared pure function.
+_Avoid_: sample, data point
+
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`
 (`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB

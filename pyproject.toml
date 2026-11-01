@@ -85,4 +85,5 @@ strict = [
     "src/gmail_labeler/corpus_record.py",
     "src/gmail_labeler/mime_extract.py",
     "src/gmail_labeler/analyze.py",
+    "src/gmail_labeler/dataset_build.py",
 ]

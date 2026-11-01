@@ -181,6 +181,14 @@ class FakeGmailClient:
     - get_message_metadata never reads the eml (invariant #5: the sync path
       is structurally body-free), and its call-log entry is distinct from a
       raw get so "no raw fetch" proofs can assert on the log;
+    - with ``retention_floor`` set, a start id BELOW the floor answers the
+      typed 404 of an out-of-date cursor (the real expiry direction, F1:
+      daemon down past retention — the history.list reference documents 404
+      when startHistoryId is "invalid or out of date");
+    - list_messages serves SCRIPTED order by default; with
+      ``documented_order=True`` it sorts by ``internal_date_ms`` DESC,
+      modeling the documented reverse-chronological order (every message
+      must carry the field; see the method docstring);
     - call log enables exact-behavior assertions (no silent extra fetches);
     - write calls (ticket #24: apply_labels, ensure_label) append to the
       SAME call log — the shadow zero-write pin (calls ⊆ read surface)
@@ -206,9 +214,32 @@ class FakeGmailClient:
         history_pages: list[HistoryPage] | None = None,
         current_history_id: int | None = None,
         stub_history_id: bool = True,
+        retention_floor: int | None = None,
+        documented_order: bool = False,
     ) -> None:
         self.messages = {m.id: m for m in messages or []}
-        self.order = [m.id for m in messages or []]
+        self.retention_floor = retention_floor
+        if documented_order:
+            # model the documented reverse-chronological order (F1):
+            # newest internalDate first. A fake that silently sorted
+            # None timestamps to the top would be inventing recency
+            # — refuse instead.
+            missing = sorted(m.id for m in messages or [] if m.internal_date_ms is None)
+            if missing:
+                raise ValueError(
+                    f"documented_order needs internal_date_ms on every "
+                    f"message (missing on {missing})"
+                )
+            self.order = [
+                m.id
+                for m in sorted(
+                    messages or [],
+                    key=lambda m: m.internal_date_ms or 0,
+                    reverse=True,
+                )
+            ]
+        else:
+            self.order = [m.id for m in messages or []]
         # list() copy (F2 review NIT, pre-existing trap): ensure_label
         # CREATES append here — an aliased caller list would mutate a
         # shared #25 fixture behind its back
@@ -310,6 +341,14 @@ class FakeGmailClient:
         *,
         label_ids: Sequence[str] | None = None,
     ) -> MessagePage:
+        """The real API's documented order (List Gmail messages guide,
+        https://developers.google.com/workspace/gmail/api/guides/list-messages):
+        "The returned ``messages`` objects are listed in reverse
+        chronological order (newest first)." The fake serves SCRIPTED
+        order by default (import fixtures pin it); pass
+        ``documented_order=True`` to have the fake APPLY that order
+        (sort by internal_date_ms desc) — the #25 bootstrap pins ride
+        it to prove the seed anchors on the newest message."""
         # labelIds filter (#74): AND across the listed ids, like the wire.
         # The filter applies BEFORE paging — the token indexes the filtered
         # window, so a paged inventory scan sees exactly the label's
@@ -447,6 +486,19 @@ class FakeGmailClient:
             raise GmailResyncError(
                 f"startHistoryId {start_history_id} outside the retained "
                 f"window (current: {self.current_history_id})",
+                status=404,
+            )
+        if self.retention_floor is not None and start_history_id < self.retention_floor:
+            # THE REAL EXPIRY DIRECTION (F1, both families): the daemon was
+            # down past Gmail's retention and the cursor is BEHIND the
+            # window. Wire basis: the history.list reference documents the
+            # 404 for a startHistoryId that is "invalid or out of date"
+            # (https://developers.google.com/workspace/gmail/api/reference/
+            # rest/v1/users.history/list) — the out-of-date half is
+            # exactly this arm
+            raise GmailPermanentError(
+                f"startHistoryId {start_history_id} is invalid or out of "
+                f"date (retention floor: {self.retention_floor})",
                 status=404,
             )
         if page_token is None:

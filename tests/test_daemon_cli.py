@@ -390,6 +390,30 @@ def test_daemon_ensure_label_transient_exit_5(
     assert "tier label resolution failed" in result.stderr
 
 
+def test_daemon_apply_auth_error_exit_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F1 MAJOR arm (c) at the CLI seam: auth on the WRITE re-raises out
+    # of the loop (never held-forever) and lands on the contract's 4
+    _prepare(tmp_path, monkeypatch)
+    fake = FakeGmailClient(
+        messages=_backlog_messages(),
+        labels=_shadow_labels(),
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+            )
+        ],
+        current_history_id=900,
+    )
+    fake.fail("apply_labels", GmailAuthError("token revoked mid-delta"))
+    result, _ = _run_daemon(tmp_path, monkeypatch, fake=fake)
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+
+
 def test_daemon_state_db_fail_fast_exit_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

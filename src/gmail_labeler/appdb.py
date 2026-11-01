@@ -60,7 +60,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .applications import ApplicationRow
 
@@ -202,6 +202,11 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
 )
+
+#: SQLite's signed INTEGER ceiling: the store's cursor bound (the wire's
+#: uint64 is WIDER — gmail_client.UINT64_MAX; F1 named each bound once
+#: instead of repeating literals in code and message).
+_MAX_SQLITE_INTEGER = 2**63 - 1
 
 # The cursor write (the single-row model at the writer): always rowid
 # 1 — set replaces, never appends. INSERT OR REPLACE with the explicit
@@ -555,14 +560,29 @@ class AppDB:
                         f"= {SCHEMA_VERSION} manually, or delete the file "
                         f"(shadow and application history is lost)"
                     )
-                else:
-                    # a foreign version ({99}), a polluted set ({1,99}),
-                    # or a future stamp — the version cause is named
-                    # (restored from the parent's _verify_version)
+                elif len(versions) == 1 and next(iter(versions)) > SCHEMA_VERSION:
+                    # a SINGLE future stamp: the only state where "a newer
+                    # tool wrote this DB" is honest (the sealed [99] pins
+                    # keep their prefix)
                     raise AppDBError(
                         f"state DB schema_version {sorted(versions, key=repr)} != "
                         f"{SCHEMA_VERSION}: {self.path} — a newer tool wrote "
-                        f"this DB"
+                        f"this DB; upgrade this tool, do not downgrade the DB"
+                    )
+                else:
+                    # a foreign polluted set ({1,99}), a zero/negative
+                    # stamp ({0}, {-1}), or a mixed legacy set ({1,2},
+                    # {2,3}): NO released tool ever writes these — the
+                    # F1 honesty fix retires the blanket "a newer tool"
+                    # diagnosis for states no tool can produce
+                    raise AppDBError(
+                        f"state DB schema_version {sorted(versions, key=repr)} != "
+                        f"{SCHEMA_VERSION}: {self.path} — unknown stamp set "
+                        f"(this tool writes exactly [{SCHEMA_VERSION}]; the "
+                        f"migratable legacy sets are [1] and [2] with no "
+                        f"later-version tables) — hand-edit or corruption: "
+                        f"recovery: inspect the tables by hand, or delete "
+                        f"the file (all local history is lost)"
                     )
         if shadow_results_valid or applications_valid or daemon_state_valid:
             # ours (coexist with any UNKNOWN extra tables); a DB with
@@ -734,7 +754,9 @@ class AppDB:
             raise AppDBError(
                 f"state DB daemon_state carries {len(rows)} rows (the "
                 f"single-row model: the writer UPSERTS rowid 1) — corrupt: "
-                f"{self.path}"
+                f"{self.path} — recovery: run DELETE FROM daemon_state "
+                f"manually (the cursor is re-established by the daemon's "
+                f"bootstrap), or delete the file"
             )
         rowid, value = rows[0]
         if rowid != 1:
@@ -749,7 +771,14 @@ class AppDB:
                 f"WHERE rowid != 1 manually, or delete the file (the "
                 f"cursor is re-established by bootstrap)"
             )
-        return _check_cursor_value(value)
+        return _check_cursor_value(
+            value,
+            recovery=(
+                f"run UPDATE daemon_state SET history_cursor = <known-good "
+                f"Gmail historyId> manually, or delete the file (the cursor "
+                f"is re-established by the daemon's bootstrap): {self.path}"
+            ),
+        )
 
     def set_history_cursor(self, history_cursor: int) -> None:
         """Establish/replace the history cursor OUTSIDE a page commit
@@ -782,6 +811,19 @@ class AppDB:
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         _check_application_batch(rows)
+        stamps = {row.applied_at.astimezone(UTC).isoformat() for row in rows}
+        if len(stamps) > 1:
+            # the #24 batch-homogeneity contract AS A STORE INVARIANT
+            # (F1, both families): one Application — one clock reading,
+            # so one delta's batch carries ONE applied_at. Enforced here,
+            # not only at the daemon call site, so #26's future caller
+            # inherits the invariant instead of rediscovering it
+            raise AppDBError(
+                f"commit_page batch carries {len(stamps)} distinct applied_at "
+                f"stamps {sorted(stamps)} — one delta, ONE clock reading; "
+                f"the caller must stamp its whole batch from a single "
+                f"clock() call"
+            )
         _check_cursor_value(history_cursor)
         try:
             # ONE transaction (the record_run precedent): the context
@@ -1046,27 +1088,34 @@ def _insert_applications(
     )
 
 
-def _check_cursor_value(value: object) -> int:
+def _check_cursor_value(value: object, recovery: str | None = None) -> int:
     # The cursor vocabulary (the _opt_int64 wire doctrine: unsigned
     # int64 — a negative historyId must never silently advance
     # anything; the fake's start_history_id < 1 refusal is the prior
     # art): an int (a bool is not one), >= 1. The write paths refuse
     # it NAMED before the transaction; the read re-validates (the
-    # tamper doctrine).
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise AppDBError(f"history_cursor must be an integer, got {value!r}")
-    if value < 1:
+    # tamper doctrine). The read path passes ``recovery`` (a tampered
+    # row is the OPERATOR's to repair); the write paths carry no
+    # recovery clause — there the value came from the caller, and
+    # "delete the file" would misdiagnose a caller bug as state damage.
+    def refuse(message: str) -> NoReturn:
         raise AppDBError(
-            f"history_cursor {value} is not a valid cursor (>= 1, unsigned)"
+            message if recovery is None else f"{message} — recovery: {recovery}"
         )
-    if value > 2**63 - 1:
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        refuse(f"history_cursor must be an integer, got {value!r}")
+    if value < 1:
+        refuse(f"history_cursor {value} is not a valid cursor (>= 1, unsigned)")
+    if value > _MAX_SQLITE_INTEGER:
         # the wire type (uint64) is WIDER than SQLite's signed INTEGER:
         # an unbounded value would escape as a raw sqlite3 OverflowError
         # at bind time (past the DatabaseError wrapper, past the CLI's
         # exit-5 mapping) — refused NAMED here instead (review finding)
         raise AppDBError(
             f"history_cursor {value} exceeds the SQLite INTEGER range "
-            "(2**63 - 1) — no real historyId reaches this bound; refusing"
+            f"({_MAX_SQLITE_INTEGER}) — no real historyId reaches this bound; "
+            f"refusing"
         )
     return value
 

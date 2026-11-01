@@ -940,6 +940,30 @@ def test_shadow_run_json_query_override_omits_cutoff(
     assert "cutoff" not in payload
 
 
+def test_shadow_run_json_since_window_keeps_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # fold-6 item 4 (the pin deepseek proved missing): the guard is
+    # query-is-None, NOT "default window only" — with --since (no
+    # --query), the cutoff fields are PRESENT and describe the --since
+    # window. Mutant: drop the fields when since is not None → this
+    # test is the one that reddens.
+    from datetime import UTC, datetime
+
+    _prepare(tmp_path, monkeypatch)
+    result, _fake = _run_shadow(
+        tmp_path, "--json", "--since", "2026-10-01", monkeypatch=monkeypatch
+    )
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    # the --since window was used: UTC midnight of the named day
+    expected_epoch = int(datetime(2026, 10, 1, tzinfo=UTC).timestamp())
+    assert payload["query"] == f"in:inbox after:{expected_epoch}"
+    # the cutoff fields are PRESENT and describe the --since cutoff
+    assert payload["cutoff_epoch"] == expected_epoch
+    assert payload["cutoff"] == datetime(2026, 10, 1, tzinfo=UTC).isoformat()
+
+
 def test_shadow_run_zero_graduated_labels_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -642,6 +642,190 @@ def test_table_unsorted_labels_refused() -> None:
         lying.validate()
 
 
+def _mutated_table(table: GraduationTable, **fields: object) -> GraduationTable:
+    return dataclasses.replace(table, **fields)
+
+
+def test_content_hash_covers_every_meaning_bearing_field() -> None:
+    # hash-coverage pin (mutation class: constant-value mutations):
+    # flipping or removing EACH meaning-bearing field must change the
+    # content hash — a hash computed from a constant (e.g. a hardcoded
+    # min_precision 0.9 / min_examples 10 / test_examples 18), or with
+    # a field dropped from the payload, dies here. Every mutation is
+    # to a value DIFFERENT from the golden value, so a constant
+    # standing in for the field cannot keep the hash green.
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    base = table.compute_hash()
+    entries = table.labels
+    bills, shipping = entries
+    mutations: dict[str, GraduationTable] = {
+        "format_version": _mutated_table(
+            table, format_version=table.format_version + 1
+        ),
+        "vocabulary_hash": _mutated_table(table, vocabulary_hash="1" * 64),
+        "corpus_fingerprint": _mutated_table(table, corpus_fingerprint="2" * 64),
+        "split_manifest_hash": _mutated_table(table, split_manifest_hash="3" * 64),
+        "encoder_id": _mutated_table(table, encoder_id="other-encoder"),
+        "split_date": _mutated_table(
+            table, split_date=datetime(2026, 2, 1, tzinfo=UTC)
+        ),
+        "test_examples": _mutated_table(table, test_examples=999),
+        "bands_content_hash": _mutated_table(table, bands_content_hash="4" * 64),
+        "candidate_thresholds": _mutated_table(
+            table, candidate_thresholds=table.candidate_thresholds[:-1]
+        ),
+        "default_targets.min_examples": _mutated_table(
+            table,
+            default_targets=GateTargets(
+                min_examples=table.default_targets.min_examples + 1,
+                min_precision=table.default_targets.min_precision,
+            ),
+        ),
+        "default_targets.min_precision": _mutated_table(
+            table,
+            default_targets=GateTargets(
+                min_examples=table.default_targets.min_examples,
+                min_precision=table.default_targets.min_precision - 0.1,
+            ),
+        ),
+        "labels.label": _mutated_table(
+            table, labels=(dataclasses.replace(bills, label="Bills2"), shipping)
+        ),
+        "labels.examples": _mutated_table(
+            table, labels=(dataclasses.replace(bills, examples=9), shipping)
+        ),
+        "labels.precision_at_high": _mutated_table(
+            table,
+            labels=(dataclasses.replace(bills, precision_at_high=0.8), shipping),
+        ),
+        "labels.high": _mutated_table(
+            table, labels=(dataclasses.replace(bills, high=0.8), shipping)
+        ),
+        "labels.med": _mutated_table(
+            table, labels=(dataclasses.replace(bills, med=0.7), shipping)
+        ),
+        "labels.min_examples": _mutated_table(
+            table, labels=(dataclasses.replace(bills, min_examples=11), shipping)
+        ),
+        "labels.min_precision": _mutated_table(
+            table, labels=(dataclasses.replace(bills, min_precision=0.8), shipping)
+        ),
+        "labels.graduated": _mutated_table(
+            table, labels=(dataclasses.replace(bills, graduated=False), shipping)
+        ),
+        "labels.reasons": _mutated_table(
+            table,
+            labels=(
+                bills,
+                dataclasses.replace(shipping, reasons=("below-min-examples",)),
+            ),
+        ),
+    }
+    for field, mutated in mutations.items():
+        assert mutated.compute_hash() != base, field
+
+
+def test_validate_refuses_negative_examples() -> None:
+    # the two-entry-path symmetry: from_json refuses a negative
+    # examples count, so validate() must too (a directly constructed
+    # table is refused exactly like a parsed one)
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    bills, shipping = table.labels
+    lying = _mutated_table(
+        table, labels=(dataclasses.replace(bills, examples=-1), shipping)
+    )
+    with pytest.raises(ValueError, match="examples"):
+        lying.validate()
+    with pytest.raises(ValueError, match="examples"):
+        GraduationTable.from_json(lying.to_json())
+
+
+def test_min_precision_int_and_float_are_one_identity() -> None:
+    # int 1 and 1.0 are ONE meaning, ONE identity: min_precision is
+    # float-normalized at the entry boundary (evaluate_graduation) and
+    # at parse (from_json's _need_number), and the canonical payload
+    # serializes floats ("1.0") — without the normalization one
+    # meaning would have two identities (json.dumps(1) is "1")
+    a = _table(
+        evaluate_graduation(
+            _golden_table(), _golden_bands(), min_precision=1, managed_labels=VOCAB
+        )
+    )
+    b = _table(
+        evaluate_graduation(
+            _golden_table(), _golden_bands(), min_precision=1.0, managed_labels=VOCAB
+        )
+    )
+    assert a.to_json() == b.to_json()
+    assert a.content_hash == b.content_hash
+
+
+def test_state_reasons_render_canonical_order() -> None:
+    # the same identity renders the same human text: _state joins
+    # reasons in CANONICAL sorted order (the hash serializes reasons
+    # sorted — the diff must agree)
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    bills, shipping = table.labels
+    reversed_reasons = dataclasses.replace(
+        shipping, reasons=tuple(reversed(shipping.reasons))
+    )
+    table_reversed = _mutated_table(table, labels=(bills, reversed_reasons))
+    assert render_graduation_diff(None, table, path="g.json") == render_graduation_diff(
+        None, table_reversed, path="g.json"
+    )
+
+
+def test_override_for_unmanaged_label_refused() -> None:
+    # an override for a label that is NOT managed is a silent drop:
+    # the gate would be configured but never applied — refused, named
+    # (refuse-never-drop)
+    with pytest.raises(ValueError, match="not in managed_labels"):
+        evaluate_graduation(
+            _golden_table(),
+            _golden_bands(),
+            overrides={"Shipping": GateTargets(min_examples=1, min_precision=0.5)},
+            managed_labels=["Bills"],
+        )
+
+
+def test_verify_graduation_refuses_corrupt_table() -> None:
+    # a corrupt table (stale hash) is refused with ValueError BEFORE
+    # the identity comparison — a corrupted table misdiagnosed as
+    # identity drift would point the human at the wrong remedy
+    table = _table(
+        evaluate_graduation(_golden_table(), _golden_bands(), managed_labels=VOCAB)
+    )
+    corrupt = _mutated_table(table, content_hash="1" * 64)
+    with pytest.raises(ValueError, match="content_hash"):
+        _verify_with(corrupt, {})
+
+
+def test_byte_identical_table_across_input_order() -> None:
+    # the total order is the vocabulary's, not the input's: a
+    # REVERSED test side (same examples, reversed order) mints a
+    # byte-identical table (eval_metrics is input-order invariant —
+    # the sibling test_bands_cli shape)
+    examples = _golden_examples()
+    table_a = eval_metrics(examples, _golden_scores(), vocabulary=VOCAB)
+    table_b = eval_metrics(list(reversed(examples)), _golden_scores(), vocabulary=VOCAB)
+    a = _table(
+        evaluate_graduation(table_a, _golden_bands(), managed_labels=list(VOCAB))
+    )
+    b = _table(
+        evaluate_graduation(
+            table_b, _golden_bands(), managed_labels=list(reversed(VOCAB))
+        )
+    )
+    assert a.to_json() == b.to_json()
+    assert a.content_hash == b.content_hash
+
+
 def test_table_malformed_json_refused() -> None:
     for payload in (
         "[1, 2, 3]",  # not an object

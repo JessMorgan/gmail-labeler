@@ -53,8 +53,9 @@ from — it does NOT authenticate the measured values: a hand-forged
 table with the correct identity verifies cleanly, so a consumer that
 needs the measurement must recompute it from the Eval Table (the eval
 table is the measurement authority; the bands/table cross-check in
-``evaluate_graduation`` refuses a bands artifact whose high band has no
-measured predictions on the table). The Bands Artifact itself is
+``evaluate_graduation`` refuses — for each Managed Label with a high
+band — a bands artifact whose high band has no measured predictions on
+the table). The Bands Artifact itself is
 computed IN-MEMORY per run (deterministically — the same eval + config
 recomputes the same artifact), so the table's ``bands_content_hash``
 binding is reproducible even when the bands file was never written
@@ -106,6 +107,27 @@ IDENTITY_FIELDS: tuple[str, ...] = (
     "split_date",
     "test_examples",
     "bands_content_hash",
+)
+
+# The keys of verify_graduation's expected-identity mapping (one home
+# for the comparison keys). A field added to IDENTITY_FIELDS without
+# an expected-value builder (or vice versa) would be a KeyError/exit-1
+# at a CONSUMER, not a caught refusal — so the drift is refused at
+# import time, crash-by-design:
+_EXPECTED_IDENTITY_KEYS: frozenset[str] = frozenset(
+    {
+        "vocabulary_hash",
+        "corpus_fingerprint",
+        "split_manifest_hash",
+        "encoder_id",
+        "split_date",
+        "test_examples",
+        "bands_content_hash",
+    }
+)
+assert set(IDENTITY_FIELDS) == _EXPECTED_IDENTITY_KEYS, (
+    "IDENTITY_FIELDS drifted from verify_graduation's expected-identity "
+    "keys — add the field to BOTH (the expected-value builder included)"
 )
 
 #: The default gate targets (the config defaults mirror these — the
@@ -345,7 +367,12 @@ class GraduationTable:
             # not "verify" (the hash-field doctrine)
             raise ValueError("graduation encoder_id must be non-empty")
         _check_thresholds(self.candidate_thresholds)
-        _check_targets("default_targets", self.default_targets)
+        _check_min_examples(
+            "default_targets.min_examples", self.default_targets.min_examples
+        )
+        _check_min_precision(
+            "default_targets.min_precision", self.default_targets.min_precision
+        )
         if not self.labels:
             raise ValueError("graduation labels must not be empty")
         if not sorted_unique(tuple(entry.label for entry in self.labels)):
@@ -354,10 +381,16 @@ class GraduationTable:
         for entry in self.labels:
             if not entry.label.strip():
                 raise ValueError("graduation label keys must be non-empty")
-            _check_targets(
-                f"{entry.label}",
-                GateTargets(entry.min_examples, entry.min_precision),
-            )
+            # the two-entry-path symmetry: from_json refuses a negative
+            # examples count, so validate() must too (a directly
+            # constructed table is refused exactly like a parsed one)
+            if isinstance(entry.examples, bool) or entry.examples < 0:
+                raise ValueError(
+                    f"graduation for {entry.label!r}: examples must be a "
+                    f"non-negative integer, got {entry.examples!r}"
+                )
+            _check_min_examples(f"{entry.label}.min_examples", entry.min_examples)
+            _check_min_precision(f"{entry.label}.min_precision", entry.min_precision)
             if entry.high is not None and entry.high not in grid:
                 raise ValueError(
                     f"graduation for {entry.label!r}: high {entry.high} is "
@@ -437,27 +470,21 @@ class GraduationRefusedError(ValueError):
         self.fields = tuple(fields)
 
 
-def _check_targets(name: str, targets: GateTargets) -> None:
+def _check_min_examples(name: str, value: int) -> None:
     # type() (not isinstance): a bool is an int subclass, and a lying
     # caller can pass a float / numpy int past the int-typed field —
     # the exact type must be int (the from_json symmetry)
-    if type(targets.min_examples) is not int:
-        raise ValueError(
-            f"{name}.min_examples must be an integer >= 0, got {targets.min_examples!r}"
-        )
-    if targets.min_examples < 0:
-        raise ValueError(
-            f"{name}.min_examples must be an integer >= 0, got {targets.min_examples!r}"
-        )
-    if isinstance(targets.min_precision, bool):
-        raise ValueError(
-            f"{name}.min_precision must be a float in [0.0, 1.0], got "
-            f"{targets.min_precision!r}"
-        )
-    if not 0.0 <= targets.min_precision <= 1.0:
-        raise ValueError(
-            f"{name}.min_precision must be in [0.0, 1.0], got {targets.min_precision}"
-        )
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
+
+
+def _check_min_precision(name: str, value: float) -> None:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a float in [0.0, 1.0], got {value!r}")
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be in [0.0, 1.0], got {value}")
     # NOTE: no tenth-grid check — a gate precision target is compared
     # against MEASURED values (any rational tp/(tp+fp)), never looked
     # up in the candidate grid (the documented asymmetry with [bands]).
@@ -513,9 +540,10 @@ def evaluate_graduation(
     labels, a managed label the table does not carry (named), a
     ``min_examples`` that is not an integer >= 0 (a bool is not a
     count), a ``min_precision`` outside [0, 1] (a bool is not a
-    target), and an override for a label the table does not carry
-    (named) all raise ValueError — the gates are a measured claim,
-    never a guess.
+    target), an override for a label the table does not carry (named),
+    and an override for a label NOT in managed_labels (named — a
+    silent drop: the gate would be configured but never applied) all
+    raise ValueError — the gates are a measured claim, never a guess.
     """
     if not table.vocabulary:
         raise ValueError("vocabulary must not be empty")
@@ -554,9 +582,8 @@ def evaluate_graduation(
             "— the high/med thresholds would not be grid points of the "
             "measured table"
         )
-    _check_targets(
-        "min_examples/min_precision", GateTargets(min_examples, min_precision)
-    )
+    _check_min_examples("min_examples", min_examples)
+    _check_min_precision("min_precision", min_precision)
     if not managed_labels:
         raise ValueError(
             "managed_labels must not be empty — nothing to graduate "
@@ -583,12 +610,25 @@ def evaluate_graduation(
             f"override(s) for label(s) {unknown_overrides} not in the "
             "vocabulary — refusing to gate silently (fix the override)"
         )
+    # an override for a label that is NOT managed is a silent drop:
+    # the gate would be configured but never applied (refuse-never-
+    # drop — the operator's intent must be visible, not absorbed)
+    unmanaged_overrides = sorted(set(override_map) - set(managed_labels))
+    if unmanaged_overrides:
+        raise ValueError(
+            f"override(s) for label(s) {unmanaged_overrides} not in "
+            "managed_labels — refusing to gate silently (fix the "
+            "override or [labels] managed)"
+        )
     # the override targets get the SAME validation as the run's — an
     # out-of-range per-label target would miscalibrate silently (the
     # config layer shields the CLI path; the core is the public
     # boundary)
     for label, override in sorted(override_map.items()):
-        _check_targets(f"overrides[{label!r}]", override)
+        _check_min_examples(f"overrides[{label!r}].min_examples", override.min_examples)
+        _check_min_precision(
+            f"overrides[{label!r}].min_precision", override.min_precision
+        )
 
     band_entries = {entry.label: entry for entry in bands.labels}
     rows = {row.label: row for row in table.rows}
@@ -646,6 +686,10 @@ def evaluate_graduation(
             and precision_at_high < effective.min_precision
         ):
             reasons.append(_REASON_PRECISION_BELOW_GATE)
+        # min_precision is float-NORMALIZED at the entry boundary:
+        # int 1 and 1.0 are ONE meaning, and the canonical payload
+        # serializes floats ("1.0") — without the normalization one
+        # meaning would have two identities (json.dumps(1) is "1")
         labels.append(
             GraduationEntry(
                 label=label,
@@ -654,7 +698,7 @@ def evaluate_graduation(
                 high=high,
                 med=band.med,
                 min_examples=effective.min_examples,
-                min_precision=effective.min_precision,
+                min_precision=float(effective.min_precision),
                 graduated=not reasons,
                 reasons=tuple(reasons),
             )
@@ -667,7 +711,7 @@ def evaluate_graduation(
         targets=tuple(targets),
         test_examples=table.test_examples,
         default_targets=GateTargets(
-            min_examples=min_examples, min_precision=min_precision
+            min_examples=min_examples, min_precision=float(min_precision)
         ),
         bands_content_hash=bands.content_hash,
     )
@@ -768,12 +812,19 @@ def verify_graduation(
             "datetime — a date/naive datetime is a caller bug, not "
             "identity drift"
         )
+    # a corrupt table (stale hash, violated invariant) is refused
+    # BEFORE the identity comparison — a corrupted table misdiagnosed
+    # as identity drift would point the human at the wrong remedy
+    # (re-run eval) when the bytes themselves are the problem
+    table.validate()
     # the expected identity, keyed by the SAME field names
     # IDENTITY_FIELDS carries (one home — a future field addition
-    # updates this mapping, and every comparison site sees it): the
-    # vocabulary check compares the table's hash against the hash of
-    # the expected vocabulary (the manifest is the authority, the
-    # table must agree with it — the sidecar rule)
+    # updates this mapping, and every comparison site sees it; the
+    # import-time assert below makes a drift an import-time crash-by-
+    # design, not a KeyError/exit-1 at a consumer): the vocabulary
+    # check compares the table's hash against the hash of the expected
+    # vocabulary (the manifest is the authority, the table must agree
+    # with it — the sidecar rule)
     expected: dict[str, object] = {
         "vocabulary_hash": vocabulary_hash(vocabulary),
         "corpus_fingerprint": corpus_fingerprint,
@@ -819,7 +870,10 @@ def _state(entry: GraduationEntry | None) -> str:
         return "(absent)"
     if entry.graduated:
         return "graduated"
-    return f"not graduated ({', '.join(entry.reasons)})"
+    # CANONICAL order (sorted): the hash serializes reasons sorted, so
+    # the same identity must render the same human text — a reversed
+    # reasons tuple is the same meaning, not a different one
+    return f"not graduated ({', '.join(sorted(entry.reasons))})"
 
 
 def render_graduation_diff(

@@ -546,7 +546,7 @@ class AppDB:
         if not rows:
             # an empty run is refused at the ONLY writer (load_run's
             # docstring assumes "an empty run was never committed" — a
-            # future caller #24/#26 cannot create the state the reader
+            # future caller #25/#26 cannot create the state the reader
             # assumes impossible)
             raise AppDBError(
                 "record_run: no rows — an empty run is never committed "

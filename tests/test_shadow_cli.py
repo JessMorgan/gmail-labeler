@@ -386,8 +386,10 @@ def test_shadow_run_zero_gmail_writes(
 ) -> None:
     # AC1: zero Gmail writes — the recorded calls are a subset of the
     # READ surface (list_messages, get_message, list_labels,
-    # list_filters); no write method of any shape (the Protocol has
-    # none in this ticket — the write surface lands #24/#25)
+    # list_filters); no write method of any shape. (The Protocol gained
+    # apply_labels/ensure_label in #24 — the name-based pin catches
+    # them BY NAME if a read path ever calls one; the assertion below
+    # is byte-identical to the #23 original)
     _prepare(tmp_path, monkeypatch)
     result, fake = _run_shadow(tmp_path, monkeypatch=monkeypatch)
     assert result.exit_code == 0, result.stderr

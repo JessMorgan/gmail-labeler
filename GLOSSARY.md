@@ -21,11 +21,12 @@ report's tier names NOW (the report renders the band tier name for would-be
 rows); the `applied` umbrella is VALIDATED at config NOW (stripped, and
 distinct from `high` / `med`) and CONSUMED by the Application write
 composition (ticket #24): `applications.plan_message_write` adds the
-umbrella plus the best band tier to every write, and the daemon/apply
-startup resolves the configured names to Gmail label ids (get-or-create,
-never a System Label name-sake). The live write itself lands with the
-daemon / `apply` CLI (#25/#26); the shadow report still attaches no
-labels.
+umbrella plus the best band tier to every write, and
+`gmail_client.ensure_label` ships the name→Gmail-label-id resolution
+(get-or-create, System Label name-sakes refused named — the daemon /
+`apply` startup of #25/#26 calls it once per configured name). The
+live write itself lands with the daemon / `apply` CLI (#25/#26); the
+shadow report still attaches no labels.
 _Avoid_: confidence label, meta label
 
 **Application**:
@@ -38,15 +39,21 @@ umbrella Tier Label (`[labels] applied`) AND exactly one band Tier Label
 med; a skip-present label earns no band tier, it is not applied). That
 composition (umbrella + one band tier) SHIPS at the library level
 (ticket #24): `applications.plan_message_write` composes it from the
-tiers core and the startup-resolved Gmail label ids; the daemon /
-`apply` CLI (#25/#26) rides that plan for the live write. Band tiers
-ACCUMULATE across Applications (accepted v1 policy): a later med-band
-Application on a message already carrying `ai-high` adds `ai-med` —
-additive-only forbids correcting the old one, so the audit truth is the
-Applications table, not the tier labels. The shadow report is a PREVIEW,
-not an Application: it renders
-the band tier NAME for would-be rows and attaches no labels (no umbrella, no
-band tier on the wire).
+tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
+ships the name→id resolution; the daemon / `apply` startup of #25/#26
+calls it once per configured name). The Application is ALL-OR-NOTHING
+per message: any compose error means NO write for that message plus a
+counted id-only warning (invariant #1's fail-safe), and nothing new
+earned — skip-present included — means an empty plan and no API call at
+all (invariant #2). Band tiers ACCUMULATE across Applications (accepted
+v1 policy): "exactly one band Tier Label" is PER-APPLICATION — a later
+Application can add a DIFFERENT band tier to the same message (a
+med-band Application on a message already carrying `ai-high` adds
+`ai-med`); additive-only never corrects the old one, so the audit truth
+is the Applications table, not the tier labels. The live write itself
+lands with the daemon / `apply` CLI (#25/#26). The shadow report is a
+PREVIEW, not an Application: it renders the band tier NAME for would-be
+rows and attaches no labels (no umbrella, no band tier on the wire).
 _Avoid_: auto-label (the event, not the label)
 
 **Additive-only**:
@@ -139,9 +146,11 @@ the `applications` table (ticket #24, schema v2: message id, label, label
 id, score, band, tier, applied-at, source — the join corrections and
 `status` read). It carries ids, probabilities, labels, and timestamps
 ONLY — never bodies (invariant #5) — so it is publicly attachable. One
-transaction per write (a crash leaves no half rows); a foreign
-schema_version is refused, and a live v1 DB is migrated in place (the
-single-row restamp to v2).
+transaction per write (a crash leaves no half rows), and every schema
+transition is one transaction too — fresh create+stamp, the live v1
+DB's single-row v1→v2 restamp, self-heals — so a crash leaves the file
+fully prior-state or fully new-state, never the intermediate; a foreign
+schema_version is refused.
 _Avoid_: shadow DB, label DB
 
 **Backlog**:

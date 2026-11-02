@@ -248,6 +248,41 @@ def test_export_refuses_out_inside_corpus_store(tmp_path: Path) -> None:
     assert not inside.exists()
 
 
+def test_export_out_is_0600(tmp_path: Path) -> None:
+    # F2 item 6: the export --out lands 0600 (the eval-guard parity the
+    # docstring CLAIMED while the write was a bare 0664 write_text beside a
+    # 0600 store). A revert to write_text() would produce 0664 (umask) -> red.
+    import stat
+
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    out_file = tmp_path / "c.json"
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(out_file)))
+    assert result.exit_code == 0, result.output
+    mode = stat.S_IMODE(out_file.stat().st_mode)
+    assert mode == 0o600, f"export --out landed {oct(mode)}, expected 0o600"
+
+
+def test_export_out_notices_replacing_existing(tmp_path: Path) -> None:
+    # F2 item 6: clobbering an EXISTING --out target is ANNOUNCED (the eval
+    # NOTICE), never silent
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    out_file = tmp_path / "c.json"
+    out_file.write_text("stale", encoding="utf-8")
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(out_file)))
+    assert result.exit_code == 0, result.output
+    assert "NOTICE" in result.output and "replacing existing" in result.output
+
+
+def test_export_out_expands_user(tmp_path: Path, monkeypatch) -> None:
+    # F2 item 12: --out expands ~ like --db does (a literal '~/' would
+    # otherwise fail the write on a nonsense path)
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", "~/out.json"))
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "out.json").is_file()
+
+
 def test_export_unwritable_out_is_5_not_crash(tmp_path: Path) -> None:
     # MAJOR: an unwritable --out target is exit 5, NOT the exit-1
     # FileNotFoundError traceback the contract forbids

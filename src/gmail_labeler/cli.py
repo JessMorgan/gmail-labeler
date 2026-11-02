@@ -124,7 +124,7 @@ def _write_secret_tight(path: Path, text: str) -> None:
         fh.write(text)
 
 
-def _write_out_report(out: str, file_text: str) -> None:
+def _write_out_report(out: str, file_text: str, *, label: str = "eval") -> None:
     """The eval ``--out`` write: 0600 from creation, EXCLUSIVE staging
     + atomic replace — a failure leaves any PREVIOUS report at the
     path intact, and no fd can leak. The staging file is
@@ -144,11 +144,13 @@ def _write_out_report(out: str, file_text: str) -> None:
     write failure) still REPLACES a previous report file — the report
     is the run's output, and the refusal is about the artifacts, not
     the report (in --json mode the file lands at the payload emit,
-    which is after the acts — the bytes are the same). Raises OSError
+    which is after the acts — the bytes are the same). ``label`` names
+    the announcing command (default "eval"; corrections export passes
+    its own name so the NOTICE is not misattributed). Raises OSError
     on failure (the caller maps it to exit 5)."""
     target = Path(out)
     if target.exists():
-        typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
+        typer.echo(f"{label}: NOTICE: replacing existing {out}", err=True)
     fd, staging_name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
     staging = Path(staging_name)
     try:
@@ -4004,7 +4006,10 @@ def corrections_export(
     # The headline danger: --out naming the state DB would overwrite the
     # SQLite file with JSON and destroy the corrections + cursor (only a
     # full resync recovers). Refuse that, plus the identity-file roots and
-    # an existing directory, BEFORE writing.
+    # an existing directory, BEFORE writing. ~ is expanded here so a
+    # `--out ~/c.json` names the same file the guards compare and the write
+    # lands (F2 item 12: parity with --db, which expands via _resolve_db_path).
+    out = str(Path(out).expanduser())
     out_path = Path(out).resolve()
     if out_path == db_path.resolve():
         typer.echo(
@@ -4032,8 +4037,11 @@ def corrections_export(
             err=True,
         )
         raise typer.Exit(code=2) from None
+    # the SAME 0600 + mkstemp/fsync/os.replace atomic write + clobber NOTICE
+    # `eval` uses (F2 item 6: the claim this guarded "like eval" was false
+    # while it was a bare 0664 write_text beside a 0600 store)
     try:
-        out_path.write_text(text + "\n", encoding="utf-8")
+        _write_out_report(out, text + "\n", label="corrections export")
     except OSError as e:
         # an unwritable target is an operation failure (5), NOT the exit-1
         # FileNotFoundError traceback the contract forbids (README: a `1`
@@ -4092,15 +4100,55 @@ def status(
     (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
     config unusable · 5 store/artifact failure (3 is the project's
     reserved not-implemented code; status never emits it)."""
-    from .appdb import AppDB, AppDBError
+    from .appdb import CORRECTION_ATTRIBUTIONS, AppDB, AppDBError
     from .graduation import GraduationTable
     from .status import PrecisionInvariantError, compute_precision
     from .thresholds import BandsArtifact
+
+    # The status caveat + attribution vocabulary, built ONCE and shared by
+    # the text NOTE and the --json basis so the two surfaces can never
+    # drift (F2 item 8). The vocabulary is RENDERED from CORRECTION_ATTRIBUTIONS
+    # — not a literal — so a future vocabulary change shows up on the line
+    # (the drift-pin asserts every constant value reaches the rendered text).
+    _vocab = " / ".join(CORRECTION_ATTRIBUTIONS)
+    _caveat = (
+        "'written' counts Application ROWS (a re-earned label is a new row, "
+        "so written can exceed the number of distinct messages) while "
+        "'removed' is deduped per (message,label); a label removed then later "
+        "re-added still counts as removed (the event log is historical truth, "
+        "not reconciled state); a Gmail label RENAME desyncs the name-keyed "
+        "join (orphaned corrections); rows may span artifact versions "
+        "(per-run binding deferred to #23); precision assumes "
+        "unseen-but-removed mail is rare (archive-equals-dismiss)"
+    )
+    # the canonical THREE-cause sentence for 'unverifiable' (F2 item 14) —
+    # mirrored verbatim in GLOSSARY / README / CHANGELOG
+    _unverifiable_causes = (
+        "no usable filters snapshot (absent or malformed); a relevant filter "
+        "whose criteria cannot be simulated from the kept fields (outside "
+        "from/to/subject, or malformed); or an add whose authorship is "
+        "otherwise undecidable (its message fields were not fetched, or a "
+        "relevant filter's addLabelIds is unreadable)"
+    )
+    _attribution_note = (
+        f"'added' counts are attributed under the corrections vocabulary "
+        f"({_vocab} — a future vocabulary change would change these lines): "
+        f"an 'added' is 'unverifiable' — withheld, not guessed — when "
+        f"authorship cannot be determined: {_unverifiable_causes}. A "
+        f"'filter-covered' add (a simulatable filter verifiably would have "
+        f"applied it) is likewise withheld. Both slices are excluded from the "
+        f"human signal, not guessed."
+    )
 
     for flag, target in (("--bands", bands), ("--graduation", graduation)):
         if not target.strip():
             typer.echo(f"status failed: {flag} PATH must be non-empty", err=True)
             raise typer.Exit(code=2) from None
+    # ~ is expanded for the artifact paths too (F2 item 12: parity with
+    # --db, which expands via _resolve_db_path — a `--bands ~/b.json` must
+    # name the file the operator meant, not a literal '~/' exit-5 miss)
+    bands = str(Path(bands).expanduser())
+    graduation = str(Path(graduation).expanduser())
 
     # NO auth gate, NO client, NO model, NO corpus: status is the DB-only
     # face (the AC — it must answer offline on a sick mailbox)
@@ -4141,6 +4189,23 @@ def status(
         )
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
+    # the bands/graduation PAIRING cross-check (F2 item 7): the Graduation
+    # Table records the bands artifact it was MEASURED against
+    # (bands_content_hash). A mismatched --bands/--graduation pair would
+    # otherwise print a basis line claiming a pairing that was never
+    # measured together — this finally makes --bands load-bearing (it was
+    # only ever displayed). Refuse NAMED at exit 5.
+    if artifact.content_hash != table.bands_content_hash:
+        typer.echo(
+            f"status failed: --bands {bands!r} (content_hash "
+            f"{artifact.content_hash[:12]}) is NOT the bands artifact this "
+            f"graduation table was measured against (bands_content_hash "
+            f"{table.bands_content_hash[:12]}) — pass the matching pair "
+            "(re-run `eval --bands`/`eval --graduation` together)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
     graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
 
     store_db = AppDB(db_path)
@@ -4167,11 +4232,9 @@ def status(
             "basis": {
                 "bands_content_hash": artifact.content_hash,
                 "graduation_content_hash": table.content_hash,
-                "caveat": (
-                    "rows may span artifact versions (per-run binding "
-                    "deferred to #23); precision assumes unseen-but-removed "
-                    "mail is rare (archive-equals-dismiss)"
-                ),
+                "caveat": _caveat,
+                "attribution_vocabulary": list(CORRECTION_ATTRIBUTIONS),
+                "unverifiable_causes": _unverifiable_causes,
             },
             "labels": [
                 {
@@ -4194,23 +4257,7 @@ def status(
         f"status: {len(rows)} graduated label(s) · basis bands="
         f"{artifact.content_hash[:12]} graduation={table.content_hash[:12]}"
     )
-    typer.echo(
-        "status: NOTE v1 caveats — 'written' counts Application ROWS (a "
-        "re-earned label is a new row, so written can exceed the number of "
-        "distinct messages) while 'removed' is deduped per (message,label); "
-        "a label removed then later re-added still counts as removed (the "
-        "event log is historical truth, not reconciled state); a Gmail "
-        "label RENAME desyncs the name-keyed join (orphaned corrections); "
-        "rows may span artifact versions (per-run binding deferred to #23); "
-        "precision assumes unseen-but-removed mail is rare "
-        "(archive-equals-dismiss); 'added' counts are attributed under the "
-        "corrections vocabulary (human / filter_covered / unverifiable — a "
-        "future vocabulary change would change these lines): only "
-        "filter-AUTHORED adds are withheld as 'filter-covered', and adds a "
-        "relevant filter makes undecidable (criteria outside "
-        "from/to/subject) are withheld as 'unverifiable' — both slices are "
-        "excluded from human, not guessed"
-    )
+    typer.echo(f"status: NOTE v1 caveats — {_caveat}; {_attribution_note}")
     if not rows:
         typer.echo("status: no graduated labels (nothing to report)")
         return

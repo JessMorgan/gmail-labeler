@@ -64,12 +64,15 @@ CLI's sleep is the interruptible one — this module never sleeps by
 itself).
 
 CORRECTION DETECTION (ticket #27; GLOSSARY: Correction): each delta's
-history records also carry ``labelAdded``/``labelRemoved`` events. They
+history records also carry ``labelsAdded``/``labelsRemoved`` events (the
+documented Gmail response keys — the singular ``labelAdded``/``labelRemoved``
+are only ``historyTypes[]`` request-enum values, never response keys; see
+``_label_events``). They
 are classified — read + local-DB only, NEVER a Gmail write — against the
 applications join: only messages ALREADY present in the Applications
-table are candidates (the join AC). A ``labelRemoved`` of a label that
+table are candidates (the join AC). A ``labelsRemoved`` of a label that
 IS that message's Application label is a 'removed' Correction (a human
-undid our work); a ``labelAdded`` of a MANAGED-VOCABULARY (graduated,
+undid our work); a ``labelsAdded`` of a MANAGED-VOCABULARY (graduated,
 non-System) label the daemon did NOT write (no Application row for it)
 is an 'added' Correction (a human did our job — positive signal).
 ANYTHING else on an applied message — System Labels, non-vocabulary

@@ -734,6 +734,52 @@ def test_eval_bodies_never_in_report_or_logs(
     assert marker not in r_json.stdout
 
 
+def test_eval_prediction_failure_names_class_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # S1 C4 (invariant #5): the eval prediction-failure arm predates the
+    # daemon/apply class-only doctrine — it used to echo the model's exception
+    # MESSAGE (FakeModel's unprogrammed-text refusal quotes the scored TEXT,
+    # which carries the body). Now it names the CLASS only.
+    import logging
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+    from gmail_labeler.corpus_store import CorpusStore
+
+    marker = "PROBE-BODY-LEAK-MARKER"
+    store = CorpusStore(tmp_path / "corpus")
+    store.enforce_modes()
+    now = datetime.now(UTC)
+    for i in range(12):
+        days_ago = 400 - i if i < 6 else 10 + i
+        rec = CorpusRecord(
+            id=f"{i:016x}",
+            date=now - timedelta(days=days_ago),
+            subject=f"subject {i}",
+            sender="shop@x.z",
+            recipients=("me@x.y",),
+            labels=("Shipping",) if i % 2 == 0 else ("Money/Bills",),
+            body_hash=body_hash(f"{marker} {i}"),
+            source="api",
+            date_provenance="internal_date",
+        )
+        store.put(rec, f"{marker} {i}")
+    for name, payload in (("filters.json", "[]"), ("labels.json", "{}")):
+        f = store.root / name
+        f.write_text(payload, encoding="utf-8")
+        os.chmod(f, 0o600)
+    caplog.set_level(logging.DEBUG)
+    assert _run_train(tmp_path, monkeypatch).exit_code == 0
+    # NO score programmed -> eval's predict raises, its message quoting a test
+    # text that carries the marker; the arm must swallow it and name the class.
+    result, _ = _run_eval(tmp_path, monkeypatch=monkeypatch, scores={})
+    assert result.exit_code == 5
+    assert "prediction/processing failed" in result.stderr  # arm executed
+    assert marker not in result.stderr
+    assert marker not in result.stdout
+    assert marker not in caplog.text
+
+
 # ---- surface ----
 
 

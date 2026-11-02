@@ -51,6 +51,18 @@ owner. Excluded from training signal; the model must earn its keep on labels
 that filters do not cover.
 _Avoid_: auto-label (reserved for AI applications)
 
+**filter-covered / filter-unverifiable (analyze statuses)**:
+`dataset analyze` report statuses for a label's filter attribution:
+*filter-covered* — a simulatable (from/to/subject) Gmail filter already
+applies the label on most of its mail; *filter-unverifiable* — a filter
+touching the label carries criteria that cannot be simulated from the kept
+record fields, so candidacy is excluded, never guessed. The report's
+`filters_posture` field (`snapshot`, `attested-none`, `missing`,
+`bridge-incomplete`) records why attribution was or was not performed.
+The remaining reason codes name themselves: `no-filter-snapshot`,
+`low-volume`, `low-recent`, `template-heavy`.
+_Avoid_: auto-excluded, shadow-flagged
+
 **Correction**:
 A later manual label edit by the owner on a message the system applied to
 (removing an applied label or adding one it missed), captured as new training

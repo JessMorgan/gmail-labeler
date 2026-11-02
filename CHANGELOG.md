@@ -8,6 +8,28 @@ does not ship releases yet.
 
 ### Added
 
+- Auth onboarding wizard (ticket #28): `auth setup` walks a new user through
+  ADR-0004 — create your own GCP project + desktop OAuth client, point the tool
+  at its JSON, wire the token store — then COMPOSES the existing `auth login`
+  loopback flow to sign in. A bare `auth` with no credentials offers the wizard
+  on a terminal, and in a script exits 5 naming it (never half-prompts).
+  - `wizard.py`: the onboarding decision core as a PURE state machine over
+    injected prompts + an `EnvironmentProbe` (typer wires the real I/O; the
+    whole matrix is tested offline). Declared steps with ids; each verifies
+    LOCALLY what it can (the client file exists / parses / is a desktop-type
+    client) and says PLAINLY what it cannot (Gmail API enablement, the consent
+    screen's In-production mode) — no verification theater; the first successful
+    sign-in is named as the real proof of those.
+  - Secret discipline (invariant #8): paths and env names only; the client
+    JSON's id/secret and the typed project id never reach output or logs
+    (sentinel-absence pins, mutation-tested); the refresh token lands in the
+    keyring via the composed login — no free-form token entry is ever offered.
+  - Confirm-before-overwrite on the config path (a `resolve()`-compare posture,
+    stated; the samefile/fd family is #47's scope). The exit contract gains 130
+    for Ctrl-C at a prompt, matching typer's raw-KeyboardInterrupt posture.
+  - README Setup now leads with the wizard (the manual steps remain as a
+    collapsible fallback); ADR-0004's Status note is updated in the same commit
+    it explicitly awaited.
 - Correction capture + `status` (ticket #27): the daemon records your
   hand-fixes of applied mail as training signal, and `status` answers
   "is it working?" with realized precision from the local store alone.

@@ -34,12 +34,14 @@ Invariants:
   names/ids, probabilities, band/tier verdicts, timestamps, and the
   history cursor ONLY — the DB must be publicly attachable (the
   corpus-sidecar discipline);
-- TRANSACTION PER WRITE: ``record_run``, ``record_applications`` and
-  ``commit_page`` insert their batch in ONE transaction — a crash
-  mid-write (or a mid-write refusal) rolls back, leaving no half rows;
-  a committed batch is atomic (``commit_page`` carries the delta's rows
-  AND the cursor advance in the SAME transaction — the Durable Handling
-  commit point, invariant #3);
+- TRANSACTION PER WRITE: ``record_run``, ``record_applications``,
+  ``commit_page`` and ``commit_applications`` insert their batch in ONE
+  transaction — a crash mid-write (or a mid-write refusal) rolls back,
+  leaving no half rows; a committed batch is atomic (``commit_page``
+  carries the delta's rows AND the cursor advance in the SAME
+  transaction — the Durable Handling commit point, invariant #3;
+  ``commit_applications`` is the apply path's rows-only sibling, no
+  cursor — invariant #3 belongs to the daemon alone);
 - create-all-if-missing: opening a fresh path creates the schema;
   opening an existing DB verifies the schema BEFORE any write (the
   ownership gate: shape equality per table, the version a HARD gate —
@@ -229,8 +231,9 @@ class AppDB:
     """The state DB adapter (bounded I/O, CODING-STANDARDS). One
     connection per instance (single-process contract, ADR-0002);
     ``open`` creates the schema if missing and verifies the version;
-    ``record_run``, ``record_applications``, ``set_history_cursor`` and
-    ``commit_page`` are the only writers (transaction-per-write); the
+    ``record_run``, ``record_applications``, ``set_history_cursor``,
+    ``commit_page`` and ``commit_applications`` are the only writers
+    (transaction-per-write); the
     ``latest_run``/``load_run`` reads serve the report, the
     ``applications_for_*`` reads serve the join, and
     ``get_history_cursor`` serves the daemon's poll loop."""
@@ -855,6 +858,58 @@ class AppDB:
             raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
         return len(rows)
 
+    def commit_applications(self, rows: Sequence[ApplicationRow]) -> int:
+        """The apply path's rows-only commit point (ticket #26): the
+        sibling of ``commit_page`` WITHOUT the cursor — apply has no
+        cursor to advance, and the Durable Handling contract (invariant
+        #3) belongs to the daemon alone. This method therefore never
+        reads or writes ``daemon_state``: the cursor a live daemon
+        persisted stands untouched across a whole backfill (the pin:
+        the state-table snapshot before/after is identical).
+
+        Same contract as ``commit_page``'s rows half: ONE explicit
+        transaction carrying the batch's Application rows, with every
+        refusal raising BEFORE the transaction — an empty batch (the
+        ``record_applications`` refusal, NOT ``commit_page``'s
+        empty-tolerance: with no cursor to move, an empty batch is a
+        caller bug — the plan's no-call-on-empty rule means a real
+        apply batch always carries a row), a row failing validation, a
+        within-batch (message_id, label) duplicate, or MORE THAN ONE
+        distinct applied_at stamp (the #24 homogeneity contract,
+        inherited here exactly as ``commit_page`` enforces it — one
+        batch, ONE clock reading at the call site). Returns the row
+        count."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        if not rows:
+            raise AppDBError(
+                "commit_applications: no rows — an empty write batch is "
+                "never committed (an empty plan is no Application; apply "
+                "has no cursor to advance in exchange)"
+            )
+        _check_application_batch(rows)
+        stamps = {row.applied_at.astimezone(UTC).isoformat() for row in rows}
+        if len(stamps) > 1:
+            # the #24 batch-homogeneity contract, the commit_page arm
+            # verbatim (the message names THIS method — a caller
+            # debugging a backfill must not be pointed at the daemon)
+            raise AppDBError(
+                f"commit_applications batch carries {len(stamps)} distinct "
+                f"applied_at stamps {sorted(stamps)} — one batch, ONE clock "
+                f"reading; the caller must stamp its whole batch from a "
+                f"single clock() call"
+            )
+        try:
+            # ONE transaction (the record_run precedent): all rows commit
+            # together or none — a mid-batch failure leaves no half rows.
+            # NO cursor statement: the daemon_state table is untouched
+            # (apply never advances a cursor it does not own).
+            with self._conn:
+                _insert_applications(self._conn, rows)
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
+        return len(rows)
+
     # -- reading ---------------------------------------------------------
 
     def latest_run(self) -> str | None:
@@ -1059,10 +1114,11 @@ def _check_row(row: ShadowRow) -> None:
 
 
 def _check_application_batch(rows: Sequence[ApplicationRow]) -> None:
-    # the ONE batch-validation authority (record_applications and
-    # commit_page share it — the dup message is pinned verbatim): every
-    # row validated, then the within-batch (message_id, label)
-    # uniqueness (one Application carries one row per label)
+    # the ONE batch-validation authority (record_applications,
+    # commit_page and commit_applications share it — the dup message is
+    # pinned verbatim): every row validated, then the within-batch
+    # (message_id, label) uniqueness (one Application carries one row
+    # per label)
     for row in rows:
         _check_application_row(row)
     seen: set[tuple[str, str]] = set()
@@ -1080,7 +1136,8 @@ def _insert_applications(
     conn: sqlite3.Connection, rows: Sequence[ApplicationRow]
 ) -> None:
     # the ONE applications-INSERT column authority (the caller owns the
-    # transaction — record_applications and commit_page both ride it)
+    # transaction — record_applications, commit_page and
+    # commit_applications all ride it)
     conn.executemany(
         "INSERT INTO applications "
         "(message_id, label, label_id, score, band, tier, "

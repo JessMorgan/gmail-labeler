@@ -343,6 +343,26 @@ def test_project_id_cap_terminates_on_declined_skip() -> None:
     assert stdin.seen.count("project-id") == 3
 
 
+def test_client_json_cap_terminates_after_three_rejects() -> None:
+    # F3-4b: the client-json loop was uncapped (contradicting C1's "terminate on
+    # every input"). A valid client is REQUIRED (no skip), so 3 rejected paths
+    # must ABORT the wizard, not re-ask forever.
+    probe = FakeProbe(client_states=[ClientFileState.MISSING] * 4)  # > the cap
+    stdin = FakeStdin(
+        answers={"project-id": [PROJECT_ID], "client-json": [CLIENT_PATH] * 4}
+    )
+    result, rec, actions, _ = _run(probe=probe, stdin=stdin)
+    assert result.outcome == "aborted"  # terminated, not hung
+    assert result.steps == (
+        "intro",
+        "project-id",
+        "client-json",
+    )  # never reached config
+    assert actions.written == []  # nothing written
+    assert stdin.seen.count("client-json") == 3  # capped at max_strikes
+    assert "manual" in rec.all_text.lower()  # guide-to-manual on the abort
+
+
 # --- NO verification theater (the AC's honesty clause) -----------------------
 def test_wizard_states_enablement_and_production_are_not_locally_checkable() -> None:
     # the honesty clause, pinned by its CONTIGUOUS signature — not by the bare

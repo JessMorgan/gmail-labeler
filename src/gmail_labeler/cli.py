@@ -323,16 +323,50 @@ def _setup_config_target(config: str | None) -> Path:
 
 def _echo_out(text: str) -> None:
     """The wizard's output sink — a named seam so tests can simulate a closed
-    stdout (BrokenPipeError) without patching typer globally."""
+    stdout (BrokenPipeError) without patching typer globally.
+
+    The explicit flush is belt-and-suspenders: click.echo already flushes, so a
+    `| head` break fires in-run here (a mutant removing this flush SURVIVED — the
+    load-bearing boundary fix is _silence_stdout, not the flush). The None guard
+    covers `>&-`, where sys.stdout is None and .flush() would raise AttributeError."""
+    import sys
+
     typer.echo(text)
+    if sys.stdout is not None:  # `>&-` leaves sys.stdout as None
+        sys.stdout.flush()
+
+
+def _silence_stdout() -> None:
+    """Point the process's stdout fd at /dev/null so the interpreter's shutdown
+    flush can neither fail (BrokenPipeError -> exit 120) nor print. Called from
+    the broken/closed-stdout handlers before raising Exit(130)."""
+    import sys
+
+    with contextlib.suppress(OSError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
 
 
 def _run_setup_wizard(config: str | None) -> None:
     """Wire the real I/O + the real auth.login/status/config-writer into the
     pure machine, then map its outcome onto the CLI exit contract."""
+    import sys
+
     from .auth import login as _login
     from .auth import status as _status
     from .wizard import WizardCancelled, WizardIO, run_wizard
+
+    if sys.stdout is None:
+        # `auth setup >&-`: fd 1 was closed at startup, so sys.stdout is None and
+        # the wizard has no channel to display on. One-line stderr diagnosis, then
+        # the cancel-class 130 — the same "output channel gone" abort as a closed
+        # pipe (F3 MINOR: previously this crashed with a traceback -> exit 1).
+        typer.echo(
+            "setup: stdout is unavailable (closed); the interactive wizard cannot run.",
+            err=True,
+        )
+        raise typer.Exit(code=_CANCEL_EXIT)
 
     target = _setup_config_target(config)
     io = WizardIO(ask=_typer_ask, confirm=_typer_confirm, out=_echo_out)
@@ -349,25 +383,38 @@ def _run_setup_wizard(config: str | None) -> None:
         typer.echo("setup cancelled.", err=True)
         raise typer.Exit(code=_CANCEL_EXIT) from None
     except BrokenPipeError:
-        # stdout closed mid-run (`auth setup | head`): the pipe is gone, NOT a
-        # config-write failure. The old broad `except OSError` mislabeled this
-        # as "setup failed writing config.toml" while nothing was being
-        # written — cancel-class (130) is the honest handling.
+        # stdout closed mid-run (`auth setup | head`): the pipe is gone. Redirect
+        # stdout to devnull FIRST so the interpreter's shutdown flush can neither
+        # fail nor print — otherwise the intended 130 becomes 120 (F3 MAJOR: the
+        # code must be true at the PROCESS boundary, not just in-process). NOT a
+        # config-write failure (that is caught machine-side as write-error).
+        #
+        # The `>&-` case (fd 1 CLOSED, not a pipe) is handled earlier by the
+        # `sys.stdout is None` guard, which fires before any prompt; a `try/
+        # except RuntimeError` around the run would be unreachable there (proven:
+        # typer.echo does not raise on a None stdout, and typer.prompt's
+        # "lost sys.stdout" is pre-empted by that guard), so it is deliberately
+        # NOT added — no dead code, no fragile message matching.
+        _silence_stdout()
         raise typer.Exit(code=_CANCEL_EXIT) from None
+    # Explicit elif chain with a loud else: a new Outcome literal must NOT
+    # silently fall through to exit 5 (F3-4c — fail loudly on unmapped outcomes).
     if result.outcome == "completed" and result.signed_in:
         return  # exit 0
-    if result.outcome == "failed":
+    elif result.outcome == "completed":
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — finished but NOT signed in
+    elif result.outcome == "failed":
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
-    # write-error / status-error: reported on STDERR (consistent with config
-    # error / setup cancelled / the non-TTY message), one surface, then exit 5.
-    if result.outcome == "write-error":
+    elif result.outcome == "write-error":
         typer.echo(f"setup: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
-    if result.outcome == "status-error":
+    elif result.outcome == "status-error":
         typer.echo(f"setup: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
-    # completed-but-not-signed-in, or declined overwrite: operation incomplete.
-    raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5
+    elif result.outcome == "aborted":
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / capped
+    else:
+        raise AssertionError(f"unmapped wizard outcome: {result.outcome!r}")
 
 
 def _write_secret_tight(path: Path, text: str) -> None:

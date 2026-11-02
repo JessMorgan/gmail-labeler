@@ -178,6 +178,15 @@ def run_wizard(
     # --- client-json (exists / parses / desktop-type) ----------------------
     executed.append("client-json")
     client_path = _run_client_json(io=io, probe=probe)
+    if client_path is None:
+        # capped strikes: no valid desktop client. Terminate cleanly (this loop
+        # ends on every input too — the F3-4b cap).
+        return WizardResult(
+            outcome="aborted",
+            signed_in=False,
+            steps=tuple(executed),
+            detail="no valid desktop client after 3 tries (manual setup suggested)",
+        )
 
     # --- token-backend (keyring posture, honest file fallback) -------------
     executed.append("token-backend")
@@ -271,7 +280,10 @@ def run_wizard(
             steps=tuple(executed),
             detail="sign-in did not complete (see the guidance above)",
         )
-    io.out("  signed in — refresh token stored")
+    # NOT "signed in" yet — that verdict belongs to the status check below, not
+    # here (F3 NIT-a: a green line immediately before a possible failure read
+    # as a premature verdict).
+    io.out("  refresh token stored — checking status…")
 
     # --- status ------------------------------------------------------------
     executed.append("status")
@@ -383,10 +395,19 @@ def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> bool:
         # forced decision)
 
 
-def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
+def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str | None:
     """Ask for the downloaded client-JSON path until it verifies as a
     desktop-type client. Only the PATH is echoed (config legitimately holds a
-    path); the file's contents never reach here (the probe returns a verdict)."""
+    path); the file's contents never reach here (the probe returns a verdict).
+
+    Returns the verified path, or None to abort the wizard after `max_strikes`
+    rejected paths. A valid client is REQUIRED (login cannot proceed without
+    one), so unlike the project-id shape guard there is nothing to skip — the cap
+    simply terminates with a guide-to-manual message. F3-4b: the same
+    terminate-on-every-input guarantee, so this loop cannot spin forever either
+    (C1's headline claim, now true for both loops)."""
+    max_strikes = 3
+    strikes = 0
     while True:
         path = io.ask(
             Prompt(
@@ -399,6 +420,7 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
         if state is ClientFileState.DESKTOP_OK:
             io.out(f"  found a desktop-type client at {path}")
             return path
+        strikes += 1
         if state is ClientFileState.MISSING:
             io.out(
                 f"  Client file not found at {path}. Download the Desktop-app "
@@ -418,6 +440,14 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
                 "console. Create an OAuth client of type Desktop app instead and "
                 "point me at its JSON."
             )
+        if strikes >= max_strikes:
+            io.out(
+                "  Stopping here — I could not verify a desktop client after "
+                f"{max_strikes} tries. Nothing was written. The README's manual "
+                "setup covers the same steps if you'd rather drive them yourself."
+            )
+            return None
+        # else: re-ask (bounded — at most max_strikes rejects before the abort)
 
 
 def _run_token_backend(*, io: WizardIO, probe: EnvironmentProbe) -> TokenBackend:

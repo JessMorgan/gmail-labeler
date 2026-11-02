@@ -3,10 +3,11 @@ and the `corrections export` command (ticket #27).
 
 Two load-bearing ACs: the export is DB-only + NEVER retrains (the human
 gate), and the builder seam (apply_corrections_to_records) folds the
-Corrections into the corpus WITHOUT forking build_dataset — a
-filter-covered 'added' is excluded (invariant #6), a 'removed' is a
-negative signal, an 'added' is positive, untouched records pass through
-by identity, and no bodies move.
+Corrections into the corpus WITHOUT forking build_dataset — only a
+'human' 'added' folds (a 'filter_covered' or 'unverifiable' one is
+excluded — invariant #6 / #22's exclusion-not-guessing), a 'removed' is a
+negative signal, untouched records pass through by identity, and no bodies
+move.
 """
 
 from __future__ import annotations
@@ -41,9 +42,9 @@ def _rec(mid: str, labels: tuple[str, ...]) -> CorpusRecord:
     )
 
 
-def _corr(mid: str, label: str, kind: str, covered: bool = False) -> CorrectionRow:
+def _corr(mid: str, label: str, kind: str, attribution: str = "human") -> CorrectionRow:
     return CorrectionRow(
-        message_id=mid, label=label, kind=kind, detected_at=TS, filter_covered=covered
+        message_id=mid, label=label, kind=kind, detected_at=TS, attribution=attribution
     )
 
 
@@ -66,9 +67,35 @@ def test_filter_covered_added_is_excluded() -> None:
     # invariant #6: a filter-authored add is NOT trainable signal
     recs = [_rec("aa11", ("Shipping",))]
     out = apply_corrections_to_records(
-        recs, [_corr("aa11", "Money/Bills", "added", covered=True)]
+        recs, [_corr("aa11", "Money/Bills", "added", attribution="filter_covered")]
     )
     assert out[0].labels == ("Shipping",)  # unchanged — the add was excluded
+
+
+def test_unverifiable_added_is_excluded() -> None:
+    # F1 (invariant #6 restored): an unverifiable add is EXCLUDED from the
+    # folded training records EXACTLY like filter_covered -- the seam's
+    # output (the artifact the retrain consumes) does NOT gain the label.
+    # This is the "ABSENT from export output" pin: the seam is the single
+    # filtering point, and guessing authorship toward the human is what #22
+    # forbids. (The CLI `corrections export` command is a faithful RAW dump
+    # that still SHOWS the row with attribution='unverifiable' for audit;
+    # the label never reaches the corpus until the seam credits it 'human'.)
+    recs = [_rec("aa11", ("Shipping",))]
+    out = apply_corrections_to_records(
+        recs, [_corr("aa11", "Money/Bills", "added", attribution="unverifiable")]
+    )
+    assert out[0].labels == ("Shipping",)  # unchanged — withheld, not folded
+
+
+def test_human_added_is_the_only_folded_add() -> None:
+    # F1 the positive control: a 'human' add DOES fold (the exclusion is
+    # not a blanket drop of every add)
+    recs = [_rec("aa11", ("Shipping",))]
+    out = apply_corrections_to_records(
+        recs, [_corr("aa11", "Money/Bills", "added", attribution="human")]
+    )
+    assert out[0].labels == ("Money/Bills", "Shipping")
 
 
 def test_untouched_record_passes_through_by_identity() -> None:
@@ -135,7 +162,8 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
         tmp_path,
         [
             _corr("aa11", "Money/Bills", "removed"),
-            _corr("bb22", "Shipping", "added", covered=True),
+            _corr("bb22", "Shipping", "added", attribution="filter_covered"),
+            _corr("cc33", "Shipping", "added", attribution="unverifiable"),
         ],
     )
     out_file = tmp_path / "corrections.json"
@@ -147,13 +175,22 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
             "message_id": "aa11",
             "label": "Money/Bills",
             "kind": "removed",
-            "filter_covered": False,
+            "attribution": "human",
         },
         {
             "message_id": "bb22",
             "label": "Shipping",
             "kind": "added",
-            "filter_covered": True,
+            "attribution": "filter_covered",
+        },
+        # F1: the raw dump is AUDITABLE — an unverifiable add is written
+        # WITH its attribution (you can see it was withheld and why); the
+        # label still never reaches the corpus because the SEAM drops it
+        {
+            "message_id": "cc33",
+            "label": "Shipping",
+            "kind": "added",
+            "attribution": "unverifiable",
         },
     ]
     # invariant #5: no body/subject/raw key anywhere in the export

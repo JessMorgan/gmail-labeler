@@ -564,7 +564,8 @@ add one it missed — the daemon captures that as a **Correction** against
 the Applications join, on its normal poll (no extra Gmail calls; the
 correction path is read + local-DB only, and it never writes back). A
 `removed` is a negative signal (you undid our work); an `added` of a
-graduated label we did not write is positive signal. System-label and
+graduated label we did not write is positive signal — but only when no
+Gmail filter explains it (see the *attribution* below). System-label and
 non-vocabulary churn is ignored — noise is not correction.
 
 ```sh
@@ -586,12 +587,18 @@ gmail-labeler corrections export --out corrections.json   # default: stdout
 ```
 
 `corrections export` writes the captured Corrections as future training
-signal — `{message_id, label, kind, filter_covered}` rows, **no bodies**.
-It does **not** retrain: folding them into the corpus is the builder's
-composition seam and running a retrain is a **separate human decision**
-(ADR-0005's human-gated retrain). A `filter_covered` add (a Gmail filter
-would have applied it) is recorded but excluded from the realized-
-precision math and the training signal, with the count disclosed.
+signal — `{message_id, label, kind, attribution}` rows, **no bodies**. It
+is a faithful raw dump: every row carries its *attribution* (`human` /
+`filter_covered` / `unverifiable`) so the artifact is auditable — you can
+see which adds were withheld and why. It does **not** retrain: folding
+them into the corpus is the builder's composition seam and running a
+retrain is a **separate human decision** (ADR-0005's human-gated retrain).
+Only a `human` add is training signal: a `filter_covered` add (a Gmail
+filter verifiably would have applied it) and an `unverifiable` add (a
+relevant filter makes authorship undecidable) are both withheld — the
+latter excluded rather than credited to you, the *exclusion, not guessing*
+principle `dataset analyze` follows (#22). `status` discloses each
+withheld slice as its own count.
 
 ## Docs
 

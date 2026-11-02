@@ -228,7 +228,9 @@ def test_added_managed_label_records_correction(tmp_path: Path) -> None:
     assert _tick(tmp_path, fake, db) == 0
     corr = db.corrections_for_message("aa11")
     assert [(c.label, c.kind) for c in corr] == [("Money/Bills", "added")]
-    assert corr[0].filter_covered is False  # no snapshot -> not attributed
+    # no snapshot -> no relevant filter claims the label -> the human added
+    # it (positive training signal; F1 replaced the old bool's False here)
+    assert corr[0].attribution == "human"
     db.close()
 
 
@@ -331,10 +333,10 @@ def test_duplicate_label_event_in_one_delta_is_one_correction(tmp_path: Path) ->
 # -- filter attribution (invariant #6) ----------------------------------------
 
 
-def test_added_correction_filter_covered_true(tmp_path: Path) -> None:
-    # an 'added' Correction whose label a Gmail filter would have applied
-    # (from: a@x.com adds L2, and the message IS from a@x.com) is recorded
-    # RAW with filter_covered set
+def test_added_correction_attributed_filter_covered(tmp_path: Path) -> None:
+    # an 'added' Correction whose label a SIMULATABLE Gmail filter verifiably
+    # would have applied (from: a@x.com adds L2, and the message IS from
+    # a@x.com) is attributed 'filter_covered' -- withheld from human credit
     db = _db(tmp_path)
     _applied(db, "aa11", "Shipping", "L1")
     fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
@@ -343,15 +345,17 @@ def test_added_correction_filter_covered_true(tmp_path: Path) -> None:
     )
     assert _tick(tmp_path, fake, db, ctx=ctx) == 0
     corr = db.corrections_for_message("aa11")
-    assert [(c.label, c.kind, c.filter_covered) for c in corr] == [
-        ("Money/Bills", "added", True)
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "filter_covered")
     ]
     db.close()
 
 
-def test_added_correction_filter_not_covered_when_filter_absent(tmp_path: Path) -> None:
-    # the SAME added label, but the snapshot's filter does NOT add it ->
-    # filter_covered False (only PROVEN filter-authorship is flagged)
+def test_added_correction_human_when_no_filter_adds_the_label(tmp_path: Path) -> None:
+    # the SAME added label, but the snapshot's filter does NOT add it (it
+    # adds L1) -> no RELEVANT filter claims Money/Bills -> 'human' (a
+    # filter that verifiably does not touch the label is not a reason to
+    # withhold the add; only a filter that ADDS the label is relevant)
     db = _db(tmp_path)
     _applied(db, "aa11", "Shipping", "L1")
     fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
@@ -360,13 +364,15 @@ def test_added_correction_filter_not_covered_when_filter_absent(tmp_path: Path) 
     )
     assert _tick(tmp_path, fake, db, ctx=ctx) == 0
     corr = db.corrections_for_message("aa11")
-    assert corr[0].filter_covered is False
+    assert corr[0].attribution == "human"
     db.close()
 
 
-def test_removed_correction_never_flagged_filter_covered(tmp_path: Path) -> None:
+def test_removed_correction_always_attributed_human(tmp_path: Path) -> None:
     # invariant #6: a 'removed' Correction is human signal regardless of
-    # filters -> the flag is NEVER set (even with a matching snapshot)
+    # filters -> it is ALWAYS 'human', even with a matching snapshot that
+    # would have made an ADD filter_covered (a human removing is not the
+    # filter's doing)
     db = _db(tmp_path)
     _applied(db, "aa22", "Money/Bills", "L2")
     fake = _fake(_page(_record("aa22", removed=[("aa22", ["L2"])])))
@@ -375,7 +381,77 @@ def test_removed_correction_never_flagged_filter_covered(tmp_path: Path) -> None
     )
     assert _tick(tmp_path, fake, db, ctx=ctx) == 0
     corr = db.corrections_for_message("aa22")
-    assert corr[0].kind == "removed" and corr[0].filter_covered is False
+    assert corr[0].kind == "removed" and corr[0].attribution == "human"
+    db.close()
+
+
+def test_added_correction_unverifiable_when_filter_criteria_outside(
+    tmp_path: Path,
+) -> None:
+    # F1 (invariant #6 restored): a RELEVANT filter (it adds the label)
+    # whose criteria are OUTSIDE the simulatable set {from,to,subject}
+    # (here: a 'query' criterion) makes authorship UNDECIDABLE -> the add
+    # is attributed 'unverifiable' -- WITHHELD, not credited to the human.
+    # The old bool INVERTED this (an unverifiable filter -> False -> human);
+    # #22's exclusion principle says guessing either way is forbidden.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[
+            {"criteria": {"query": "has:attachment"}, "action": {"addLabelIds": ["L2"]}}
+        ]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
+def test_added_correction_unverifiable_when_fields_unavailable(
+    tmp_path: Path,
+) -> None:
+    # F1: a RELEVANT filter exists but the message's fields were NOT
+    # fetched this delta (parsed_by_id lacks it) -> authorship cannot be
+    # checked -> 'unverifiable' (withheld), NOT 'human'. The old bool
+    # recorded False (human) here -- the same inversion, other branch.
+    # (aa11 is the applied message; the added label L2 rides a DIFFERENT
+    # message id 'ff00' that is NOT in _messages(), so it is unfetched --
+    # but it must still be in the Applications join to be a correction.)
+    db = _db(tmp_path)
+    _applied(db, "ff00", "Shipping", "L1")  # ff00 applied (join row exists)
+    fake = _fake(_page(_record("ff00", added=[("ff00", ["L2"])])))
+    ctx = _ctx(
+        filters=[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": ["L2"]}}]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("ff00")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
+def test_added_correction_human_when_relevant_filter_verifiably_absent(
+    tmp_path: Path,
+) -> None:
+    # F1 the OTHER direction (the exclusion is not a default-to-withhold):
+    # a relevant SIMULATABLE filter that verifiably does NOT match this
+    # message (from: nobody@x.com, message is from a@x.com) leaves the add
+    # 'human' -- we PROVE the filter did not author it, so the human did.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[
+            {"criteria": {"from": "nobody@x.com"}, "action": {"addLabelIds": ["L2"]}}
+        ]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert corr[0].attribution == "human"
     db.close()
 
 

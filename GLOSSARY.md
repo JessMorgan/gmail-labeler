@@ -130,12 +130,21 @@ managed-vocabulary (graduated, non-System) label appears on an applied
 message that the daemon did not write (the human did our job — a
 positive signal). **Ignore boundary:** anything else on an applied
 message — System Labels, non-vocabulary labels, a removed NON-applied
-label, INBOX churn — records NOTHING (noise is not correction). A
-*filter-covered* `added` (a Gmail filter would have applied it —
-invariant #6) is recorded raw with that flag and EXCLUDED from the
-realized-precision math and the training signal; a `removed` is NEVER
-filter-excluded (a human removing is human signal regardless of
-filters). A corrected message is never re-written by the daemon.
+label, INBOX churn — records NOTHING (noise is not correction). An
+`added` carries an *attribution* (the store's CHECK vocabulary: *human*,
+*filter-covered*, *unverifiable*) deciding WHO it is credited to:
+*filter-covered* — a simulatable (from/to/subject) Gmail filter verifiably
+would have applied it (invariant #6), withheld from the realized-precision
+human signal and the training fold; *unverifiable* — a filter touching the
+label carries criteria that cannot be simulated from the kept fields, so
+authorship is undecidable and the add is **withheld, not credited** to the
+human — the same *exclusion, not guessing* principle that governs
+`dataset analyze` (#22): guessing either way is what that doctrine forbids.
+Only a *human* `added` (no relevant filter, or a verifiable one that does
+not match) is positive training signal. A `removed` is ALWAYS *human* (a
+human removing is human signal regardless of filters). `status` discloses
+each withheld slice as its own count. A corrected message is never
+re-written by the daemon.
 _Avoid_: feedback, undo
 
 **Status**:
@@ -147,7 +156,11 @@ call, no auth (it answers on a sick or offline mailbox). A label with no
 Applications yet reports `no data`. The basis line names the current
 bands/graduation artifact content hashes and states the v1 caveats
 (rows may span artifact versions; precision assumes unseen-but-removed
-mail is rare — archive-equals-dismiss).
+mail is rare — archive-equals-dismiss). The `added` counts are attributed
+under the Correction attribution vocabulary (*human* / *filter-covered* /
+*unverifiable*), which the basis line lists verbatim so a future
+vocabulary change is visible on the line; both withheld slices are
+disclosed as their own counts and excluded from the human signal.
 _Avoid_: accuracy (this is realized, in-production precision, not eval)
 
 **Shadow Pass**:

@@ -35,7 +35,7 @@ def test_precision_formula_and_no_data() -> None:
     rows = compute_precision(
         frozenset({"A", "B"}),
         {"A": 10, "B": 0},
-        {"A": (2, 1, 0)},  # A: removed=2, added=1, added_fc=0
+        {"A": (2, 1, 0, 0)},  # A: removed=2, added=1, fc=0, uv=0
     )
     by = {r.label: r for r in rows}
     assert by["A"].precision == pytest.approx(0.8)  # (10-2)/10
@@ -45,17 +45,29 @@ def test_precision_formula_and_no_data() -> None:
 
 
 def test_precision_zero_when_everything_removed() -> None:
-    rows = compute_precision(frozenset({"A"}), {"A": 4}, {"A": (4, 0, 0)})
+    rows = compute_precision(frozenset({"A"}), {"A": 4}, {"A": (4, 0, 0, 0)})
     assert rows[0].precision == 0.0
 
 
 def test_filter_covered_added_excluded_from_human_signal() -> None:
     # invariant #6: the filter-covered slice is DISCLOSED but EXCLUDED
     # from the net human signal
-    rows = compute_precision(frozenset({"A"}), {"A": 5}, {"A": (0, 3, 2)})
+    rows = compute_precision(frozenset({"A"}), {"A": 5}, {"A": (0, 3, 2, 0)})
     r = rows[0]
     assert r.added == 3 and r.added_filter_covered == 2
-    assert r.human_added == 1  # 3 - 2
+    assert r.human_added == 1  # 3 - 2 - 0
+
+
+def test_unverifiable_added_excluded_from_human_signal() -> None:
+    # F1 (invariant #6 restored): the unverifiable slice is EXCLUDED from
+    # the human signal EXACTLY like filter_covered -- an add whose
+    # authorship cannot be determined is WITHHELD, not credited to the
+    # human. human_added = added - filter_covered - unverifiable.
+    rows = compute_precision(frozenset({"A"}), {"A": 5}, {"A": (0, 4, 1, 2)})
+    r = rows[0]
+    assert r.added == 4 and r.added_filter_covered == 1
+    assert r.added_unverifiable == 2
+    assert r.human_added == 1  # 4 - 1 - 2 (the withheld slices never count)
 
 
 def test_graduated_label_with_no_corrections_is_perfect() -> None:
@@ -84,9 +96,9 @@ def _app_row(label: str, mid: str) -> ApplicationRow:
     )
 
 
-def _corr(label: str, mid: str, kind: str, covered: bool = False) -> CorrectionRow:
+def _corr(label: str, mid: str, kind: str, attribution: str = "human") -> CorrectionRow:
     return CorrectionRow(
-        message_id=mid, label=label, kind=kind, detected_at=TS, filter_covered=covered
+        message_id=mid, label=label, kind=kind, detected_at=TS, attribution=attribution
     )
 
 
@@ -213,6 +225,8 @@ def test_status_json_shape(tmp_path: Path, monkeypatch) -> None:
     bills = next(x for x in payload["labels"] if x["label"] == "Money/Bills")
     assert bills["written"] == 2 and bills["removed"] == 1
     assert bills["precision"] == pytest.approx(0.5)
+    # F1: the json carries the unverifiable withheld slice as its own field
+    assert bills["added_unverifiable"] == 0
     assert payload["basis"]["graduation_content_hash"]
 
 
@@ -222,12 +236,32 @@ def test_status_filter_covered_disclosed(tmp_path: Path, monkeypatch) -> None:
     _seed(
         tmp_path,
         [_app_row("Money/Bills", "aa11")],
-        [_corr("Money/Bills", "aa22", "added", covered=True)],
+        [_corr("Money/Bills", "aa22", "added", attribution="filter_covered")],
     )
     result = _status(tmp_path, cfg)
     assert result.exit_code == 0, result.output
     assert "filter-covered=1" in result.output
     assert "human=0" in result.output  # the covered slice is excluded
+
+
+def test_status_unverifiable_disclosed_and_excluded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # F1 (invariant #6 restored): an unverifiable 'added' is DISCLOSED as
+    # its OWN withheld slice and EXCLUDED from the human count -- the
+    # status line shows unverifiable=1, human=0 (the old bool credited it
+    # to the human; the inversion is exactly what F1 removed)
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(
+        tmp_path,
+        [_app_row("Money/Bills", "aa11")],
+        [_corr("Money/Bills", "aa22", "added", attribution="unverifiable")],
+    )
+    result = _status(tmp_path, cfg)
+    assert result.exit_code == 0, result.output
+    assert "unverifiable=1" in result.output
+    assert "human=0" in result.output  # withheld, NOT credited to the human
 
 
 def test_status_no_applications_reports_no_data(tmp_path: Path, monkeypatch) -> None:

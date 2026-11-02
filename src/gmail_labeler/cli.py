@@ -3541,9 +3541,12 @@ def _serve_startup(
     # the offline filter-attribution snapshot for the daemon's correction
     # arm (#27, invariant #6): a LOCAL file read (never a Gmail call — the
     # startup exact-call pins stand). Best-effort: absent or malformed →
-    # () → every 'added' Correction records filter_covered False (the flag
-    # means PROVEN filter-authored; the unverifiable slice is not separately
-    # disclosed — a v1 limit surfaced to the manager). apply never reads it.
+    # () → no relevant filter, so every 'added' Correction is attributed
+    # 'human' (nothing claims it). With a snapshot, an 'added' whose
+    # relevant filter has criteria outside from/to/subject is attributed
+    # 'unverifiable' — WITHHELD from human credit and the export, and
+    # disclosed as its own status slice (F1: exclusion, not guessing).
+    # apply never reads it.
     filters_snapshot: list[dict[str, object]] = []
     sidecar = store.root / SIDECAR_FILTERS
     if sidecar.is_file():
@@ -3907,13 +3910,17 @@ def corrections_export(
     fmt: str = typer.Option("json", "--format", help="Export format (json)"),
 ) -> None:
     """Export the recorded Corrections as future TRAINING SIGNAL: a JSON
-    list of ``{message_id, label, kind, filter_covered}`` (ticket #27;
-    GLOSSARY: Correction). Reads the LOCAL state DB only — no Gmail call
-    — and NEVER retrains: this writes an artifact; folding it into the
-    corpus is the builder's correction-folding composition point and
-    running a retrain is a SEPARATE human decision (the AC's
-    no-auto-retrain gate). NO
-    bodies (invariant #5): the export carries ids/labels/kinds/flags
+    list of ``{message_id, label, kind, attribution}`` (ticket #27;
+    GLOSSARY: Correction). This is a faithful RAW dump — every row is
+    written with its attribution so the artifact is auditable (you can see
+    WHICH adds were withheld and why); the actual signal-filtering is the
+    builder's correction-folding seam's single job (it drops every
+    non-'human' 'added' before the corpus ever sees it). Reads the LOCAL
+    state DB only — no Gmail call — and NEVER retrains: this writes an
+    artifact; folding it into the corpus is a composition point a human
+    opts into, and running a retrain is a SEPARATE human decision (the
+    AC's no-auto-retrain gate). NO
+    bodies (invariant #5): the export carries ids/labels/kinds/attributions
     only. Exit contract 0/2/4/5."""
     from .appdb import AppDB, AppDBError
 
@@ -3956,7 +3963,7 @@ def corrections_export(
             "message_id": r.message_id,
             "label": r.label,
             "kind": r.kind,
-            "filter_covered": r.filter_covered,
+            "attribution": r.attribution,
         }
         for r in rows
     ]
@@ -4041,9 +4048,12 @@ def status(
     Per graduated label: written (Application rows), removed (matching
     'removed' Corrections), precision = (written - removed)/written or
     'no data' when nothing is applied yet, and the positive-signal
-    added Corrections split into the filter-covered slice (a Gmail
-    filter would have applied it — invariant #6) EXCLUDED from the net
-    human signal and disclosed. The basis line names the CURRENT
+    added Corrections split into the two withheld slices — 'filter-covered'
+    (a Gmail filter verifiably would have applied it) and 'unverifiable'
+    (a relevant filter makes authorship undecidable, so it is withheld not
+    credited — invariant #6 / #22's exclusion-not-guessing) — BOTH
+    EXCLUDED from the net human signal and disclosed. The basis line names
+    the attribution vocabulary it counted under and the CURRENT
     bands/graduation artifact content hashes and states the honest v1
     caveats: rows can span artifact versions (per-run binding deferred
     to #23), and precision assumes unseen-but-removed mail is rare
@@ -4133,6 +4143,7 @@ def status(
                     "precision": r.precision,
                     "added": r.added,
                     "added_filter_covered": r.added_filter_covered,
+                    "added_unverifiable": r.added_unverifiable,
                     "human_added": r.human_added,
                 }
                 for r in rows
@@ -4154,9 +4165,13 @@ def status(
         "label RENAME desyncs the name-keyed join (orphaned corrections); "
         "rows may span artifact versions (per-run binding deferred to #23); "
         "precision assumes unseen-but-removed mail is rare "
-        "(archive-equals-dismiss); 'filter-covered' counts only PROVEN "
-        "filter-authored adds (a filter with criteria outside "
-        "from/to/subject is unverifiable and is NOT counted there)"
+        "(archive-equals-dismiss); 'added' counts are attributed under the "
+        "corrections vocabulary (human / filter_covered / unverifiable — a "
+        "future vocabulary change would change these lines): only "
+        "filter-AUTHORED adds are withheld as 'filter-covered', and adds a "
+        "relevant filter makes undecidable (criteria outside "
+        "from/to/subject) are withheld as 'unverifiable' — both slices are "
+        "excluded from human, not guessed"
     )
     if not rows:
         typer.echo("status: no graduated labels (nothing to report)")
@@ -4167,6 +4182,7 @@ def status(
             f"  {r.label}: written={r.written} removed={r.removed} "
             f"precision={precision} added={r.added} "
             f"(filter-covered={r.added_filter_covered} "
+            f"unverifiable={r.added_unverifiable} "
             f"human={r.human_added})"
         )
 

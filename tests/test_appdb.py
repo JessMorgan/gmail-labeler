@@ -13,6 +13,7 @@ import pytest
 
 from gmail_labeler.appdb import (
     _SCHEMA,
+    CORRECTION_ATTRIBUTIONS,
     CORRECTION_KINDS,
     SCHEMA_VERSION,
     AppDB,
@@ -639,7 +640,7 @@ def test_fresh_db_is_v4_with_corrections(tmp_path: Path) -> None:
             "label",
             "kind",
             "detected_at",
-            "filter_covered",
+            "attribution",
         }
         corr_indexes = {
             r[0]
@@ -1843,14 +1844,14 @@ def _corr_row(
     label: str = "Shipping",
     kind: str = "removed",
     detected_at: datetime = TS,
-    filter_covered: bool = False,
+    attribution: str = "human",
 ) -> CorrectionRow:
     return CorrectionRow(
         message_id=message_id,
         label=label,
         kind=kind,
         detected_at=detected_at,
-        filter_covered=filter_covered,
+        attribution=attribution,
     )
 
 
@@ -1871,7 +1872,7 @@ def test_v3_db_migrates_to_a_single_v4_row(tmp_path: Path) -> None:
             "label",
             "kind",
             "detected_at",
-            "filter_covered",
+            "attribution",
         }
     finally:
         conn.close()
@@ -1911,7 +1912,7 @@ def test_v3_stamp_with_corrections_table_is_refused(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(db_path))
     conn.execute(
         "CREATE TABLE corrections (message_id TEXT, label TEXT, kind TEXT, "
-        "detected_at TEXT, filter_covered INTEGER)"
+        "detected_at TEXT, attribution TEXT)"
     )
     conn.commit()
     conn.close()
@@ -1951,7 +1952,7 @@ def test_corrections_has_no_body_columns(tmp_path: Path) -> None:
             "label",
             "kind",
             "detected_at",
-            "filter_covered",
+            "attribution",
         }
     finally:
         conn.close()
@@ -2000,15 +2001,35 @@ def test_correction_kind_outside_vocabulary_is_refused(tmp_path: Path) -> None:
     db.close()
 
 
-def test_removed_correction_never_carries_filter_covered(tmp_path: Path) -> None:
+def test_removed_correction_is_always_attributed_human(tmp_path: Path) -> None:
     # invariant #6: a 'removed' Correction is human signal regardless of
-    # filters -- the store refuses the flag on a removal NAMED
+    # filters -- the store refuses ANY non-'human' attribution on a removal
+    # NAMED (the F1 three-way vocabulary did not widen the old bool's rule;
+    # it kept it and made the withheld states explicit on 'added')
     db = AppDB(tmp_path / "state.db")
     db.open()
     db.set_history_cursor(10)
-    with pytest.raises(AppDBError, match="never filter-covered"):
-        db.commit_page([], 20, [_corr_row(kind="removed", filter_covered=True)])
+    with pytest.raises(AppDBError, match="always attributed 'human'"):
+        db.commit_page(
+            [], 20, [_corr_row(kind="removed", attribution="filter_covered")]
+        )
+    with pytest.raises(AppDBError, match="always attributed 'human'"):
+        db.commit_page([], 20, [_corr_row(kind="removed", attribution="unverifiable")])
     assert db.get_history_cursor() == 10
+    db.close()
+
+
+def test_added_attribution_outside_vocabulary_is_refused(tmp_path: Path) -> None:
+    # the attribution CHECK vocabulary's Python mirror (F1): a lying
+    # attribution is refused NAMED at the writer, not as a raw sqlite3
+    # CHECK traceback -- the fourth value ('guessed') is exactly what the
+    # vocabulary exists to refuse
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.set_history_cursor(10)
+    with pytest.raises(AppDBError, match="attribution 'guessed' must be one of"):
+        db.commit_page([], 20, [_corr_row(kind="added", attribution="guessed")])
+    assert db.get_history_cursor() == 10  # refused BEFORE the transaction
     db.close()
 
 
@@ -2178,8 +2199,9 @@ def test_corrections_read_roundtrip_and_ordering(tmp_path: Path) -> None:
     # all_corrections is (detected_at, message_id, label) ordered
     everything = db.all_corrections()
     assert [c.message_id for c in everything] == ["aa", "bb", "cc"]
-    # the filter_covered flag round-trips through the int column
-    assert shipping[0].filter_covered is False
+    # the attribution TEXT round-trips through the column (F1: the old
+    # int flag is gone; 'human' is the default a no-filter add records)
+    assert shipping[0].attribution == "human"
     db.close()
 
 
@@ -2229,6 +2251,61 @@ def test_correction_kinds_vocabulary_is_the_documented_pair() -> None:
     # the CHECK vocabulary's Python mirror is exactly the two GLOSSARY
     # kinds (a drift here would silently widen or narrow the vocabulary)
     assert CORRECTION_KINDS == ("removed", "added")
+
+
+def test_correction_attributions_vocabulary_is_the_documented_triple() -> None:
+    # F1 (invariant #6): the attribution CHECK vocabulary is EXACTLY the
+    # three GLOSSARY states -- 'human' / 'filter_covered' / 'unverifiable'.
+    # A drift here silently widens or narrows WHO an add is credited to;
+    # the fourth value the vocabulary must NOT contain is any 'guessed
+    # toward the human' state (that inversion is what F1 removed)
+    assert CORRECTION_ATTRIBUTIONS == ("human", "filter_covered", "unverifiable")
+
+
+def test_attribution_check_refuses_a_fourth_value(tmp_path: Path) -> None:
+    # the DB CHECK is the AUTHORITY (not just the Python mirror): a raw
+    # INSERT of a fourth attribution -- the 'guessed' state F1 deleted --
+    # is refused by sqlite3 itself, so a foreign tool / hand-edit cannot
+    # land an authorship state the vocabulary does not name
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.close()  # the v4 schema (with the corrections CHECK) now exists
+    conn = sqlite3.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
+            conn.execute(
+                "INSERT INTO corrections (message_id, label, kind, detected_at, "
+                "attribution) VALUES ('aa', 'Shipping', 'added', "
+                "'2026-11-01T12:00:00+00:00', 'guessed')"
+            )
+    finally:
+        conn.close()
+
+
+def test_corrections_tampered_attribution_is_refused_on_read(tmp_path: Path) -> None:
+    # the read-side revalidation covers the attribution too (F1): a
+    # hand-edited authorship state is refused NAMED, not rendered as a
+    # bogus slice -- the aggregate reader status uses must not silently
+    # bucket an out-of-vocabulary attribution
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    db.commit_page([], 20, [_corr_row(message_id="aa", kind="added")])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute("UPDATE corrections SET attribution = 'guessed'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="attribution 'guessed' must be one of"):
+        db2.corrections_for_message("aa")
+    with pytest.raises(AppDBError, match="correction attribution 'guessed' not in"):
+        db2.correction_label_stats()
+    db2.close()
 
 
 def test_correction_label_stats_rejects_tampered_kind(tmp_path: Path) -> None:

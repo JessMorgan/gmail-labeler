@@ -82,9 +82,12 @@ gmail-labeler auth setup
 Running plain `gmail-labeler auth` on a terminal with no credentials yet offers
 the same wizard. It is honest about its limits: it **cannot** check from your
 machine whether the Gmail API is enabled or the consent screen is set to *In
-production* — the first successful sign-in is the real proof of those, not
-anything it can verify up front. It never asks for your token; the refresh
-token goes to your OS keyring via the existing `auth login` flow.
+production*. Signing in proves the OAuth client and your consent; the first
+Gmail call (e.g. `dataset export`) is what proves the API is enabled; and a
+token still working after 7 days proves *In production* mode — none of which it
+can verify up front. It never asks for your token; the refresh token goes to
+your OS keyring (or a 0600 file when no keyring backend exists) via the existing
+`auth login` flow.
 
 <details>
 <summary>Manual setup — the same steps, if you'd rather drive them yourself</summary>

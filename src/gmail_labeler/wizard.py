@@ -29,8 +29,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
-from .auth import AuthStatus
-from .config import Config, GmailConfig
+from .auth import AuthError, AuthStatus
+from .config import Config, GmailConfig, TokenBackend
+from .tokens import TokenStoreError
 
 ConsoleUrl = str
 GCP_PROJECTS_URL: ConsoleUrl = "https://console.cloud.google.com/projectselector2/home"
@@ -143,8 +144,11 @@ def run_wizard(
     ``login``/``status``/``write_config`` are injected (the CLI wires the real
     ``auth.login``/``auth.status``/config writer) — the wizard COMPOSES the
     existing login flow rather than forking the exchange logic. Cancel is not
-    caught here: a ``WizardCancelled`` from any prompt propagates, and because
-    every write is downstream of a prompt, nothing partial is left behind.
+    caught here: a ``WizardCancelled`` from any prompt propagates, and every
+    write is downstream of its own prompt, so a cancel AT A PROMPT leaves
+    nothing on disk. (A cancel during the composed browser sign-in happens
+    after config is written — it leaves a valid config but no token; re-running
+    finishes it. That residual is benign and disclosed, not "nothing partial".)
     """
     executed: list[str] = []
 
@@ -168,8 +172,12 @@ def run_wizard(
     executed.append("config")
     cfg = Config(
         gmail=GmailConfig(
-            credentials_path=Path(client_path),
-            token_backend=backend,  # type: ignore[arg-type]
+            # expanduser so the value the probe verified (it expands too) is
+            # the SAME value login() receives — otherwise a `~/…` path passes
+            # the local check then fails inside login with a misleading
+            # console-side diagnosis (review MAJOR 1).
+            credentials_path=Path(client_path).expanduser(),
+            token_backend=backend,
         )
     )
     if backend == "file":
@@ -178,13 +186,16 @@ def run_wizard(
     # Path.resolve() compare in the probe — the samefile/fd-level caution
     # family is issue #47's scope, deliberately NOT extended here.
     if probe.config_target_exists(config_target) and not io.confirm(
-        f"A config.toml already exists at {config_target}; overwrite it with "
-        "the credentials wiring this wizard just collected?"
+        f"A config.toml already exists at {config_target}. Continuing REPLACES "
+        "that ENTIRE file with just the gmail wiring this wizard collected — "
+        "every other section and comment is lost. To keep your current config, "
+        "answer no. Overwrite it?"
     ):
         io.out(
-            "Not overwriting. Edit the manual path yourself (set "
-            "gmail.credentials_path in config.toml) and run "
-            "`gmail-labeler auth login`. The wizard wrote nothing."
+            "Not overwriting — your config.toml is untouched. If you only need "
+            "to re-authenticate, run `gmail-labeler auth login`; if the client "
+            "path changed, edit gmail.credentials_path by hand. The wizard "
+            "wrote nothing."
         )
         return WizardResult(
             outcome="aborted",
@@ -199,16 +210,31 @@ def run_wizard(
     executed.append("login")
     try:
         login(cfg)
-    except Exception:
-        # The exception text is NOT echoed: around a token exchange it can
-        # carry fragments of secret material (invariant #8). Map to the named
-        # console steps the user can actually act on, plainly framed.
-        _emit_login_failure(io)
+    except WizardCancelled:
+        raise  # a cancel is not a sign-in failure — let it reach the 130 mapping
+    except (AuthError, TokenStoreError) as e:
+        # These are secret-free BY CONSTRUCTION (auth.py / tokens.py raise them
+        # from type names + paths only). We still do not echo the raw text — a
+        # caller can hand us a value-bearing error — but naming the type and
+        # splitting local-vs-console causes is the actionable part (review
+        # MINOR 5: the old bare `except Exception` turned a local "file not
+        # found" into a wild-goose console diagnosis).
+        _emit_login_failure(
+            io, cause=type(e).__name__, store=isinstance(e, TokenStoreError)
+        )
         return WizardResult(
             outcome="failed",
             signed_in=False,
             steps=tuple(executed),
-            detail="sign-in did not complete (see the console steps above)",
+            detail="sign-in did not complete (see the guidance above)",
+        )
+    except Exception as e:  # unexpected: type name only, never the text
+        _emit_login_failure(io, cause=type(e).__name__, store=False)
+        return WizardResult(
+            outcome="failed",
+            signed_in=False,
+            steps=tuple(executed),
+            detail="sign-in did not complete (see the guidance above)",
         )
     io.out("  signed in — refresh token stored")
 
@@ -250,10 +276,12 @@ def _emit_intro(io: WizardIO) -> None:
         "\n"
         "I can only check things on THIS machine: that the client file exists,\n"
         "parses, and is a desktop-type client, and that a token store is usable.\n"
-        "I CANNOT check from here whether the Gmail API is enabled in your\n"
-        "project or whether the consent screen is set to In production — the\n"
-        "first successful sign-in is the real proof of those, not anything I can\n"
-        "verify now. I will not pretend otherwise."
+        "I CANNOT check from here whether the Gmail API is enabled in your project\n"
+        "or whether the consent screen is set to In production. Signing in proves\n"
+        "the OAuth client and your consent; the FIRST GMAIL CALL (e.g. `dataset\n"
+        "export`) is what proves the API is enabled; and a token still working\n"
+        "after 7 days is what proves In-production mode. I will not pretend to\n"
+        "verify any of that now."
     )
 
 
@@ -285,7 +313,7 @@ def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> None:
             io.out(
                 "  Continuing without the shape check. Remember: I cannot verify "
                 "the Gmail API is enabled or the consent screen is In production "
-                "— the first sign-in proves those."
+                "— the first Gmail call proves enablement, not anything here."
             )
             return
         # else: keep looping (re-ask)
@@ -314,8 +342,9 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
             )
         elif state is ClientFileState.MALFORMED:
             io.out(
-                f"  {path} is not valid JSON (unreadable). Re-download the client "
-                "file (it is a .json Google generated — don't hand-edit it)."
+                f"  {path} is not a complete desktop client — it is not valid "
+                "JSON, or it is missing client_id/client_secret. Re-download the "
+                "client file (it is a .json Google generated — don't hand-edit it)."
             )
         else:  # NOT_DESKTOP
             io.out(
@@ -326,7 +355,7 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
             )
 
 
-def _run_token_backend(*, io: WizardIO, probe: EnvironmentProbe) -> str:
+def _run_token_backend(*, io: WizardIO, probe: EnvironmentProbe) -> TokenBackend:
     """Keyring first (the existing posture); an honest 0600-file fallback when
     the box has no working keyring backend — stated, never silent."""
     if probe.keyring_available():
@@ -340,12 +369,23 @@ def _run_token_backend(*, io: WizardIO, probe: EnvironmentProbe) -> str:
     return "file"
 
 
-def _emit_login_failure(io: WizardIO) -> None:
-    """The composed login raised. Echo nothing of the exception (it can carry
-    secret fragments); point at the human console steps, plainly as a hint."""
+def _emit_login_failure(io: WizardIO, *, cause: str, store: bool) -> None:
+    """The composed login raised. Echo nothing of the exception TEXT (a caller
+    can hand us a value-bearing error); name its TYPE (secret-free by
+    construction) and split the likely cause — a local store/path problem is
+    fixable here, everything else is console-side and was never checkable."""
+    io.out(f"  Sign-in did not complete ({cause}).")
+    if store:
+        io.out(
+            "  This is the TOKEN STORE, not the console: on a headless box set "
+            'gmail.token_backend = "file" in config.toml (a 0600 file), or fix '
+            "your OS keyring, then re-run `gmail-labeler auth setup`."
+        )
+        return
     io.out(
-        "  Sign-in did not complete. I cannot tell from here exactly why, but the\n"
-        "  usual causes are console-side, and I could not check any of them:\n"
+        "  A missing or unreadable client path is a LOCAL problem to fix "
+        "directly (re-check the file you pointed me at). Otherwise the usual "
+        "causes are console-side, and I could not check any of them:\n"
         "    * the Gmail API is not ENABLED in your project;\n"
         "    * the OAuth consent screen is in Testing, not In production;\n"
         "    * the 'Google hasn't verified this app' screen needs Advanced → Go to\n"

@@ -447,8 +447,9 @@ credentials on a terminal): create your own GCP project + desktop OAuth client,
 point the tool at its JSON, wire the token store, then sign in by COMPOSING the
 existing `auth login` loopback flow. It verifies locally what it can (the client
 file exists, parses, is a desktop-type client) and states plainly what it cannot
-(Gmail API enablement, the consent screen's *In production* mode) — the first
-successful sign-in is the real proof of those. It never asks for a token value,
+(Gmail API enablement, the consent screen's *In production* mode): signing in
+proves the client + consent, the first Gmail call proves enablement, and a token
+surviving 7 days proves *In production* mode. It never asks for a token value,
 never echoes secret material, and never overwrites an existing config without an
 explicit confirm.
 _Avoid_: setup script, installer, bootstrap

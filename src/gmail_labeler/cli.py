@@ -101,10 +101,23 @@ def auth_status(
             typer.echo(f"config error: {e}", err=True)
             raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
     else:
+        # No explicit --config: distinguish "no config file anywhere" (a fresh
+        # profile → the wizard is the answer) from "a config exists but is
+        # invalid" (a real config error → exit 4, the message preserved). A
+        # bare `except ConfigError: cfg=None` would conflate the two (review
+        # MAJOR 3): a typo'd ./config.toml must NOT be reported as "no config".
+        from .config import find_config
+
         try:
-            cfg = load_config(None)
+            found = find_config()
         except ConfigError:
-            cfg = None  # fresh profile: no config found → no credentials
+            cfg = None  # genuinely nothing found → fresh profile
+        else:
+            try:
+                cfg = load_config(str(found))
+            except ConfigError as e:
+                typer.echo(f"config error: {e}", err=True)
+                raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
     if cfg is None:
         typer.echo("auth: NOT SIGNED IN — no config.toml found")
     else:
@@ -265,7 +278,24 @@ def _write_config_toml(target: Path, cfg: Config) -> None:
         f"token_file = {json.dumps(str(cfg.gmail.token_file.expanduser()))}\n"
     )
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(body, encoding="utf-8")
+    # atomic write: temp in the same dir, fsync, then replace — a torn config
+    # would break every later command (the durability the comment promises,
+    # matching FileTokenStore.save). The config is paths-only (invariant #8), so
+    # it is mode 0644 like example.toml — NOT the 0600 a token file needs. An
+    # OSError here (parent is a file, read-only dir, …) propagates and the
+    # caller maps it to exit 5 — never a raw traceback (exit 1).
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _setup_config_target(config: str | None) -> Path:
@@ -300,6 +330,14 @@ def _run_setup_wizard(config: str | None) -> None:
     except WizardCancelled:
         typer.echo("setup cancelled.", err=True)
         raise typer.Exit(code=_CANCEL_EXIT) from None
+    except OSError as e:
+        # a config-write failure (parent is a file, read-only dir, …): exit 5,
+        # never a raw traceback that would exit 1 outside the contract.
+        typer.echo(
+            f"setup failed writing {target}: {type(e).__name__}",
+            err=True,
+        )
+        raise typer.Exit(code=_INCOMPLETE_EXIT) from None
     if result.outcome == "completed" and result.signed_in:
         return  # exit 0
     if result.outcome == "failed":

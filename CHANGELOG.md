@@ -18,8 +18,9 @@ does not ship releases yet.
     whole matrix is tested offline). Declared steps with ids; each verifies
     LOCALLY what it can (the client file exists / parses / is a desktop-type
     client) and says PLAINLY what it cannot (Gmail API enablement, the consent
-    screen's In-production mode) — no verification theater; the first successful
-    sign-in is named as the real proof of those.
+    screen's In-production mode) — no verification theater; it names the real
+    proofs precisely (sign-in → the client + consent; the first Gmail call →
+    API enablement; a 7-day-surviving token → In-production mode).
   - Secret discipline (invariant #8): paths and env names only; the client
     JSON's id/secret and the typed project id never reach output or logs
     (sentinel-absence pins, mutation-tested); the refresh token lands in the

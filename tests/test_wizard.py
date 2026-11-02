@@ -11,7 +11,6 @@ pin reddens.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import FrozenInstanceError, dataclass, field
 from pathlib import Path
 
@@ -104,7 +103,7 @@ class FakeConfirms:
     def confirm(self, text: str) -> bool:
         self.seen.append(text)
         for key, val in self.answers.items():
-            if key in text:
+            if key.lower() in text.lower():
                 return val
         return True  # default yes
 
@@ -304,12 +303,16 @@ def test_wizard_states_enablement_and_production_are_not_locally_checkable() -> 
     assert "enabled confirmed" not in low
 
 
-def test_first_sign_in_named_as_the_real_proof() -> None:
-    # the design: the first successful token refresh is the actual proof — the
-    # honesty clause names it with its own contiguous signature
+def test_wizard_names_the_real_proofs_precisely() -> None:
+    # the design's honesty, corrected (review MINOR 8): sign-in proves the
+    # client+consent, the first GMAIL CALL proves enablement, and a token that
+    # survives 7 days proves In-production mode — the wizard must not name
+    # sign-in as the proof of API enablement (it isn't).
     _result, rec, _actions, _ = _run()
     low = rec.all_text.lower()
-    assert "first successful sign-in is the real proof" in low
+    assert "signing in proves" in low and "oauth client" in low
+    assert "first gmail call" in low and "proves the api is enabled" in low
+    assert "after 7 days" in low and "in-production mode" in low
 
 
 # --- token backend degrade is honest (keyring posture) -----------------------
@@ -335,6 +338,11 @@ def test_existing_config_asks_before_overwrite_and_writes_on_yes() -> None:
     confirms = FakeConfirms({"overwrite": True})
     _result, _rec, actions, _ = _run(probe=probe, confirms=confirms)
     assert any("overwrite" in c.lower() for c in confirms.seen)
+    # MAJOR-2 disclosure pinned: the confirm must plainly say it REPLACES the
+    # whole file (a mild "overwrite it with the wiring" wording hid the blast
+    # radius — the reviewer's m_confirmwording mutant)
+    confirm_text = " ".join(confirms.seen).lower()
+    assert "replaces" in confirm_text and "entire file" in confirm_text
     assert actions.written  # confirmed → it writes
 
 
@@ -344,6 +352,8 @@ def test_declined_overwrite_does_not_write_and_aborts_cleanly() -> None:
     result, rec, actions, _ = _run(probe=probe, confirms=confirms)
     assert actions.written == []  # NOTHING overwritten
     assert result.outcome != "completed"  # aborted, not a silent continue
+    # MAJOR-2: the decline names the lighter re-auth route (m_declinehint)
+    assert "auth login" in rec.all_text
     low = rec.all_text.lower()
     assert "manual" in low or "config.toml" in low  # names the manual path
 
@@ -372,6 +382,55 @@ def test_login_failure_never_leaks_secret_or_traceback() -> None:
     assert CLIENT_ID not in rec.all_text
     assert CLIENT_SECRET not in result.detail
     assert CLIENT_ID not in result.detail
+
+
+def test_login_token_store_error_gets_store_guidance_not_console_guess() -> None:
+    # review MINOR 5: a headless-keyring failure is LOCAL, not a console
+    # red-herring. TokenStoreError -> the store-specific remedy (and the type
+    # is named, never the raw text).
+    from gmail_labeler.tokens import TokenStoreError
+
+    actions = FakeActions(
+        login_error=TokenStoreError("OS keyring write failed (RuntimeError)")
+    )
+    result, rec, _a, _ = _run(actions=actions)
+    assert result.outcome == "failed"
+    # scope to the FAILURE message (the intro's honesty clause mentions
+    # "enabled" too — a whole-output check would be presence-not-pairing)
+    tail = rec.all_text.split("Sign-in did not complete", 1)[1].lower()
+    assert "token store" in tail and "0600" in tail
+    assert "enabled" not in tail  # NOT misdiagnosed as a console enablement issue
+
+
+def test_login_unexpected_error_names_type_and_never_echoes_text() -> None:
+    # the generic fallback: an unexpected error is reported by TYPE only
+    actions = FakeActions(login_error=RuntimeError(f"unexpected {CLIENT_SECRET}"))
+    result, rec, _a, _ = _run(actions=actions)
+    assert result.outcome == "failed"
+    assert "RuntimeError" in rec.all_text  # the type is named for diagnosis
+    assert CLIENT_SECRET not in rec.all_text  # the raw text is never echoed
+
+
+def test_cancel_during_login_propagates_not_reported_as_failure() -> None:
+    # review MINOR 5: a WizardCancelled raised inside the composed login must
+    # NOT be swallowed into a "failed" sign-in — it propagates to the 130 path
+    actions = FakeActions(login_error=WizardCancelled())
+    io = WizardIO(
+        ask=FakeStdin(
+            answers={"project-id": [PROJECT_ID], "client-json": [CLIENT_PATH]}
+        ).ask,
+        confirm=FakeConfirms().confirm,
+        out=Recorder().out,
+    )
+    with pytest.raises(WizardCancelled):
+        run_wizard(
+            probe=FakeProbe(),
+            io=io,
+            login=actions.login,
+            status=actions.status,
+            write_config=actions.write_config,
+            config_target=CONFIG_TARGET,
+        )
 
 
 # --- secret discipline: sentinels absent from ALL output + detail ------------
@@ -461,27 +520,49 @@ def test_result_is_a_frozen_value_object() -> None:
         result.outcome = "mutated"  # type: ignore[misc]
 
 
-# --- the machine is PURE: it never imports typer / touches a real FS ---------
-def test_run_wizard_never_constructs_a_real_store_or_flow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # belt-and-braces purity: a real InstalledAppFlow or keyring import during
-    # run_wizard would mean the machine leaked I/O. Poison both; the pure run
-    # must not touch either.
-    def _boom(*a: object, **k: object) -> None:
-        raise AssertionError("pure machine performed real I/O")
+# --- the machine is PURE: pinned at the SOURCE/AST level --------------------
+def test_wizard_module_has_no_io_imports_or_calls() -> None:
+    # The old "poison the flow module" test could never fail — the pure path
+    # imports none of those, so poisoning them is inert (review NIT). Purity is
+    # real only if adding I/O to wizard.py REDDENS a pin. Parse the module's
+    # AST: no I/O imports, no open() call. Docstring prose about typer does not
+    # create Import/Call nodes, so this stays honest and fail-able.
+    import ast
 
-    # Poison the OAuth flow module: if the machine (or its fakes) tried to
-    # build a real InstalledAppFlow, attribute access would explode. The pure
-    # run completes through the injected seams and never touches it.
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "google_auth_oauthlib.flow",
-        _BoomModule(_boom),
+    import gmail_labeler.wizard as wmod
+
+    tree = ast.parse(Path(wmod.__file__).read_text(encoding="utf-8"))
+    banned = {"typer", "keyring", "google_auth_oauthlib", "subprocess", "socket"}
+    # bare open() AND Path/FS attribute calls — the reviewer's m_pathio mutant
+    # (Path(...).read_text() inside run_wizard) slipped past an open()-only pin.
+    banned_calls = {
+        "open",
+        "read_text",
+        "write_text",
+        "read_bytes",
+        "write_bytes",
+        "iterdir",
+        "glob",
+        "stat",
+        "exists",
+        "is_file",
+        "is_dir",
+        "mkdir",
+        "touch",
+    }
+    imported: set[str] = set()
+    impure_calls: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+            if name in banned_calls:
+                impure_calls.add(name)
+    assert not (imported & banned), (
+        f"wizard.py imports I/O modules: {imported & banned}"
     )
-    _run()  # completes purely through the fakes
-
-
-class _BoomModule:
-    def __init__(self, boom: Callable[..., None]) -> None:
-        self.InstalledAppFlow = boom  # any attribute access to build a flow explodes
+    assert not impure_calls, f"wizard.py performs file I/O: {impure_calls}"

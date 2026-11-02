@@ -207,7 +207,42 @@ def test_auth_wizard_alias_is_rejected_exit_2() -> None:
 
 
 # --- exit-contract mapping ---------------------------------------------------
-def test_setup_cancel_exits_130(
+def test_setup_cancel_exits_130(tmp_path: Path) -> None:
+    # REAL prompt path (no monkeypatch of _typer_ask): an empty stdin makes
+    # typer.prompt hit EOF -> Abort -> _typer_ask maps it to WizardCancelled ->
+    # _run_setup_wizard exits 130. This is the code the monkeypatched variant
+    # below skips (review MINOR 4: the Abort/EOF->130 mapping was unpinned).
+    config = tmp_path / "config.toml"
+    result = runner.invoke(app, ["auth", "setup", "--config", str(config)], input="")
+    assert result.exit_code == 130
+    assert "setup cancelled" in (result.output + result.stderr)
+    assert not config.exists()  # cancel wrote nothing
+
+
+def test_setup_confirm_eof_exits_130(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # reach the overwrite CONFIRM (config exists), then EOF there -> the
+    # _typer_confirm Abort/EOF->130 mapping (its own arm, not _typer_ask's).
+    monkeypatch.setattr(
+        cli._RealEnvironmentProbe, "keyring_available", lambda self: False
+    )
+    config = tmp_path / "config.toml"
+    config.write_text("# existing\n", encoding="utf-8")
+    client = _client_json(tmp_path)
+    # answer project-id + client-json, then NOTHING (EOF at the confirm)
+    result = runner.invoke(
+        app,
+        ["auth", "setup", "--config", str(config)],
+        input=f"{PROJECT_ID}\n{client}\n",
+    )
+    assert result.exit_code == 130
+    assert (
+        config.read_text(encoding="utf-8") == "# existing\n"
+    )  # confirm cancelled -> no write
+
+
+def test_setup_cancelled_marker_exits_130(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from gmail_labeler.wizard import WizardCancelled
@@ -215,6 +250,7 @@ def test_setup_cancel_exits_130(
     def _boom(prompt: object) -> str:
         raise WizardCancelled()
 
+    # pins the _run_setup_wizard WizardCancelled -> 130 mapping directly
     monkeypatch.setattr(cli, "_typer_ask", _boom)
     config = tmp_path / "config.toml"
     result = runner.invoke(app, ["auth", "setup", "--config", str(config)], input="")
@@ -245,6 +281,71 @@ def test_setup_login_failure_exits_4(
     # the failure names the console steps and never echoes the secret token
     assert "enable" in result.output.lower() and "production" in result.output.lower()
     assert REFRESH not in result.output
+
+
+def test_setup_tilde_client_path_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_flow: None,
+    headless: None,
+) -> None:
+    # review MAJOR 1: the prompt invites `~`. The value the probe verified must
+    # be the value login receives — before the expanduser fix a `~/…` path
+    # passed the local check then failed inside login with a misleading
+    # console-side diagnosis (exit 4). It must now sign in (exit 0).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = tmp_path / "desktop-client.json"
+    client.write_text(
+        json.dumps(
+            {"installed": {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}}
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / "config.toml"
+    result = runner.invoke(
+        app,
+        ["auth", "setup", "--config", str(config)],
+        input=f"{PROJECT_ID}\n~/desktop-client.json\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "signed in" in result.output.lower()
+
+
+def test_setup_config_write_failure_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # review MINOR 6: a config-write OSError exits 5 (the contract), never a
+    # raw traceback (which would exit 1). Parent path is a FILE -> mkdir fails.
+    monkeypatch.setattr(
+        cli._RealEnvironmentProbe, "keyring_available", lambda self: False
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = _client_json(tmp_path)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file", encoding="utf-8")
+    config = blocker / "config.toml"
+    result = runner.invoke(
+        app, ["auth", "setup", "--config", str(config)], input=_setup_input(client)
+    )
+    assert result.exit_code == 5
+    assert "Traceback" not in result.output
+
+
+def test_bare_auth_invalid_config_no_flag_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # review MAJOR 3: a config that EXISTS but is INVALID is a config error
+    # (exit 4, message preserved) — NOT "no config found" (which would falsely
+    # offer the wizard). Discovered via the no-flag search path.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.toml").write_text(
+        '[gmail]\nbogus_key = "x"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    result = runner.invoke(app, ["auth"])
+    assert result.exit_code == 4
+    assert "config error" in (result.output + result.stderr)
+    assert "no config.toml found" not in result.output  # the false claim is gone
 
 
 def test_setup_declined_overwrite_exits_5_and_writes_nothing(

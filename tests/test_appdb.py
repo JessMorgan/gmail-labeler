@@ -1360,9 +1360,9 @@ def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:
 
 
 def test_commit_page_empty_rows_still_advances_cursor(tmp_path: Path) -> None:
-    # a page whose messages all composed EMPTY plans (skip-present /
+    # a delta whose messages all composed EMPTY plans (skip-present /
     # no-band) still advances the cursor — record_applications'
-    # empty-batch refusal is deliberately NOT inherited here: the page
+    # empty-batch refusal is deliberately NOT inherited here: the delta
     # WAS handled, the cursor must move
     db = AppDB(tmp_path / "state.db")
     db.open()

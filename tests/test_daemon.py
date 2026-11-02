@@ -2,7 +2,8 @@
 point (write FIRST, then ONE transaction of rows + cursor: COMMIT =
 handled, invariant #3), skip-present replay idempotency (the crash
 matrix's convergence proof), the 404 resync arm, graceful shutdown,
-and the ids-only logging surface (invariant #5, caplog pins).
+and the body-free logging surface (message ids and typed
+errors, never message content — invariant #5, caplog pins).
 
 The loop is FULLY injected (client/db/model/clock/sleep/should_stop) —
 tests never real-sleep. The crash matrix: injected-raise between every
@@ -377,7 +378,7 @@ def test_multi_message_page_one_predict_one_commit_batch_homogeneity(
         return real_plan(message_id, **kw)
 
     # a TICKING clock: every read returns a different microsecond — the
-    # homogeneity pin is only real if a second read per page CHANGES
+    # homogeneity pin is only real if a second read per delta CHANGES
     # the rows (a constant clock would bless the double-read mutant)
     clock_calls = 0
 
@@ -920,10 +921,18 @@ def test_history_permanent_non_404_holds_cursor(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # F2 MAJOR sibling: the page arm's 404 guard too (same idiom at the
-    # history call) — a 400 from history() is NOT the expiry arm
+    # history call) — a 400 from history() is NOT the expiry arm.
+    # F3 MINOR 3 (state-discrimination): the bootstrap seed is programmed
+    # AWAY from the held cursor (950 != 777) — under the guard-broadening
+    # mutant the resync arm SETS 950 and the CURSOR assertion reddens,
+    # not just the log text (the F2 node passed the cursor check under
+    # the mutant because seed == held cursor)
     caplog.set_level(logging.WARNING)
+    msgs = _messages()
+    for m in msgs:
+        m.history_id = 950
     fake = FakeGmailClient(
-        messages=_messages(),
+        messages=msgs,
         labels=_labels(),
         history_pages=[_page(_record("aa22"))],
         current_history_id=900,
@@ -961,6 +970,136 @@ def test_prediction_unsized_row_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_FlatModel(VOCAB, scores={})) == 0
     assert db.get_history_cursor() == 777  # held, loop alive
+    assert "does not align" in caplog.text
+    db.close()
+
+
+def test_prediction_str_vocabulary_starvation_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 MINOR 2 (the deterministic-starvation hole, ds probe verbatim
+    # shape): a stray str vocabulary + string score rows passed EVERY
+    # structural check and landed in the plan's per-message fail-safe —
+    # warnings every tick, ZERO writes, cursor ADVANCING forever. The
+    # str/bytes vocabulary is now a named shape defect: HOLD.
+    caplog.set_level(logging.WARNING)
+
+    class _StrVocabModel:
+        vocabulary = "ab"  # tuple('ab') would pass Sized/width checks
+
+        def predict(self, texts):  # (the ds probe shape: '01' rows)
+            return tuple("01" for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa11"), _record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_StrVocabModel()) == 0
+    assert db.get_history_cursor() == 777  # HOLDS (was: advanced every tick)
+    assert "str/bytes" in caplog.text
+    db.close()
+
+
+def test_prediction_non_numeric_element_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 MINOR 2 sibling: string elements ('0.9') pass every structural
+    # check and poison the plan; bool is NOT a number here
+    caplog.set_level(logging.WARNING)
+
+    class _StrElements:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(("0.9", "0.1") for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_StrElements()) == 0
+    assert db.get_history_cursor() == 777
+    assert "not numeric" in caplog.text
+    db.close()
+
+
+def test_prediction_lying_len_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 MINOR 1 (ds executed): a Sized+Iterable row whose __len__ LIES
+    # passed the isinstance+width checks and raised TypeError from the
+    # compose zip OUTSIDE the guard — exit 1. Materialized inside the
+    # arm, the honest length mismatches and the delta HOLDS.
+    caplog.set_level(logging.WARNING)
+
+    class _LyingLen:
+        def __len__(self) -> int:
+            return 2  # claims vocab width
+
+        def __iter__(self):
+            yield 0.9
+            yield 0.1
+            yield 0.5  # actually three
+
+    class _LyingLenModel:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(_LyingLen() for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_LyingLenModel()) == 0
+    assert db.get_history_cursor() == 777
+    assert "does not align" in caplog.text
+    db.close()
+
+
+def test_prediction_raising_iter_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 MINOR 1 sibling: __iter__ that RAISES — materialization inside
+    # the guarded arm converts it to the named shape defect
+    caplog.set_level(logging.WARNING)
+
+    class _RaisingIter:
+        def __len__(self) -> int:
+            return 2
+
+        def __iter__(self):
+            raise TypeError("boom")
+            yield 0.0  # pragma: no cover (makes it a generator fn)
+
+    class _RaisingModel:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(_RaisingIter() for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_RaisingModel()) == 0
+    assert db.get_history_cursor() == 777
     assert "does not align" in caplog.text
     db.close()
 
@@ -1218,11 +1357,11 @@ def test_history_response_without_history_id_holds(
     db.close()
 
 
-def test_fail_safe_warning_shape_and_end_of_page_count(
+def test_fail_safe_warning_shape_and_end_of_delta_count(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     # the #24 warning shape surfaces EXACT (plan.warning verbatim) and
-    # the end-of-page report line carries the count (bodies never). The
+    # the end-of-delta report line carries the count (bodies never). The
     # lying row bypasses FakeModel's programming check (a real lying
     # model row reaches the plan from a defective checkpoint — the
     # test_applications precedent)
@@ -1248,7 +1387,7 @@ def test_fail_safe_warning_shape_and_end_of_page_count(
         "aa22: ValueError: tiers for 'Money/Bills': score 1.5 is out of [0, 1] "
         "— a lying model row" in caplog.text
     )
-    assert "warnings=1" in caplog.text  # the end-of-page report count
+    assert "warnings=1" in caplog.text  # the end-of-delta report count
     assert fake.writes == []  # no write for the failed message
     assert db.get_history_cursor() == 900  # the delta WAS handled (no write)
     db.close()

@@ -42,15 +42,32 @@ does not ship releases yet.
 
 ### Changed
 
-- GYB import rejects DRAFT/CHAT rows at ingest (ticket #32, completing
-  #17 corpus-wide): a backup row whose raw label tokens carry the
-  canonical id DRAFT or CHAT is counted `skipped_draft_chat` and never
-  stored — previously the token was stripped from the row's label set
-  and the contaminated row imported silently. The exclusion pair now
-  has one shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both
-  ingest layers import, so export and import cannot drift; `dataset
-  import-gyb` reports the count in its summary line.
-- `dataset export` scope excludes DRAFT and CHAT (maintainer decision
+- GYB import rejects DRAFT/CHAT rows at ingest (maintainer decision
+  2026-11-02, ticket #32, completing #17 corpus-wide): a backup row
+  whose raw label tokens carry the canonical token DRAFT or CHAT is
+  counted `skipped_draft_chat` and never stored (a row already in the
+  corpus answers `skipped_present`; a not-yet-stored row whose
+  backup-index path escapes the backup root aborts the run, exit 5,
+  uncounted) — previously
+  the token was stripped from the row's label set and the
+  contaminated row imported silently. The exclusion pair now has one
+  shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both ingest
+  layers import,
+  so export and import cannot drift; `dataset import-gyb` reports the
+  count in its summary line.
+  Upgrade consequence: corpora assembled before the pair landed keep
+  their DRAFT/CHAT-contaminated records — anything exported before #17
+  (2026-11-01) may carry it (an explicit `--query` may already have
+  dropped drafts, but chats had no reliable exclusion), anything
+  GYB-imported before #32 carries it, and the store never deletes in
+  place. Resume runs report those ids as
+  `skipped_present` (skip-present wins), never `skipped_draft_chat`, so
+  pre-existing contamination stays invisible to the counter; remediation
+  is a fresh `corpus.dir` (the corpus store is rooted at exactly that
+  path) plus a full re-ingest — a GYB re-import, or a re-export for
+  API-sourced corpora.
+- `dataset export` scope (now recorded as Corpus Exclusion) excludes
+  DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message
   whose raw wire labelIds contain the system label id DRAFT or CHAT —

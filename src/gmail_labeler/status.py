@@ -8,8 +8,15 @@ it working?" WITHOUT asking Gmail anything (the AC: status is DB-only).
 
 The math (design decision 4, v1 honest-and-simple):
 
-- ``written``  = the Application rows for the label (we applied it);
-- ``removed``  = the matching 'removed' Corrections (a human undid it);
+- ``written``  = the Application ROWS for the label (we applied it); a
+  re-earned label is a NEW row (the applications table has no UNIQUE
+  constraint), so ``written`` can exceed the number of distinct messages
+  that carry the label;
+- ``removed``  = the matching 'removed' Corrections (a human undid it),
+  deduped per (message, label) by the store's UNIQUE index — so the
+  denominator (rows) and the numerator's correction count are on
+  DIFFERENT units when a label has been re-earned; the CLI's basis line
+  states this (v1, per the manager's "all rows" ruling);
 - ``precision`` = (written - removed) / written, or ``None`` ('no data')
   when the label has no Applications yet. The join gate makes
   ``removed <= written`` (a 'removed' Correction exists only for an

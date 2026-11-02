@@ -3541,10 +3541,9 @@ def _serve_startup(
     # the offline filter-attribution snapshot for the daemon's correction
     # arm (#27, invariant #6): a LOCAL file read (never a Gmail call — the
     # startup exact-call pins stand). Best-effort: absent or malformed →
-    # () → every 'added' Correction records filter_covered False
-    # (unattributable, disclosed by status). apply never reads it.
-    from .export import SIDECAR_FILTERS
-
+    # () → every 'added' Correction records filter_covered False (the flag
+    # means PROVEN filter-authored; the unverifiable slice is not separately
+    # disclosed — a v1 limit surfaced to the manager). apply never reads it.
     filters_snapshot: list[dict[str, object]] = []
     sidecar = store.root / SIDECAR_FILTERS
     if sidecar.is_file():
@@ -3930,6 +3929,16 @@ def corrections_export(
     db_path = _resolve_db_path(cfg, db, "corrections export")
     db_origin = "--db PATH" if db is not None else "[store] db_path"
     _check_store_db_path(db_path, cfg, "corrections export", db_origin)
+    # the export READS the store — refuse a typo'd --db rather than
+    # silently create an empty DB and export [] with exit 0
+    if not db_path.exists():
+        typer.echo(
+            f"corrections export failed: no state DB at {db_path} — the "
+            "export reads the store, it does not create one (run the daemon "
+            "first, or check --db)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     _validate_store_db(db_path, command="corrections export")
 
     store_db = AppDB(db_path)
@@ -3954,8 +3963,48 @@ def corrections_export(
     text = json.dumps(payload, indent=2, sort_keys=True)
     if out == "-":
         typer.echo(text)
-    else:
-        Path(out).write_text(text + "\n", encoding="utf-8")
+        return
+
+    # --out is a WRITE target — guard it like `eval` guards its outputs.
+    # The headline danger: --out naming the state DB would overwrite the
+    # SQLite file with JSON and destroy the corrections + cursor (only a
+    # full resync recovers). Refuse that, plus the identity-file roots and
+    # an existing directory, BEFORE writing.
+    out_path = Path(out).resolve()
+    if out_path == db_path.resolve():
+        typer.echo(
+            f"corrections export failed: --out {out!r} is the state DB path "
+            f"— exporting there would DESTROY the corrections + cursor "
+            f"(choose a different file)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    for root, what in (
+        (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
+        (Path(cfg.corpus.dir).resolve(), "the corpus store"),
+    ):
+        if out_path == root or root in out_path.parents:
+            typer.echo(
+                f"corrections export failed: --out {out!r} lives inside "
+                f"{what} ({root}) — refusing to write there",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
+    if out_path.is_dir():
+        typer.echo(
+            f"corrections export failed: --out {out!r} names an existing "
+            f"directory — the target is a file",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    try:
+        out_path.write_text(text + "\n", encoding="utf-8")
+    except OSError as e:
+        # an unwritable target is an operation failure (5), NOT the exit-1
+        # FileNotFoundError traceback the contract forbids (README: a `1`
+        # is an unhandled crash)
+        typer.echo(f"corrections export failed: cannot write {out!r}: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
 
 @app.command("status")
@@ -4017,6 +4066,16 @@ def status(
     db_path = _resolve_db_path(cfg, db, "status")
     db_origin = "--db PATH" if db is not None else "[store] db_path"
     _check_store_db_path(db_path, cfg, "status", db_origin)
+    # status READS the store — it must not silently CREATE one on a typo'd
+    # --db (which would answer 'no data' with exit 0 and hide the mistake)
+    if not db_path.exists():
+        typer.echo(
+            f"status failed: no state DB at {db_path} — status reads the "
+            "store, it does not create one (run the daemon/apply first, or "
+            "check --db)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     _validate_store_db(db_path, command="status")
 
     # the two artifacts (LOCAL reads; from_json self-validates the content
@@ -4087,9 +4146,15 @@ def status(
         f"{artifact.content_hash[:12]} graduation={table.content_hash[:12]}"
     )
     typer.echo(
-        "status: NOTE rows may span artifact versions (per-run binding "
-        "deferred to #23); precision assumes unseen-but-removed mail is "
-        "rare (archive-equals-dismiss)"
+        "status: NOTE v1 caveats — 'written' counts Application ROWS (a "
+        "re-earned label is a new row, so written can exceed the number of "
+        "distinct messages) while 'removed' is deduped per (message,label); "
+        "a label removed then later re-added still counts as removed (the "
+        "event log is historical truth, not reconciled state); a Gmail "
+        "label RENAME desyncs the name-keyed join (orphaned corrections); "
+        "rows may span artifact versions (per-run binding deferred to #23); "
+        "precision assumes unseen-but-removed mail is rare "
+        "(archive-equals-dismiss)"
     )
     if not rows:
         typer.echo("status: no graduated labels (nothing to report)")

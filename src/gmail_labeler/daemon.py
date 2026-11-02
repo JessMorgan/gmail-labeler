@@ -311,8 +311,12 @@ class ServingContext:
     # file read — never a Gmail call, so the daemon's exact startup-call
     # pins stand). The correction arm uses it to flag an 'added'
     # Correction filter_covered; empty (the default) means NO snapshot —
-    # every 'added' Correction then records filter_covered False
-    # (unattributable, honestly disclosed by status). Defaults so the
+    # every 'added' Correction then records filter_covered False. NOTE
+    # (invariant #6, honest limit): an UNVERIFIABLE filter (criteria
+    # outside {from,to,subject}) also yields filter_covered False — the
+    # flag means "PROVEN filter-authored", not "not filter-authored";
+    # status does NOT separately disclose the unverifiable slice (a v1
+    # limitation, surfaced to the manager — see #27). Defaults so the
     # #25/#26 ServingContext constructions (and their suites) are
     # behavior-identical — the daemon's correction arm is the ONLY reader.
     filters: Sequence[Mapping[str, object]] = ()
@@ -413,44 +417,70 @@ def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
     return ids
 
 
+def _label_event_message_id(event: dict[str, object], field: str) -> str:
+    # the documented HistoryLabelAdded/Removed nests the Message under
+    # 'message' (id at event['message']['id']); the generic messages[]
+    # form is a flat Message. Tolerate BOTH id nestings — the discovery
+    # doc is the authority but no raw HTTP body was capturable, so the
+    # daemon must not wedge if the wire differs (a wrong shape reads as
+    # 'no events', never a bad write — ADR-0005 fail-safe)
+    msg = event.get("message")
+    if isinstance(msg, dict):
+        mid = msg.get("id")
+        if isinstance(mid, str) and mid:
+            return mid
+    mid = event.get("id")
+    if isinstance(mid, str) and mid:
+        return mid
+    raise GmailPermanentError(f"history {field} event without a message id")
+
+
 def _label_events(
     records: tuple[dict[str, object], ...],
 ) -> list[tuple[str, str, str]]:
     """The (kind, message_id, label_id) label-change events of one page's
     history records, in wire order (ticket #27; GLOSSARY: Correction).
-    ``labelAdded``/``labelRemoved`` each carry a list of
-    ``{"id": <message id>, "labelIds": [<label id>, ...]}`` (the
-    codebase's normalized record shape, the ``messages`` convention
-    extended to label changes — the adapter passes record internals
-    raw). kind is 'added' for a labelAdded event, 'removed' for a
-    labelRemoved one. A malformed label-event list is a lying wire —
-    loud permanent (the adapter's shape doctrine, like _message_ids).
-    Records with no label events pass through."""
+
+    THE WIRE SHAPE (verified against the Gmail discovery document,
+    revision 20261026): the response keys are the PLURAL ``labelsAdded``
+    / ``labelsRemoved`` (the singular ``labelAdded``/``labelRemoved`` are
+    only ``historyTypes[]`` REQUEST-enum values, never response keys),
+    each a list of ``{"message": {"id": ...}, "labelIds": [...]}``. The
+    adapter passes record internals RAW (gmail_client.history), so this
+    is the ONLY place the shape is interpreted. We read the plural keys
+    (correct) and ALSO the singular ones (defensive — the locked design
+    named them; harmless if absent), and tolerate both ``message.id`` and
+    a flat ``id`` (see _label_event_message_id). kind is 'added' for a
+    labelsAdded event, 'removed' for a labelsRemoved one. A malformed
+    label-event list is a lying wire — loud permanent (the _message_ids
+    shape doctrine). Records with no label events pass through."""
     events: list[tuple[str, str, str]] = []
-    for kind, field in (("added", "labelAdded"), ("removed", "labelRemoved")):
+    for kind, fields in (
+        ("added", ("labelsAdded", "labelAdded")),
+        ("removed", ("labelsRemoved", "labelRemoved")),
+    ):
         for record in records:
-            raw = record.get(field)
-            if raw is None:
-                continue
-            if not isinstance(raw, list) or not all(isinstance(e, dict) for e in raw):
-                raise GmailPermanentError(
-                    f"history record {field!r} not a list of objects"
-                )
-            for event in raw:
-                message_id = event.get("id")
-                if not isinstance(message_id, str) or not message_id:
-                    raise GmailPermanentError(
-                        f"history {field} event without a message id"
-                    )
-                label_ids = event.get("labelIds")
-                if not isinstance(label_ids, list) or not all(
-                    isinstance(x, str) for x in label_ids
+            for field in fields:
+                raw = record.get(field)
+                if raw is None:
+                    continue
+                if not isinstance(raw, list) or not all(
+                    isinstance(e, dict) for e in raw
                 ):
                     raise GmailPermanentError(
-                        f"history {field} event 'labelIds' not a list of strings"
+                        f"history record {field!r} not a list of objects"
                     )
-                for label_id in label_ids:
-                    events.append((kind, message_id, label_id))
+                for event in raw:
+                    message_id = _label_event_message_id(event, field)
+                    label_ids = event.get("labelIds")
+                    if not isinstance(label_ids, list) or not all(
+                        isinstance(x, str) for x in label_ids
+                    ):
+                        raise GmailPermanentError(
+                            f"history {field} event 'labelIds' not a list of strings"
+                        )
+                    for label_id in label_ids:
+                        events.append((kind, message_id, label_id))
     return events
 
 

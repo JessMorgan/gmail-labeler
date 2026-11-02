@@ -95,14 +95,21 @@ def _record(
     added: list[tuple[str, list[str]]] | None = None,
     removed: list[tuple[str, list[str]]] | None = None,
 ) -> dict[str, object]:
+    # the REAL Gmail wire shape (discovery rev 20261026): PLURAL
+    # labelsAdded/labelsRemoved, each element nesting the Message under
+    # 'message' (id at message.id). This is what the adapter delivers raw.
     rec: dict[str, object] = {
         "id": hid,
         "messages": [{"id": m, "threadId": f"t{m}"} for m in message_ids],
     }
     if added:
-        rec["labelAdded"] = [{"id": m, "labelIds": lids} for m, lids in added]
+        rec["labelsAdded"] = [
+            {"message": {"id": m}, "labelIds": lids} for m, lids in added
+        ]
     if removed:
-        rec["labelRemoved"] = [{"id": m, "labelIds": lids} for m, lids in removed]
+        rec["labelsRemoved"] = [
+            {"message": {"id": m}, "labelIds": lids} for m, lids in removed
+        ]
     return rec
 
 
@@ -384,8 +391,44 @@ def test_malformed_label_event_holds_cursor(
     caplog.set_level(logging.WARNING)
     db = _db(tmp_path)
     _applied(db, "aa22", "Money/Bills", "L2")
-    fake = _fake(_page({"id": 1, "labelAdded": "not-a-list"}))
+    fake = _fake(_page({"id": 1, "labelsAdded": "not-a-list"}))
     assert _tick(tmp_path, fake, db) == 0
     assert db.get_history_cursor() == 900  # HELD, not advanced
     assert "cursor held" in caplog.text
+    db.close()
+
+
+def test_real_gmail_wire_shape_is_detected(tmp_path: Path) -> None:
+    # ADAPTER-CONFORMANCE pin: the EXACT documented Gmail shape (discovery
+    # rev 20261026) — PLURAL labelsRemoved, message id NESTED under
+    # 'message' — is what the adapter delivers raw; detection must see it.
+    # (The design brief's singular labelAdded/flat-id shape never appears
+    # on the wire; this node is the guard against regressing to it.)
+    db = _db(tmp_path)
+    _applied(db, "aa22", "Money/Bills", "L2")
+    real_record = {
+        "id": 1,
+        "messages": [{"id": "aa22", "threadId": "t2"}],
+        "labelsRemoved": [{"message": {"id": "aa22"}, "labelIds": ["L2"]}],
+    }
+    fake = _fake(_page(real_record))
+    assert _tick(tmp_path, fake, db) == 0
+    corr = db.corrections_for_message("aa22")
+    assert [(c.label, c.kind) for c in corr] == [("Money/Bills", "removed")]
+    db.close()
+
+
+def test_flat_id_label_event_is_tolerated(tmp_path: Path) -> None:
+    # defensive: a flat event['id'] (the generic messages[] form) is also
+    # accepted, so the daemon never wedges on an id-nesting surprise
+    db = _db(tmp_path)
+    _applied(db, "aa22", "Money/Bills", "L2")
+    flat_record = {
+        "id": 1,
+        "messages": [{"id": "aa22", "threadId": "t2"}],
+        "labelsRemoved": [{"id": "aa22", "labelIds": ["L2"]}],
+    }
+    fake = _fake(_page(flat_record))
+    assert _tick(tmp_path, fake, db) == 0
+    assert len(db.corrections_for_message("aa22")) == 1
     db.close()

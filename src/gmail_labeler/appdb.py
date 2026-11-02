@@ -1280,6 +1280,14 @@ class AppDB:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         stats: dict[str, list[int]] = {}
         for label, kind, covered, count in rows:
+            if kind not in CORRECTION_KINDS:
+                # the tamper doctrine: the per-row readers revalidate; the
+                # aggregate reader must not SILENTLY drop a hand-edited
+                # kind into a zero bucket — refuse it, named
+                raise AppDBError(
+                    f"state DB corrupt (correction kind {kind!r} not in "
+                    f"{CORRECTION_KINDS}): {self.path}"
+                )
             bucket = stats.setdefault(label, [0, 0, 0])  # [removed, added, added_fc]
             if kind == "removed":
                 bucket[0] += count

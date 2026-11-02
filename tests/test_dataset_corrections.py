@@ -186,6 +186,59 @@ def test_export_bad_format_is_usage_2(tmp_path: Path) -> None:
     assert result.exit_code == 2
 
 
+def test_export_refuses_out_equal_to_state_db(tmp_path: Path) -> None:
+    # CRITICAL guard: --out naming the state DB would overwrite the SQLite
+    # file with JSON and destroy the corrections + cursor. Refused (exit 2)
+    # and the DB SURVIVES (re-opens clean).
+    db_path = tmp_path / "state.db"
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(db_path)))
+    assert result.exit_code == 2
+    assert "state DB" in result.output
+    # the DB is NOT destroyed: it still opens and still has the correction
+    db = AppDB(db_path)
+    db.open()
+    assert len(db.corrections_for_message("aa11")) == 1
+    db.close()
+
+
+def test_export_refuses_out_inside_corpus_store(tmp_path: Path) -> None:
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    inside = tmp_path / "corpus" / "leak.json"
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(inside)))
+    assert result.exit_code == 2
+    assert not inside.exists()
+
+
+def test_export_unwritable_out_is_5_not_crash(tmp_path: Path) -> None:
+    # MAJOR: an unwritable --out target is exit 5, NOT the exit-1
+    # FileNotFoundError traceback the contract forbids
+    _seed_corr(tmp_path, [_corr("aa11", "Shipping", "removed")])
+    bad = tmp_path / "no-such-dir" / "x.json"
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(bad)))
+    assert result.exit_code == 5, result.output
+
+
+def test_export_missing_db_is_5(tmp_path: Path) -> None:
+    # the export READS the store — a typo'd --db is refused, not silently
+    # created-then-answered-with-[]-exit-0
+    cfg = _cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "corrections",
+            "export",
+            "--config",
+            str(cfg),
+            "--db",
+            str(tmp_path / "does-not-exist.db"),
+        ],
+    )
+    assert result.exit_code == 5
+    assert not (tmp_path / "does-not-exist.db").exists()  # NOT created
+
+
 # -- the human gate: no call path from corrections/status to a train entry ----
 
 

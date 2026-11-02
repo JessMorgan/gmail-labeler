@@ -136,15 +136,17 @@ def test_status_reports_realized_precision(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_status_makes_no_gmail_call(tmp_path: Path, monkeypatch) -> None:
-    # the no-network pin: the client factory RAISES if ever called; status
-    # exits 0 proving it never builds a GmailClient
+    # the no-network pin: EVERY client factory in cli RAISES if called;
+    # status exits 0 proving it never builds a GmailClient through ANY of
+    # them (_daemon_client / _shadow_client / _export_client)
     _prepare(tmp_path, monkeypatch)
     import gmail_labeler.cli as cli
 
     def _boom(cfg_: object) -> object:
         raise AssertionError("status must not construct a GmailClient")
 
-    monkeypatch.setattr(cli, "_daemon_client", _boom)
+    for factory in ("_daemon_client", "_shadow_client", "_export_client"):
+        monkeypatch.setattr(cli, factory, _boom)
     cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
     _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
     result = _status(tmp_path, cfg)
@@ -161,7 +163,10 @@ def test_status_source_has_no_client_construction() -> None:
     src = inspect.getsource(status_cmd)
     for forbidden in (
         "_daemon_client",
+        "_shadow_client",
+        "_export_client",
         "GmailRestClient",
+        "build_credentials",
         "_daemon_model_factory",
         "load_model",
         "CorpusStore",
@@ -225,11 +230,15 @@ def test_status_filter_covered_disclosed(tmp_path: Path, monkeypatch) -> None:
     assert "human=0" in result.output  # the covered slice is excluded
 
 
-def test_status_empty_graduated_set_answers(tmp_path: Path, monkeypatch) -> None:
-    # a store with NO applications: every graduated label is 'no data',
-    # status still answers 0 (it is not a failure to have no data)
+def test_status_no_applications_reports_no_data(tmp_path: Path, monkeypatch) -> None:
+    # a store with NO applications: every graduated label is 'no data'
+    # (the graduated set is NON-empty here — _prepare graduates both
+    # labels — so this pins the 'no data' state, not an empty set), and
+    # status still answers 0 (having no data is not a failure). The DB
+    # must EXIST (a missing --db is the separate exit-5 typo case).
     _prepare(tmp_path, monkeypatch)
     cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [], [])  # create an empty (but real) state DB
     result = _status(tmp_path, cfg)
     assert result.exit_code == 0, result.output
     assert "no data" in result.output
@@ -274,3 +283,26 @@ def test_status_missing_artifact_is_5(tmp_path: Path, monkeypatch) -> None:
         ],
     )
     assert result.exit_code == 5
+
+
+def test_status_missing_db_is_5(tmp_path: Path, monkeypatch) -> None:
+    # status READS the store — a typo'd --db is refused (exit 5), not
+    # silently created-then-answered-with-'no data'-exit-0
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "status",
+            "--config",
+            str(cfg),
+            "--bands",
+            str(tmp_path / "bands.json"),
+            "--graduation",
+            str(tmp_path / "graduation.json"),
+            "--db",
+            str(tmp_path / "does-not-exist.db"),
+        ],
+    )
+    assert result.exit_code == 5
+    assert not (tmp_path / "does-not-exist.db").exists()  # NOT created

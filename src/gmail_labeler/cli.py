@@ -4123,9 +4123,8 @@ def status(
     the attribution vocabulary it counted under and the CURRENT
     bands/graduation artifact content hashes and states the honest v1
     caveats: rows can span artifact versions (per-run binding deferred
-    to post-merge calibration), and precision assumes
-     unseen-but-removed mail is rare
-    (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
+    to post-merge calibration), and precision assumes unseen-but-removed
+    mail is rare (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
     config unusable · 5 store/artifact failure (3 is the project's
     reserved not-implemented code; status never emits it)."""
     from .appdb import CORRECTION_ATTRIBUTIONS, AppDB, AppDBError
@@ -4241,12 +4240,15 @@ def status(
         store_db.open()
         # READ ORDER MATTERS (F2 item 9, the torn-read): these are two
         # separate autocommit SELECTs, so a daemon delta can commit BETWEEN
-        # them. A 'removed' Correction is only ever detected for an app row
-        # committed in the SAME delta transaction, so reading corrections
-        # FIRST guarantees every removed's app row is present in the LATER
-        # written read (removed <= written holds across the split). Reading
-        # written first would let a delta land a (removed, its app) pair
-        # between the reads and spuriously trip the removed>written refuse.
+        # them. Reading corrections FIRST is sound because `applications` is
+        # INSERT-only (no UPDATE/DELETE/DROP anywhere in src/) and a 'removed'
+        # Correction is only ever detected for an app row ALREADY in the join
+        # (normally an EARLIER delta). So any removed visible in the
+        # corrections read (T1) has an app row committed at <= T1, and the
+        # later written read (T2 >= T1) necessarily includes it -> removed <=
+        # written across the split. Reading written FIRST would let a delta
+        # land a (removed, its app) pair between the reads and spuriously
+        # trip the removed>written refuse. Do NOT "simplify" the order back.
         correction_stats = store_db.correction_label_stats()
         written_by_label = store_db.application_label_counts()
     except AppDBError as e:

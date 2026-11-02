@@ -36,7 +36,7 @@ Temporal honesty (design landmine): precision counts removals over ALL
 rows (v1); the CLI's basis line states the 'assumes unseen-but-removed
 mail is rare' caveat and the archive-equals-dismiss assumption, and
 notes the rows can span artifact versions (the per-run binding stays
-deferred to #23)."""
+deferred to post-merge calibration)."""
 
 from __future__ import annotations
 

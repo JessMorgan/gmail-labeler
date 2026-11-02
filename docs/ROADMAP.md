@@ -115,17 +115,29 @@ schema-v3 `daemon_state` single-row History Cursor (the v2→v3 migration
 rides the same atomic machinery), the sync-guide full-sync bootstrap
 and the 404 re-bootstrap arm, graceful SIGTERM/SIGINT shutdown, and the
 `daemon` command with the exit-code contract (the collision refusal →
-exit 4 naming the `[labels]` key) (#25).
+exit 4 naming the `[labels]` key) (#25); and the `apply` bulk path — the
+gates-first startup lifted into the shared `_serve_startup` both the
+daemon and apply serve from (the daemon suites rode the extraction
+verbatim), `appdb.commit_applications` (the rows-only sibling of
+`commit_page`, no cursor — invariant #3 stays the daemon's alone),
+`apply.py`'s one-page-per-batch loop reusing the daemon's decision core
+(`plan_message_write`) and positive-conformance predict seam
+(`predict_conformant`, extracted from `_run_tick`), and the `apply
+--since [--apply]` command (the preview's zero-write mint guard, the AC5
+provenance warning, the exit-code contract) (#26).
 
 Scope:
 
 - `daemon`: ~30 s History-API polling, cursor durability (invariant #3),
   skip-present idempotency (invariant #2), Tier Labels on every
   Application — LANDED (#25);
+- the deliberate bulk path: `apply --since … [--apply]` — always
+  human-triggered, never automatic (the daemon never invokes it; a grep
+  pin enforces it); the preview writes nothing, the backfill reuses the
+  daemon's one decision core and records Applications identically, and
+  skip-present makes a re-run idempotent — LANDED (#26);
 - Correction capture (manual fixes on applied mail become the next
   retrain's signal) and `status` (realized precision per graduated label);
-- the deliberate bulk path: `apply --since … --apply` — always
-  human-triggered, never automatic;
 - the `auth` wizard (ADR-0004) — ships in Phase 0's spirit but is
   scheduled in Phase 2 (it is onboarding polish, not a gate to training).
 

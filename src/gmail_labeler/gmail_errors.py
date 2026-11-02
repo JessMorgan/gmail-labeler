@@ -113,7 +113,7 @@ class GmailResyncError(GmailPermanentError):
     remembering to pass it: a GmailResyncError() with no status would
     otherwise read status=None and slip past the ``is_404`` arm)."""
 
-    def __init__(self, message: str = "", *, status: int | None = 404) -> None:
+    def __init__(self, message: str = "", *, status: int = 404) -> None:
         super().__init__(message, status=status)
 
 
@@ -124,8 +124,11 @@ def is_404(e: GmailError) -> bool:
     GmailPermanentError carries status=404. GmailResyncError IS such an
     error (the documented subclass relationship), so the adapter's reading
     and the fake's raw 404 route to the SAME handling. Checked, never
-    string-matched (CODING-STANDARDS). Every call site — the daemon's
-    history/get/apply arms and the apply path's read/write arms — rides
-    THIS predicate; a fourth inlined copy is the taxonomy drift this repo
-    names as its worst bug class."""
+    string-matched (CODING-STANDARDS). Every CONSUMER of a 404 — the
+    daemon's history/get/apply arms and the apply path's read/write arms —
+    rides THIS predicate; a fourth inlined consumer-copy is the taxonomy
+    drift this repo names as its worst bug class. (The adapter's
+    ``history()`` wrapper is the 404 PRODUCER — it reads the raw status to
+    mint a GmailResyncError, so it is not a consumer that would ride this
+    predicate.)"""
     return isinstance(e, GmailPermanentError) and e.status == 404

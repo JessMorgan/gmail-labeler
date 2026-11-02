@@ -5,11 +5,12 @@ headline pins:
 
 - AC1 preview: run_apply(dry_run=True) performs ZERO wire writes (no
   apply_labels, no writes recorded) and reports the would-apply lines;
-- AC2 one-core parity: the structural identity (apply's plan_message_write
-  IS daemon's IS applications') + the semantic parity (one daemon tick and
+- AC2 one-core parity: the structural identity (apply's composition entry
+  IS daemon's `compose_plan`, whose globals reach the one
+  `plan_message_write` core) + the semantic parity (one daemon tick and
   one apply batch over identical mail land IDENTICAL plans through the
-  SAME function object) — mutation-pinned (give apply a local copy and the
-  identity check reddens);
+  SAME core) — mutation-pinned (give apply a local copy of the
+  composition and the identity check reddens);
 - AC3: backfilled rows are recorded identically to daemon rows (source
   differs, the literal that entered the write path);
 - AC4: mid-page SIGTERM completes the batch to its commit point, and a
@@ -571,6 +572,11 @@ def test_transient_READ_failure_holds_nothing_continues(tmp_path: Path) -> None:
     assert outcome.skipped == 0  # NOT a skip (it is not a 404 vanish)
     assert outcome.written == 1  # the run CONTINUED: aa22 still applied
     assert fake.messages["aa22"].label_ids != ("INBOX",)
+    # the un-labeled AND un-rowed half of the shape: the blipped message
+    # left no audit row (a re-run is what picks it up), and the one row
+    # that exists is aa22's
+    assert outcome.rows == 1
+    assert db.applications_for_message("aa11") == ()
     db.close()
 
 

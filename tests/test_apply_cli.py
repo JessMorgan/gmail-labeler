@@ -253,7 +253,9 @@ def test_provenance_warning_one_counted_line(
             "b",
         )
 
-    noon = lambda d: datetime(2026, 10, d, 12, 0, 0, tzinfo=UTC)  # noqa: E731
+    def noon(d: int) -> datetime:
+        return datetime(2026, 10, d, 12, 0, 0, tzinfo=UTC)
+
     # three unprovenanced, strictly inside the --since window (>= Oct-1 midnight)
     _rec("ffff000000000001", noon(5), "unknown")
     _rec("ffff000000000002", noon(15), "unknown")

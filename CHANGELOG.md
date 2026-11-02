@@ -52,7 +52,13 @@ does not ship releases yet.
     `--apply`: the backfill, Applications recorded identically to
     daemon-applied ones (`source='apply'`). AC5: corpus records dated at
     or after the boundary that lack a server-authoritative Date Provenance
-    stamp surface ONE counted warning. Exit contract 0/2/4/5. The daemon
+    stamp surface ONE counted warning. Exit contract 0/2/4/5. A
+    per-message READ or WRITE blip (non-404, non-auth) is a counted
+    warning that holds nothing — both arms symmetric, a re-run picks it
+    up (no cursor to retry against); a message served twice in one page
+    is deduped per page (the daemon's `_message_ids` shape) so a
+    double-serve cannot compose a duplicate row after the first write
+    landed. The daemon
     never invokes any of it — a grep pin on `daemon.py` fails if the apply
     machinery is ever referenced there (the AC's "never automatic").
 - Daemon: poll, decide, write (ticket #25) — the live application loop

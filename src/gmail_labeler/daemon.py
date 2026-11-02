@@ -77,11 +77,15 @@ non-System) label the daemon did NOT write (no Application row for it)
 is an 'added' Correction (a human did our job — positive signal).
 ANYTHING else on an applied message — System Labels, non-vocabulary
 labels, a removed NON-applied label, INBOX churn — records NOTHING:
-noise is not correction. An 'added' Correction whose label a Gmail
-filter would have applied anyway (the #22 ``simulates_filter`` mechanism
-over the offline filters.json snapshot) is recorded RAW with
-``filter_covered`` set; a 'removed' Correction never carries the flag
-(a human removing is human signal regardless of filters — invariant #6).
+noise is not correction. An 'added' Correction carries an
+``attribution`` (the #22 ``simulates_filter`` mechanism over the offline
+filters.json snapshot): ``"human"`` (no relevant filter, or a verifiable
+one that does not match — training signal), ``"filter_covered"`` (a
+simulatable filter verifiably would have added it — withheld), or
+``"unverifiable"`` (authorship cannot be determined — WITHHELD, not
+guessed, #22's exclusion principle). Only ``"human"`` adds are training
+signal. A 'removed' Correction is always attributed ``"human"`` (a human
+removing is human signal regardless of filters — invariant #6).
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
 write for the corrected message). The correction rows ride the SAME
@@ -312,16 +316,16 @@ class ServingContext:
     # the offline filter-attribution snapshot (ticket #27, invariant #6):
     # the filters.json the export path wrote, read at startup (a LOCAL
     # file read — never a Gmail call, so the daemon's exact startup-call
-    # pins stand). The correction arm uses it to flag an 'added'
-    # Correction filter_covered; empty (the default) means NO snapshot —
-    # every 'added' Correction then records filter_covered False. NOTE
-    # (invariant #6, honest limit): an UNVERIFIABLE filter (criteria
-    # outside {from,to,subject}) also yields filter_covered False — the
-    # flag means "PROVEN filter-authored", not "not filter-authored";
-    # status does NOT separately disclose the unverifiable slice (a v1
-    # limitation, surfaced to the manager — see #27). Defaults so the
-    # #25/#26 ServingContext constructions (and their suites) are
-    # behavior-identical — the daemon's correction arm is the ONLY reader.
+    # pins stand). The correction arm uses it to attribute an 'added'
+    # Correction (human / filter_covered / unverifiable — see
+    # _attribution); empty (the default) means NO snapshot — no relevant
+    # filter, so every 'added' Correction is attributed 'human' (nothing
+    # claims it). An UNVERIFIABLE filter (criteria outside
+    # {from,to,subject}) yields 'unverifiable' — WITHHELD, not credited to
+    # the human (#22's exclusion principle; the old bool inverted this).
+    # Defaults so the #25/#26 ServingContext constructions (and their
+    # suites) are behavior-identical — the daemon's correction arm is the
+    # ONLY reader.
     filters: Sequence[Mapping[str, object]] = ()
 
 
@@ -487,31 +491,46 @@ def _label_events(
     return events
 
 
-def _filter_covered(
+def _attribution(
     ctx: ServingContext,
     label_id: str,
-    sender: str,
-    recipients: tuple[str, ...],
-    subject: str,
-) -> bool:
+    fields: tuple[str, tuple[str, ...], str] | None,
+) -> str:
     """Invariant #6 attribution for an 'added' Correction (the #22
-    mechanism, REUSED not forked): True exactly when a filter that adds
-    ``label_id`` SIMULATES True against the message's kept fields. An
-    unverifiable filter (simulates_filter -> None) does NOT flag covered
-    (exclusion, not guessing — we only withhold what we can PROVE a
-    filter authored). No snapshot (ctx.filters empty) -> False."""
+    mechanism, REUSED not forked) — one of CORRECTION_ATTRIBUTIONS:
+    - ``"human"`` — no filter adds this label, or every relevant filter is
+      verifiable and does NOT match this message: the human added it
+      (positive training signal);
+    - ``"filter_covered"`` — a relevant filter verifiably WOULD have added
+      it (``simulates_filter`` True): withheld from human credit + export;
+    - ``"unverifiable"`` — a relevant filter's criteria are outside the
+      simulatable set (``simulates_filter`` None), OR the message's fields
+      were unavailable so authorship cannot be determined: WITHHELD, not
+      guessed (#22's exclusion principle — the old bool INVERTED this by
+      defaulting an unverifiable add to the human).
+    No snapshot (``ctx.filters`` empty) -> no relevant filter -> 'human'."""
     from types import SimpleNamespace
 
+    relevant = [f for f in ctx.filters if label_id in filter_label_ids(f)]
+    if not relevant:
+        return "human"  # no filter claims this label -> the human added it
+    if fields is None:
+        return "unverifiable"  # a relevant filter exists but nothing to check
+    sender, recipients, subject = fields
     rec = SimpleNamespace(sender=sender, recipients=recipients, subject=subject)
-    for filter_ in ctx.filters:
-        if label_id not in filter_label_ids(filter_):
-            continue
+    saw_unverifiable = False
+    for filter_ in relevant:
         criteria = filter_.get("criteria")
         if not isinstance(criteria, dict):
+            saw_unverifiable = True
             continue
-        if simulates_filter(criteria, rec) is True:  # type: ignore[arg-type]
-            return True
-    return False
+        verdict = simulates_filter(criteria, rec)  # type: ignore[arg-type]
+        if verdict is True:
+            return "filter_covered"  # proven filter authorship
+        if verdict is None:
+            saw_unverifiable = True
+    # no filter PROVED coverage; unverifiable only when one was inconclusive
+    return "unverifiable" if saw_unverifiable else "human"
 
 
 def detect_corrections(
@@ -532,8 +551,9 @@ def detect_corrections(
     one delta is ONE Correction (the store also refuses a within-batch
     duplicate — this keeps the batch honest). ``parsed_by_id`` carries
     (sender, recipients, subject) for the messages fetched this delta
-    (the filter-coverage fields); a correction on a message NOT fetched
-    records filter_covered False (unattributable without the fields)."""
+    (the attribution fields); an 'added' on a message NOT fetched cannot
+    be checked against a relevant filter and is attributed 'unverifiable'
+    (withheld, not guessed) — see _attribution."""
     # the join: which labels are THIS message's Applications (a name set)
     applied_cache: dict[str, frozenset[str]] = {}
 
@@ -566,7 +586,7 @@ def detect_corrections(
                     label=name,
                     kind="removed",
                     detected_at=detected_at,
-                    filter_covered=False,
+                    attribution="human",
                 )
             )
         else:  # 'added'
@@ -579,16 +599,13 @@ def detect_corrections(
                 continue
             seen.add(key)
             fields = parsed_by_id.get(message_id)
-            covered = (
-                _filter_covered(ctx, label_id, *fields) if fields is not None else False
-            )
             rows.append(
                 CorrectionRow(
                     message_id=message_id,
                     label=name,
                     kind="added",
                     detected_at=detected_at,
-                    filter_covered=covered,
+                    attribution=_attribution(ctx, label_id, fields),
                 )
             )
     return rows

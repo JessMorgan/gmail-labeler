@@ -21,10 +21,14 @@ The math (design decision 4, v1 honest-and-simple):
   when the label has no Applications yet. The join gate makes
   ``removed <= written`` (a 'removed' Correction exists only for an
   applied (message, label), deduped), so precision never goes negative;
-- ``added`` / ``added_filter_covered`` = the positive-signal Corrections
-  and the invariant-#6 slice a Gmail filter would have applied anyway.
-  The filter-covered slice is EXCLUDED from ``human_added`` (the net
-  human signal) and DISCLOSED separately — status shows BOTH totals.
+- ``added`` / ``added_filter_covered`` / ``added_unverifiable`` = the
+  positive-signal Corrections and the two invariant-#6 WITHHELD slices: a
+  Gmail filter verifiably applied it (``filter_covered``), or authorship
+  cannot be determined (``unverifiable``). BOTH slices are EXCLUDED from
+  ``human_added`` (the net human signal) and DISCLOSED separately — status
+  shows the total and each withheld slice. An unverifiable add is WITHHELD,
+  not credited to the human (#22's exclusion principle: guessing either way
+  is what #22 forbids).
 
 Temporal honesty (design landmine): precision counts removals over ALL
 rows (v1); the CLI's basis line states the 'assumes unseen-but-removed
@@ -51,29 +55,32 @@ class LabelPrecision:
     precision: float | None  # None == 'no data' (written == 0)
     added: int
     added_filter_covered: int
+    added_unverifiable: int
 
     @property
     def human_added(self) -> int:
-        """The positive-signal Corrections NOT explained by a Gmail
-        filter (invariant #6: the filter-covered slice is excluded)."""
-        return self.added - self.added_filter_covered
+        """The positive-signal Corrections credited to the human — the
+        'added' total minus BOTH withheld slices (invariant #6: a
+        filter-covered add is not human signal, and an unverifiable one is
+        WITHHELD, not guessed either way — #22's exclusion principle)."""
+        return self.added - self.added_filter_covered - self.added_unverifiable
 
 
 def compute_precision(
     graduated: frozenset[str],
     written_by_label: Mapping[str, int],
-    correction_stats: Mapping[str, tuple[int, int, int]],
+    correction_stats: Mapping[str, tuple[int, int, int, int]],
 ) -> list[LabelPrecision]:
     """Per GRADUATED label (sorted — a total order for the report), the
     realized-precision line. ``correction_stats`` maps label ->
-    (removed, added, added_filter_covered) (the store's
+    (removed, added, added_filter_covered, added_unverifiable) (the store's
     ``correction_label_stats``). A graduated label with no Applications
     reports 'no data' (precision None); one with no Corrections reports
     precision 1.0 (everything applied is still standing)."""
     out: list[LabelPrecision] = []
     for label in sorted(graduated):
         written = written_by_label.get(label, 0)
-        removed, added, added_fc = correction_stats.get(label, (0, 0, 0))
+        removed, added, added_fc, added_uv = correction_stats.get(label, (0, 0, 0, 0))
         precision = (written - removed) / written if written > 0 else None
         out.append(
             LabelPrecision(
@@ -83,6 +90,7 @@ def compute_precision(
                 precision=precision,
                 added=added,
                 added_filter_covered=added_fc,
+                added_unverifiable=added_uv,
             )
         )
     return out

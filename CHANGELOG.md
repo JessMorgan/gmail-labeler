@@ -13,8 +13,9 @@ does not ship releases yet.
   "is it working?" with realized precision from the local store alone.
   - `appdb`: the schema-v4 `corrections` table — rows
     (message_id, label, kind ∈ {removed, added}, detected_at,
-    filter_covered) with the kind CHECK-vocabularyd like SOURCES, a
-    UNIQUE (message_id, label, kind) dedupe index and a (label,
+    attribution ∈ {human, filter_covered, unverifiable}) with the kind and
+    attribution both CHECK-vocabularyd like SOURCES, a UNIQUE
+    (message_id, label, kind) dedupe index and a (label,
     message_id) join index. The v3→v4 migration rides the #24/#25 atomic
     single-row-restamp machinery (both crash directions + the
     {3}-with-corrections tamper refusal, recovery named). `commit_page`
@@ -26,18 +27,25 @@ does not ship releases yet.
     keys), classify against the Applications
     join (read + local-DB only, never a Gmail write), the ignore-boundary
     (system/non-vocabulary labels, a removed non-applied label) records
-    NOTHING, a corrected message is never re-written, and an `added`
-    whose label a Gmail filter would have applied is flagged
-    `filter_covered` (invariant #6, the #22 mechanism reused). The 91-node
+    NOTHING, a corrected message is never re-written, and an `added` is
+    attributed (`human` / `filter_covered` / `unverifiable`) via the #22
+    mechanism reused: a simulatable filter that verifiably would have
+    applied it is `filter_covered`, and one whose criteria make authorship
+    undecidable is `unverifiable` — withheld, not credited to the human
+    (invariant #6, exclusion-not-guessing). The 91-node
     daemon suite rode the change verbatim.
   - `status.py` + the `status` command: per graduated label, realized
     precision = (written − removed)/written from the LOCAL DB only — no
     Gmail call, no auth gate (it answers offline); `--json`; the basis
-    line names the artifact hashes + the v1 caveats. Exit 0/2/4/5.
+    line names the artifact hashes + the v1 caveats and lists the
+    attribution vocabulary it counted under; each withheld slice
+    (`filter_covered`, `unverifiable`) is disclosed as its own count and
+    excluded from the human signal. Exit 0/2/4/5.
   - `corrections export`: the captured Corrections as future training
-    signal ({message_id, label, kind, filter_covered}, no bodies) through
+    signal ({message_id, label, kind, attribution}, no bodies) through
     `dataset_build.apply_corrections_to_records` — the builder's
-    composition seam (no fork). NO auto-retrain (the human gate holds;
+    composition seam (no fork), which folds only `human` adds. NO
+    auto-retrain (the human gate holds;
     grep-pinned: no call path from status/export to any train entry).
 - `apply --since [--apply]`: the only bulk path (ticket #26) — a
   human-gated preview/backfill of graduated labels over historical mail,

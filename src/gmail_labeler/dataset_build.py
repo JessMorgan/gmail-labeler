@@ -655,21 +655,27 @@ def apply_corrections_to_records(
     builder. A 'removed' Correction drops the label from the message's
     training labels (a human undid our application — a negative signal);
     an 'added' Correction adds it (a human did our job — a positive
-    signal). A filter-covered 'added' is EXCLUDED (invariant #6: a Gmail
-    filter authored it, not the human, so it is not trainable signal).
+    signal). Only an attribution=='human' 'added' is trainable signal:
+    'filter_covered' (a Gmail filter verifiably authored it) and
+    'unverifiable' (authorship cannot be determined) are BOTH EXCLUDED
+    (invariant #6 / #22's exclusion principle — we credit the human only
+    what we can PROVE the human authored; guessing either way is what
+    #22 forbids).
 
     Pure + deterministic (CODING-STANDARDS): a record with no correction
     passes through UNCHANGED (identity-preserving); corrected records get
     their labels re-sorted (the corpus_record label-path order). NO
     bodies are read or written (invariant #5) — a Correction carries only
-    (message_id, label, kind, filter_covered). This is a PRE-PROCESSING
+    (message_id, label, kind, attribution). This is a PRE-PROCESSING
     composition a HUMAN-GATED retrain opts into; nothing here retrains."""
     adds: dict[str, set[str]] = {}
     removes: dict[str, set[str]] = {}
     for c in corrections:
         if c.kind == "added":
-            if c.filter_covered:
-                continue  # invariant #6: filter-authored, not human signal
+            if c.attribution != "human":
+                # invariant #6: filter-authored (proven) or authorship
+                # unknown (withheld) — neither is human training signal
+                continue
             adds.setdefault(c.message_id, set()).add(c.label)
         elif c.kind == "removed":
             removes.setdefault(c.message_id, set()).add(c.label)

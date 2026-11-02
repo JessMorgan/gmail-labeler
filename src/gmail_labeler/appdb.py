@@ -69,6 +69,7 @@ from typing import Any, NoReturn
 from .applications import ApplicationRow
 
 __all__ = [
+    "CORRECTION_ATTRIBUTIONS",
     "CORRECTION_KINDS",
     "SCHEMA_VERSION",
     "AppDB",
@@ -114,7 +115,7 @@ _APPLICATIONS_COLUMNS = frozenset(
 )
 _DAEMON_STATE_COLUMNS = frozenset({"history_cursor"})
 _CORRECTIONS_COLUMNS = frozenset(
-    {"message_id", "label", "kind", "detected_at", "filter_covered"}
+    {"message_id", "label", "kind", "detected_at", "attribution"}
 )
 _SCHEMA_VERSION_COLUMNS = frozenset({"version"})
 
@@ -130,6 +131,25 @@ _SOURCES = ("daemon", "apply")
 # traceback. 'removed' = a human undid an applied label; 'added' = a
 # human applied a managed-vocabulary label we did not write.
 CORRECTION_KINDS = ("removed", "added")
+
+# The Correction ATTRIBUTION literals (ticket #27 F1; invariant #6) — the
+# CHECK vocabulary for WHO an 'added' Correction is credited to, following
+# the SOURCES/CORRECTION_KINDS pattern. This replaces the old bool
+# filter_covered, which INVERTED #22's 'exclusion, not guessing' doctrine
+# (an unverifiable filter defaulted the add to the human). Three states:
+#   'human'          — no relevant filter, or a relevant filter verifiably
+#                      does NOT match this message: the human added it
+#                      (positive training signal);
+#   'filter_covered' — a SIMULATABLE filter verifiably WOULD have added it:
+#                      withheld from human credit + the export seam;
+#   'unverifiable'   — a relevant filter's criteria are outside the
+#                      simulatable set (or the message's fields were
+#                      unavailable), so authorship CANNOT be determined:
+#                      WITHHELD, not guessed either way (#22's exclusion
+#                      principle). A 'removed' Correction is always
+#                      'human' (a human removing is human signal regardless
+#                      of filters — invariant #6).
+CORRECTION_ATTRIBUTIONS = ("human", "filter_covered", "unverifiable")
 
 
 class AppDBError(Exception):
@@ -168,22 +188,25 @@ class CorrectionRow:
     join as training signal for the next HUMAN-GATED retrain. NO bodies
     (invariant #5): the message id, the Managed Label NAME, the kind
     (``"removed"`` / ``"added"`` — the CORRECTION_KINDS vocabulary),
-    the UTC detected-at stamp, and the ``filter_covered`` flag.
+    the UTC detected-at stamp, and the ``attribution``.
 
-    ``filter_covered`` (invariant #6): an 'added' Correction whose label
-    a Gmail filter would have applied anyway is recorded RAW with this
-    flag set (the #22 attribution mechanism decides it at detection);
-    ``status`` EXCLUDES the flagged slice from the default realized-
-    precision math and discloses the count. 'removed' Corrections are
-    NEVER filter-excluded (a human removing is human signal regardless
-    of filters), so a 'removed' row always carries ``filter_covered``
-    False."""
+    ``attribution`` (invariant #6; the CORRECTION_ATTRIBUTIONS vocabulary,
+    decided at detection by the #22 mechanism): WHO an 'added' Correction
+    is credited to — ``"human"`` (no relevant filter, or a verifiable one
+    that does not match: positive training signal), ``"filter_covered"``
+    (a simulatable filter verifiably would have added it: withheld), or
+    ``"unverifiable"`` (authorship cannot be determined: WITHHELD, not
+    guessed — #22's exclusion principle). Only ``"human"`` adds are
+    training signal and enter the export; ``status`` discloses the
+    filter-covered and unverifiable slices as their own withheld counts. A
+    'removed' Correction is ALWAYS ``"human"`` (a human removing is human
+    signal regardless of filters — invariant #6)."""
 
     message_id: str
     label: str
     kind: str
     detected_at: datetime
-    filter_covered: bool = False
+    attribution: str = "human"
 
 
 # The schema as INDIVIDUAL statements: _apply_schema runs them inside ONE
@@ -249,9 +272,12 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     -- per human hand-fix of an applied message, captured against the
     -- Applications join. kind is the CHECK-vocabularyd authority
     -- ('removed' / 'added' — the CORRECTION_KINDS set, mirrored in the
-    -- Python validation for named refusals). filter_covered is the
-    -- invariant-#6 flag (an 'added' Correction a Gmail filter would
-    -- have applied anyway; 'removed' never carries it). The UNIQUE index
+    -- Python validation for named refusals). attribution is the
+    -- invariant-#6 CHECK vocabulary ('human' / 'filter_covered' /
+    -- 'unverifiable' — the CORRECTION_ATTRIBUTIONS set): WHO an 'added'
+    -- Correction is credited to; only 'human' is training signal, an
+    -- unverifiable authorship is WITHHELD not guessed (#22's exclusion
+    -- principle); a 'removed' is always 'human'. The UNIQUE index
     -- below is the store-level dedupe on (message_id, label, kind):
     -- history-event REPLAY re-detects the same correction, and the
     -- writer's INSERT OR IGNORE makes the replay idempotent (unlike the
@@ -263,7 +289,8 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         label TEXT NOT NULL,
         kind TEXT NOT NULL CHECK (kind IN ('removed', 'added')),
         detected_at TEXT NOT NULL,
-        filter_covered INTEGER NOT NULL DEFAULT 0 CHECK (filter_covered IN (0, 1))
+        attribution TEXT NOT NULL DEFAULT 'human'
+            CHECK (attribution IN ('human', 'filter_covered', 'unverifiable'))
     )
     """,
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_dedup "
@@ -1205,7 +1232,7 @@ class AppDB:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT message_id, label, kind, detected_at, filter_covered "
+                "SELECT message_id, label, kind, detected_at, attribution "
                 "FROM corrections WHERE label = ? "
                 "ORDER BY detected_at, message_id",
                 (label,),
@@ -1221,7 +1248,7 @@ class AppDB:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT message_id, label, kind, detected_at, filter_covered "
+                "SELECT message_id, label, kind, detected_at, attribution "
                 "FROM corrections WHERE message_id = ? "
                 "ORDER BY detected_at, label",
                 (message_id,),
@@ -1238,7 +1265,7 @@ class AppDB:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT message_id, label, kind, detected_at, filter_covered "
+                "SELECT message_id, label, kind, detected_at, attribution "
                 "FROM corrections "
                 "ORDER BY detected_at, message_id, label"
             ).fetchall()
@@ -1263,23 +1290,25 @@ class AppDB:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         return {label: count for label, count in rows}
 
-    def correction_label_stats(self) -> dict[str, tuple[int, int, int]]:
-        """Per label the (removed, added, added_filter_covered) Correction
-        counts, from the LOCAL DB only. ``added_filter_covered`` is the
-        invariant-#6 slice EXCLUDED from the default math and disclosed.
-        A label with no Corrections is absent. 'removed' is NEVER
-        filter-covered (invariant #6), so it is not sliced."""
+    def correction_label_stats(self) -> dict[str, tuple[int, int, int, int]]:
+        """Per label the (removed, added, added_filter_covered,
+        added_unverifiable) Correction counts, from the LOCAL DB only. The
+        two invariant-#6 slices (``added_filter_covered``,
+        ``added_unverifiable``) are EXCLUDED from the human signal and
+        disclosed separately by status. A label with no Corrections is
+        absent. 'removed' is always attributed 'human' (invariant #6), so
+        it is not sliced by attribution."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT label, kind, filter_covered, COUNT(*) FROM corrections "
-                "GROUP BY label, kind, filter_covered"
+                "SELECT label, kind, attribution, COUNT(*) FROM corrections "
+                "GROUP BY label, kind, attribution"
             ).fetchall()
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         stats: dict[str, list[int]] = {}
-        for label, kind, covered, count in rows:
+        for label, kind, attribution, count in rows:
             if kind not in CORRECTION_KINDS:
                 # the tamper doctrine: the per-row readers revalidate; the
                 # aggregate reader must not SILENTLY drop a hand-edited
@@ -1288,20 +1317,31 @@ class AppDB:
                     f"state DB corrupt (correction kind {kind!r} not in "
                     f"{CORRECTION_KINDS}): {self.path}"
                 )
-            bucket = stats.setdefault(label, [0, 0, 0])  # [removed, added, added_fc]
+            if attribution not in CORRECTION_ATTRIBUTIONS:
+                raise AppDBError(
+                    f"state DB corrupt (correction attribution {attribution!r} "
+                    f"not in {CORRECTION_ATTRIBUTIONS}): {self.path}"
+                )
+            # [removed, added, added_filter_covered, added_unverifiable]
+            bucket = stats.setdefault(label, [0, 0, 0, 0])
             if kind == "removed":
                 bucket[0] += count
-            elif kind == "added":
+            else:  # 'added'
                 bucket[1] += count
-                if covered:
+                if attribution == "filter_covered":
                     bucket[2] += count
-        return {label: (r, a, fc) for label, (r, a, fc) in stats.items()}
+                elif attribution == "unverifiable":
+                    bucket[3] += count
+        return {
+            label: (removed, added, fc, uv)
+            for label, (removed, added, fc, uv) in stats.items()
+        }
 
     def _correction_rows(self, rows: list[Any]) -> tuple[CorrectionRow, ...]:
         # the shared read-back path (the fetchall rows are the DB
         # boundary): parse the detected_at stamp (a non-ISO value is
-        # corrupt, named — the load_run doctrine), the filter_covered
-        # int→bool, and re-validate every row (a tampered kind is
+        # corrupt, named — the load_run doctrine), the attribution
+        # TEXT, and re-validate every row (a tampered kind/attribution is
         # refused, named, not rendered)
         out: list[CorrectionRow] = []
         for r in rows:
@@ -1317,7 +1357,7 @@ class AppDB:
                 label=r[1],
                 kind=r[2],
                 detected_at=detected_at,
-                filter_covered=bool(r[4]),
+                attribution=str(r[4]),
             )
             try:
                 _check_correction_row(row)
@@ -1436,7 +1476,7 @@ def _insert_corrections(
     # #27 three-way-atomicity replay pin)
     conn.executemany(
         "INSERT OR IGNORE INTO corrections "
-        "(message_id, label, kind, detected_at, filter_covered) "
+        "(message_id, label, kind, detected_at, attribution) "
         "VALUES (?, ?, ?, ?, ?)",
         [
             (
@@ -1444,7 +1484,7 @@ def _insert_corrections(
                 row.label,
                 row.kind,
                 row.detected_at.astimezone(UTC).isoformat(),
-                1 if row.filter_covered else 0,
+                row.attribution,
             )
             for row in rows
         ],
@@ -1456,9 +1496,10 @@ def _check_correction_row(row: CorrectionRow) -> None:
     # BEFORE the transaction): the id shape, the label, the kind
     # vocabulary (the CHECK constraint's authority, mirrored so the
     # refusal is named here not a raw sqlite3 traceback), the aware
-    # detected_at (the split_date doctrine), and the invariant-#6 rule
-    # that a 'removed' Correction is NEVER filter-excluded (filter_covered
-    # only ever rides an 'added' row)
+    # detected_at (the split_date doctrine), the attribution vocabulary
+    # (the CHECK's authority, mirrored for named refusals), and the
+    # invariant-#6 rule that a 'removed' Correction is ALWAYS 'human'
+    # (a human removing is human signal regardless of filters)
     if not _ID_RE.fullmatch(row.message_id):
         raise AppDBError(
             f"correction row message_id {row.message_id!r} must be 1-64 hex chars"
@@ -1472,16 +1513,17 @@ def _check_correction_row(row: CorrectionRow) -> None:
             f"correction row for {row.message_id} / {row.label}: kind "
             f"{row.kind!r} must be one of {CORRECTION_KINDS}"
         )
-    if not isinstance(row.filter_covered, bool):
+    if row.attribution not in CORRECTION_ATTRIBUTIONS:
         raise AppDBError(
-            f"correction row for {row.message_id} / {row.label}: "
-            f"filter_covered must be a bool, got {row.filter_covered!r}"
+            f"correction row for {row.message_id} / {row.label}: attribution "
+            f"{row.attribution!r} must be one of {CORRECTION_ATTRIBUTIONS}"
         )
-    if row.kind == "removed" and row.filter_covered:
+    if row.kind == "removed" and row.attribution != "human":
         raise AppDBError(
             f"correction row for {row.message_id} / {row.label}: a 'removed' "
-            "Correction is never filter-covered (a human removing is human "
-            "signal regardless of filters — invariant #6)"
+            "Correction is always attributed 'human' (a human removing is "
+            "human signal regardless of filters — invariant #6); "
+            f"got {row.attribution!r}"
         )
     if not isinstance(row.detected_at, datetime):
         raise AppDBError(

@@ -949,10 +949,10 @@ def test_history_permanent_non_404_holds_cursor(
 def test_prediction_unsized_row_holds(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F2 MINOR 1: a flat vector served as the WHOLE batch (len == the
-    # text count, but the rows are floats) made len(row) raise TypeError
-    # OUTSIDE the caught tuple — exit 1 (executed in review). Every
-    # shape defect lands in the _PredictionShapeError territory: hold.
+    # F2 MINOR 1 (wording-synced at F4: the guard is now POSITIVE
+    # Protocol conformance): a flat vector served as the WHOLE batch
+    # made len(row) raise TypeError outside the caught tuple — exit 1
+    # (executed in review). A float row is now refused by class name.
     caplog.set_level(logging.WARNING)
 
     class _FlatModel(FakeModel):
@@ -970,7 +970,7 @@ def test_prediction_unsized_row_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_FlatModel(VOCAB, scores={})) == 0
     assert db.get_history_cursor() == 777  # held, loop alive
-    assert "does not align" in caplog.text
+    assert "not a tuple" in caplog.text
     db.close()
 
 
@@ -1005,7 +1005,7 @@ def test_prediction_str_vocabulary_starvation_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_StrVocabModel()) == 0
     assert db.get_history_cursor() == 777  # HOLDS (was: advanced every tick)
-    assert "str/bytes" in caplog.text
+    assert "not a tuple[str, ...]" in caplog.text
     db.close()
 
 
@@ -1041,7 +1041,8 @@ def test_prediction_bytes_row_holds(
 ) -> None:
     # F3 closeout (reviewer probe): b'\x00\x01' materializes to (0, 1)
     # INTS and passed the numeric gate — worse than starvation, a
-    # garbage 1.0 score could WRITE a label. Named row-type refusal.
+    # garbage 1.0 score could WRITE a label. F4: refused by class name
+    # under positive conformance (the denylist entry this replaces).
     caplog.set_level(logging.WARNING)
 
     class _BytesRows:
@@ -1061,7 +1062,182 @@ def test_prediction_bytes_row_holds(
     assert _run(tmp_path, fake, db=db, model=_BytesRows()) == 0
     assert db.get_history_cursor() == 777  # held: no garbage write
     assert fake.writes == []
-    assert "not a numeric sequence" in caplog.text
+    assert "not a tuple" in caplog.text
+    db.close()
+
+
+def test_prediction_memoryview_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 MAJOR (qwen, executed at ef208b7): memoryview(b'\x00\x01')
+    # MATERIALIZES TO (0, 1) INTS, passed the whole denylist, WROTE a
+    # garbage label and advanced the cursor: cursor=900 writes=1.
+    # Positive conformance refuses it by class name.
+    caplog.set_level(logging.WARNING)
+
+    class _MV:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(memoryview(b"\x00\x01") for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_MV()) == 0
+    assert db.get_history_cursor() == 777  # held: the garbage write dies here
+    assert fake.writes == []
+    assert "not a tuple" in caplog.text
+    db.close()
+
+
+def test_prediction_array_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 MAJOR (qwen, executed): array('B', [0, 1]) — same int-
+    # materializing class, same garbage-write outcome at ef208b7
+    caplog.set_level(logging.WARNING)
+    from array import array
+
+    class _Arr:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(array("B", [0, 1]) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_Arr()) == 0
+    assert db.get_history_cursor() == 777
+    assert fake.writes == []
+    assert "not a tuple" in caplog.text
+    db.close()
+
+
+def test_prediction_dict_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 MAJOR (qwen, executed): a dict row materializes to its KEYS
+    # — {0: 0.0, 1: 1.0} became the (0, 1) garbage score at ef208b7
+    caplog.set_level(logging.WARNING)
+
+    class _DictRow:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple({0: 0.0, 1: 1.0} for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_DictRow()) == 0
+    assert db.get_history_cursor() == 777
+    assert fake.writes == []
+    assert "not a tuple" in caplog.text
+    db.close()
+
+
+def test_prediction_range_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 MAJOR (qwen, executed): range(2) — the fourth int-materializer
+    caplog.set_level(logging.WARNING)
+
+    class _RangeRow:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(range(2) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_RangeRow()) == 0
+    assert db.get_history_cursor() == 777
+    assert fake.writes == []
+    assert "not a tuple" in caplog.text
+    db.close()
+
+
+def test_prediction_int_vocabulary_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 MAJOR (ds P6, executed): an INT vocabulary — label ids where
+    # Label Paths belong — is the MIS-WIRED CHECKPOINT case that
+    # verify_sidecar CANNOT catch (it hashes the sidecar against the
+    # expected vocabulary, model.py). At ef208b7 it sailed into the
+    # per-message fail-safe: cursor=900 writes=0 forever — the exact
+    # starvation fea1ba7 declared closed. Positive conformance: only
+    # tuple[str, ...] is a vocabulary.
+    caplog.set_level(logging.WARNING)
+
+    class _IntVocab:
+        vocabulary = (1, 2)
+
+        def predict(self, texts):
+            return tuple((0.9, 0.1) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_IntVocab()) == 0
+    assert db.get_history_cursor() == 777  # HOLDS (was: advanced forever)
+    assert fake.writes == []
+    assert "not a tuple[str, ...]" in caplog.text
+    db.close()
+
+
+def test_prediction_memoryview_vocabulary_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F4 (ds): memoryview vocabulary — tuple() of it yields INTS
+    # (97, 98), the same fail-safe starvation path as the int vocab
+    caplog.set_level(logging.WARNING)
+
+    class _MVVocab:
+        vocabulary = memoryview(b"ab")
+
+        def predict(self, texts):
+            return tuple((0.9, 0.1) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_MVVocab()) == 0
+    assert db.get_history_cursor() == 777
+    assert fake.writes == []
+    assert "not a tuple[str, ...]" in caplog.text
     db.close()
 
 
@@ -1167,10 +1343,11 @@ def test_prediction_missing_vocabulary_holds(
 def test_prediction_lying_len_row_holds(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F3 MINOR 1 (ds executed): a Sized+Iterable row whose __len__ LIES
-    # passed the isinstance+width checks and raised TypeError from the
-    # compose zip OUTSIDE the guard — exit 1. Materialized inside the
-    # arm, the honest length mismatches and the delta HOLDS.
+    # F3 MINOR 1 (ds executed), F4 wording-sync: a row whose __len__
+    # LIES once reached the compose zip outside the guard; under
+    # positive conformance a non-tuple row is refused by class name,
+    # and a tuple SUBCLASS with a lying __len__ dies on the
+    # materialized width check (iteration is the authority)
     caplog.set_level(logging.WARNING)
 
     class _LyingLen:
@@ -1198,15 +1375,17 @@ def test_prediction_lying_len_row_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_LyingLenModel()) == 0
     assert db.get_history_cursor() == 777
-    assert "does not align" in caplog.text
+    assert "not a tuple" in caplog.text
     db.close()
 
 
 def test_prediction_raising_iter_row_holds(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F3 MINOR 1 sibling: __iter__ that RAISES — materialization inside
-    # the guarded arm converts it to the named shape defect
+    # F3 MINOR 1 sibling, F4 wording-sync: a non-tuple row whose
+    # __iter__ RAISES is now refused by class name BEFORE iteration;
+    # the residual face (a tuple SUBCLASS whose __iter__ raises outside
+    # the caught set) is named in the daemon comment
     caplog.set_level(logging.WARNING)
 
     class _RaisingIter:
@@ -1233,7 +1412,7 @@ def test_prediction_raising_iter_row_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_RaisingModel()) == 0
     assert db.get_history_cursor() == 777
-    assert "does not align" in caplog.text
+    assert "not a tuple" in caplog.text
     db.close()
 
 
@@ -1286,16 +1465,16 @@ def test_prediction_non_iterable_vocabulary_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_BadVocab()) == 0
     assert db.get_history_cursor() == 777
-    assert "not iterable" in caplog.text
+    assert "not a tuple[str, ...]" in caplog.text
     db.close()
 
 
 def test_prediction_sized_but_uniterable_row_holds(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F2 review NIT (round 2): a row with __len__ but no __iter__ passes
-    # the Sized+width checks and raises TypeError from the compose zip
-    # — the Iterable term closes it into the shape arm
+    # F2 review NIT (round 2), F4 wording-sync: a row with __len__ but
+    # no __iter__ once escaped at the compose zip; under positive
+    # conformance it is refused by class name before iteration
     caplog.set_level(logging.WARNING)
 
     class _LenOnly:
@@ -1317,7 +1496,7 @@ def test_prediction_sized_but_uniterable_row_holds(
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db, model=_OddRows(VOCAB, scores={})) == 0
     assert db.get_history_cursor() == 777  # held, loop alive
-    assert "does not align" in caplog.text
+    assert "not a tuple" in caplog.text
     db.close()
 
 

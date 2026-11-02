@@ -207,15 +207,18 @@ overridden per-command by the `--db` flag) holding the `shadow_results`
 table (run id, message id, label, probability, band, run timestamp), the
 `applications` table (ticket #24, schema v2: message id, label, label
 id, score, band, tier, applied-at, source — the join corrections and
-`status` read), and the `daemon_state` table (ticket #25, schema v3: the
-single-row History Cursor). It carries ids, probabilities, labels,
-timestamps, and the cursor ONLY — never bodies (invariant #5) — so it is
-publicly attachable. One transaction per write (a crash leaves no half
-rows), and every schema transition is one transaction too — fresh
-create+stamp, the live v1 DB's v1→v2 and the v2 DB's v2→v3 single-row
-restamps, self-heals — so a crash leaves the file fully prior-state or
-fully new-state, never the intermediate; a foreign schema_version is
-refused.
+`status` read), the `daemon_state` table (ticket #25, schema v3: the
+single-row History Cursor), and the `corrections` table (ticket #27,
+schema v4: message id, label, kind, detected-at, attribution — the human
+hand-fixes that `status` and the fold seam read, UNIQUE on
+(message_id, label, kind) so a replayed label event is idempotent). It
+carries ids, probabilities, labels, timestamps, and the cursor ONLY —
+never bodies (invariant #5) — so it is publicly attachable. One
+transaction per write (a crash leaves no half rows), and every schema
+transition is one transaction too — fresh create+stamp, the live v1 DB's
+v1→v2, the v2 DB's v2→v3, and the v3 DB's v3→v4 single-row restamps,
+self-heals — so a crash leaves the file fully prior-state or fully
+new-state, never the intermediate; a foreign schema_version is refused.
 _Avoid_: shadow DB, label DB
 
 **History Cursor**:

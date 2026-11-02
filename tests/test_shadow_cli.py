@@ -866,6 +866,42 @@ def test_shadow_run_bodies_absent_everywhere(
     assert marker not in caplog.text
 
 
+def test_shadow_run_prediction_failure_names_class_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # S1 C4 (invariant #5): the shadow prediction-failure arm predates the
+    # daemon/apply class-only doctrine — it used to echo the model's exception
+    # MESSAGE, and FakeModel's unprogrammed-text refusal QUOTES the scored
+    # TEXT (which carries the body). The arm now names the CLASS only. The
+    # non-vacuity assert proves the failure arm actually ran this run.
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    marker = "PROBE-BODY-LEAK-MARKER"
+    _prepare(tmp_path, monkeypatch)
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aa11",
+                eml=_eml("backlog one", f"{marker} body one"),
+                label_ids=("INBOX", "L1"),
+                thread_id="t1",
+            )
+        ],
+        labels=_shadow_labels(),
+    )
+    # NO score programmed -> predict raises, its message quoting the text
+    # (and the marker). The arm must swallow the message, name the class.
+    result, _ = _run_shadow(tmp_path, monkeypatch=monkeypatch, fake=fake, scores={})
+    assert result.exit_code == 5
+    assert "prediction/processing failed" in result.stderr  # arm executed
+    assert marker not in result.stderr
+    assert marker not in result.stdout
+    assert marker not in caplog.text
+
+
 def test_shadow_run_json_single_object(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

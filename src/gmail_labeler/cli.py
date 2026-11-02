@@ -1985,14 +1985,18 @@ def eval(
             err=True,
         )
 
+    from .daemon import _PredictionShapeError
+
     try:
         rows = model.predict(texts)
         if len(rows) != len(test_examples):
             # a named operator message, not raw zip internals: a wrong
-            # row count is a checkpoint/recipe defect
-            raise ValueError(
+            # row count is a checkpoint/recipe defect (self-authored,
+            # counts-only — safe to log verbatim, unlike a model-raised
+            # error which may quote the scored TEXT)
+            raise _PredictionShapeError(
                 f"the model returned {len(rows)} score rows for "
-                f"{len(test_examples)} texts \u2014 checkpoint/recipe defect"
+                f"{len(test_examples)} texts — checkpoint/recipe defect"
             )
         # alignment by EXAMPLE ID (not position): the Protocol's row i
         # ↔ texts[i] is re-keyed onto the example ids before the core
@@ -2003,8 +2007,18 @@ def eval(
             example.id: row for example, row in zip(test_examples, rows, strict=True)
         }
         table = eval_metrics(test_examples, scores, vocabulary=manifest.vocabulary)
+    except _PredictionShapeError as e:
+        # self-authored, counts-only (ids/counts, never a body): named verbatim
+        typer.echo(f"eval failed: prediction/processing failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (ValueError, OSError, RuntimeError) as e:
-        typer.echo(f"eval failed: prediction failed: {e}", err=True)
+        # the model's OWN failure may quote the scored TEXT (which carries the
+        # body) — named by CLASS only (invariant #5; the daemon/apply doctrine
+        # this #20-era arm predated)
+        typer.echo(
+            f"eval failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     trust = (
@@ -2999,15 +3013,29 @@ def shadow_run(
 
     # the batched predict (the #20 batching seam: ONE call over all
     # texts — the model materializes the iterable once)
+    from .daemon import _PredictionShapeError
+
     try:
         rows = model.predict(texts)
         if len(rows) != len(fetched):
-            raise ValueError(
+            # self-authored, counts-only (safe to log verbatim, unlike a
+            # model-raised error which may quote the scored TEXT)
+            raise _PredictionShapeError(
                 f"the model returned {len(rows)} score rows for "
-                f"{len(fetched)} texts \u2014 checkpoint/recipe defect"
+                f"{len(fetched)} texts — checkpoint/recipe defect"
             )
+    except _PredictionShapeError as e:
+        # self-authored, counts-only (ids/counts, never a body): named verbatim
+        typer.echo(f"shadow run failed: prediction/processing failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (ValueError, OSError, RuntimeError) as e:
-        typer.echo(f"shadow run failed: prediction failed: {e}", err=True)
+        # the model's OWN failure may quote the scored TEXT (which carries the
+        # body) — named by CLASS only (invariant #5; the daemon/apply doctrine
+        # this #23-era arm predated)
+        typer.echo(
+            f"shadow run failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     # the would-apply verdicts (the single decision core — tiers.py):

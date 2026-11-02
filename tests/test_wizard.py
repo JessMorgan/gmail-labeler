@@ -266,6 +266,24 @@ def test_malformed_client_json_is_named_and_retried() -> None:
     )
 
 
+def test_malformed_names_both_remedies_permissions_and_redownload() -> None:
+    # B8: EACCES is mapped to MALFORMED by the probe; the guidance must NOT say
+    # only "re-download" (wrong remedy for a permissions problem). Name both.
+    probe = FakeProbe(
+        client_states=[ClientFileState.MALFORMED, ClientFileState.DESKTOP_OK]
+    )
+    stdin = FakeStdin(
+        answers={
+            "project-id": [PROJECT_ID],
+            "client-json": [CLIENT_PATH, CLIENT_PATH],
+        }
+    )
+    _result, rec, _actions, _ = _run(probe=probe, stdin=stdin)
+    low = rec.all_text.lower()
+    assert "permission" in low  # the EACCES remedy
+    assert "re-download" in low  # the genuinely-corrupt-file remedy
+
+
 def test_project_id_malformed_retries_without_echoing_the_value() -> None:
     probe = FakeProbe(project_ok=False)
     stdin = FakeStdin(
@@ -485,13 +503,25 @@ def test_completed_wizard_reports_not_signed_in_when_status_says_so() -> None:
 
 
 # --- secret discipline: sentinels absent from ALL output + detail ------------
-def test_no_secret_sentinels_in_any_wizard_output() -> None:
+def test_no_secret_sentinels_in_any_wizard_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # the invariant-#8 tripwire: client id/secret + the typed project id must
-    # be absent from every out line and the result detail, on the HAPPY path
+    # be absent from every out line AND the result detail, on the HAPPY path
     result, rec, _actions, _ = _run()
     for sentinel in (CLIENT_ID, CLIENT_SECRET, PROJECT_ID):
         assert sentinel not in rec.all_text, f"{sentinel} leaked to output"
         assert sentinel not in result.detail, f"{sentinel} leaked to detail"
+    # B9: the "and logs" half of the invariant — the wizard emits NO log records
+    # today, so this is honest-but-guarding: if anyone adds logging on the auth
+    # path, a sentinel reaching a LogRecord reddens this (the surface is covered,
+    # not assumed clean).
+    with caplog.at_level("DEBUG"):
+        _run()
+    for record in caplog.records:
+        msg = record.getMessage()
+        for sentinel in (CLIENT_ID, CLIENT_SECRET, PROJECT_ID):
+            assert sentinel not in msg, f"{sentinel} leaked to a log record"
 
 
 def test_no_secret_sentinels_on_the_retry_and_failure_paths() -> None:
@@ -573,11 +603,13 @@ def test_result_is_a_frozen_value_object() -> None:
 
 # --- the machine is PURE: pinned at the SOURCE/AST level --------------------
 def test_wizard_module_has_no_io_imports_or_calls() -> None:
-    # The old "poison the flow module" test could never fail — the pure path
-    # imports none of those, so poisoning them is inert (review NIT). Purity is
-    # real only if adding I/O to wizard.py REDDENS a pin. Parse the module's
-    # AST: no I/O imports, no open() call. Docstring prose about typer does not
-    # create Import/Call nodes, so this stays honest and fail-able.
+    # Purity, pinned precisely: the machine performs NO filesystem, network, or
+    # keyring I/O and never imports typer / the OAuth flow. (It DOES read $HOME
+    # via Path.expanduser — an environment lookup, not a file read — so the
+    # claim is scoped to real I/O, not "touches nothing".) The old "poison the
+    # flow module" test could never fail; this AST pin reddens if I/O is added.
+    # Docstring prose about typer creates no Import/Call nodes, so it stays
+    # honest and fail-able.
     import ast
 
     import gmail_labeler.wizard as wmod

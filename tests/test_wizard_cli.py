@@ -418,6 +418,48 @@ def test_auth_explicit_invalid_config_exits_4(tmp_path: Path) -> None:
     assert "no config.toml found" not in out
 
 
+def test_setup_decline_via_real_n_input_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B10: the decline path exercised through the REAL typer.confirm (an 'n' on
+    # stdin), not a monkeypatched _typer_confirm — and it must change NOTHING.
+    monkeypatch.setattr(
+        cli._RealEnvironmentProbe, "keyring_available", lambda self: False
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = tmp_path / "config.toml"
+    original = "# user's hand-written config — must survive\n"
+    config.write_text(original, encoding="utf-8")
+    client = _client_json(tmp_path)
+    # project-id, client-json, then 'n' at the overwrite confirm
+    result = runner.invoke(
+        app,
+        ["auth", "setup", "--config", str(config)],
+        input=f"{PROJECT_ID}\n{client}\nn\n",
+    )
+    assert result.exit_code == 5
+    assert config.read_text(encoding="utf-8") == original  # byte-identical
+
+
+def test_bare_auth_no_config_hint_names_paths_and_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B7: the fresh-profile (no config anywhere) bare `auth` keeps exit 4 AND the
+    # informative hint that the C2 rewrite dropped — looked-in paths + copy
+    # example.toml + the `auth setup` route.
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HOME", str(empty_home))
+    monkeypatch.chdir(tmp_path)  # no ./config.toml here either
+    monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+    result = runner.invoke(app, ["auth"])
+    assert result.exit_code == 4
+    out = result.output + result.stderr
+    assert "~/.config/gmail-labeler/" in out  # names where it looked
+    assert "example.toml" in out  # the copy hint
+    assert "auth setup" in out  # the wizard route
+
+
 # --- the real probe's local checks (adapter side) ---------------------------
 def test_real_probe_desktop_ok(tmp_path: Path) -> None:
     client = _client_json(tmp_path)

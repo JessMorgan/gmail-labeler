@@ -88,7 +88,13 @@ snapshot is UNKNOWN attribution, not "no filters": every 'added' is then
 ``"unverifiable"`` (withheld), and the daemon warns at startup. Only
 ``"human"`` adds are training signal. A 'removed' Correction is always
 attributed ``"human"`` (a human removing is human signal regardless of
-filters — invariant #6).
+filters — invariant #6). A fourth UNVERIFIABLE trigger (S1 C2): when the
+delta carries a ``labelsAdded`` for a label this tick's plan SKIPPED as
+already-present yet no Application row exists for it, the add is the
+crash-replay ambiguity — our own landed write whose row was lost before the
+commit, indistinguishable from a human who added exactly what we would have —
+so it is routed straight to ``"unverifiable"`` (withheld), never credited to
+the human (which would poison human_added and the training fold).
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
 write for the corrected message). The correction rows ride the SAME
@@ -119,6 +125,7 @@ from .gmail_errors import GmailAuthError, GmailError, GmailPermanentError, is_40
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 from .model import Model
+from .tiers import would_apply
 
 __all__ = [
     "BOOTSTRAP_QUERY",
@@ -620,6 +627,42 @@ def _attribution(
     return "unverifiable" if saw_unverifiable else "human"
 
 
+def _skip_present_pairs(
+    ctx: ServingContext,
+    fetched: list[tuple[str, frozenset[str], str]],
+    vocab: tuple[str, ...],
+    rows: list[tuple[float, ...]],
+) -> frozenset[tuple[str, str]]:
+    """The (message_id, label_name) pairs this tick would have APPLIED but
+    found already PRESENT — a band verdict AND present (skip-present,
+    invariant #2). S1 C2 feeds these to detect_corrections: a labelsAdded
+    event for such a pair with no Application row is the crash-replay
+    ambiguity (our own lost write vs a human who added the same label).
+
+    Reuses ``tiers.would_apply`` (the SAME decision core the plan composes
+    through — never re-derived). A message whose would_apply raises is a
+    lying input the plan loop already routes to a per-message warning; here
+    it contributes NO pair (we cannot claim a skip-present we could not
+    compute), so attribution falls through to the ordinary path."""
+    pairs: set[tuple[str, str]] = set()
+    for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
+        scores = dict(zip(vocab, score_row, strict=True))
+        try:
+            decisions = would_apply(
+                scores=scores,
+                bands=ctx.bands,
+                graduated=ctx.graduated,
+                present=present,
+                system_labels=ctx.system_labels,
+            )
+        except ValueError:
+            continue  # the plan loop warns it; no pair claimed
+        for d in decisions:
+            if d.band is not None and d.present:
+                pairs.add((message_id, d.label))
+    return frozenset(pairs)
+
+
 def detect_corrections(
     records: tuple[dict[str, object], ...],
     *,
@@ -627,6 +670,7 @@ def detect_corrections(
     db: AppDB,
     parsed_by_id: Mapping[str, tuple[str, tuple[str, ...], str]],
     detected_at: datetime,
+    skip_present: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[CorrectionRow]:
     """Classify one page's label-change events into Corrections
     (ticket #27; GLOSSARY: Correction; the module docstring's CORRECTION
@@ -686,13 +730,27 @@ def detect_corrections(
                 continue
             seen.add(key)
             fields = parsed_by_id.get(message_id)
+            if (message_id, name) in skip_present:
+                # S1 C2 (crash-replay window): this tick's plan path SKIPPED
+                # this add as already-present, yet the delta carries a
+                # labelsAdded for it and there is NO Application row. That is
+                # AMBIGUOUS — either the daemon's own landed write whose row
+                # was lost before the commit (a replay), or a human who added
+                # exactly what we would have added. We cannot tell, so it is
+                # WITHHELD as 'unverifiable' (invariant #6, withheld-not-guessed
+                # — the #27 three-way vocabulary makes this a one-line route),
+                # never credited to the human (which would poison human_added
+                # AND the training fold with our own work).
+                attribution = "unverifiable"
+            else:
+                attribution = _attribution(ctx, label_id, fields)
             rows.append(
                 CorrectionRow(
                     message_id=message_id,
                     label=name,
                     kind="added",
                     detected_at=detected_at,
-                    attribution=_attribution(ctx, label_id, fields),
+                    attribution=attribution,
                 )
             )
     return rows
@@ -872,32 +930,6 @@ def _run_tick(
         if should_stop():
             stop = True  # the delta still drains to its commit point
 
-    # #27 CORRECTION DETECTION (read + local-DB only — never a Gmail
-    # write): classify this delta's label-change events against the
-    # applications join. A corrected message is EXCLUDED from the write
-    # below (the daemon does not fight the human's hand-fix — the landmine
-    # "detection never produces a write for the corrected message, ever").
-    # The correction rows ride the SAME delta transaction as the rows and
-    # the cursor (one commit point, unchanged).
-    try:
-        corrections = detect_corrections(
-            tuple(all_records),
-            ctx=ctx,
-            db=db,
-            parsed_by_id=parsed_by_id,
-            detected_at=applied_at,
-        )
-    except GmailPermanentError as e:
-        # a malformed label-event wire is a lying delta — hold the cursor
-        # (the same posture as a malformed messages list above)
-        log.warning(
-            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
-            cursor,
-            e,
-        )
-        return stop
-    corrected_ids = frozenset(row.message_id for row in corrections)
-
     # the batched predict (the shadow seam: ONE call over the delta's
     # texts, vocab zip like shadow). A model defect is SYSTEMATIC —
     # hold the cursor (every retry fails identically and loudly; a
@@ -906,6 +938,13 @@ def _run_tick(
     # seam (``predict_conformant`` — apply #26 imports it, never
     # re-implements it); the arms below are the DAEMON's posture: the
     # shape defect and the model's own failure both HOLD the cursor.
+    #
+    # S1 C2: predict now runs BEFORE correction detection — the ambiguous-
+    # add check needs this tick's band verdicts (which labels were skipped
+    # as already-present), and those come from the scores. Both predict and
+    # detection are read-only (model + local DB, no Gmail write), and the
+    # commit point is unchanged, so the reorder is behavior-preserving: on a
+    # model hold nothing is committed either way.
     try:
         vocab, rows = predict_conformant(model, [text for _, _, text in fetched])
     except _PredictionShapeError as e:
@@ -929,6 +968,37 @@ def _run_tick(
             type(e).__name__,
         )
         return stop
+
+    skip_present = _skip_present_pairs(ctx, fetched, vocab, rows)
+
+    # #27 CORRECTION DETECTION (read + local-DB only — never a Gmail
+    # write): classify this delta's label-change events against the
+    # applications join. A corrected message is EXCLUDED from the write
+    # below (the daemon does not fight the human's hand-fix — the landmine
+    # "detection never produces a write for the corrected message, ever").
+    # The correction rows ride the SAME delta transaction as the rows and
+    # the cursor (one commit point, unchanged). skip_present (computed above
+    # from this tick's verdicts) lets an added-correction that is really the
+    # daemon's own lost write be WITHHELD, not credited (S1 C2).
+    try:
+        corrections = detect_corrections(
+            tuple(all_records),
+            ctx=ctx,
+            db=db,
+            parsed_by_id=parsed_by_id,
+            detected_at=applied_at,
+            skip_present=skip_present,
+        )
+    except GmailPermanentError as e:
+        # a malformed label-event wire is a lying delta — hold the cursor
+        # (the same posture as a malformed messages list above)
+        log.warning(
+            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
+            cursor,
+            e,
+        )
+        return stop
+    corrected_ids = frozenset(row.message_id for row in corrections)
 
     # per message: compose (the plan's fail-safe is the net), then the
     # Gmail write FIRST — see the module docstring's safety proof

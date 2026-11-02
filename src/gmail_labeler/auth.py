@@ -9,8 +9,10 @@ names (`from None`) because backend errors can embed the value they touched.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +32,26 @@ _UNVERIFIED_APP_NOTICE = (
     "for a personal OAuth client (ADR-0004). Click Advanced → Go to project → "
     "Allow. Make sure the OAuth app is published to 'In production' (not "
     "'Testing'), or the refresh token expires every 7 days."
+)
+
+# #53: prompt for the browser-less retry on headless boxes. The lib renders
+# it with message.format(url=...) (google_auth_oauthlib/flow.py:464) — any
+# literal brace here must be doubled. The port is deliberately NOT
+# interpolated: the operator reads it from the URL's own redirect_uri
+# parameter, so the recipe cannot drift from the port actually bound.
+_HEADLESS_PROMPT = (
+    "No browser could be opened on this box — open the URL below in a "
+    "browser on any machine that has one. This box's redirect server binds "
+    "the loopback interface only, so a browser elsewhere must reach it "
+    "through the tunnel below.\n\n{url}\n\n"
+    "From the browser machine, first forward this box's loopback port "
+    "(visible in the URL's redirect_uri parameter):\n"
+    "    ssh -L <port>:localhost:<port> <this-box>\n"
+    "then open the URL there; the consent redirect returns to this box "
+    "through the tunnel.\n\n"
+    'Headless boxes usually have no OS keyring: set token_backend = "file" '
+    "in the config (see the README setup section) so the refresh token can "
+    "be saved when consent completes."
 )
 
 
@@ -96,12 +118,52 @@ def login(cfg: Config, store: TokenStore | None = None) -> None:
         },
         scopes=[GMAIL_MODIFY_SCOPE],
     )
+    # #53 follow-up: the retry's prompt rides the lib's print() to stdout,
+    # which Python block-buffers when stdout is not a TTY — over
+    # `ssh box 'gmail-labeler auth login'` or `| tee` the URL would stay
+    # invisible while the loopback server waits, the ticket's symptom class
+    # one layer down. Line-buffering flushes every print at its newline.
+    # sys.stdout is only typed as TextIO: objects without reconfigure
+    # (io.StringIO, injected custom targets — pytest's capsys CaptureIO is
+    # a TextIOWrapper subclass and DOES have it) must not abort login, and
+    # neither must a reconfigure that raises (TextIOWrapper over a closed
+    # buffer -> ValueError). The flag is process-global and never restored
+    # — fine for a one-shot CLI command; revisit if login() is ever called
+    # in-process. Tests pin the guard applied on a real TextIOWrapper, and
+    # applied BEFORE the flow is attempted, so the guards can never mask
+    # the normal path.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        # closed-stream etc.: flow proceeds on current buffering
+        with contextlib.suppress(ValueError):
+            reconfigure(line_buffering=True)
     try:
-        creds = flow.run_local_server(port=0, open_browser=True)
+        try:
+            creds = flow.run_local_server(port=0, open_browser=True)
+        except webbrowser.Error:
+            # #53: with zero runnable-browser candidates the lib's
+            # webbrowser.get(browser).open() RAISES before the URL print
+            # (google_auth_oauthlib/flow.py:458-464), so the desktop attempt
+            # dies showing nothing. Safe to retry: the failed attempt's
+            # redirect server is closed by the lib's finally-block
+            # (flow.py:483-484) before the raise reaches us, so the retry
+            # rebinds a fresh ephemeral port cleanly; with
+            # open_browser=False the lib never touches webbrowser, making a
+            # second webbrowser.Error structurally impossible. The custom
+            # prompt prints the URL plus the remote-consent recipe where the
+            # first attempt never got to print anything. (A merely-dead
+            # launcher whose open() only returns False never raises — the
+            # lib's default prompt stands on that path.)
+            creds = flow.run_local_server(
+                port=0,
+                open_browser=False,
+                authorization_prompt_message=_HEADLESS_PROMPT,
+            )
     except Exception as e:
         # google_auth_oauthlib raises AttributeError-derived WSGITimeoutError
         # and oauthlib OAuth2Error types — catch-all with type name only:
-        # exception text around token exchange can carry fragments.
+        # exception text around token exchange can carry fragments. Retry
+        # failures (#53) land here too — same type-name-only contract.
         raise AuthError(f"consent flow did not complete ({type(e).__name__})") from None
     refresh = getattr(creds, "refresh_token", None)
     if not refresh:

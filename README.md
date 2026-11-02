@@ -73,6 +73,24 @@ us.
 The token grants one scope (`gmail.modify`); token values never appear in
 logs, config, or the corpus.
 
+### Headless / remote boxes
+
+When no browser can be launched at all, `auth login` notices the failure and
+retries browser-less: it prints the authorization URL plus the remote-consent
+recipe — port-forward the loopback port shown in the URL's `redirect_uri`
+parameter from your workstation (`ssh -L <port>:localhost:<port> <this-box>`),
+then open the URL there; the consent redirect returns to the server box
+through the tunnel. The URL appears immediately even when stdout is a pipe
+(`ssh box 'gmail-labeler auth login'`, `| tee`): `auth login` forces
+line-buffered stdout (`ssh -t` does the same for any prompt). If a browser
+launcher exists but silently fails to open a window, that is not treated as a
+launch failure: the library's plain "Please visit this URL" prompt prints
+instead — no recipe — and the `ssh -L` tunnel above is still required, since
+a browser on your workstation opening the `localhost` URL reaches your
+workstation's own loopback. Pair this with `token_backend = "file"` (step 5
+above / [example.toml](example.toml)) so the refresh token has somewhere to
+land without a keyring.
+
 ## CLI
 
 ```sh

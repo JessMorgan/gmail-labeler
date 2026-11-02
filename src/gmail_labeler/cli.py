@@ -119,7 +119,13 @@ def auth_status(
                 typer.echo(f"config error: {e}", err=True)
                 raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
     if cfg is None:
-        typer.echo("auth: NOT SIGNED IN — no config.toml found")
+        # B7: the informative hint (looked-in paths + copy-example.toml) that
+        # the C2-era rewrite silently dropped — restored; exit stays 4 (F1).
+        typer.echo(
+            "auth: NOT SIGNED IN — no config.toml found (looked in ./ and "
+            "~/.config/gmail-labeler/); copy example.toml and edit, or run "
+            "`gmail-labeler auth setup` to create one."
+        )
     else:
         st = _status(cfg)
         state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
@@ -314,6 +320,12 @@ def _setup_config_target(config: str | None) -> Path:
         return Path.cwd() / "config.toml"
 
 
+def _echo_out(text: str) -> None:
+    """The wizard's output sink — a named seam so tests can simulate a closed
+    stdout (BrokenPipeError) without patching typer globally."""
+    typer.echo(text)
+
+
 def _run_setup_wizard(config: str | None) -> None:
     """Wire the real I/O + the real auth.login/status/config-writer into the
     pure machine, then map its outcome onto the CLI exit contract."""
@@ -322,7 +334,7 @@ def _run_setup_wizard(config: str | None) -> None:
     from .wizard import WizardCancelled, WizardIO, run_wizard
 
     target = _setup_config_target(config)
-    io = WizardIO(ask=_typer_ask, confirm=_typer_confirm, out=typer.echo)
+    io = WizardIO(ask=_typer_ask, confirm=_typer_confirm, out=_echo_out)
     try:
         result = run_wizard(
             probe=_RealEnvironmentProbe(),
@@ -335,19 +347,24 @@ def _run_setup_wizard(config: str | None) -> None:
     except WizardCancelled:
         typer.echo("setup cancelled.", err=True)
         raise typer.Exit(code=_CANCEL_EXIT) from None
-    except OSError as e:
-        # a config-write failure (parent is a file, read-only dir, …): exit 5,
-        # never a raw traceback that would exit 1 outside the contract.
-        typer.echo(
-            f"setup failed writing {target}: {type(e).__name__}",
-            err=True,
-        )
-        raise typer.Exit(code=_INCOMPLETE_EXIT) from None
+    except BrokenPipeError:
+        # stdout closed mid-run (`auth setup | head`): the pipe is gone, NOT a
+        # config-write failure. The old broad `except OSError` mislabeled this
+        # as "setup failed writing config.toml" while nothing was being
+        # written — cancel-class (130) is the honest handling.
+        raise typer.Exit(code=_CANCEL_EXIT) from None
     if result.outcome == "completed" and result.signed_in:
         return  # exit 0
     if result.outcome == "failed":
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
-    raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / incomplete
+    if result.outcome == "write-error":
+        typer.echo(f"setup failed writing {target}: {result.detail}", err=True)
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
+    if result.outcome == "status-error":
+        typer.echo(f"setup: {result.detail}", err=True)
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
+    # completed-but-not-signed-in, or declined overwrite: operation incomplete.
+    raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5
 
 
 def _write_secret_tight(path: Path, text: str) -> None:

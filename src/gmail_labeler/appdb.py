@@ -1246,6 +1246,49 @@ class AppDB:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         return self._correction_rows(rows)
 
+    # -- aggregate reads for `status` (DB-only realized precision) --------
+
+    def application_label_counts(self) -> dict[str, int]:
+        """The number of Application rows per label (the realized-
+        precision DENOMINATOR — 'written'), from the LOCAL DB only (no
+        Gmail call). Labels with no rows are absent (not zero-filled) —
+        the caller reports the graduated set and treats absent as 0."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            rows = self._conn.execute(
+                "SELECT label, COUNT(*) FROM applications GROUP BY label"
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return {label: count for label, count in rows}
+
+    def correction_label_stats(self) -> dict[str, tuple[int, int, int]]:
+        """Per label the (removed, added, added_filter_covered) Correction
+        counts, from the LOCAL DB only. ``added_filter_covered`` is the
+        invariant-#6 slice EXCLUDED from the default math and disclosed.
+        A label with no Corrections is absent. 'removed' is NEVER
+        filter-covered (invariant #6), so it is not sliced."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            rows = self._conn.execute(
+                "SELECT label, kind, filter_covered, COUNT(*) FROM corrections "
+                "GROUP BY label, kind, filter_covered"
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        stats: dict[str, list[int]] = {}
+        for label, kind, covered, count in rows:
+            bucket = stats.setdefault(label, [0, 0, 0])  # [removed, added, added_fc]
+            if kind == "removed":
+                bucket[0] += count
+            elif kind == "added":
+                bucket[1] += count
+                if covered:
+                    bucket[2] += count
+        return {label: (r, a, fc) for label, (r, a, fc) in stats.items()}
+
     def _correction_rows(self, rows: list[Any]) -> tuple[CorrectionRow, ...]:
         # the shared read-back path (the fetchall rows are the DB
         # boundary): parse the detected_at stamp (a non-ISO value is

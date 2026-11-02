@@ -3890,5 +3890,151 @@ def apply_cmd(
     )
 
 
+@app.command("status")
+def status(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — the basis-line identity)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — the graduated label set)",
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output"),
+) -> None:
+    """Answer "is it working?" with realized precision per graduated
+    label — derived from the LOCAL Corrections + Applications store
+    ALONE (ticket #27; GLOSSARY: Correction, Status).
+
+    ``status`` performs NO Gmail call on ANY path: it reads the state DB
+    and the two local artifacts (bands/graduation) and nothing else, so
+    it answers on a sick or offline mailbox (an UNAUTHENTICATED config
+    still works — there is no auth gate here, by design; the AC pins it
+    with a no-client call). Bodies never enter the output (invariant #5):
+    labels, counts and rates only.
+
+    Per graduated label: written (Application rows), removed (matching
+    'removed' Corrections), precision = (written - removed)/written or
+    'no data' when nothing is applied yet, and the positive-signal
+    added Corrections split into the filter-covered slice (a Gmail
+    filter would have applied it — invariant #6) EXCLUDED from the net
+    human signal and disclosed. The basis line names the CURRENT
+    bands/graduation artifact content hashes and states the honest v1
+    caveats: rows can span artifact versions (per-run binding deferred
+    to #23), and precision assumes unseen-but-removed mail is rare
+    (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
+    config unusable · 5 store/artifact failure (3 is the project's
+    reserved not-implemented code; status never emits it)."""
+    from .appdb import AppDB, AppDBError
+    from .graduation import GraduationTable
+    from .status import compute_precision
+    from .thresholds import BandsArtifact
+
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if not target.strip():
+            typer.echo(f"status failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+
+    # NO auth gate, NO client, NO model, NO corpus: status is the DB-only
+    # face (the AC — it must answer offline on a sick mailbox)
+    cfg = _load_config(config)  # config load failure -> exit 4 (its own mapping)
+    db_path = _resolve_db_path(cfg, db, "status")
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, "status", db_origin)
+    _validate_store_db(db_path, command="status")
+
+    # the two artifacts (LOCAL reads; from_json self-validates the content
+    # hash — a corrupt/foreign file refuses to exit 5, never a traceback)
+    try:
+        table = GraduationTable.from_json(Path(graduation).read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"status failed: graduation table {graduation!r} unreadable or "
+            f"not a Graduation Table: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        artifact = BandsArtifact.from_json(Path(bands).read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"status failed: bands artifact {bands!r} unreadable or not a "
+            f"Bands Artifact: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
+
+    store_db = AppDB(db_path)
+    try:
+        store_db.open()
+        written_by_label = store_db.application_label_counts()
+        correction_stats = store_db.correction_label_stats()
+    except AppDBError as e:
+        typer.echo(f"status failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        store_db.close()
+
+    rows = compute_precision(graduated, written_by_label, correction_stats)
+
+    if as_json:
+        payload = {
+            "basis": {
+                "bands_content_hash": artifact.content_hash,
+                "graduation_content_hash": table.content_hash,
+                "caveat": (
+                    "rows may span artifact versions (per-run binding "
+                    "deferred to #23); precision assumes unseen-but-removed "
+                    "mail is rare (archive-equals-dismiss)"
+                ),
+            },
+            "labels": [
+                {
+                    "label": r.label,
+                    "written": r.written,
+                    "removed": r.removed,
+                    "precision": r.precision,
+                    "added": r.added,
+                    "added_filter_covered": r.added_filter_covered,
+                    "human_added": r.human_added,
+                }
+                for r in rows
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    typer.echo(
+        f"status: {len(rows)} graduated label(s) · basis bands="
+        f"{artifact.content_hash[:12]} graduation={table.content_hash[:12]}"
+    )
+    typer.echo(
+        "status: NOTE rows may span artifact versions (per-run binding "
+        "deferred to #23); precision assumes unseen-but-removed mail is "
+        "rare (archive-equals-dismiss)"
+    )
+    if not rows:
+        typer.echo("status: no graduated labels (nothing to report)")
+        return
+    for r in rows:
+        precision = "no data" if r.precision is None else f"{r.precision:.2f}"
+        typer.echo(
+            f"  {r.label}: written={r.written} removed={r.removed} "
+            f"precision={precision} added={r.added} "
+            f"(filter-covered={r.added_filter_covered} "
+            f"human={r.human_added})"
+        )
+
+
 if __name__ == "__main__":
     app()

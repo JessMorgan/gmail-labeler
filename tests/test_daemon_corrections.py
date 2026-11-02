@@ -455,6 +455,47 @@ def test_added_correction_human_when_relevant_filter_verifiably_absent(
     db.close()
 
 
+def test_added_correction_filter_covered_dominates_unverifiable(
+    tmp_path: Path,
+) -> None:
+    # mixed case, order-INDEPENDENT: the UNVERIFIABLE filter is listed
+    # FIRST, the verifiably-matching one SECOND. A proven match must win
+    # (filter_covered) regardless of iteration order -- an unverifiable
+    # filter must not mask a filter we can PROVE authored the add.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[
+            {
+                "criteria": {"query": "has:attachment"},
+                "action": {"addLabelIds": ["L2"]},
+            },
+            {"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": ["L2"]}},
+        ]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert corr[0].attribution == "filter_covered"
+    db.close()
+
+
+def test_added_correction_unverifiable_when_relevant_filter_lacks_criteria(
+    tmp_path: Path,
+) -> None:
+    # a relevant filter (it adds L2) whose 'criteria' key is ABSENT (a
+    # malformed / non-mapping snapshot entry) -> authorship undecidable ->
+    # 'unverifiable' (withheld), the same posture as outside-{from,to,subject}
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _page(_record("aa11", added=[("aa11", ["L2"])]))
+    ctx = _ctx(filters=[{"action": {"addLabelIds": ["L2"]}}])
+    assert _tick(tmp_path, _fake(fake), db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert corr[0].attribution == "unverifiable"
+    db.close()
+
+
 # -- malformed label-event wire is a lying delta (hold, not crash) ------------
 
 

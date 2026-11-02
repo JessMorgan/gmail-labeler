@@ -230,6 +230,34 @@ def test_status_json_shape(tmp_path: Path, monkeypatch) -> None:
     assert payload["basis"]["graduation_content_hash"]
 
 
+def test_status_json_nonzero_withheld_slices_pinned(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # the JSON arithmetic on the NONZERO path (the zero-only assertion above
+    # would survive hardcoding added_unverifiable=0 / human_added=added):
+    # one filter-covered add + one unverifiable add + one human add, so the
+    # json must report added=3, filter_covered=1, unverifiable=1, human=1
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(
+        tmp_path,
+        [_app_row("Money/Bills", "aa00")],
+        [
+            _corr("Money/Bills", "aa11", "added", attribution="filter_covered"),
+            _corr("Money/Bills", "aa22", "added", attribution="unverifiable"),
+            _corr("Money/Bills", "aa33", "added", attribution="human"),
+        ],
+    )
+    result = _status(tmp_path, cfg, extra=("--json",))
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    bills = next(x for x in payload["labels"] if x["label"] == "Money/Bills")
+    assert bills["added"] == 3
+    assert bills["added_filter_covered"] == 1
+    assert bills["added_unverifiable"] == 1
+    assert bills["human_added"] == 1  # 3 - 1 - 1 (both withheld slices excluded)
+
+
 def test_status_filter_covered_disclosed(tmp_path: Path, monkeypatch) -> None:
     _prepare(tmp_path, monkeypatch)
     cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')

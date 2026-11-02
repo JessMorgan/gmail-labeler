@@ -1430,6 +1430,149 @@ def test_commit_page_refusals_write_nothing(tmp_path: Path) -> None:
     db.close()
 
 
+# -- commit_applications: the apply path's rows-only sibling (#26) ----------
+
+
+def _daemon_state_snapshot(db_path: Path) -> object:
+    """The raw daemon_state table contents (rowid + cursor) — the
+    untouched-proof: apply NEVER reads or writes it (invariant #3 is the
+    daemon's alone)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT rowid, history_cursor FROM daemon_state ORDER BY rowid"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_commit_applications_rows_land_cursor_untouched(tmp_path: Path) -> None:
+    # AC3: backfilled Applications recorded identically to daemon-applied
+    # ones (same table, same row shape) — AND the daemon_state table is
+    # byte-for-byte untouched (the ZERO-cursor-involvement pin: a live
+    # daemon's cursor stands where it was across a whole backfill)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(12345)  # a live daemon's cursor
+    before = _daemon_state_snapshot(db_path)
+    count = db.commit_applications(
+        [
+            _app_row("aa", source="apply"),
+            _app_row(
+                "bb",
+                "Money/Bills",
+                "Label_2",
+                0.7,
+                "med",
+                "ai-med",
+                source="apply",
+            ),
+        ]
+    )
+    assert count == 2
+    assert _daemon_state_snapshot(db_path) == before  # cursor untouched
+    assert db.get_history_cursor() == 12345  # the daemon's cursor stands
+    # the rows are indistinguishable from daemon rows in shape (AC3)
+    rows = db.applications_for_message("aa")
+    assert [(r.label, r.source) for r in rows] == [("Shipping", "apply")]
+    db.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    assert len(db2.applications_for_message("bb")) == 1  # durability
+    db2.close()
+
+
+def test_commit_applications_empty_batch_refused(tmp_path: Path) -> None:
+    # the record_applications refusal, NOT commit_page's empty-tolerance:
+    # apply has no cursor to advance in exchange for an empty batch, so
+    # an empty commit is a caller bug (the plan's no-call-on-empty rule
+    # means a real apply batch always carries a row)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="no rows"):
+        db.commit_applications([])
+    db.close()
+
+
+def test_commit_applications_refuses_mixed_applied_at(tmp_path: Path) -> None:
+    # the #24 homogeneity contract, inherited by the apply caller exactly
+    # as commit_page enforces it — a batch with >1 distinct applied_at is
+    # refused NAMED before the transaction (the ONE-clock-reading call
+    # -site contract, pinned at the store too)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    rows = [
+        _app_row(message_id="a1", applied_at=TS),
+        _app_row(
+            message_id="b2",
+            label="Other",
+            applied_at=datetime(2026, 11, 1, 12, 0, 1, tzinfo=UTC),
+        ),
+    ]
+    with pytest.raises(AppDBError, match="distinct applied_at") as exc:
+        db.commit_applications(rows)
+    assert "ONE clock reading" in str(exc.value)
+    assert db.applications_for_message("a1") == ()  # refused BEFORE the txn
+    db.close()
+
+
+def test_commit_applications_refusals_write_nothing(tmp_path: Path) -> None:
+    # the same pre-transaction refusals as commit_page's rows half: a
+    # lying row, a within-batch (message_id, label) duplicate — nothing
+    # lands
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="hex"):
+        db.commit_applications([_app_row(message_id="zz")])
+    with pytest.raises(AppDBError, match="duplicate"):
+        db.commit_applications([_app_row("aa"), _app_row("aa", label_id="Label_2")])
+    assert db.applications_for_message("aa") == ()
+    db.close()
+
+
+def test_commit_applications_rolls_back_rows_on_mid_write_failure(
+    tmp_path: Path,
+) -> None:
+    # the atomicity pin (the ONE-transaction contract): a mid-write
+    # failure rolls the whole batch back — no half rows. There is no
+    # cursor to roll back (apply never carries one), so the split-
+    # transaction mutant this kills is "rows committed, batch lost"
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+
+    class _FlakyConn:
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        def executemany(self, sql: str, *a: object) -> object:
+            if "INSERT INTO applications" in sql:
+                raise sqlite3.OperationalError("disk full (simulated)")
+            return self._real.executemany(sql, *a)  # pyright: ignore[reportArgumentType]
+
+        def execute(self, sql: str, *a: object) -> object:
+            return self._real.execute(sql, *a)  # pyright: ignore[reportArgumentType]
+
+        def __enter__(self) -> _FlakyConn:
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> object:
+            return self._real.__exit__(*exc)  # type: ignore[arg-type,no-any-return]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+    real_conn = db._conn
+    assert real_conn is not None
+    db._conn = _FlakyConn(real_conn)  # type: ignore[assignment]
+    with pytest.raises(AppDBError, match="disk full"):
+        db.commit_applications([_app_row("aa")])
+    db._conn = real_conn
+    assert db.applications_for_message("aa") == ()  # rows rolled back
+    db.close()
+
+
 # -- F1: atomic schema transitions (the crash windows closed) ---------------
 
 

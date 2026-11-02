@@ -19,8 +19,9 @@ headline pins:
 - AC6: a lying resolution map pointing a would-apply label at a System
   Label id composes NO write on THIS path (named-mutation pin);
 - the landmines: 404-vanished mail is a counted skip (never fatal); a
-  transient write failure HOLDS nothing (no cursor) and a re-run picks it
-  up; >1-page paging fidelity; the empty plan is no write AND no row;
+  transient READ **or** WRITE failure HOLDS nothing (no cursor) and a
+  re-run picks it up (both arms symmetric); >1-page paging fidelity; the
+  empty plan is no write AND no row;
   daemon_state is byte-for-byte untouched across a whole backfill.
 """
 

@@ -128,7 +128,8 @@ def is_404(e: GmailError) -> bool:
     daemon's history/get/apply arms and the apply path's read/write arms —
     rides THIS predicate; a fourth inlined consumer-copy is the taxonomy
     drift this repo names as its worst bug class. (The adapter's
-    ``history()`` wrapper is the 404 PRODUCER — it reads the raw status to
-    mint a GmailResyncError, so it is not a consumer that would ride this
-    predicate.)"""
+    ``history()`` wrapper is the 404 PRODUCER — it inspects the raw status
+    to mint the typed error, instead of consuming an already-typed one;
+    hoisting ``is_404`` there would silently narrow the check, since
+    ``is_404`` also requires the ``GmailPermanentError`` type.)"""
     return isinstance(e, GmailPermanentError) and e.status == 404

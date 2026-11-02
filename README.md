@@ -493,9 +493,11 @@ upward** — it reaches right up to the newest message and therefore
 allowed and safe (skip-present makes both paths idempotent on the same
 mail), but see the concurrency caution below.
 
-The backfill runs the **exact same decision core** as the live daemon —
-`applications.plan_message_write` (imported, never re-implemented; a test
-runs one daemon tick and one apply batch over identical mail and asserts
+The backfill reaches the **exact same decision core** as the live daemon
+through the same composition seam — `apply` imports `daemon.compose_plan`
+(and `daemon.present_names`), and `compose_plan` calls the one
+`applications.plan_message_write` core (never re-implemented; a test runs
+one daemon tick and one apply batch over identical mail and asserts
 they land identical plans). So the tier/band/skip-present semantics are
 identical, and **backfilled Applications are recorded identically to
 daemon-applied ones** (only the `source` column differs: `apply` vs
@@ -536,8 +538,9 @@ together is **not recommended** — the exposure is honest, not benign:
   backfill** (the pages already committed stand; a re-run picks up the
   rest).
 
-Stop the daemon before a backfill, or point `apply` at a `--since` window
-the daemon has not reached.
+Stop the daemon before a backfill — there is **no** `--since` value that
+excludes mail the daemon is processing: the window is `after:<epoch>`,
+upward-unbounded, so it always reaches the newest message.
 
 **Date-provenance warning (AC5).** The `--since` boundary is a date, and
 a corpus record whose date has no server-authoritative provenance stamp

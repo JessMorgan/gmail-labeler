@@ -14,8 +14,12 @@ does not ship releases yet.
   - `apply.py`: `run_apply` pages `list_messages` (the wire pageToken
     chain — apply has NO history cursor) and processes one page per
     batch: fetch → predict → compose → write-first → commit. It IMPORTS
-    the daemon's seams, never mirrors them — `applications.
-    plan_message_write` (THE decision core), `daemon.predict_conformant`
+    the daemon's seams, never mirrors them — `daemon.compose_plan` (the
+    composition call-shape that threads the ctx maps to THE one
+    `applications.plan_message_write` decision core; apply holds NO
+    `plan_message_write` binding of its own — the one-core truth stands
+    through this seam) and `daemon.present_names` (the present-set
+    reader), `daemon.predict_conformant`
     (the positive-conformance predict seam, extracted verbatim from
     `_run_tick`; the daemon's suite rides the extraction untouched), and
     the `ServingContext`. ONE `clock()` read per batch stamps every row

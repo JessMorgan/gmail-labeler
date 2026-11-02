@@ -36,9 +36,13 @@ concept the glossary lacks, add it there in the same commit.
 - **Fail-safe**: any error on the application path results in *no* labels —
   a never-labeling failure is always preferred to a wrong-label write.
 - **Idempotent by construction**: the audit record is persisted after the
-  Gmail write succeeds; a crash in between is recovered by the next poll, and
-  skip-present makes the retry harmless. No application may depend on
-  in-memory state.
+  Gmail write succeeds; a crash in between is recovered by the next poll (the
+  daemon's held cursor), and skip-present makes the retry harmless. On the
+  cursorless `apply` face there is no poll to recover it: the re-run never
+  re-adds the uncommitted row — the label is now present, so skip-present
+  composes an empty plan and no row is written (the write stands; the row is
+  simply not re-written — see `apply.py`'s module docstring). No application
+  may depend on in-memory state.
 - **Cursor discipline**: the `historyId` cursor persists only after all events
   of the poll's delta are durably handled; a replayed delta must be harmless.
 

@@ -188,7 +188,15 @@ def test_daemon_serves_a_write_through_the_full_stack(
             HistoryPage(
                 history_id=None,
                 next_page_token=None,
-                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+                records=(
+                    {
+                        "id": 5,
+                        "messages": [{"id": "aa22", "threadId": "t2"}],
+                        "messagesAdded": [
+                            {"message": {"id": "aa22", "threadId": "t2"}}
+                        ],
+                    },
+                ),
             )
         ],
         current_history_id=900,
@@ -408,7 +416,15 @@ def test_daemon_counter_line_reaches_stderr(
             HistoryPage(
                 history_id=None,
                 next_page_token=None,
-                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+                records=(
+                    {
+                        "id": 5,
+                        "messages": [{"id": "aa22", "threadId": "t2"}],
+                        "messagesAdded": [
+                            {"message": {"id": "aa22", "threadId": "t2"}}
+                        ],
+                    },
+                ),
             )
         ],
         current_history_id=900,
@@ -451,7 +467,15 @@ def test_daemon_apply_auth_error_exit_4(
             HistoryPage(
                 history_id=None,
                 next_page_token=None,
-                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+                records=(
+                    {
+                        "id": 5,
+                        "messages": [{"id": "aa22", "threadId": "t2"}],
+                        "messagesAdded": [
+                            {"message": {"id": "aa22", "threadId": "t2"}}
+                        ],
+                    },
+                ),
             )
         ],
         current_history_id=900,
@@ -558,7 +582,15 @@ def test_daemon_bodies_absent_cli_layer(
             HistoryPage(
                 history_id=None,
                 next_page_token=None,
-                records=({"id": 5, "messages": [{"id": "aa22", "threadId": "t2"}]},),
+                records=(
+                    {
+                        "id": 5,
+                        "messages": [{"id": "aa22", "threadId": "t2"}],
+                        "messagesAdded": [
+                            {"message": {"id": "aa22", "threadId": "t2"}}
+                        ],
+                    },
+                ),
             )
         ],
         current_history_id=900,

@@ -1036,6 +1036,35 @@ def test_prediction_non_numeric_element_holds(
     db.close()
 
 
+def test_prediction_bytes_row_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 closeout (reviewer probe): b'\x00\x01' materializes to (0, 1)
+    # INTS and passed the numeric gate — worse than starvation, a
+    # garbage 1.0 score could WRITE a label. Named row-type refusal.
+    caplog.set_level(logging.WARNING)
+
+    class _BytesRows:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple(b"\x00\x01" for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_BytesRows()) == 0
+    assert db.get_history_cursor() == 777  # held: no garbage write
+    assert fake.writes == []
+    assert "not a numeric sequence" in caplog.text
+    db.close()
+
+
 def test_prediction_bool_element_holds(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

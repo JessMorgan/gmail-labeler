@@ -187,12 +187,22 @@ def test_status_source_has_no_client_construction() -> None:
         "_daemon_client",
         "_shadow_client",
         "_export_client",
+        "GmailClient",
         "GmailRestClient",
         "build_credentials",
         "_daemon_model_factory",
         "load_model",
+        "load_hf_model",
         "CorpusStore",
         "list_messages",
+        # F2 item 11: status is DB + the two artifacts ONLY — it must never
+        # reach the filter-snapshot sidecar machinery (the daemon's concern).
+        # A dead reference to any of these in status's source rode the old
+        # denylist green; the reviewer's injection probe is the pin's mutant.
+        "_load_filters_snapshot",
+        "SIDECAR_FILES",
+        "SIDECAR_FILTERS",
+        "write_filters_snapshot",
     ):
         assert forbidden not in src, f"status source references {forbidden!r}"
 

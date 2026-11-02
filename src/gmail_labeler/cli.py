@@ -2852,8 +2852,10 @@ def shadow_report(
 
     The verdicts are bound to the bands/graduation artifacts AS OF THE
     RUN — the report does NOT re-verify them (a basis disclosure, in
-    the header + the ``basis`` payload field). Hash persistence is
-    deferred to #26-27 (the status/corrections surface); re-run
+    the header + the ``basis`` payload field). Per-run hash PERSISTENCE
+    is deferred to post-merge calibration; the shipped interim mechanism
+    is the `status` basis line (#27), which names the current
+    bands/graduation content hashes and cross-checks the pair. Re-run
     ``shadow run`` after any retrain/recalibration to refresh the
     basis.
     """
@@ -3015,9 +3017,10 @@ def shadow_report(
 
     # the basis disclosure (T3): the verdicts are bound to the
     # bands/graduation artifacts AS OF THE RUN — the report does NOT
-    # re-verify them (hash persistence is deferred to #26-27, when the
-    # status/corrections surface needs it). A retrain/recalibration
-    # moves the basis; re-run shadow run to refresh.
+    # re-verify them (per-run hash persistence is deferred to post-merge
+    # calibration; the shipped interim mechanism is the `status` basis line
+    # (#27), which names the current hashes and cross-checks the pair). A
+    # retrain/recalibration moves the basis; re-run shadow run to refresh.
     basis = {
         "note": (
             "verdicts bound to the bands/graduation artifacts as of the "

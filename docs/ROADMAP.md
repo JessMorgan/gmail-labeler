@@ -146,8 +146,10 @@ Scope:
   ONE transaction, the UNIQUE (message_id, label, kind) dedupe makes a
   replayed event idempotent), `status` reports realized precision from the
   local store alone (no Gmail call, no auth gate), and `corrections
-  export` emits the signal through the builder's composition seam — no
-  auto-retrain (the human gate holds);
+  export` writes a faithful raw dump (every attribution, auditable); the
+  builder's fold seam ships as a pure function but is NOT wired into a
+  retrain — folding the dump into the corpus and retraining is the deferred
+  human step (no auto-retrain; the human gate holds);
 - the `auth` wizard (ADR-0004) — ships in Phase 0's spirit but is
   scheduled in Phase 2 (it is onboarding polish, not a gate to training).
 

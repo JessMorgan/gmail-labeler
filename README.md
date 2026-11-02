@@ -588,20 +588,24 @@ tooling. Exit codes 0/2/4/5.
 gmail-labeler corrections export --out corrections.json   # default: stdout
 ```
 
-`corrections export` writes the captured Corrections as future training
-signal — `{message_id, label, kind, attribution}` rows, **no bodies**. It
-is a faithful raw dump: every row carries its *attribution* (`human` /
-`filter_covered` / `unverifiable`) so the artifact is auditable — you can
-see which adds were withheld and why. It does **not** retrain: folding
-them into the corpus is the builder's composition seam and running a
-retrain is a **separate human decision** (ADR-0005's human-gated retrain).
-Only a `human` add is training signal: a `filter_covered` add (a Gmail
-filter verifiably would have applied it) and an `unverifiable` add (a
-relevant filter makes authorship undecidable, **or there is no filters
-snapshot to check at all**) are both withheld — the latter excluded rather
-than credited to you, the *exclusion, not guessing*
-principle `dataset analyze` follows (#22). `status` discloses each
-withheld slice as its own count.
+`corrections export` writes a faithful RAW dump of the captured Corrections
+— `{message_id, label, kind, attribution}` rows, **no bodies**. Every row
+carries its *attribution* (`human` / `filter_covered` / `unverifiable`) so
+the artifact is auditable — you can see which adds were withheld and why.
+The builder's fold seam (`apply_corrections_to_records`) ships as a **pure
+function** (it credits only a `human` add), but the export does **not**
+call it, and **nothing wires the dump or the seam into a retrain** —
+folding them into the corpus and running a retrain is the **deferred human
+step** (ADR-0005's human-gated retrain). Only a `human` add is training
+signal: a `filter_covered` add (a Gmail filter verifiably would have
+applied it) and an `unverifiable` add — withheld, not guessed, when
+authorship cannot be determined: no usable filters snapshot (absent or
+malformed); a relevant filter whose criteria cannot be simulated from the
+kept fields (outside `from`/`to`/`subject`, or malformed); or an add whose
+authorship is otherwise undecidable (its message fields were not fetched,
+or a relevant filter's `addLabelIds` is unreadable) — are both excluded,
+the *exclusion, not guessing* principle `dataset analyze` follows (#22).
+`status` discloses each withheld slice as its own count.
 
 ## Docs
 

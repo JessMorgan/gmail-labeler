@@ -30,12 +30,17 @@ does not ship releases yet.
     NOTHING, a corrected message is never re-written, and an `added` is
     attributed (`human` / `filter_covered` / `unverifiable`) via the #22
     mechanism reused: a simulatable filter that verifiably would have
-    applied it is `filter_covered`, and one whose criteria make authorship
-    undecidable — OR no usable filters snapshot at all (absent/malformed,
-    the `ServingContext.filters is None` case mirroring analyze.py, warned
-    at startup) — is `unverifiable`, withheld not credited to the human
-    (invariant #6, exclusion-not-guessing; an empty *snapshot* is the
-    attested-none case where an `added` is `human`). The 91-node
+    applied it is `filter_covered`; `unverifiable` (withheld, not credited
+    to the human) is when authorship cannot be determined — no usable
+    filters snapshot (absent or malformed; the `ServingContext.filters is
+    None` case mirroring analyze.py, warned at startup); a relevant filter
+    whose criteria cannot be simulated from the kept fields (outside
+    `from`/`to`/`subject`, or malformed); or an add whose authorship is
+    otherwise undecidable (its message fields were not fetched, or a
+    relevant filter's `addLabelIds` is unreadable — the credit arm reads
+    through the strict `filter_label_ids_strict`) (invariant #6,
+    exclusion-not-guessing; an empty *snapshot* is the attested-none case
+    where an `added` is `human`). The 91-node
     daemon suite rode the change verbatim.
   - `status.py` + the `status` command: per graduated label, realized
     precision = (written − removed)/written from the LOCAL DB only — no
@@ -44,12 +49,15 @@ does not ship releases yet.
     attribution vocabulary it counted under; each withheld slice
     (`filter_covered`, `unverifiable`) is disclosed as its own count and
     excluded from the human signal. Exit 0/2/4/5.
-  - `corrections export`: the captured Corrections as future training
-    signal ({message_id, label, kind, attribution}, no bodies) through
-    `dataset_build.apply_corrections_to_records` — the builder's
-    composition seam (no fork), which folds only `human` adds. NO
-    auto-retrain (the human gate holds;
-    grep-pinned: no call path from status/export to any train entry).
+  - `corrections export`: a faithful RAW dump of the captured Corrections —
+    every row with its `attribution` (`human` / `filter_covered` /
+    `unverifiable`, no bodies), so the artifact is auditable. The builder's
+    composition seam `dataset_build.apply_corrections_to_records` ships as a
+    PURE function (folds only `human` adds; no fork), but the export does
+    NOT call it — and NOTHING wires either into a retrain: folding the dump
+    into the corpus and running a retrain is the DEFERRED HUMAN STEP
+    (ADR-0005's human-gated retrain; grep-pinned: no call path from
+    status/export to any train entry or to the seam).
 - `apply --since [--apply]`: the only bulk path (ticket #26) — a
   human-gated preview/backfill of graduated labels over historical mail,
   reusing the daemon's exact decision core.

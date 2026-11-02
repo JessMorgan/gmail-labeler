@@ -135,11 +135,13 @@ label, INBOX churn — records NOTHING (noise is not correction). An
 *filter-covered*, *unverifiable*) deciding WHO it is credited to:
 *filter-covered* — a simulatable (from/to/subject) Gmail filter verifiably
 would have applied it (invariant #6), withheld from the realized-precision
-human signal and the training fold; *unverifiable* — a filter touching the
-label carries criteria that cannot be simulated from the kept fields, OR
-there is no usable filters snapshot at all (absent or malformed), so
-authorship is undecidable and the add is **withheld, not credited** to the
-human — the same *exclusion, not guessing* principle that governs
+human signal and the training fold; *unverifiable* — withheld, not credited
+to the human, when authorship cannot be determined: no usable filters
+snapshot (absent or malformed); a relevant filter whose criteria cannot be
+simulated from the kept fields (outside `from`/`to`/`subject`, or
+malformed); or an add whose authorship is otherwise undecidable (its
+message fields were not fetched, or a relevant filter's `addLabelIds` is
+unreadable) — the same *exclusion, not guessing* principle that governs
 `dataset analyze` (#22): guessing either way is what that doctrine forbids.
 A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation
 that no filter exists (an empty *snapshot* — the operator ran the export
@@ -381,7 +383,7 @@ discipline), and a consumer verifying it against a disagreeing
 checkpoint/eval REFUSES it (every field checked independently, all
 disagreements named). The config's per-label band targets
 (`[bands]`) ride in its per-label effective targets (provenance). The
-shadow pass and the daemon (later phases) read it.
+shadow pass and the daemon (shipped) read it.
 _Avoid_: bands file, threshold config
 
 **Graduation Table**:

@@ -42,9 +42,19 @@ def _rec(mid: str, labels: tuple[str, ...]) -> CorpusRecord:
     )
 
 
-def _corr(mid: str, label: str, kind: str, attribution: str = "human") -> CorrectionRow:
+def _corr(
+    mid: str,
+    label: str,
+    kind: str,
+    attribution: str = "human",
+    detected_at: datetime = TS,
+) -> CorrectionRow:
     return CorrectionRow(
-        message_id=mid, label=label, kind=kind, detected_at=TS, attribution=attribution
+        message_id=mid,
+        label=label,
+        kind=kind,
+        detected_at=detected_at,
+        attribution=attribution,
     )
 
 
@@ -206,9 +216,18 @@ def test_export_round_trips_to_correction_rows(tmp_path: Path) -> None:
     # into CorrectionRow instances and assert they EQUAL the store's rows —
     # the round-trip that makes the artifact a faithful training-signal input,
     # not a lossy summary.
+    # S2 C: seed with SUB-SECOND microseconds. TS alone (whole second) let the
+    # deepseek ts-trunc mutant (export serialising detected_at with
+    # microsecond=0) SURVIVE at tip — nothing to truncate. A .123456 stamp makes
+    # lossy serialization die: the rebuilt row's detected_at no longer equals
+    # the store's. The store preserves microseconds (appdb writes
+    # detected_at.astimezone(UTC).isoformat(), reads fromisoformat).
+    ts_us = datetime(2026, 11, 1, 12, 0, 0, 123456, tzinfo=UTC)
     seeded = [
-        _corr("aa11", "Money/Bills", "removed"),
-        _corr("bb22", "Shipping", "added", attribution="filter_covered"),
+        _corr("aa11", "Money/Bills", "removed", detected_at=ts_us),
+        _corr(
+            "bb22", "Shipping", "added", attribution="filter_covered", detected_at=ts_us
+        ),
     ]
     _seed_corr(tmp_path, seeded)
     out_file = tmp_path / "corrections.json"
@@ -236,8 +255,8 @@ def test_export_round_trips_to_correction_rows(tmp_path: Path) -> None:
     )
     db.close()
     assert rebuilt == stored
-    # and the detected_at survived the round-trip (the fold needs it)
-    assert all(c.detected_at == TS for c in rebuilt)
+    # and the sub-second detected_at survived the round-trip (the fold needs it)
+    assert all(c.detected_at == ts_us for c in rebuilt)
 
 
 def test_export_to_stdout(tmp_path: Path) -> None:

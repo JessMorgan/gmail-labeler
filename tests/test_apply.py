@@ -444,6 +444,59 @@ def test_vanished_message_is_counted_skip_not_fatal(
     db.close()
 
 
+def test_message_vanished_between_fetch_and_write_is_counted_skip(
+    tmp_path: Path,
+) -> None:
+    # the WRITE-path 404 arm (a message deleted between get_message and
+    # apply_labels): counted SKIPPED only, no row (rows record
+    # Applications that DID land) — the delta-free claim the read-path
+    # test does not cover
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    fake.fail("apply_labels", GmailPermanentError("message gone", status=404))
+    db = _db(tmp_path)
+    outcome = _run_apply(tmp_path, fake, db=db, dry_run=False)
+    assert outcome.skipped == 1 and outcome.written == 0 and outcome.rows == 0
+    assert (
+        db.applications_for_message("aa22") == ()
+    )  # no row for a write that did not land
+    assert fake.messages["aa22"].label_ids == ("INBOX",)  # the mail is untouched
+    db.close()
+
+
+# -- AC6: the mailbox System Label NAME set is forwarded to the core ----------
+
+
+def test_apply_forwards_system_label_names_to_the_core(tmp_path: Path) -> None:
+    # AC6 on THIS path, the NAME guard (not just the id guard): a lying
+    # Graduation Table that graduated a System Label NAME, resolved to a
+    # real USER id (so the composition's _resolve_id id-screen does NOT
+    # fire) — only tiers' graduated-System-Label NAME refusal, fed by the
+    # forwarded ctx.system_labels, keeps it off the wire. Mutant: drop
+    # system_labels from the plan call → the name sails through and WRITES
+    ctx = _ctx(
+        graduated=frozenset({"INBOX"}),
+        system_labels=frozenset({"INBOX"}),
+        managed_label_ids={"INBOX": "L1"},  # a USER id — the id guard is blind here
+        bands={"INBOX": (0.8, 0.6)},
+    )
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    db = _db(tmp_path)
+    outcome = _run_apply(
+        tmp_path,
+        fake,
+        ctx=ctx,
+        db=db,
+        dry_run=False,
+        model=FakeModel(
+            ("INBOX",),
+            scores={"one\nbody one": (0.95,), "two\nbody two": (0.95,)},
+        ),
+    )
+    assert outcome.written == 0 and outcome.rows == 0
+    assert fake.writes == []  # the graduated System Label NAME never reached the wire
+    db.close()
+
+
 # -- landmine: transient write failure holds nothing, re-run picks it up ------
 
 

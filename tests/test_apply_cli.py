@@ -279,6 +279,57 @@ def test_apply_midrun_auth_error_exit_4(
     assert "auth:" in result.stderr
 
 
+def test_apply_page_read_failure_exit_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the exit-5 arm for a page-read failure: apply has no cursor to
+    # resume from, so a list_messages wire error is a LOUD stop (exit 5),
+    # never a silent truncated window reported as exit 0 (a backfill that
+    # covered 10% of the window and exited 0 is the exact failure this pins)
+    _prepare(tmp_path, monkeypatch)
+    from gmail_labeler.gmail_errors import GmailTransientError
+
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_apply_labels())
+    fake.fail("list_messages", GmailTransientError("network down"))
+    result, _ = _run_apply_cli(
+        tmp_path, monkeypatch, fake=fake, extra=("--since", "2026-10-01", "--apply")
+    )
+    assert result.exit_code == 5
+    assert "apply failed" in result.stderr
+
+
+def test_apply_model_shape_defect_exit_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the exit-5 arm for a systematic model defect: predict_conformant
+    # raises on an off-Protocol shape (a str vocabulary) — the CLI maps it
+    # to 5 (operation failed), never the exit-1 'a bug' landing
+    _prepare(tmp_path, monkeypatch)
+
+    class _BadRowModel:
+        # vocabulary MATCHES the manifest (so the startup vocabulary gate
+        # passes) but predict serves a non-tuple row — off the Model
+        # Protocol → predict_conformant raises _PredictionShapeError
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts: object) -> object:
+            return [0.9, 0.1]  # a flat list, not tuple[tuple[float, ...], ...]
+
+    def factory(_checkpoint_dir: object, _vocab: object) -> object:
+        return _BadRowModel()
+
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=_apply_labels())
+    result, _ = _run_apply_cli(
+        tmp_path,
+        monkeypatch,
+        fake=fake,
+        model_factory=factory,
+        extra=("--since", "2026-10-01", "--apply"),
+    )
+    assert result.exit_code == 5
+    assert "prediction/processing failed" in result.stderr
+
+
 def test_apply_bodies_absent_cli_layer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

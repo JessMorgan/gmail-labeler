@@ -314,22 +314,25 @@ BOOTSTRAP_QUERY = ""
 #: daemon should score. The skip is COMPOUND (see the fetch-loop guard): a
 #: message is skipped iff it carries one of these ids AND is NOT also in INBOX.
 #:
-#: Per-label reason (the two ids earn their place differently):
+#: Per-label reason (these ids earn their place for two different reasons):
 #:   DRAFT / CHAT — never legitimate classification targets; the corpus already
 #:     hard-excludes them (export.py _EXCLUDED_SYSTEM_LABEL_IDS), so scoring a
 #:     pre-send draft or a chat would feed the model an inference target it was
 #:     never trained on.
-#:   SENT — a SELF-ECHO guard, not a corpus-exclusion one: our own
-#:     apply_labels writes and the operator's sent mail arrive on the history
-#:     stream as a messageAdded too (the push guide's notification-loop hazard;
-#:     MEDIUM confidence — a single practitioner report, but the need to not
-#:     re-score our own writes holds regardless of the field Gmail signals it
-#:     with). SENT is NOT corpus-excluded — export's DEFAULT_QUERY is
-#:     `in:anywhere …`, which INCLUDES sent mail — so it is wrong to call it
-#:     "outside the training distribution"; it is here to stop the daemon
-#:     labelling the operator's own outgoing mail, nothing more. "SELF" is a
-#:     search-query term, not a label id, so the SENT system id is the
-#:     machine-checkable signal.
+#:   SENT — the operator's OWN send: a message they send lands a SENT-tagged
+#:     copy in the mailbox that arrives on the history stream as a messageAdded
+#:     (the push guide's notification-loop hazard; MEDIUM confidence — a single
+#:     practitioner report, but the need to not label the operator's own
+#:     outgoing mail holds regardless of the field Gmail signals it with). This
+#:     guard does NOT cover our own apply_labels echo — that echo is a label-only
+#:     MODIFY (labelsAdded, no messagesAdded), already kept out of the scoring
+#:     set by _message_ids (S1); do NOT revert that to the generic messages[]
+#:     field on the assumption this guard catches the echo. SENT is NOT
+#:     corpus-excluded — export's DEFAULT_QUERY is `in:anywhere …`, which
+#:     INCLUDES sent mail — so it is wrong to call it "outside the training
+#:     distribution"; it is here to stop the daemon labelling the operator's own
+#:     outgoing mail, nothing more. "SELF" is a search-query term, not a label
+#:     id, so the SENT system id is the machine-checkable signal.
 #:
 #: WHY THE INBOX EXEMPTION (the compound) — the manager SUSTAINED this over a
 #: reviewer disagreement, both families heard:
@@ -339,12 +342,19 @@ BOOTSTRAP_QUERY = ""
 #:     zero native coverage.
 #:   qwen (dissent, recorded not erased): the plain skip is correct because our
 #:     own outgoing is not incoming-from-others mail.
-#: Both INDEPENDENTLY verified the compound is a NO-OP on every NATIVE Gmail
-#: flow: self-addressed mail arrives as a DISTINCT inbox copy Gmail does NOT
-#: tag SENT, and a user label merely NAMED 'sent' never matches the id-guard
-#: (it keys on label IDS). So the only producer of SENT+INBOX co-occurrence is
-#: the human's own drag — and README scopes the daemon to "scores arriving
-#: mail" (line 19), which a dragged-back message is once it is in the inbox.
+#: Both families verified — by wire-reasoning, not CI (the same MEDIUM
+#: confidence as the SENT note; these are external Gmail-flow facts no offline
+#: test can prove) — that the compound is a no-op on the NATIVE flows we can
+#: name: self-addressed mail arrives as a DISTINCT inbox copy Gmail does NOT tag
+#: SENT, and a user label merely NAMED 'sent' never matches the id-guard (it keys
+#: on label IDS). So the practical producer of SENT+INBOX co-occurrence is the
+#: human's own drag (a Trash→Inbox RESTORE of a sent message is a second
+#: human-action path); the list is not exhaustive, but the failure direction is
+#: the SAFE one — the compound scores (INBOX mail's default) rather than skips
+#: (the guard's exception), so an un-named co-occurrence can only under-apply the
+#: guard, never wrongly starve a real arrival. README scopes the daemon to
+#: "scores arriving mail" (line 19), which a dragged-back message is once in the
+#: inbox.
 #: The guard is DAEMON-SCOPED only: ROADMAP's Never-list (line 206) explicitly
 #: permits the deliberate `apply` command to label non-incoming mail.
 NON_INCOMING_LABEL_IDS = frozenset({"SENT", "DRAFT", "CHAT"})

@@ -33,10 +33,12 @@ skip-present (invariant #2) makes a re-run over the same window
 idempotent — a label that already landed reads present, composes an
 EMPTY plan, and earns no second write and no duplicate row. A crash
 between a Gmail write and the commit leaves the write standing with its
-audit row uncommitted; the re-run re-surfaces the message, skip-present
-holds the label off the wire, and the row is written then. The audit
-truth is the Applications table PLUS the mailbox, never a guaranteed 1:1
-(the daemon's documented posture, inherited).
+audit row UNCOMMITTED, and the re-run does NOT re-add it: the label is
+now present, so skip-present composes an empty plan and no row is
+written (the documented face of the same design the daemon carries —
+"the rows are not re-added"). The audit truth is the Applications table
+PLUS the mailbox, never a guaranteed 1:1 (the daemon's posture,
+inherited).
 
 THE ARMS (the gmail_errors taxonomy, checked not string-matched):
 GmailAuthError propagates (human-gated — the CLI's exit-4 mapping); a
@@ -319,6 +321,12 @@ def run_apply(
         )
         if stop:
             break  # the batch ran to its commit point; the flag stops the loop
+        # the between-PAGES sample (the daemon's shape): a flag that
+        # flips after this batch's message loop but before the next page
+        # must not pay for another page of Gmail writes — the current
+        # batch already reached its commit point
+        if should_stop():
+            break
         token = page.next_page_token
         if token is None:
             break

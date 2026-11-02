@@ -70,6 +70,196 @@ def test_index_reads_joined_rows_in_date_order(gyb: Path) -> None:
     assert a.eml_relpath.endswith(".eml")
 
 
+def test_index_flags_draft_chat_rows_exact_case(tmp_path: Path) -> None:
+    # ticket #32: the raw-token exclusion flag is computed
+    # BEFORE _keep_label filtering, exact-case on the canonical uppercase
+    # ids — a lowercase user label "chat"/"draft" is user content, never
+    # the system token (export's id-exact precedent, test_export.py)
+    make_gyb(
+        tmp_path,
+        [
+            ("aaaa", "2026-07-15 10:00:00", ["DRAFT", "Money/Purchases"]),
+            ("bbbb", "2026-07-15 10:01:00", ["CHAT", "Friends"]),
+            ("cccc", "2026-07-15 10:02:00", ["INBOX", "Work"]),
+            ("dddd", "2026-07-15 10:03:00", ["Friends", "chat", "draft"]),
+        ],
+    )
+    rows = {r.id: r for r in read_gyb_index(tmp_path / "msg-db.sqlite")}
+    assert rows["aaaa"].excluded_draft_chat
+    assert rows["bbbb"].excluded_draft_chat
+    assert not rows["cccc"].excluded_draft_chat
+    assert not rows["dddd"].excluded_draft_chat
+
+
+def test_import_rejects_draft_chat_rows(tmp_path: Path) -> None:
+    # THE repro from #17's review (ticket #32): a DRAFT/CHAT
+    # row used to import with the system token silently stripped — the
+    # contamination invisible. Now rejected at ingest: counted, never
+    # stored, never a failure (a policy decision, not a defect)
+    make_gyb(
+        tmp_path,
+        [
+            ("aaaa", "2026-07-15 10:00:00", ["DRAFT", "Money/Purchases"]),
+            ("bbbb", "2026-07-15 10:01:00", ["CHAT", "Friends"]),
+            ("cccc", "2026-07-15 10:02:00", ["INBOX", "Work"]),
+        ],
+    )
+    store = CorpusStore(tmp_path / "corpus")
+    stats = import_gyb(tmp_path, store)
+    assert {r.id for r in store.iter_records()} == {"cccc"}
+    assert stats.scanned == 3 and stats.written == 1
+    assert stats.skipped_draft_chat == 2
+    assert not stats.failed
+
+
+def test_import_keeps_lowercase_user_lookalikes(tmp_path: Path) -> None:
+    # exact-case posture (ticket #32): "chat"/"draft" as USER
+    # labels are content — the rows import with them kept verbatim
+    make_gyb(
+        tmp_path,
+        [
+            ("aaaa", "2026-07-15 10:00:00", ["Friends", "chat"]),
+            ("bbbb", "2026-07-15 10:01:00", ["draft", "Work"]),
+        ],
+    )
+    store = CorpusStore(tmp_path / "corpus")
+    stats = import_gyb(tmp_path, store)
+    assert stats.written == 2 and stats.skipped_draft_chat == 0
+    recs = {r.id: r for r in store.iter_records()}
+    assert recs["aaaa"].labels == ("Friends", "chat")  # sorted, byte-stable
+    assert recs["bbbb"].labels == ("Work", "draft")
+
+
+def test_skip_present_precedes_draft_chat(tmp_path: Path) -> None:
+    # mirror of export's ordering (store.has BEFORE the policy skip,
+    # ticket #32): a resume run over already-present DRAFT
+    # mail counts present, not draft_chat — the id-set cursor answers first
+    from datetime import datetime  # UTC is module-level
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+
+    make_gyb(tmp_path, [("aaaa", "2026-07-15 10:00:00", ["DRAFT", "Work"])])
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(
+        CorpusRecord(
+            id="aaaa",
+            date=datetime(2026, 7, 15, 10, 0, tzinfo=UTC),
+            subject="seed",
+            sender="s@x.com",
+            recipients=("me@x.com",),
+            labels=("Work",),
+            body_hash=body_hash("seed body"),
+            source="api",
+            date_provenance="internal_date",
+            thread_id="",
+        ),
+        "seed body",
+    )
+    stats = import_gyb(tmp_path, store)
+    assert stats.skipped_present == 1 and stats.skipped_draft_chat == 0
+
+
+def test_max_messages_holds_on_rejected_rows(tmp_path: Path) -> None:
+    # rejected rows consume scan budget (ticket #32): the
+    # bound stops the stream AT max_messages, not past it — the same
+    # per-path discipline export's bottom-of-loop bound enforces
+    make_gyb(
+        tmp_path,
+        [(f"{n:04d}", f"2026-07-15 10:{n:02d}:00", ["DRAFT"]) for n in range(1, 6)],
+    )
+    store = CorpusStore(tmp_path / "corpus")
+    stats = import_gyb(tmp_path, store, max_messages=3)
+    assert stats.scanned == 3
+    assert stats.skipped_draft_chat == 3
+    assert stats.written == 0
+
+
+def test_max_messages_holds_on_failed_rows(tmp_path: Path) -> None:
+    # pre-existing hole (ticket #32 reviews): the bound was ABSENT on the
+    # per-row failure paths, so an all-failing prefix scanned past
+    # max_messages — ONE bottom-of-loop check covers every path
+    rows = [
+        (n, f"2026/7/15/{n:04x}.eml", f"2026-07-15 {n % 24:02d}:00:00")
+        for n in range(1, 8)
+    ]
+    gyb = _mini_db(tmp_path, rows)
+    # NO .eml files written: every read fails, nothing is ever stored
+    stats = import_gyb(gyb, CorpusStore(tmp_path / "corpus"), max_messages=3)
+    assert stats.scanned == 3
+    assert len(stats.failed) == 3
+
+
+def test_escape_stops_run_even_for_rejected_rows(tmp_path: Path) -> None:
+    # fail-closed for DB-sourced paths is unconditional for every row NOT
+    # already in the corpus (deepseek review): the containment guard runs
+    # BEFORE the policy-rejection branch, so a DRAFT row with an escaping
+    # message_filename aborts the whole run even though its .eml is never
+    # read
+    from gmail_labeler.gyb_import import GybImportError
+
+    gyb = tmp_path / "gyb"
+    gyb.mkdir()  # the escaping relpath references no folder
+    con = sqlite3.connect(gyb / "msg-db.sqlite")
+    con.executescript(
+        "CREATE TABLE messages (message_num INTEGER PRIMARY KEY,"
+        " message_filename TEXT, message_internaldate TEXT);"
+        "CREATE TABLE labels (message_num INTEGER, label TEXT);"
+        "CREATE TABLE uids (message_num INTEGER PRIMARY KEY, uid TEXT);"
+        "INSERT INTO messages VALUES (1, '../../../secret.eml',"
+        " '2026-07-15 10:00:00');"
+        "INSERT INTO uids VALUES (1, 'aa');"
+        "INSERT INTO labels VALUES (1, 'DRAFT');"
+    )
+    con.commit()
+    con.close()
+    store = CorpusStore(tmp_path / "corpus")
+    with pytest.raises(GybImportError, match="escapes"):
+        import_gyb(gyb, store)
+
+
+def test_present_row_with_escape_skips_not_aborts(tmp_path: Path) -> None:
+    # skip-present precedence over the guard (base behavior, pinned): a
+    # row already in the corpus is answered from the id-set BEFORE any
+    # path question is asked — resume never aborts on a stored id's row
+    from datetime import datetime
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+
+    gyb = tmp_path / "gyb"
+    gyb.mkdir()
+    con = sqlite3.connect(gyb / "msg-db.sqlite")
+    con.executescript(
+        "CREATE TABLE messages (message_num INTEGER PRIMARY KEY,"
+        " message_filename TEXT, message_internaldate TEXT);"
+        "CREATE TABLE labels (message_num INTEGER, label TEXT);"
+        "CREATE TABLE uids (message_num INTEGER PRIMARY KEY, uid TEXT);"
+        "INSERT INTO messages VALUES (1, '../../../secret.eml',"
+        " '2026-07-15 10:00:00');"
+        "INSERT INTO uids VALUES (1, 'aa');"
+        "INSERT INTO labels VALUES (1, 'Work');"
+    )
+    con.commit()
+    con.close()
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(
+        CorpusRecord(
+            id="aa",
+            date=datetime(2026, 7, 15, 10, 0, tzinfo=UTC),
+            subject="seed",
+            sender="s@x.com",
+            recipients=("me@x.com",),
+            labels=("Work",),
+            body_hash=body_hash("b"),
+            source="api",
+            date_provenance="internal_date",
+            thread_id="",
+        ),
+        "b",
+    )
+    stats = import_gyb(gyb, store)  # NO raise: skip-present answers first
+    assert stats.skipped_present == 1
+
+
 def test_import_writes_normalized_records(gyb: Path, tmp_path: Path) -> None:
     store = CorpusStore(tmp_path / "corpus")
     stats = import_gyb(gyb, store)
@@ -93,6 +283,18 @@ def test_system_labels_extra_localizes_the_filter(gyb: Path, tmp_path: Path) -> 
     import_gyb(gyb, store, system_labels_extra=frozenset({"INKASSIE"}))
     recs = {r.id: r for r in store.iter_records()}
     assert recs["cccc"].labels == ("Friends",)
+
+
+def test_declared_localized_token_never_rejects_rows(tmp_path: Path) -> None:
+    # pins the --system-labels help claim: a DECLARED localized equivalent
+    # of DRAFT (ENTWURF = German) is stripped from the label SET but does
+    # NOT trigger row rejection — rejection is canonical-tokens-only
+    make_gyb(tmp_path, [("aaaa", "2026-07-15 10:00:00", ["ENTWURF", "Work"])])
+    store = CorpusStore(tmp_path / "corpus")
+    stats = import_gyb(tmp_path, store, system_labels_extra=frozenset({"ENTWURF"}))
+    assert stats.written == 1 and stats.skipped_draft_chat == 0
+    rec = next(iter(store.iter_records()))
+    assert rec.labels == ("Work",)  # token stripped, row kept
 
 
 def test_resume_skips_present_without_touching_disk(gyb: Path, tmp_path: Path) -> None:

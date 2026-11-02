@@ -35,7 +35,7 @@ from .corpus_store import CorpusError, CorpusStore
 from .corpus_store import _fsync_dir as _fsync_dir
 from .gmail_client import FilterInfo, GmailClient
 from .gmail_errors import BACKOFF, RETRY, GmailAuthError, GmailError
-from .labels import normalize_label_names
+from .labels import EXCLUDED_CORPUS_LABEL_IDS, normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 
 log = logging.getLogger("gmail_labeler.export")
@@ -58,22 +58,14 @@ log = logging.getLogger("gmail_labeler.export")
 #     and carries a silent word-degradation hazard (an unknown in: value
 #     may be word-degraded and drop legit mail containing the word
 #     "chat"). Chat exclusion therefore lives at INGEST:
-#     _EXCLUDED_SYSTEM_LABEL_IDS below hard-skips raw-wire DRAFT/CHAT
-#     labelIds — the load-bearing layer, which an explicit --query
-#     override cannot bypass.
+#     labels.EXCLUDED_CORPUS_LABEL_IDS (the shared home in labels.py)
+#     hard-skips raw-wire DRAFT/CHAT labelIds — the load-bearing layer,
+#     which an explicit --query override cannot bypass. The GYB importer
+#     imports the SAME constant (ticket #32: two ingest layers, one
+#     policy, no drift).
 # Pinned in test_export_scope_pins_both_layers.
 DEFAULT_QUERY = "in:anywhere -in:spam -in:trash -in:draft"
 
-# Ingest-layer exclusion (same decision as DEFAULT_QUERY above): a
-# message whose RAW wire labelIds carry the system label id DRAFT or
-# CHAT is hard-skipped before anything is stored. Exact id match on the
-# raw payload, BEFORE labels.py normalization — normalize_label_names
-# strips System Labels from the record vocabulary, so matching after it
-# would be impossible. Never name-matched: a user label named "chat" is
-# not chat. (labels.py's SYSTEM_LABEL_IDS already tracks these ids; the
-# pair is called out here because the consequence is corpus exclusion,
-# not just vocabulary filtering.)
-_EXCLUDED_SYSTEM_LABEL_IDS = frozenset({"DRAFT", "CHAT"})
 MAX_ATTEMPTS = 5
 _BASE_BACKOFF_S = 1.0
 
@@ -219,7 +211,7 @@ def _export_one(
     if msg is None:
         stats.failed.append((message_id, "fetch failed (permanent/retries)"))
         return "failed"
-    if _EXCLUDED_SYSTEM_LABEL_IDS.intersection(msg.label_ids):
+    if EXCLUDED_CORPUS_LABEL_IDS.intersection(msg.label_ids):
         # policy skip on the RAW wire labelIds (before parse/normalize):
         # counted by the caller, never stored, never a failure — the
         # exclusion is a decision, not a defect

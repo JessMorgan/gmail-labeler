@@ -42,6 +42,14 @@ does not ship releases yet.
 
 ### Changed
 
+- GYB import rejects DRAFT/CHAT rows at ingest (ticket #32, completing
+  #17 corpus-wide): a backup row whose raw label tokens carry the
+  canonical id DRAFT or CHAT is counted `skipped_draft_chat` and never
+  stored — previously the token was stripped from the row's label set
+  and the contaminated row imported silently. The exclusion pair now
+  has one shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both
+  ingest layers import, so export and import cannot drift; `dataset
+  import-gyb` reports the count in its summary line.
 - `dataset export` scope excludes DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message

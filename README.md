@@ -564,9 +564,11 @@ add one it missed — the daemon captures that as a **Correction** against
 the Applications join, on its normal poll (no extra Gmail calls; the
 correction path is read + local-DB only, and it never writes back). A
 `removed` is a negative signal (you undid our work); an `added` of a
-graduated label we did not write is positive signal — but only when no
-Gmail filter explains it (see the *attribution* below). System-label and
-non-vocabulary churn is ignored — noise is not correction.
+graduated label we did not write is positive signal — but only when a
+Gmail filter verifiably did **not** author it (see the *attribution*
+below; with no filters snapshot the daemon can't tell, so it withholds the
+add rather than guess). System-label and non-vocabulary churn is ignored —
+noise is not correction.
 
 ```sh
 gmail-labeler status --bands bands.json --graduation graduation.json
@@ -595,8 +597,9 @@ them into the corpus is the builder's composition seam and running a
 retrain is a **separate human decision** (ADR-0005's human-gated retrain).
 Only a `human` add is training signal: a `filter_covered` add (a Gmail
 filter verifiably would have applied it) and an `unverifiable` add (a
-relevant filter makes authorship undecidable) are both withheld — the
-latter excluded rather than credited to you, the *exclusion, not guessing*
+relevant filter makes authorship undecidable, **or there is no filters
+snapshot to check at all**) are both withheld — the latter excluded rather
+than credited to you, the *exclusion, not guessing*
 principle `dataset analyze` follows (#22). `status` discloses each
 withheld slice as its own count.
 

@@ -79,12 +79,15 @@ ANYTHING else on an applied message — System Labels, non-vocabulary
 labels, a removed NON-applied label, INBOX churn — records NOTHING:
 noise is not correction. An 'added' Correction carries an
 ``attribution`` (the #22 ``simulates_filter`` mechanism over the offline
-filters.json snapshot): ``"human"`` (no relevant filter, or a verifiable
-one that does not match — training signal), ``"filter_covered"`` (a
-simulatable filter verifiably would have added it — withheld), or
-``"unverifiable"`` (authorship cannot be determined — WITHHELD, not
-guessed, #22's exclusion principle). Only ``"human"`` adds are training
-signal. A 'removed' Correction is always attributed ``"human"`` (a human
+filters.json snapshot): ``"human"`` (an attested snapshot with no relevant
+filter, or a verifiable one that does not match — training signal),
+``"filter_covered"`` (a simulatable filter verifiably would have added it —
+withheld), or ``"unverifiable"`` (authorship cannot be determined —
+WITHHELD, not guessed, #22's exclusion principle). A MISSING or malformed
+snapshot is UNKNOWN attribution, not "no filters": every 'added' is then
+``"unverifiable"`` (withheld), and the daemon warns at startup. Only
+``"human"`` adds are training signal. A 'removed' Correction is always
+attributed ``"human"`` (a human
 removing is human signal regardless of filters — invariant #6).
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
@@ -318,15 +321,23 @@ class ServingContext:
     # file read — never a Gmail call, so the daemon's exact startup-call
     # pins stand). The correction arm uses it to attribute an 'added'
     # Correction (human / filter_covered / unverifiable — see
-    # _attribution); empty (the default) means NO snapshot — no relevant
-    # filter, so every 'added' Correction is attributed 'human' (nothing
-    # claims it). An UNVERIFIABLE filter (criteria outside
-    # {from,to,subject}) yields 'unverifiable' — WITHHELD, not credited to
-    # the human (#22's exclusion principle; the old bool inverted this).
-    # Defaults so the #25/#26 ServingContext constructions (and their
-    # suites) are behavior-identical — the daemon's correction arm is the
-    # ONLY reader.
-    filters: Sequence[Mapping[str, object]] = ()
+    # _attribution). THREE states, mirroring analyze.py's filters=None
+    # posture (the #22 mechanism REUSED, not forked):
+    #   None  — NO usable snapshot (absent or malformed): attribution is
+    #           UNKNOWN, so an 'added' is 'unverifiable' (WITHHELD, not
+    #           credited to the human — #22's exclusion principle; treating
+    #           an absent snapshot as "no filters" is the fail-open F1
+    #           removes, one level up). The CLI warns at startup.
+    #   ()    — a snapshot was read and lists NO filters: the operator's
+    #           ATTESTATION that none exist, so no relevant filter claims a
+    #           label and an 'added' is 'human' (positive signal). This is
+    #           the default, so the #25/#26 ServingContext constructions (and
+    #           their suites) stay behavior-identical — the daemon's
+    #           correction arm is the ONLY reader.
+    #   [...] — the filters; an 'added' whose relevant filter is simulatable
+    #           and matches is 'filter_covered'; one whose criteria are
+    #           outside {from,to,subject} is 'unverifiable' (withheld).
+    filters: Sequence[Mapping[str, object]] | None = ()
 
 
 def present_names(ctx: ServingContext, raw_label_ids: Sequence[str]) -> frozenset[str]:
@@ -509,9 +520,16 @@ def _attribution(
       were unavailable so authorship cannot be determined: WITHHELD, not
       guessed (#22's exclusion principle — the old bool INVERTED this by
       defaulting an unverifiable add to the human).
-    No snapshot (``ctx.filters`` empty) -> no relevant filter -> 'human'."""
+    ``ctx.filters is None`` (NO usable snapshot — absent or malformed) ->
+    attribution is UNKNOWN -> 'unverifiable' for every 'added' (we cannot
+    tell a filter-authored add from a human one; #22's exclusion principle,
+    the same posture as analyze.py's ``filters=None``). An attested-empty
+    snapshot (``()``) is NOT this case — it means "no filters exist", so an
+    'added' is 'human'."""
     from types import SimpleNamespace
 
+    if ctx.filters is None:
+        return "unverifiable"  # no snapshot -> authorship unknown -> withhold
     relevant = [f for f in ctx.filters if label_id in filter_label_ids(f)]
     if not relevant:
         return "human"  # no filter claims this label -> the human added it

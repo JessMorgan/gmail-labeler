@@ -3171,6 +3171,32 @@ class _ServeStartup:
     records: tuple[CorpusRecord, ...]
 
 
+def _load_filters_snapshot(sidecar: Path) -> list[dict[str, object]] | None:
+    """Read the offline filter-attribution snapshot for the daemon's
+    correction arm (#27, invariant #6). A LOCAL file read — never a Gmail
+    call, so the startup exact-call pins stand. THREE outcomes, mirroring
+    analyze.py's ``filters=None`` posture (the #22 mechanism reused):
+    - ``None`` — the sidecar is ABSENT or malformed: attribution is
+      UNKNOWN, so an 'added' Correction must be withheld as 'unverifiable'
+      rather than credited to the human (a missing snapshot is NOT an
+      attestation that no filter exists — that fail-open is what F1
+      removes);
+    - ``[]`` — the sidecar is present and lists no filters: the operator's
+      ATTESTATION that none exist (an 'added' is then 'human' signal);
+    - ``[filter, ...]`` — the parsed snapshot.
+    A malformed file is ``None`` (unknown), never ``[]`` (a corrupt file
+    must not masquerade as an attested-empty one)."""
+    if not sidecar.is_file():
+        return None
+    try:
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
+    if isinstance(raw, list) and all(isinstance(f, dict) for f in raw):
+        return [dict(f) for f in raw]
+    return None
+
+
 def _serve_startup(
     *,
     command: str,
@@ -3540,22 +3566,23 @@ def _serve_startup(
 
     # the offline filter-attribution snapshot for the daemon's correction
     # arm (#27, invariant #6): a LOCAL file read (never a Gmail call — the
-    # startup exact-call pins stand). Best-effort: absent or malformed →
-    # () → no relevant filter, so every 'added' Correction is attributed
-    # 'human' (nothing claims it). With a snapshot, an 'added' whose
-    # relevant filter has criteria outside from/to/subject is attributed
-    # 'unverifiable' — WITHHELD from human credit and the export, and
-    # disclosed as its own status slice (F1: exclusion, not guessing).
-    # apply never reads it.
-    filters_snapshot: list[dict[str, object]] = []
-    sidecar = store.root / SIDECAR_FILTERS
-    if sidecar.is_file():
-        try:
-            raw = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (ValueError, OSError, UnicodeDecodeError):
-            raw = None
-        if isinstance(raw, list) and all(isinstance(f, dict) for f in raw):
-            filters_snapshot = [dict(f) for f in raw]
+    # startup exact-call pins stand). _load_filters_snapshot distinguishes
+    # UNKNOWN (None: absent or malformed — an 'added' is withheld as
+    # 'unverifiable', NOT credited to the human) from ATTESTED-NONE ([]: the
+    # operator ran the export and has no filters — an 'added' is 'human').
+    # The old code collapsed absent/malformed into [], failing open exactly
+    # as the bool F1 removed did, one level up. apply never reads it.
+    filters_snapshot = _load_filters_snapshot(store.root / SIDECAR_FILTERS)
+    if filters_snapshot is None and command == "daemon":
+        typer.echo(
+            f"daemon: NOTE no usable filters snapshot at "
+            f"{store.root / SIDECAR_FILTERS} — correction attribution is "
+            "UNKNOWN, so every 'added' Correction is withheld as "
+            "'unverifiable' (not credited as training signal). Run "
+            "`dataset export` against this store to enable filter "
+            "attribution.",
+            err=True,
+        )
 
     ctx = ServingContext(
         bands=bands_map,

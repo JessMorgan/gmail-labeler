@@ -228,9 +228,46 @@ def test_added_managed_label_records_correction(tmp_path: Path) -> None:
     assert _tick(tmp_path, fake, db) == 0
     corr = db.corrections_for_message("aa11")
     assert [(c.label, c.kind) for c in corr] == [("Money/Bills", "added")]
-    # no snapshot -> no relevant filter claims the label -> the human added
-    # it (positive training signal; F1 replaced the old bool's False here)
+    # _ctx()'s default filters=() is an ATTESTED-NONE snapshot (the operator
+    # ran the export and has no filters) -> no relevant filter claims the
+    # label -> the human added it (positive training signal). A MISSING
+    # snapshot is the SEPARATE None case, pinned below as 'unverifiable'.
     assert corr[0].attribution == "human"
+    db.close()
+
+
+def test_added_correction_unknown_snapshot_is_unverifiable(tmp_path: Path) -> None:
+    # F1 MAJOR (invariant #6, one level up): a MISSING filters snapshot
+    # (ctx.filters is None) is authorship-UNKNOWN, NOT "no filters" -- every
+    # 'added' is withheld as 'unverifiable', never credited to the human.
+    # This is the same fail-open F1 removed (the bool defaulted an
+    # unverifiable add to human), now at the snapshot level; analyze.py's
+    # filters=None posture is the reused #22 precedent.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(filters=None)  # NO usable snapshot
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
+def test_removed_correction_still_human_under_unknown_snapshot(
+    tmp_path: Path,
+) -> None:
+    # the unknown-snapshot withhold applies ONLY to 'added'; a 'removed' is
+    # ALWAYS 'human' (a human removing is human signal regardless of whether
+    # we can see the filters -- invariant #6), even with ctx.filters None.
+    db = _db(tmp_path)
+    _applied(db, "aa22", "Money/Bills", "L2")
+    fake = _fake(_page(_record("aa22", removed=[("aa22", ["L2"])])))
+    ctx = _ctx(filters=None)
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa22")
+    assert corr[0].kind == "removed" and corr[0].attribution == "human"
     db.close()
 
 
@@ -549,3 +586,45 @@ def test_flat_id_label_event_is_tolerated(tmp_path: Path) -> None:
     assert _tick(tmp_path, fake, db) == 0
     assert len(db.corrections_for_message("aa22")) == 1
     db.close()
+
+
+# -- the startup snapshot reader (the None-vs-attested-none wiring) -----------
+
+
+def test_load_filters_snapshot_absent_is_unknown(tmp_path: Path) -> None:
+    # a MISSING sidecar is UNKNOWN (None), NOT attested-none ([]) -- the
+    # fail-open F1 removes at the snapshot level
+    from gmail_labeler.cli import _load_filters_snapshot
+
+    assert _load_filters_snapshot(tmp_path / "filters.json") is None
+
+
+def test_load_filters_snapshot_malformed_is_unknown(tmp_path: Path) -> None:
+    # a CORRUPT sidecar is UNKNOWN (None), never an attested-empty [] (a
+    # broken file must not masquerade as "the operator has no filters")
+    from gmail_labeler.cli import _load_filters_snapshot
+
+    bad = tmp_path / "filters.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert _load_filters_snapshot(bad) is None
+    # a JSON list containing a non-dict element is also malformed -> None
+    bad.write_text('["not-a-filter"]', encoding="utf-8")
+    assert _load_filters_snapshot(bad) is None
+
+
+def test_load_filters_snapshot_present_empty_is_attested_none(tmp_path: Path) -> None:
+    # a present sidecar listing NO filters is the operator's ATTESTATION
+    # ([]), distinct from the unknown (None) case above
+    from gmail_labeler.cli import _load_filters_snapshot
+
+    empty = tmp_path / "filters.json"
+    empty.write_text("[]", encoding="utf-8")
+    assert _load_filters_snapshot(empty) == []
+
+
+def test_load_filters_snapshot_present_returns_the_list(tmp_path: Path) -> None:
+    from gmail_labeler.cli import _load_filters_snapshot
+
+    snap = tmp_path / "filters.json"
+    snap.write_text('[{"criteria": {"from": "a@x.com"}}]', encoding="utf-8")
+    assert _load_filters_snapshot(snap) == [{"criteria": {"from": "a@x.com"}}]

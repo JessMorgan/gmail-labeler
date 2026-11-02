@@ -136,15 +136,19 @@ label, INBOX churn — records NOTHING (noise is not correction). An
 *filter-covered* — a simulatable (from/to/subject) Gmail filter verifiably
 would have applied it (invariant #6), withheld from the realized-precision
 human signal and the training fold; *unverifiable* — a filter touching the
-label carries criteria that cannot be simulated from the kept fields, so
+label carries criteria that cannot be simulated from the kept fields, OR
+there is no usable filters snapshot at all (absent or malformed), so
 authorship is undecidable and the add is **withheld, not credited** to the
 human — the same *exclusion, not guessing* principle that governs
 `dataset analyze` (#22): guessing either way is what that doctrine forbids.
-Only a *human* `added` (no relevant filter, or a verifiable one that does
-not match) is positive training signal. A `removed` is ALWAYS *human* (a
-human removing is human signal regardless of filters). `status` discloses
-each withheld slice as its own count. A corrected message is never
-re-written by the daemon.
+A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation
+that no filter exists (an empty *snapshot* — the operator ran the export
+and has none — is the attested-none case where an `added` is *human*).
+Only a *human* `added` (an attested snapshot with no relevant filter, or a
+verifiable one that does not match) is positive training signal. A
+`removed` is ALWAYS *human* (a human removing is human signal regardless of
+filters). `status` discloses each withheld slice as its own count. A
+corrected message is never re-written by the daemon.
 _Avoid_: feedback, undo
 
 **Status**:

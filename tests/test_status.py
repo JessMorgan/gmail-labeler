@@ -80,6 +80,20 @@ def test_removed_exceeding_written_is_refused_not_clamped() -> None:
         compute_precision(frozenset({"A"}), {"A": 1}, {"A": (3, 0, 0, 0)})
 
 
+def test_removed_exceeding_written_names_path_and_recovery() -> None:
+    # F3 item 3: with several --db files in play the refusal must name WHICH
+    # store is corrupt + a recovery clause (the appdb tamper-family tone)
+    from gmail_labeler.status import PrecisionInvariantError
+
+    with pytest.raises(PrecisionInvariantError) as exc:
+        compute_precision(
+            frozenset({"A"}), {"A": 1}, {"A": (3, 0, 0, 0)}, db_path="/x/state.db"
+        )
+    msg = str(exc.value)
+    assert "/x/state.db" in msg
+    assert "recovery" in msg and "delete the state DB" in msg
+
+
 def test_graduated_label_with_no_corrections_is_perfect() -> None:
     rows = compute_precision(frozenset({"A"}), {"A": 7}, {})
     assert rows[0].precision == 1.0 and rows[0].removed == 0
@@ -469,7 +483,13 @@ def test_status_json_basis_full_caveats_and_vocab(
         assert needle in basis["caveat"], needle
     # the vocabulary is RENDERED from CORRECTION_ATTRIBUTIONS (not a literal)
     assert basis["attribution_vocabulary"] == list(CORRECTION_ATTRIBUTIONS)
+    # item 1 (F3, M5 gap): the NOTE/json cause-list must carry the GLOBAL
+    # breadth, not drift back to per-filter -- assert the mirrored sentence
     assert "addLabelIds is unreadable" in basis["unverifiable_causes"]
+    assert (
+        "every 'added' Correction, for every label, is withheld until the "
+        "snapshot is clean" in basis["unverifiable_causes"]
+    )
 
 
 def test_status_note_vocab_tracks_the_constant(
@@ -487,6 +507,12 @@ def test_status_note_vocab_tracks_the_constant(
     result = _status(tmp_path, cfg)
     assert result.exit_code == 0, result.output
     assert " / ".join(CORRECTION_ATTRIBUTIONS) in result.output
+    # F3 item 1 (M5 gap): the TEXT NOTE (not just --json) must carry the
+    # GLOBAL breadth verbatim
+    assert (
+        "every 'added' Correction, for every label, is withheld until the "
+        "snapshot is clean" in result.output
+    )
 
 
 def test_status_bands_graduation_expanduser(
@@ -520,11 +546,17 @@ def test_status_reads_corrections_before_written(
 ) -> None:
     # F2 item 9 (the torn-read): the two aggregate SELECTs are separate
     # autocommit reads, so a daemon delta can commit BETWEEN them. Reading
-    # corrections FIRST is monotone (a 'removed' rides the same delta
-    # transaction as its app row, so the later written read always sees it)
-    # -- reading written first would let a (removed, its app) pair land
-    # between the reads and spuriously trip the removed>written refuse. Pin
-    # the ORDER (a mutant swapping them back reddens).
+    # corrections FIRST is monotone -- the PROPERTY guard is the INSERT-only
+    # premise in the cli.py comment (`applications` is never UPDATEd/DELETEd,
+    # and a 'removed' requires an app already in the join, so the later
+    # written read always includes it). This test pins the READ ORDER as a
+    # PROXY for that property: a mutant swapping the two calls back reddens
+    # it. CAVEAT (deepseek F3 item 5): a legitimate future REFACTOR to a
+    # SINGLE snapshot-consistent query would call NEITHER method separately,
+    # leaving `order` empty and reddening this proxy spuriously -- that is
+    # the correct signal to UPDATE this pin (the property it guards would be
+    # even safer under one query), NOT a reason to keep two reads. If you hit
+    # this, replace the order assertion with a single-query snapshot test.
     import gmail_labeler.appdb as appdb_mod
 
     _prepare(tmp_path, monkeypatch)
@@ -547,3 +579,32 @@ def test_status_reads_corrections_before_written(
     result = _status(tmp_path, cfg)
     assert result.exit_code == 0, result.output
     assert order == ["corrections", "written"]
+
+
+def test_status_exit5_names_the_db_path(tmp_path: Path, monkeypatch) -> None:
+    # F3 item 3 (M4 gap): the CLI must actually PASS the path into the
+    # refusal (a pure-math test alone would not catch a dropped db_path= at
+    # the call site). Seed a store with removed>written for a graduated
+    # label (valid rows -- the aggregate shape check passes; only the
+    # aggregate COUNT violates the join gate), and assert the exit-5 stderr
+    # names WHICH --db file is corrupt.
+    _prepare(tmp_path, monkeypatch)
+    db_path = tmp_path / "state.db"
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{db_path}"')
+    db = AppDB(db_path)
+    db.open()
+    db.commit_applications([_app_row("Money/Bills", "aa11")])  # written=1
+    db.commit_page(
+        [],
+        999,
+        [
+            _corr("Money/Bills", "aa11", "removed"),
+            _corr("Money/Bills", "bb22", "removed"),  # removed=2 > written=1
+        ],
+    )
+    db.close()
+    result = _status(tmp_path, cfg)
+    assert result.exit_code == 5, result.output
+    # assert on STDERR specifically (the refusal is an error line, not stdout)
+    assert str(db_path) in result.stderr  # the path is named (multi --db context)
+    assert "recovery" in result.stderr

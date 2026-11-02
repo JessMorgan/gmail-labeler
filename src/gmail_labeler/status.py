@@ -78,30 +78,49 @@ def compute_precision(
     graduated: frozenset[str],
     written_by_label: Mapping[str, int],
     correction_stats: Mapping[str, tuple[int, int, int, int]],
+    *,
+    db_path: str | None = None,
 ) -> list[LabelPrecision]:
     """Per GRADUATED label (sorted — a total order for the report), the
     realized-precision line. ``correction_stats`` maps label ->
     (removed, added, added_filter_covered, added_unverifiable) (the store's
     ``correction_label_stats``). A graduated label with no Applications
     reports 'no data' (precision None); one with no Corrections reports
-    precision 1.0 (everything applied is still standing).
+    precision 1.0 (everything applied is still standing). ``db_path`` (when
+    given) names the state DB in the refusal — with several --db files in
+    play the operator must know WHICH store is corrupt.
 
     Raises ``PrecisionInvariantError`` when ``removed > written`` for a
     label: the join gate keeps ``removed <= written`` on the honest path
     (a 'removed' Correction exists only for an applied (message, label),
     deduped), so a violation is a hand-edited/corrupt store — refused
-    NAMED, never clamped to 0.0 (a clamp would hide the corruption behind
-    a plausible-looking precision)."""
+    NAMED with a recovery clause (the appdb tamper-family tone), never
+    clamped to 0.0 (a clamp would hide the corruption behind a
+    plausible-looking precision)."""
     out: list[LabelPrecision] = []
     for label in sorted(graduated):
         written = written_by_label.get(label, 0)
         removed, added, added_fc, added_uv = correction_stats.get(label, (0, 0, 0, 0))
         if removed > written:
+            where = f": {db_path}" if db_path else ""
+            recovery = (
+                " — recovery: a 'removed' Correction has no matching "
+                "Application row; hand-fix the corrections rows, or delete "
+                "the state DB (ALL local history — applications, shadow, "
+                "corrections — is lost and CANNOT be rebuilt: the daemon "
+                "re-bootstraps the cursor without replaying history, so past "
+                "Applications are never restored, the 'written' count "
+                "restarts at zero and grows only from mail applied AFTER the "
+                "reset, and mail before the new bootstrap cursor is not "
+                "processed)"
+                if db_path
+                else ""
+            )
             raise PrecisionInvariantError(
                 f"label {label!r}: {removed} 'removed' Corrections exceed "
                 f"{written} Application rows — the join gate makes this "
-                "impossible on an honest store; the state DB is corrupt "
-                "(refusing, not clamping)"
+                f"impossible on an honest store; the state DB is corrupt "
+                f"(refusing, not clamping){where}{recovery}"
             )
         precision = (written - removed) / written if written > 0 else None
         out.append(

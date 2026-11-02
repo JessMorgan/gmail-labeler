@@ -35,8 +35,10 @@ does not ship releases yet.
     filters snapshot (absent or malformed); a relevant filter whose criteria
     cannot be simulated from the kept fields (outside `from`/`to`/`subject`,
     or malformed); or an add whose authorship is otherwise undecidable (its
-    message fields were not fetched, or a relevant filter's `addLabelIds` is
-    unreadable). The no-snapshot case is `ServingContext.filters is None`
+    message fields were not fetched, or a filter's `addLabelIds` is unreadable
+    — which is GLOBAL, not per-filter: every 'added' Correction, for every
+    label, is withheld until the snapshot is clean). The no-snapshot case is
+    `ServingContext.filters is None`
     (mirroring analyze.py, warned at startup); the credit arm reads each
     filter through the strict `filter_label_ids_strict` so an unreadable
     `addLabelIds` withholds rather than looking irrelevant (invariant #6,

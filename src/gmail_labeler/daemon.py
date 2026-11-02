@@ -531,7 +531,11 @@ def _attribution(
       relevant filter whose criteria cannot be simulated from the kept
       fields (outside ``from``/``to``/``subject``, or malformed); or an add
       whose authorship is otherwise undecidable (its message fields were
-      not fetched, or a relevant filter's ``addLabelIds`` is unreadable).
+      not fetched, or a filter's ``addLabelIds`` is unreadable). An
+      unreadable ``addLabelIds`` is GLOBAL, not per-filter: because we
+      cannot read which labels that entry adds, we cannot rule it out as
+      any add's author, so every 'added' Correction, for every label, is
+      withheld until the snapshot is clean.
     The credit arm reads each filter's added labels through the STRICT
     ``filter_label_ids_strict`` (analyze's, the same one the builder and
     the CLI bridge check use): an unreadable ``addLabelIds`` must NOT

@@ -147,9 +147,14 @@ Scope:
   replayed event idempotent), `status` reports realized precision from the
   local store alone (no Gmail call, no auth gate), and `corrections
   export` writes a faithful raw dump (every attribution, auditable); the
-  builder's fold seam ships as a pure function but is NOT wired into a
-  retrain — folding the dump into the corpus and retraining is the deferred
-  human step (no auto-retrain; the human gate holds);
+  builder's fold seam ships as a pure function but is NOT operator-runnable
+  end-to-end today — the corpus store is append-only (a folded record re-put
+  over an existing id is a no-op, so the fold cannot rewrite stored labels)
+  and the checkpoint's sidecar pins the corpus fingerprint + split manifest,
+  which a folded corpus changes and `train` then refuses on the identity
+  mismatch. The re-fingerprint tooling to rebuild a consistent corpus is the
+  deferred part; the retrain itself is `train --force`. No auto-retrain — the
+  human gate holds;
 - the `auth` wizard (ADR-0004) — LANDED (#28): `auth setup` walks the console
   steps, verifies locally what it can (client file exists / parses / is
   desktop-type), wires the config + token store, and COMPOSES the existing

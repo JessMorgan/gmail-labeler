@@ -4344,18 +4344,19 @@ def corrections_export(
     fmt: str = typer.Option("json", "--format", help="Export format (json)"),
 ) -> None:
     """Export the recorded Corrections as future TRAINING SIGNAL: a JSON
-    list of ``{message_id, label, kind, attribution}`` (ticket #27;
-    GLOSSARY: Correction). This is a faithful RAW dump — every row is
+    list of ``{message_id, label, kind, detected_at, attribution}`` (ticket
+    #27; GLOSSARY: Correction). This is a faithful RAW dump — every row is
     written with its attribution so the artifact is auditable (you can see
     WHICH adds were withheld and why); the actual signal-filtering is the
     builder's correction-folding seam's single job (it drops every
     non-'human' 'added' before the corpus ever sees it). Reads the LOCAL
     state DB only — no Gmail call — and NEVER retrains: this writes an
-    artifact; folding it into the corpus is a composition point a human
-    opts into, and running a retrain is a SEPARATE human decision (the
-    AC's no-auto-retrain gate). NO
-    bodies (invariant #5): the export carries ids/labels/kinds/attributions
-    only. Exit contract 0/2/4/5."""
+    artifact. The fold seam ships as a PURE function, but running a folded
+    corpus end-to-end today hits the sidecar-identity and append-only walls
+    (see ROADMAP); the re-fingerprint tooling is the deferred part and the
+    retrain itself is `train --force`. NO
+    bodies (invariant #5): the export carries ids/labels/kinds/detected-at/
+    attributions only. Exit contract 0/2/4/5."""
     from .appdb import AppDB, AppDBError
 
     if fmt != "json":
@@ -4397,6 +4398,7 @@ def corrections_export(
             "message_id": r.message_id,
             "label": r.label,
             "kind": r.kind,
+            "detected_at": r.detected_at.isoformat(),
             "attribution": r.attribution,
         }
         for r in rows

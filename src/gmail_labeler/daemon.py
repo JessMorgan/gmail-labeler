@@ -78,10 +78,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .appdb import AppDB, AppDBError
-from .applications import ApplicationRow, plan_message_write
+from .applications import ApplicationRow, WritePlan, plan_message_write
 from .corpus_record import preprocess_text
 from .gmail_client import GmailClient
-from .gmail_errors import GmailAuthError, GmailError, GmailPermanentError
+from .gmail_errors import GmailAuthError, GmailError, GmailPermanentError, is_404
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 from .model import Model
@@ -90,8 +90,10 @@ __all__ = [
     "BOOTSTRAP_QUERY",
     "ServingContext",
     "bootstrap_cursor",
+    "compose_plan",
     "daemon_loop",
     "predict_conformant",
+    "present_names",
 ]
 
 log = logging.getLogger("gmail_labeler.daemon")
@@ -282,6 +284,54 @@ class ServingContext:
     tier_label_ids: Mapping[str, str]
 
 
+def present_names(ctx: ServingContext, raw_label_ids: Sequence[str]) -> frozenset[str]:
+    """The ONE present-set reader (ticket #26 F1): a message's Gmail
+    label ids → the normalized NAMES the plan tests skip-present against,
+    System Labels dropped. The daemon's live path and the apply bulk path
+    ride THIS reader — the id→name bridge is a ctx field, so a change to
+    how presence is read reaches BOTH paths together (the decision core
+    was always shared; this closes the plumbing mirror the review named).
+    Lives in daemon.py (where ServingContext is defined) so the apply
+    module imports it the same way it imports predict_conformant — never
+    a re-derivation."""
+    return frozenset(normalize_label_names(raw_label_ids, ctx.id_to_name))
+
+
+def compose_plan(
+    ctx: ServingContext,
+    message_id: str,
+    *,
+    scores: Mapping[str, float],
+    present: frozenset[str],
+    applied_at: datetime,
+    source: str,
+) -> WritePlan:
+    """The ONE composition call-shape both the daemon (#25) and the apply
+    bulk path (#26) ride (ticket #26 F1): it threads the six
+    ``ServingContext`` maps to ``plan_message_write`` in a SINGLE place,
+    so a new ctx field reaches BOTH paths together and neither caller can
+    drift a kwarg. ``plan_message_write`` is THE decision core (composition
+    over ``tiers.would_apply``) — this wrapper adds NO decision, only the
+    ctx→kwarg wiring; the daemon call site and the apply call site both
+    reach the core through HERE. It calls the module-global
+    ``plan_message_write`` (not a re-import) so the daemon suite's spy on
+    ``daemon.plan_message_write`` still intercepts every plan this helper
+    composes — the extraction is behavior-preserving at the seam the tests
+    watch."""
+    return plan_message_write(
+        message_id,
+        scores=scores,
+        bands=ctx.bands,
+        graduated=ctx.graduated,
+        present=present,
+        system_labels=ctx.system_labels,
+        managed_label_ids=ctx.managed_label_ids,
+        tier_label_ids=ctx.tier_label_ids,
+        applied_at=applied_at,
+        source=source,
+    )
+
+
 def bootstrap_cursor(client: GmailClient) -> int | None:
     """The export prior-art cursor seed (module docstring). GmailError
     propagates (the caller maps the arms); ``None`` = cannot establish
@@ -402,7 +452,7 @@ def _run_tick(
         except GmailError as e:
             if isinstance(e, GmailAuthError):
                 raise  # human-gated, never a page-hold
-            if isinstance(e, GmailPermanentError) and e.status == 404:
+            if is_404(e):
                 # the expiry arm PER THE TAXONOMY: GmailResyncError IS
                 # a GmailPermanentError with status=404 (documented
                 # subclass) — the fake's raw 404 and the adapter's
@@ -439,7 +489,7 @@ def _run_tick(
             except GmailAuthError:
                 raise
             except GmailError as e:
-                if isinstance(e, GmailPermanentError) and e.status == 404:
+                if is_404(e):
                     # the message is gone (deleted mid-window): the
                     # per-message fail-safe — skip + a counted warning
                     # naming the id and the typed error (body-free by the
@@ -468,7 +518,7 @@ def _run_tick(
                 )
                 continue
             parsed = parse_mime(data)  # never raises (the mime contract)
-            present = frozenset(normalize_label_names(raw.label_ids, ctx.id_to_name))
+            present = present_names(ctx, raw.label_ids)  # the SHARED reader
             # the body feeds ONLY this in-memory preprocess (invariant
             # #5 — it never reaches a log line, the DB, or the plan)
             fetched.append(
@@ -521,15 +571,14 @@ def _run_tick(
     warnings = 0
     for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
         scores = dict(zip(vocab, score_row, strict=True))
-        plan = plan_message_write(
+        # the SHARED composition call-shape (compose_plan → the one
+        # plan_message_write core); the daemon suite's spy on
+        # daemon.plan_message_write still intercepts every plan here
+        plan = compose_plan(
+            ctx,
             message_id,
             scores=scores,
-            bands=ctx.bands,
-            graduated=ctx.graduated,
             present=present,
-            system_labels=ctx.system_labels,
-            managed_label_ids=ctx.managed_label_ids,
-            tier_label_ids=ctx.tier_label_ids,
             applied_at=applied_at,
             source="daemon",
         )
@@ -550,7 +599,7 @@ def _run_tick(
         except GmailAuthError:
             raise
         except GmailError as e:
-            if isinstance(e, GmailPermanentError) and e.status == 404:
+            if is_404(e):
                 # the message vanished between fetch and write: no
                 # write happened → no rows (rows record Applications
                 # that DID land); counted SKIPPED only — the F1 round's

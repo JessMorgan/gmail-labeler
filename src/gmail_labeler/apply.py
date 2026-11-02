@@ -74,12 +74,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .appdb import AppDB
-from .applications import ApplicationRow, plan_message_write
+from .applications import ApplicationRow
 from .corpus_record import preprocess_text
-from .daemon import ServingContext, predict_conformant
+from .daemon import ServingContext, compose_plan, predict_conformant, present_names
 from .gmail_client import GmailClient, MessageStub
-from .gmail_errors import GmailAuthError, GmailError, GmailPermanentError
-from .labels import normalize_label_names
+from .gmail_errors import GmailAuthError, GmailError, is_404
 from .mime_extract import decode_gmail_raw, parse_mime
 from .model import Model
 
@@ -106,13 +105,6 @@ class ApplyOutcome:
     warnings: int
     rows: int
     batches: int
-
-
-def _is_404(e: GmailError) -> bool:
-    # the taxonomy's documented relationship: GmailResyncError IS a
-    # GmailPermanentError with status=404 — a vanished message is the
-    # typed 404, checked not string-matched
-    return isinstance(e, GmailPermanentError) and e.status == 404
 
 
 def _log_preview(message_id: str, rows: Sequence[ApplicationRow]) -> None:
@@ -144,26 +136,53 @@ def _run_batch(
     which never records); the commit is the CALLER's (one transaction per
     batch). ``applied_at`` is the caller's ONE clock read for this batch
     (the homogeneity contract, stamped at the call site). GmailAuthError
-    and a non-404 page-read failure propagate (the CLI's arms); a 404
-    message is a counted skip; a non-404 write error is a counted warning
-    that holds nothing (the re-run picks it up)."""
+    and a page-level ``list_messages`` failure propagate (the CLI's arms);
+    a 404 message (read OR write) is a counted skip; any OTHER per-message
+    read or write error is a counted WARNING that holds nothing and
+    CONTINUES — the message stays un-labeled and un-rowed and a RE-RUN
+    picks it up (the cursorless path's safe shape: the daemon's
+    hold-the-cursor retry has no analog here, so a blip must not abort a
+    whole backfill)."""
     fetched: list[tuple[str, frozenset[str], str]] = []  # (id, present, text)
+    seen: set[str] = set()  # per-page dedupe (the daemon's _message_ids shape)
     skipped = 0
+    warnings = 0
     stop = False
     for stub in stubs:
+        if stub.id in seen:
+            # a message served twice in one page (a wire/replay overlap):
+            # process it ONCE. Without this the second pass re-fetches,
+            # re-composes an IDENTICAL row, and commit_applications refuses
+            # the within-batch (message_id, label) DUPLICATE with exit 5 —
+            # AFTER the first pass's Gmail write already LANDED (the
+            # review's executed probe: labels on the mail, no audit row).
+            continue
+        seen.add(stub.id)
         try:
             raw = client.get_message(stub.id)
         except GmailAuthError:
             raise
         except GmailError as e:
-            if _is_404(e):
+            if is_404(e):
                 # the message is gone (deleted since the export — a
                 # backfill over years WILL hit this): counted skip, the
                 # run continues (there is no cursor to wedge)
                 skipped += 1
                 log.warning("apply: skipped message %s: %s", stub.id, e)
                 continue
-            raise  # a non-404 read failure is systematic: abort (no cursor)
+            # a non-404 read error is the SAME safe shape as a write blip:
+            # counted warning, continue — the message stays un-labeled and
+            # un-rowed and a re-run picks it up (there is no cursor to
+            # hold, so aborting a whole multi-year backfill on one blip is
+            # the wrong posture the daemon's cursor-hold rationale would
+            # have imported)
+            warnings += 1
+            log.warning(
+                "apply: read failed for %s (no cursor held — a re-run picks it up): %s",
+                stub.id,
+                e,
+            )
+            continue
         try:
             data = decode_gmail_raw(raw.raw_b64url)
         except ValueError as e:  # UnicodeEncodeError IS a ValueError
@@ -175,7 +194,7 @@ def _run_batch(
             )
             continue
         parsed = parse_mime(data)  # never raises (the mime contract)
-        present = frozenset(normalize_label_names(raw.label_ids, ctx.id_to_name))
+        present = present_names(ctx, raw.label_ids)  # the SHARED reader
         # the body feeds ONLY this in-memory preprocess (invariant #5)
         fetched.append(
             (stub.id, present, preprocess_text(parsed.subject, parsed.body_text))
@@ -190,20 +209,17 @@ def _run_batch(
 
     batch_rows: list[ApplicationRow] = []
     written = 0
-    warnings = 0
     for (message_id, present, _text), score_row in zip(
         fetched, score_rows, strict=True
     ):
         scores = dict(zip(vocab, score_row, strict=True))
-        plan = plan_message_write(
+        # the SHARED composition call-shape (compose_plan → the one
+        # plan_message_write core the daemon also rides — AC2, one core)
+        plan = compose_plan(
+            ctx,
             message_id,
             scores=scores,
-            bands=ctx.bands,
-            graduated=ctx.graduated,
             present=present,
-            system_labels=ctx.system_labels,
-            managed_label_ids=ctx.managed_label_ids,
-            tier_label_ids=ctx.tier_label_ids,
             applied_at=applied_at,
             source="apply",
         )
@@ -225,7 +241,7 @@ def _run_batch(
         except GmailAuthError:
             raise
         except GmailError as e:
-            if _is_404(e):
+            if is_404(e):
                 # vanished between fetch and write: no write happened →
                 # no rows (rows record Applications that DID land);
                 # counted SKIPPED only (the daemon's F1 nit, inherited)

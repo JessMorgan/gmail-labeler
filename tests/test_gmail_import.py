@@ -14,6 +14,7 @@ from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import GmailPermanentError, classify_status
 from gmail_labeler.gmail_import import DEFAULT_QUERY, import_gmail
+from gmail_labeler.labels import EXCLUDED_CORPUS_LABEL_IDS
 from gmail_labeler.sync_cursor import SIDECAR_CURSOR, SyncCursor
 
 
@@ -151,6 +152,10 @@ def test_import_gmail_scope_pins_both_layers(tmp_path: Path) -> None:
         "-in:trash",
         "-in:draft",
     ]
+    # ONE policy, two layers (ticket #32 completion of #17): the exclusion
+    # pair has a single shared home in labels.py that BOTH ingest layers
+    # import — export and GYB import must not drift apart
+    assert frozenset({"DRAFT", "CHAT"}) == EXCLUDED_CORPUS_LABEL_IDS
 
 
 def test_ingest_rejects_draft_and_chat_label_ids(tmp_path: Path) -> None:

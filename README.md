@@ -127,9 +127,10 @@ whose raw wire labelIds carry the system label id DRAFT or CHAT (no
 documented chat query token exists, and this layer is load-bearing: an
 explicit `--query` replaces the default wholesale but cannot bypass it).
 Records already in the corpus are unaffected (append-only). GYB import
-follows whatever the backup holds (tracked by #32). It writes
-`filters.json` and `labels.json` sidecars next to the
-corpus — the offline snapshot `dataset analyze` uses for filter
+applies the same DRAFT/CHAT exclusion at ingest (#32): a backup row whose
+raw label tokens carry either canonical id is never stored — counted
+`skipped_draft_chat`. It writes `filters.json` and `labels.json` sidecars
+next to the corpus — the offline snapshot `dataset analyze` uses for filter
 attribution — and births the `sync-cursor.json` Sync Cursor (ADR-0008)
 when the corpus has none, seeded from the first list page before any
 message is ingested (or warns and leaves the corpus birth-eligible when no

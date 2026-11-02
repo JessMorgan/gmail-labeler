@@ -3159,7 +3159,10 @@ class _ServeStartup:
     client: GmailClient
     model: Model
     ctx: ServingContext
-    records: list[CorpusRecord]
+    # a TUPLE, not a list: a frozen dataclass carrying a mutable list
+    # would let a caller mutate the "immutable" bundle's records in place
+    # (the AC5 provenance scan reads them; the daemon ignores them)
+    records: tuple[CorpusRecord, ...]
 
 
 def _serve_startup(
@@ -3199,6 +3202,7 @@ def _serve_startup(
     from .corpus_store import CorpusError, CorpusStore
     from .daemon import ServingContext
     from .dataset_build import SplitManifest
+    from .gmail_client import find_user_label, system_label_namesake
     from .gmail_errors import GmailAuthError, GmailError
     from .model import (
         MANIFEST_FILENAME,
@@ -3461,42 +3465,37 @@ def _serve_startup(
     ):
         if not mint_labels:
             # the preview's MINT GUARD (AC1): a dry run never creates a
-            # label, so the Tier Label names resolve by LOOKUP ONLY. An
-            # exact-case USER label of the name is used as-is (the same
-            # get ensure_label would take); a System-Label name-sake is
-            # the config error it always was (exit 4, the rename
-            # diagnosis); an ABSENT name is refused NAMED (exit 5) — the
-            # preview cannot mint the label it needs to compose a
+            # label, so the Tier Label names resolve by LOOKUP ONLY — via
+            # the SAME read-only resolvers ensure_label rides (gmail_client.
+            # find_user_label / system_label_namesake), NOT a forked copy
+            # of its two-pass logic (the drift this seam exists to stop).
+            # An exact-case USER label of the name is used as-is; a
+            # System-Label name-sake is the config error it always was
+            # (exit 4); an ABSENT exact-case name is refused NAMED (exit 5)
+            # — the preview cannot mint the label it needs to compose a
             # faithful plan, so it says so instead of writing
-            hit = next(
-                (li for li in labels if li.name == name and li.type == "user"), None
-            )
+            hit = find_user_label(labels, name)
             if hit is not None:
-                tier_label_ids[tier_constants[key]] = hit.id
+                tier_label_ids[tier_constants[key]] = hit
                 continue
-            collide = next(
-                (
-                    li
-                    for li in labels
-                    if li.type == "system" and li.name.casefold() == name.casefold()
-                ),
-                None,
-            )
-            if collide is not None:
+            if system_label_namesake(labels, name) is not None:
                 typer.echo(
-                    f"{command} failed: [labels] {key} = {name!r} refused: "
-                    f"{name!r} collides with a System Label name in the "
-                    "mailbox — rename [labels] applied/high/med (System "
-                    f"Labels are never write targets) \u2014 rename [labels] "
-                    f"{key} and restart",
+                    f"{command} failed: [labels] {key} = {name!r} collides "
+                    "with a System Label name in the mailbox (System Labels "
+                    f"are never write targets) \u2014 rename [labels] {key} "
+                    "and restart",
                     err=True,
                 )
                 raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+            # honest wording: an exact-case USER label is absent — a
+            # case-DIFFERING user label may well exist (the match is
+            # exact-case), so "is not present in the mailbox" would be a
+            # lie; say what is actually missing
             typer.echo(
-                f"{command} failed: [labels] {key} = {name!r} is not present "
-                "in the mailbox \u2014 a preview does not create Tier Labels; "
-                "run `apply --apply` (or `daemon`) to create it, or create "
-                "it yourself",
+                f"{command} failed: [labels] {key} = {name!r} has no "
+                "exact-case USER label in the mailbox \u2014 a preview does "
+                "not create Tier Labels; run `apply --apply` (or `daemon`) "
+                "to create it, or create it yourself",
                 err=True,
             )
             raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
@@ -3547,7 +3546,7 @@ def _serve_startup(
         client=client,
         model=model,
         ctx=ctx,
-        records=records,
+        records=tuple(records),
     )
 
 

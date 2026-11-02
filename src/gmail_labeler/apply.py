@@ -91,13 +91,15 @@ log = logging.getLogger("gmail_labeler.apply")
 class ApplyOutcome:
     """The aggregate counters of one apply run (the operator-visible
     vocabulary — the SAME count discipline as the daemon's per-delta
-    line, summed over batches). ``written`` is the Gmail writes that
-    landed (ZERO in a preview — the AC1 fact, not a display convention);
-    ``skipped`` counts vanished/undecodable messages; ``warnings``
-    counts fail-safe and transient-write events (a message held off the
-    wire with no cursor to retry it — the re-run picks it up); ``rows``
-    is the Application rows committed (ZERO in a preview); ``batches``
-    is the pages processed."""
+    line, summed over batches). ``messages`` is the count of messages
+    FETCHED and scored (after the 404 skips and the per-page dedupe — the
+    denominator the other counters run against); ``written`` is the Gmail
+    writes that landed (ZERO in a preview — the AC1 fact, not a display
+    convention); ``skipped`` counts vanished (404) / undecodable messages;
+    ``warnings`` counts fail-safe composes and per-message READ-or-WRITE
+    errors held off the wire with no cursor to retry them (the re-run
+    picks each up); ``rows`` is the Application rows committed (ZERO in a
+    preview); ``batches`` is the pages processed."""
 
     messages: int
     written: int

@@ -23,6 +23,8 @@ from .gmail_client import (
     MessagePage,
     MessageStub,
     RawMessage,
+    find_user_label,
+    system_label_namesake,
 )
 from .gmail_errors import GmailError, GmailPermanentError
 
@@ -410,19 +412,18 @@ class FakeGmailClient:
         self.calls.append(f"ensure_label:{name}")
         self._maybe_fail("ensure_label")
         labels = self.list_labels()  # the wire call the adapter makes
-        wanted = name.casefold()
-        for label in labels:  # pass 1: the exact-case get-or-create hit
-            if label.name == name and label.type == "user":
-                return label.id
-        for label in labels:  # pass 2: the casefolded collision guard
-            # AFTER the user-hit pass (deterministic precedence, F2
-            # review) — the guard only prevents MINTING a look-alike
-            if label.type == "system" and label.name.casefold() == wanted:
-                raise ValueError(
-                    f"ensure_label: {name!r} collides with a System Label "
-                    "name in the mailbox — rename [labels] applied/high/med "
-                    "(System Labels are never write targets)"
-                )
+        hit = find_user_label(labels, name)  # pass 1: the exact-case get-or-create hit
+        if hit is not None:
+            return hit
+        # pass 2: the casefolded collision guard AFTER the user-hit pass
+        # (deterministic precedence, F2 review) — the guard only prevents
+        # MINTING a look-alike
+        if system_label_namesake(labels, name) is not None:
+            raise ValueError(
+                f"ensure_label: {name!r} collides with a System Label "
+                "name in the mailbox — rename [labels] applied/high/med "
+                "(System Labels are never write targets)"
+            )
         self._created_label_count += 1
         new_id = f"Label_fake_{self._created_label_count}"
         self.labels_list.append(LabelInfo(id=new_id, name=name, type="user"))

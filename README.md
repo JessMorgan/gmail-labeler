@@ -609,7 +609,10 @@ authorship cannot be determined: no usable filters snapshot (absent or
 malformed); a relevant filter whose criteria cannot be simulated from the
 kept fields (outside `from`/`to`/`subject`, or malformed); or an add whose
 authorship is otherwise undecidable (its message fields were not fetched,
-or a relevant filter's `addLabelIds` is unreadable) — are both excluded,
+or a filter's `addLabelIds` is unreadable — which is GLOBAL, not per-filter:
+we cannot read which labels that entry adds, so we cannot rule it out as any
+add's author, and every 'added' Correction, for every label, is withheld
+until the snapshot is clean) — are both excluded,
 the *exclusion, not guessing* principle `dataset analyze` follows (#22).
 `status` discloses each withheld slice as its own count.
 

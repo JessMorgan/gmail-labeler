@@ -3592,24 +3592,37 @@ def _serve_startup(
     elif filters_snapshot is not None and command == "daemon":
         # a snapshot with one or more UNREADABLE filter entries (a present-
         # but-wrong-shaped action/addLabelIds) makes _attribution withhold
-        # EVERY 'added' (authorship can't be ruled out) — name the count at
+        # EVERY 'added' (authorship can't be ruled out) — name the entries at
         # startup so the operator is not left with a silent rising
         # 'unverifiable' and no cause (the #22 bridge-malformed posture:
-        # name it, don't guess; a legitimately action-less filter reads []
-        # and is NOT counted here)
-        unreadable = 0
-        for f in filters_snapshot:
+        # name it, don't guess). Entries are named by 1-based INDEX + which
+        # FIELD is unreadable (the strict reader's ValueError names
+        # action/addLabelIds, NEVER a value — a from:/to: criterion is a mail
+        # address and must not reach the log, invariant #5 adjacent); a
+        # legitimately action-less filter reads [] and is NOT counted here.
+        unreadable_entries: list[str] = []
+        for idx, f in enumerate(filters_snapshot, start=1):
             try:
                 filter_label_ids_strict(f)
-            except ValueError:
-                unreadable += 1
-        if unreadable:
+            except ValueError as e:
+                unreadable_entries.append(f"#{idx}: {e}")
+        if unreadable_entries:
+            n = len(unreadable_entries)
+            noun = "entry" if n == 1 else "entries"
+            verb = "has" if n == 1 else "have"
             typer.echo(
-                f"daemon: NOTE {unreadable} filter(s) in the snapshot have an "
-                "unreadable action/addLabelIds — their authorship cannot be "
-                "determined, so 'added' Corrections they might explain are "
-                "withheld as 'unverifiable' (not credited as training "
-                "signal). Re-run `dataset export` to refresh the snapshot.",
+                f"daemon: NOTE {n} filter {noun} in the snapshot {verb} an "
+                f"unreadable action/addLabelIds (1-based entry numbers, "
+                f"entry #1 is the first filter in the snapshot: "
+                f"{'; '.join(unreadable_entries)}) — authorship cannot be "
+                "determined, so every 'added' Correction, for every label, "
+                "is withheld until the snapshot is clean (an add a readable "
+                "filter provably covers is still attributed 'filter_covered' "
+                "and remains withheld). If the sidecar was hand-edited into a "
+                "bad shape, re-run `dataset export` and RESTART the daemon "
+                "(the snapshot is read at startup only); if the malformation "
+                "came off the wire, export reproduces it — fix the filter in "
+                "Gmail instead.",
                 err=True,
             )
 
@@ -4155,7 +4168,8 @@ def status(
         "whose criteria cannot be simulated from the kept fields (outside "
         "from/to/subject, or malformed); or an add whose authorship is "
         "otherwise undecidable (its message fields were not fetched, or a "
-        "relevant filter's addLabelIds is unreadable)"
+        "filter's addLabelIds is unreadable — which is GLOBAL: every 'added' "
+        "Correction, for every label, is withheld until the snapshot is clean)"
     )
     _attribution_note = (
         f"'added' counts are attributed under the corrections vocabulary "
@@ -4258,7 +4272,9 @@ def status(
         store_db.close()
 
     try:
-        rows = compute_precision(graduated, written_by_label, correction_stats)
+        rows = compute_precision(
+            graduated, written_by_label, correction_stats, db_path=str(db_path)
+        )
     except PrecisionInvariantError as e:
         # a tampered store (removed > written): refuse named at exit 5,
         # never print a negative precision (F2 item 9)

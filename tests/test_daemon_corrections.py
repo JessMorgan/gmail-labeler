@@ -863,12 +863,29 @@ def test_serve_startup_unreadable_filter_entry_warns(
         tmp_path,
         monkeypatch,
         sidecar_text=(
-            '[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": "L2"}}]'
+            '[{"criteria": {"from": "a@x.com", "to": "b@x.com", '
+            '"subject": "SECRET-SUBJ"}, "action": {"addLabelIds": "L2"}}]'
         ),
     )
     err = capsys.readouterr().err
-    assert "unreadable action/addLabelIds" in err
-    assert "1 filter" in err
+    assert "unreadable action/" in err
+    assert "1 filter entry" in err  # singular grammar (F3 MINOR 2)
+    # item 2 (F3): the offending entry is NAMED by 1-based array position, the
+    # global breadth is stated plainly, and BOTH remedy cases + the RESTART
+    # step are named
+    assert "#1" in err and "1-based entry number" in err
+    assert (
+        "every 'added' Correction, for every label, is withheld until the "
+        "snapshot is clean" in err
+    )
+    assert "hand-edited" in err and "RESTART" in err and "off the wire" in err
+    # INVARIANT #5 ADJACENT: the warning names the entry INDEX + which FIELD
+    # is unreadable, NEVER a criteria VALUE -- from:/to: are mail addresses
+    # and subject is message content (invariant #5). This catches a mutant
+    # that leaks the filter dict / any criteria value into the log.
+    assert "a@x.com" not in err
+    assert "b@x.com" not in err
+    assert "SECRET-SUBJ" not in err
 
 
 def test_serve_startup_actionless_filter_does_not_warn(
@@ -881,3 +898,54 @@ def test_serve_startup_actionless_filter_does_not_warn(
     )
     err = capsys.readouterr().err
     assert "unreadable action/addLabelIds" not in err
+
+
+def test_apply_command_passes_command_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F3 item 4 (ds F2-3): the apply command SHARES _serve_startup with the
+    # daemon. The daemon call-site was pinned (F2 item 13), but flipping the
+    # APPLY literal (command="apply" -> "daemon") rode the whole suite green
+    # -- the warning is gated on command=="daemon", so an apply run would
+    # then emit a correction-attribution warning it should never show, and
+    # nothing checked the apply literal. Pin it: capture the command kwarg
+    # the apply command hands _serve_startup. Mutant apply->daemon reddens.
+    import gmail_labeler.cli as cli
+    from test_apply_cli import _run_apply_cli
+    from test_shadow_cli import _prepare
+
+    _prepare(tmp_path, monkeypatch)
+    captured: dict[str, str] = {}
+    real = cli._serve_startup
+
+    def spy(*, command: str, **kw: Any) -> Any:
+        captured["command"] = command
+        return real(command=command, **kw)
+
+    monkeypatch.setattr(cli, "_serve_startup", spy)
+    result, _fake = _run_apply_cli(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert captured.get("command") == "apply"
+
+
+def test_serve_startup_unreadable_entries_plural_grammar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # F3 NIT: the plural branch (n=2) was unpinned -- a regression hardcoding
+    # the singular noun/verb rode green. Two unreadable entries -> "2 filter
+    # entries ... have", both named by 1-based number; an action-less entry
+    # between them is skipped (not counted, not named).
+    _startup_with_sidecar(
+        tmp_path,
+        monkeypatch,
+        sidecar_text=(
+            '[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": "L2"}}, '
+            '{"criteria": {"from": "c@x.com"}}, '
+            '{"criteria": {"from": "d@x.com"}, "action": {"addLabelIds": 5}}]'
+        ),
+    )
+    err = capsys.readouterr().err
+    assert "2 filter entries" in err and "have an unreadable" in err
+    assert "#1" in err and "#3" in err  # 1-based; the action-less #2 skipped
+    assert "#2" not in err
+    assert "a@x.com" not in err and "c@x.com" not in err and "d@x.com" not in err

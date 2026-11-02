@@ -140,8 +140,11 @@ to the human, when authorship cannot be determined: no usable filters
 snapshot (absent or malformed); a relevant filter whose criteria cannot be
 simulated from the kept fields (outside `from`/`to`/`subject`, or
 malformed); or an add whose authorship is otherwise undecidable (its
-message fields were not fetched, or a relevant filter's `addLabelIds` is
-unreadable) — the same *exclusion, not guessing* principle that governs
+message fields were not fetched, or a filter's `addLabelIds` is unreadable —
+which is GLOBAL, not per-filter: we cannot read which labels that entry
+adds, so we cannot rule it out as any add's author, and every 'added'
+Correction, for every label, is withheld until the snapshot is clean) — the
+same *exclusion, not guessing* principle that governs
 `dataset analyze` (#22): guessing either way is what that doctrine forbids.
 A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation
 that no filter exists (an empty *snapshot* — the operator ran the export

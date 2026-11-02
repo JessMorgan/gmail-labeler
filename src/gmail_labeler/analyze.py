@@ -119,7 +119,11 @@ def filter_label_ids_strict(filter_: Mapping[str, object]) -> list[str]:
     wrong-shaped action/addLabelIds with ValueError (the cli.py guard):
     unreadable bindings must not contribute zero ids and let the filter's
     labels surface un-attributed. The shape rule lives in exactly one
-    place, shared by the CLI bridge check and the dataset builder."""
+    place, shared by the CLI bridge check and the dataset builder. The
+    ValueError messages are surfaced VERBATIM into the daemon's startup
+    log (cli.py names the unreadable entries), so they MUST stay
+    value-free — never interpolate a criteria value (a from:/to: criterion
+    is a mail address; invariant #5) or an addLabelIds value into them."""
     action = filter_.get("action")
     if action is not None and not isinstance(action, Mapping):
         raise ValueError("action must be an object")

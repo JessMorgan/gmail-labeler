@@ -346,96 +346,102 @@ def _run_tick(
             )
         # Divergence from shadow's one-shot posture (cli.py treats a
         # width defect as exit-1 'a bug'): the daemon is a long-lived
-        # service — hold, warn, keep the cursor. F3 MINOR 1: the rows
-        # are MATERIALIZED INSIDE this arm (as the vocabulary already
-        # was) — the compose zip outside it was the escape: a
-        # Sized+Iterable row with a lying __len__ or a raising __iter__
-        # blew up at the zip line, exit 1. F3 round-2 (reviewer MAJOR):
-        # the COUNT check rides the MATERIALIZED rows too — trusting
-        # the container's own __len__ was the container twin of that
-        # defect (a lying len reached zip(strict=True) outside the arm).
-        # Materialized, width AND count read honest lengths and the
-        # compose zip can no longer fail on shape. The checks are TOTAL
-        # for the defect classes a checkpoint can produce; the residual
-        # pathologies (review round-2, named honestly): a container or
-        # row whose __iter__ raises something OUTSIDE the caught set
-        # (TypeError/ValueError/OSError/RuntimeError — e.g. a KeyError
-        # property) still escapes to exit 1; numpy-style scalar rows
-        # would need numbers.Real once the real encoder lands; a Sized
-        # container yielding unboundedly is drained before the count
-        # mismatch fires (pathological; early-len fail-fast deferred).
+        # service — hold, warn, keep the cursor.
+        # F4 POSITIVE PROTOCOL CONFORMANCE (the cycle-ender): every
+        # earlier round ADDED A TYPE NAME to a row denylist (float
+        # → Sized/Iterable → bytes/bytearray) and a NEW int-
+        # materializing container escaped each time — memoryview,
+        # array('B'), int-keyed dict and range ALL materialize to
+        # (0, 1) and WROTE a garbage label at ef208b7 (executed). The
+        # vocabulary denylist likewise let an INT vocabulary (label
+        # ids where Label Paths belong — the mis-wired-checkpoint
+        # case verify_sidecar cannot catch: it hashes the sidecar
+        # against the EXPECTED vocabulary, model.py) sail into the
+        # per-message fail-safe: cursor advancing forever, zero
+        # writes. The positive form closes the family: model.predict's
+        # DECLARED return type IS the contract (Model Protocol:
+        # vocabulary: tuple[str, ...]; predict -> tuple[tuple[float,
+        # ...], ...]) — a row is accepted ONLY as a tuple, a
+        # vocabulary ONLY as tuple[str, ...]. Off-conformance is a
+        # WIRING bug: it belongs in the hold arm, never in the
+        # per-message fail-safe. The checks are now TOTAL for off-
+        # Protocol containers and rows and for lying lengths (positive
+        # conformance leaves no type-name to miss); the residuals are
+        # exactly: a container/row/vocabulary whose __iter__ RAISES
+        # outside the caught set (TypeError/ValueError/OSError/
+        # RuntimeError) — the tuple-subclass-lying-__iter__ face;
+        # an unbounded-yield container drained before the count fires;
+        # numpy-style scalar rows (numbers.Real when the real encoder
+        # lands).
         try:
-            vocab_src = model.vocabulary  # read ONCE (F3 round-2 NIT:
-            # the attribute access itself was outside any net)
+            vocab_src = model.vocabulary  # read ONCE (F3 round-2 NIT)
         except AttributeError as e:
             raise _PredictionShapeError(
                 f"the model exposes no vocabulary attribute "
                 f"({type(e).__name__}) — checkpoint/recipe defect"
             ) from e
-        if isinstance(vocab_src, (str, bytes)):
-            # F3 MINOR 2 (the deterministic-starvation hole, ds probe):
-            # a stray str vocabulary (tuple('ab') passes EVERY structural
-            # check) plus score rows sailed through into the plan's
-            # per-message fail-safe — warnings every tick, ZERO writes,
-            # the cursor ADVANCING forever: label starvation by a model
-            # that can never score anything, invisible behind busy
-            # warnings. A str/bytes vocabulary is a named shape defect.
-            raise _PredictionShapeError(
-                "the model vocabulary is a str/bytes, not a label "
-                "sequence — checkpoint/recipe defect"
-            )
         try:
-            vocab = tuple(vocab_src)  # materialized ONCE (the compose
-            # zip below rides this, never the live attribute)
+            vocab_ok = isinstance(vocab_src, tuple) and all(
+                isinstance(v, str) for v in vocab_src
+            )
         except TypeError as e:
             raise _PredictionShapeError(
                 f"the model vocabulary is not iterable ({type(e).__name__}) "
                 f"— checkpoint/recipe defect"
             ) from e
-        vocab_len = len(vocab)
-        try:
-            rows = [tuple(row) for row in score_rows]
-        except TypeError as e:
-            # covers an unmaterializable ROW and a Sized-but-not-
-            # iterable CONTAINER (iteration raises here)
+        if not vocab_ok:
+            # POSITIVE guard (replaces the F3 str/bytes denylist):
+            # str, bytes, memoryview, int vocabularies, lists, sets,
+            # dicts, non-str elements — ALL refused by class name
             raise _PredictionShapeError(
-                f"a score row does not align to the {vocab_len}-label "
-                f"vocabulary (unmaterializable row or container: "
-                f"{type(e).__name__}) — checkpoint/recipe defect"
-            ) from e
-        if len(rows) != len(fetched):
-            # the count check AFTER materialization (honest length)
-            raise _PredictionShapeError(
-                f"the model returned {len(rows)} score rows for "
-                f"{len(fetched)} texts — checkpoint/recipe defect"
+                f"the model vocabulary is not a tuple[str, ...] as the "
+                f"Model Protocol declares (got "
+                f"{type(vocab_src).__name__} with str elements "
+                f"required) — checkpoint/recipe defect"
             )
-        for raw_row, row in zip(score_rows, rows, strict=True):
-            # F3 closeout (reviewer NIT, probed): a bytes/bytearray row
-            # MATERIALIZES TO INTS (b'\x00\x01' -> (0, 1)) and would
-            # pass the numeric gate — worse than starvation: a garbage
-            # score of 1 could WRITE a label. str rows die on the element
-            # check (chars are not numbers); bytes need the type name at
-            # the row level
-            if isinstance(raw_row, (bytes, bytearray)):
+        vocab = vocab_src  # the honest tuple itself (no re-materialize)
+        vocab_len = len(vocab)
+        rows: list[tuple[float, ...]] = []
+        for row in score_rows:  # the container iterated EXACTLY ONCE
+            # (F3 round-2 double-iteration MINOR: the denylist pass
+            # touched it twice — a one-shot Sized container could
+            # lie about its contents between the passes)
+            if not isinstance(row, tuple):
+                # memoryview / array / dict / range / frozenset / set /
+                # list / float — refused by class name. frozenset
+                # dies here for the RIGHT reason (F3 P5): its iteration
+                # order is arbitrary, so materialize-and-check could
+                # MIS-ALIGN scores to labels, not just miscount them
                 raise _PredictionShapeError(
-                    f"a score row is a {type(raw_row).__name__}, not a "
-                    f"numeric sequence — checkpoint/recipe defect"
+                    f"a score row is not a tuple as the Model Protocol "
+                    f"declares (got {type(row).__name__}) — "
+                    f"checkpoint/recipe defect"
                 )
-            # TYPE NAMES only in every message here (class comment): an
-            # element VALUE is an arbitrary string and never interpolates
-            if len(row) != vocab_len:
+            item = tuple(row)  # honest materialization: a tuple
+            # SUBCLASS with a lying __len__ cannot survive the width
+            # check (iteration is the authority); a lying __iter__ is
+            # the named residual above
+            if len(item) != vocab_len:
                 raise _PredictionShapeError(
                     f"a score row does not align to the {vocab_len}-label "
                     f"vocabulary — checkpoint/recipe defect"
                 )
-            for element in row:
+            for element in item:
+                # TYPE NAMES only in every message (class comment): an
+                # element VALUE is an arbitrary object and never
+                # interpolates
                 if isinstance(element, bool) or not isinstance(element, (int, float)):
-                    # F3 MINOR 2: '0.9' passes every structural check and
-                    # poisons the plan; bool is NOT a number here
                     raise _PredictionShapeError(
                         f"a score element is not numeric "
                         f"({type(element).__name__}) — checkpoint/recipe defect"
                     )
+            rows.append(item)
+        if len(rows) != len(fetched):
+            # the count check on the materialized rows (honest length)
+            raise _PredictionShapeError(
+                f"the model returned {len(rows)} score rows for "
+                f"{len(fetched)} texts — checkpoint/recipe defect"
+            )
     except _PredictionShapeError as e:
         # self-authored, counts-only message: safe to log verbatim
         log.warning(

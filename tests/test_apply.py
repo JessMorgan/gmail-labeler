@@ -199,25 +199,35 @@ def test_preview_bodies_never_in_output(
 
 def test_apply_imports_the_daemon_decision_core_not_a_copy() -> None:
     # the STRUCTURAL one-core claim (AC2, mutation-pinned): apply's
-    # plan_message_write IS the daemon's IS applications' — the SAME
-    # function object. Mutant: give apply a local re-implementation copy
-    # and this identity check reddens (the spy never sees apply's copy)
+    # composition entry IS the daemon's — the SAME compose_plan object
+    # (which threads the ctx maps to the one plan_message_write core).
+    # Mutant: give apply a local re-implementation of the composition (or
+    # of the core) and this identity check reddens — the review's
+    # "never mirrors" is now true of the PLUMBING (compose_plan), not just
+    # the decision (plan_message_write)
     import gmail_labeler.apply as apply_module
     import gmail_labeler.daemon as daemon_module
 
-    assert apply_module.plan_message_write is daemon_module.plan_message_write
-    assert apply_module.plan_message_write is applications_plan
+    assert apply_module.compose_plan is daemon_module.compose_plan
+    # and the shared composition reaches the ONE core, not a copy
+    assert (
+        daemon_module.compose_plan.__globals__["plan_message_write"]
+        is applications_plan
+    )
 
 
 def test_one_daemon_tick_and_one_apply_batch_land_identical_plans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # AC2 semantic parity: instrument plan_message_write (spy) in BOTH
-    # modules, run ONE daemon tick AND ONE apply batch over IDENTICAL
-    # fixture mail (same scores, same present sets, same clock) → both
-    # land with IDENTICAL plans (same core, same inputs, same outputs;
-    # only the source literal differs — the literal that entered the path)
-    import gmail_labeler.apply as apply_module
+    # AC2 semantic parity: instrument the ONE core (plan_message_write,
+    # which BOTH paths reach through the shared compose_plan), run ONE
+    # daemon tick AND ONE apply batch over IDENTICAL fixture mail (same
+    # scores, same present sets, same clock) → both land with IDENTICAL
+    # plans (same core, same inputs, same outputs; only the source literal
+    # differs — the literal that entered the path). The spy is on the
+    # daemon module's plan_message_write because compose_plan (daemon.py)
+    # calls THAT module-global — so a single patch intercepts both the
+    # daemon's and apply's compositions, which IS the one-core proof.
     import gmail_labeler.daemon as daemon_module
 
     recorded: list[Any] = []
@@ -228,7 +238,6 @@ def test_one_daemon_tick_and_one_apply_batch_land_identical_plans(
         recorded.append((message_id, kw["source"], plan))
         return plan
 
-    monkeypatch.setattr(apply_module, "plan_message_write", spy)
     monkeypatch.setattr(daemon_module, "plan_message_write", spy)
 
     # the daemon tick: a delta naming aa11 + aa22, cursor preset
@@ -525,6 +534,45 @@ def test_transient_write_failure_holds_nothing_rerun_picks_it_up(
     assert "L2" in fake.messages["aa22"].label_ids
     assert len(db2.applications_for_message("aa22")) == 1
     db2.close()
+
+
+def test_transient_READ_failure_holds_nothing_continues(tmp_path: Path) -> None:
+    # item C (the read/write asymmetry the review named): a NON-404 per-
+    # message READ error takes the SAME safe shape as a write blip — a
+    # counted warning, the run CONTINUES (the surviving message still
+    # applies), and the failed message stays un-labeled for a re-run. The
+    # daemon's hold-the-cursor rationale does NOT transfer to a cursorless
+    # path, so a transient read blip must not abort a whole backfill.
+    # Mutant: revert the read arm to `raise` → run_apply raises
+    # GmailTransientError → this node errors (no outcome).
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    fake.fail("get_message", GmailTransientError("read blip"))  # aa11 (first) blips
+    db = _db(tmp_path)
+    outcome = _run_apply(tmp_path, fake, db=db, dry_run=False)
+    assert outcome.warnings == 1  # the blipped read counted as a WARNING
+    assert outcome.skipped == 0  # NOT a skip (it is not a 404 vanish)
+    assert outcome.written == 1  # the run CONTINUED: aa22 still applied
+    assert fake.messages["aa22"].label_ids != ("INBOX",)
+    db.close()
+
+
+def test_duplicate_message_id_in_one_page_processed_once(tmp_path: Path) -> None:
+    # item D (the daemon's _message_ids dedupe, now on the apply path): a
+    # message served TWICE in one page is processed ONCE. Without the
+    # dedupe the second pass re-composes an IDENTICAL row and
+    # commit_applications refuses the within-batch (message_id, label)
+    # DUPLICATE with exit 5 — AFTER the first pass's Gmail write LANDED
+    # (labels on the mail, no audit row: the review's executed probe).
+    # Mutant: drop the `seen` dedupe → AppDBError (duplicate row) → red.
+    fake = FakeGmailClient(messages=_messages(), labels=_labels())
+    fake.order = ["aa22", "aa22"]  # the same id served twice in one page
+    db = _db(tmp_path)
+    outcome = _run_apply(tmp_path, fake, db=db, dry_run=False)
+    assert outcome.messages == 1  # deduped: one message, not two
+    assert outcome.written == 1 and outcome.rows == 1  # single write, single row
+    assert len([w for w in fake.writes if w["method"] == "apply_labels"]) == 1
+    assert len(db.applications_for_message("aa22")) == 1
+    db.close()
 
 
 # -- landmine: >1-page paging fidelity ----------------------------------------

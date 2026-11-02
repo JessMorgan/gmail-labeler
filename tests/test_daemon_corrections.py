@@ -855,10 +855,12 @@ def test_daemon_command_passes_command_daemon(
 def test_serve_startup_unreadable_filter_entry_warns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # F2 item 3 (diagnosability): a snapshot with an UNREADABLE addLabelIds
-    # (a bare string) makes _attribution withhold every 'added' -- startup
-    # NAMES the count (the #22 bridge-malformed posture), never a silent
-    # rising unverifiable with no cause
+    # F2 item 3 (diagnosability) / F4 strengthening: a snapshot with an
+    # UNREADABLE addLabelIds (a bare string) makes _attribution withhold
+    # every 'added' -- startup NAMES the entry (index + which field), states
+    # the global breadth, and gives the right remedy per cause. F4 tightens
+    # the F3 pins from PRESENCE to PAIRING (deepseek mutants F and G rode
+    # green at db8da27 -- presence is not pairing).
     _startup_with_sidecar(
         tmp_path,
         monkeypatch,
@@ -868,21 +870,50 @@ def test_serve_startup_unreadable_filter_entry_warns(
         ),
     )
     err = capsys.readouterr().err
-    assert "unreadable action/" in err
-    assert "1 filter entry" in err  # singular grammar (F3 MINOR 2)
-    # item 2 (F3): the offending entry is NAMED by 1-based array position, the
-    # global breadth is stated plainly, and BOTH remedy cases + the RESTART
-    # step are named
-    assert "#1" in err and "1-based entry number" in err
+    # (4) the FULL string (F3 silently relaxed this to "unreadable action/")
+    assert "unreadable action/addLabelIds" in err
+    assert "1 filter entry" in err  # singular grammar
+    # (2) FIELD TEXT pinned per-entry (mutant F: dropping the ValueError text
+    # from the entry name must DIE) -- the entry-list item is "#<idx>: <text>"
+    assert "#1: addLabelIds must be a list of strings" in err
+    # (3) INDEX ASSIGNMENT, not the "entry #1 is the first filter" boilerplate:
+    # a single-entry snapshot has no second entry. The field-text pin above
+    # ("#1: addLabelIds must be a list of strings") is the PRIMARY start=2
+    # guard (start=2 renames the lone entry "#2", so that exact string is
+    # gone); this "#2 absent" line is a SECONDARY guard that the lone entry
+    # is not double-numbered.
+    assert "#2" not in err
+    assert "1-based entry number" in err
+    # global breadth stated plainly
     assert (
         "every 'added' Correction, for every label, is withheld until the "
         "snapshot is clean" in err
     )
-    assert "hand-edited" in err and "RESTART" in err and "off the wire" in err
+    # (1) REMEDIES PINNED AS PAIRS (mutant G: swapping them must DIE). The
+    # pairing is asserted PER CLAUSE (split on the remedy boundary), NOT by
+    # clause ORDER -- a correct message that happens to list the wire cause
+    # FIRST must still pass (F4's own lesson: test the property, not an
+    # incidental artifact like clause order). RESTART is the hand-edited
+    # remedy's signature, Gmail the wire remedy's; each must sit on its own
+    # clause and NOT on the other's.
+    assert "off the wire" in err  # explicit guard: a missing marker reads as
+    # an assertion failure, not a raw ValueError from a bare .index()
+    remedy_clauses = [
+        c for c in err.split("; ") if "hand-edited" in c or "off the wire" in c
+    ]
+    assert len(remedy_clauses) == 2  # both cause clauses are present
+    for clause in remedy_clauses:
+        if "hand-edited" in clause:
+            assert "RESTART" in clause and "dataset export" in clause, (
+                "hand-edited must pair with re-export + RESTART"
+            )
+            assert "Gmail" not in clause, "hand-edited must NOT pair with Gmail"
+        else:  # "off the wire"
+            assert "Gmail" in clause, "wire must pair with fix-in-Gmail"
+            assert "RESTART" not in clause, "wire must NOT pair with RESTART"
     # INVARIANT #5 ADJACENT: the warning names the entry INDEX + which FIELD
-    # is unreadable, NEVER a criteria VALUE -- from:/to: are mail addresses
-    # and subject is message content (invariant #5). This catches a mutant
-    # that leaks the filter dict / any criteria value into the log.
+    # is unreadable, NEVER a criteria VALUE (from:/to: are mail addresses,
+    # subject is message content). Catches a mutant leaking the dict/values.
     assert "a@x.com" not in err
     assert "b@x.com" not in err
     assert "SECRET-SUBJ" not in err
@@ -945,7 +976,14 @@ def test_serve_startup_unreadable_entries_plural_grammar(
         ),
     )
     err = capsys.readouterr().err
+    assert "unreadable action/addLabelIds" in err  # full string (F4 item 4)
     assert "2 filter entries" in err and "have an unreadable" in err
-    assert "#1" in err and "#3" in err  # 1-based; the action-less #2 skipped
+    # (2) per-entry FIELD TEXT pinned (mutant F must die here too): both bad
+    # entries carry the strict reader's "addLabelIds must be a list" message
+    assert "#1: addLabelIds must be a list of strings" in err
+    assert "#3: addLabelIds must be a list of strings" in err
+    # 1-based; the action-less #2 skipped. start=2 would name them #2/#4 ->
+    # "#1" absent reddens, and "#2" (the skipped slot) would appear -> reddens
+    assert "#1" in err and "#3" in err
     assert "#2" not in err
     assert "a@x.com" not in err and "c@x.com" not in err and "d@x.com" not in err

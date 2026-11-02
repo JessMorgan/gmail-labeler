@@ -60,6 +60,12 @@ app.add_typer(dataset_app, name="dataset")
 auth_app = typer.Typer(help="Gmail OAuth credential (ADR-0004).", no_args_is_help=False)
 app.add_typer(auth_app, name="auth")
 
+corrections_app = typer.Typer(
+    help="Corrections: the human hand-fixes captured as training signal.",
+    no_args_is_help=True,
+)
+app.add_typer(corrections_app, name="corrections")
+
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
 # (typer requires concrete annotations: str | None, not Any)
 
@@ -3888,6 +3894,68 @@ def apply_cmd(
         f"warnings={outcome.warnings} rows={outcome.rows}",
         err=True,
     )
+
+
+@corrections_app.command("export")
+def corrections_export(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+    out: str = typer.Option("-", "--out", help="Output file path (default: stdout)"),
+    fmt: str = typer.Option("json", "--format", help="Export format (json)"),
+) -> None:
+    """Export the recorded Corrections as future TRAINING SIGNAL: a JSON
+    list of ``{message_id, label, kind, filter_covered}`` (ticket #27;
+    GLOSSARY: Correction). Reads the LOCAL state DB only — no Gmail call
+    — and NEVER retrains: this writes an artifact; folding it into the
+    corpus is the builder's correction-folding composition point and
+    running a retrain is a SEPARATE human decision (the AC's
+    no-auto-retrain gate). NO
+    bodies (invariant #5): the export carries ids/labels/kinds/flags
+    only. Exit contract 0/2/4/5."""
+    from .appdb import AppDB, AppDBError
+
+    if fmt != "json":
+        typer.echo(
+            f"corrections export failed: --format {fmt!r} unsupported (only json)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+
+    # NO auth gate, NO client: the export is a LOCAL DB read (like status)
+    cfg = _load_config(config)
+    db_path = _resolve_db_path(cfg, db, "corrections export")
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, "corrections export", db_origin)
+    _validate_store_db(db_path, command="corrections export")
+
+    store_db = AppDB(db_path)
+    try:
+        store_db.open()
+        rows = store_db.all_corrections()
+    except AppDBError as e:
+        typer.echo(f"corrections export failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        store_db.close()
+
+    payload = [
+        {
+            "message_id": r.message_id,
+            "label": r.label,
+            "kind": r.kind,
+            "filter_covered": r.filter_covered,
+        }
+        for r in rows
+    ]
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    if out == "-":
+        typer.echo(text)
+    else:
+        Path(out).write_text(text + "\n", encoding="utf-8")
 
 
 @app.command("status")

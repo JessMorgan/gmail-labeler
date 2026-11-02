@@ -424,8 +424,8 @@ silent label loss). A per-message failure (a deleted message, corrupt
 raw) means NO write for that message (invariant #1's fail-safe) with a
 counted warning naming the message id and the typed error, never the
 body; the delta's cursor still advances. A STRUCTURALLY lying model
-row (container, count, width, or element type) is SYSTEMATIC, not
-per-message: the whole delta holds and retries — its cursor does NOT
+surface (vocabulary, container, row type, width, or element type) is
+SYSTEMATIC, not per-message: the whole delta holds and retries — its cursor does NOT
 advance. An out-of-range score VALUE is different: the plan's
 per-message fail-safe catches it (counted warning, no write), and the
 delta's cursor still advances.

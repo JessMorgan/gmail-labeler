@@ -760,12 +760,17 @@ def test_silence_output_is_noop_without_real_fds(
 ) -> None:
     # The in-process CliRunner gives sys.stdout a StringIO (fileno() raises). The
     # fileno() guard must make _silence_output a NO-OP there — a hardcoded
-    # dup2(..., 1) would retarget the pytest process's OWN stdout to /dev/null for
-    # the rest of the run (a latent landmine the full suite hides behind pytest's
-    # early reporter dup, and one the round-2 code briefly had). The subprocess
-    # boundary tests above pin the other half: that it DOES retarget a real fd.
+    # dup2(..., 1) or dup2(..., 2) would retarget the pytest process's OWN stdout/
+    # stderr to /dev/null for the rest of the run (a latent landmine the full suite
+    # hides behind pytest's early reporter dups, and one the round-2 code briefly
+    # had). BOTH fds are asserted: a mutant that guards only fd 1 but retargets fd
+    # 2 unconditionally (deepseek's M2) otherwise rode every node green. The
+    # subprocess boundary tests above pin the other half: that it DOES retarget a
+    # real fd.
     fd1_before = os.fstat(1)
+    fd2_before = os.fstat(2)
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     monkeypatch.setattr(sys, "stderr", io.StringIO())
     cli._silence_output()
-    assert os.fstat(1) == fd1_before  # the real descriptor was left alone
+    assert os.fstat(1) == fd1_before  # the real stdout descriptor was left alone
+    assert os.fstat(2) == fd2_before  # ... and so was the real stderr descriptor

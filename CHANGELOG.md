@@ -43,7 +43,12 @@ does not ship releases yet.
     The lost-stdout case (`>&-`, fd 1 closed so `sys.stdout is None`) used to
     crash with a `RuntimeError: lost sys.stdout` traceback (exit 1) from the first
     prompt; it is now caught up front by a `sys.stdout is None` guard that prints
-    a one-line stderr diagnosis and exits 130.
+    a one-line stderr diagnosis and exits 130. F3 round-2: the diagnosis itself
+    rides STDERR, so a merged stream (`auth setup 2>&1 | head`, where stderr SHARES
+    the dead pipe) used to EPIPE on `write(2, "setup cancelled.")` and escape the
+    handler with exit 1 — the cancel/error handlers now swallow a broken-stderr
+    diagnosis and retarget BOTH fds to /dev/null before exiting, so 130/5 hold even
+    when the two output channels are one dead pipe.
   - F2 robustness: the project-id shape loop caps at 3 malformed strikes then
     forces a final skip decision (accept → continue, decline → abort), so THAT
     loop terminates on every input (the old one could hang on a declined skip);

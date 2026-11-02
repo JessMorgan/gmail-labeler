@@ -75,10 +75,17 @@ class FakeProbe:
 @dataclass
 class FakeStdin:
     """Scripted prompt answers keyed by prompt id; a list value is consumed
-    per invocation (retry walks it). Raises WizardCancelled on a Cancel."""
+    per invocation (retry walks it). Raises WizardCancelled on a Cancel.
+
+    Default mode repeats the final scripted value indefinitely (handy for a
+    retry test that feeds the same malformed value every round). `strict=True`
+    pops one per ask and RAISES once the sequence runs dry — used by the cap
+    tests so a machine-side loop that fails to terminate is a fast named failure
+    rather than an infinite hang (the cap must fail, not stall CI)."""
 
     answers: dict[str, list[str]] = field(default_factory=dict)
     seen: list[str] = field(default_factory=list)
+    strict: bool = False
 
     def ask(self, prompt: Prompt) -> str:
         self.seen.append(prompt.id)
@@ -87,7 +94,8 @@ class FakeStdin:
             raise AssertionError(f"unexpected prompt: {prompt.id}")
         if not seq:
             raise AssertionError(f"ran out of answers for {prompt.id}")
-        value = seq.pop(0) if len(seq) > 1 else seq[0]
+        # strict: always pop (exhaustion raises above); else repeat the last value
+        value = seq.pop(0) if (self.strict or len(seq) > 1) else seq[0]
         if value == "__CANCEL__":
             raise WizardCancelled()
         return value
@@ -332,7 +340,8 @@ def test_project_id_cap_terminates_on_declined_skip() -> None:
         answers={
             "project-id": [PROJECT_ID] * 4,  # more than the cap would consume
             "client-json": [CLIENT_PATH],
-        }
+        },
+        strict=True,  # cap removed -> runs dry -> fast fail, not a hang
     )
     confirms = FakeConfirms({"Skip": False})  # decline the forced skip
     result, _rec, actions, _ = _run(probe=probe, stdin=stdin, confirms=confirms)
@@ -349,7 +358,8 @@ def test_client_json_cap_terminates_after_three_rejects() -> None:
     # must ABORT the wizard, not re-ask forever.
     probe = FakeProbe(client_states=[ClientFileState.MISSING] * 4)  # > the cap
     stdin = FakeStdin(
-        answers={"project-id": [PROJECT_ID], "client-json": [CLIENT_PATH] * 4}
+        answers={"project-id": [PROJECT_ID], "client-json": [CLIENT_PATH] * 4},
+        strict=True,  # cap removed -> runs dry -> fast fail, not a hang
     )
     result, rec, actions, _ = _run(probe=probe, stdin=stdin)
     assert result.outcome == "aborted"  # terminated, not hung

@@ -439,3 +439,16 @@ written by the backup) — while `mime_date` is sender-claimed and
 `unknown` is legacy; the two server forms must not be
 treated as different trust classes by a split-builder.
 _Avoid_: date source, timestamp origin
+
+**Onboarding (the auth-setup wizard)**:
+The guided path from a fresh profile to a signed-in state under ADR-0004 —
+`gmail-labeler auth setup` (also offered by a bare `gmail-labeler auth` with no
+credentials on a terminal): create your own GCP project + desktop OAuth client,
+point the tool at its JSON, wire the token store, then sign in by COMPOSING the
+existing `auth login` loopback flow. It verifies locally what it can (the client
+file exists, parses, is a desktop-type client) and states plainly what it cannot
+(Gmail API enablement, the consent screen's *In production* mode) — the first
+successful sign-in is the real proof of those. It never asks for a token value,
+never echoes secret material, and never overwrites an existing config without an
+explicit confirm.
+_Avoid_: setup script, installer, bootstrap

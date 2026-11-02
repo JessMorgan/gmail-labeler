@@ -4379,10 +4379,11 @@ def corrections_export(
     builder's correction-folding seam's single job (it drops every
     non-'human' 'added' before the corpus ever sees it). Reads the LOCAL
     state DB only — no Gmail call — and NEVER retrains: this writes an
-    artifact. The fold seam ships as a PURE function, but running a folded
-    corpus end-to-end today hits the sidecar-identity and append-only walls
-    (see ROADMAP); the re-fingerprint tooling is the deferred part and the
-    retrain itself is `train --force`. NO
+    artifact. The fold seam ships as a PURE function, but it is not
+    operator-runnable end-to-end today — no shipped command invokes it and the
+    corpus store is append-only (`put()` no-ops on an existing id), so a folded
+    corpus cannot be produced through the CLI; the tooling for that is deferred
+    and the retrain itself is `train --force` (see ROADMAP). NO
     bodies (invariant #5): the export carries ids/labels/kinds/detected-at/
     attributions only. Exit contract 0/2/4/5."""
     from .appdb import AppDB, AppDBError

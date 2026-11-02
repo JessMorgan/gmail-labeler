@@ -340,21 +340,22 @@ def test_old_mail_label_change_is_not_scored_arrival_still_flows(
     assert "get_message:aa11" not in fake.calls
     # ...while the true arrival flowed through the scoring path normally.
     assert "get_message:aa22" in fake.calls
-    # and the retroactive write is impossible: aa11 earns no Application row.
-    assert db.applications_for_message("aa11") == [] or all(
-        r.label != "Money/Bills" for r in db.applications_for_message("aa11")
-    )
+    # and the retroactive write is impossible: aa11 earns no Application row at
+    # all (applications_for_message returns a tuple; a truthiness check is the
+    # non-vacuous form — `== []` would never match a tuple).
+    assert not db.applications_for_message("aa11")
     db.close()
 
 
 def test_sent_mail_arrival_is_counted_skip_not_written(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # S1 sent-mail guard: the operator's OWN sent mail arrives as a
-    # messageAdded too. This one WOULD score a graduated label (Money/Bills
-    # high on "two\nbody two") — the guard must count-skip it after the
-    # fetch, never write it. (Removing the guard is the mutant: a write for
-    # sent01 appears and this pin dies.)
+    # S1 sent/non-incoming guard: the operator's OWN sent mail AND a draft
+    # arrive as a messageAdded. Both WOULD score a graduated label (Money/Bills
+    # high on "two\nbody two") — the guard must count-skip them, never write.
+    # (Removing the guard is the mutant: a write for them appears and this pin
+    # dies.) DRAFT is included because export excludes it from the corpus; the
+    # daemon labelling a pre-send draft is the same hazard.
     caplog.set_level(logging.WARNING)
     sent = FakeMessage(
         id="sent01",
@@ -363,21 +364,31 @@ def test_sent_mail_arrival_is_counted_skip_not_written(
         thread_id="ts",
         history_id=777,
     )
+    draft = FakeMessage(
+        id="dr01",
+        eml=_eml("two", "body two"),
+        label_ids=("DRAFT",),
+        thread_id="td",
+        history_id=777,
+    )
     fake = FakeGmailClient(
-        messages=[sent],
+        messages=[sent, draft],
         labels=_labels(),
-        history_pages=[_page(_record("sent01"))],
+        history_pages=[_page(_record("sent01", "dr01"))],
         current_history_id=900,
     )
     db = _db(tmp_path)
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db) == 0
-    # it WAS fetched (the guard reads the label post-fetch)...
+    # both WERE fetched (the guard reads the label post-fetch)...
     assert "get_message:sent01" in fake.calls
+    assert "get_message:dr01" in fake.calls
     # ...but counted-skipped by name, never written, no rows.
-    assert "skipped message sent01: outgoing" in caplog.text
+    assert "skipped message sent01: non-incoming (SENT)" in caplog.text
+    assert "skipped message dr01: non-incoming (DRAFT)" in caplog.text
     assert fake.writes == []
     assert not db.applications_for_message("sent01")
+    assert not db.applications_for_message("dr01")
     db.close()
 
 

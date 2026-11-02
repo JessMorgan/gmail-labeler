@@ -441,6 +441,31 @@ def test_added_correction_attributed_filter_covered(tmp_path: Path) -> None:
     db.close()
 
 
+def test_filter_covered_survives_the_crash_replay_ambiguity(tmp_path: Path) -> None:
+    # S1 C2 (deepseek MINOR-1): the crash-replay withhold applies ONLY to the
+    # HUMAN credit. An 'added' whose authorship is PROVEN filter_covered (a
+    # simulatable filter adds L2, the message matches) stays filter_covered even
+    # when the label is skip-present this tick (banded + present, no row) — a
+    # proof must not be downgraded to "unverifiable" (which claims an ignorance
+    # we do not have). RED pre-fix (the withhold overrode any skip-present add);
+    # the route-all-to-unverifiable mutant dies here too.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")  # clears the join; Money/Bills row absent
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": ["L2"]}}]
+    )
+    # Money/Bills banded high + present (L2 on aa11) -> a skip_present pair; the
+    # filter PROVES authorship, so it stays filter_covered, not unverifiable.
+    model = FakeModel(VOCAB, scores={"one\nbody": (0.9, 0.1)})
+    assert _tick(tmp_path, fake, db, ctx=ctx, model=model) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "filter_covered")
+    ]
+    db.close()
+
+
 def test_added_correction_human_when_no_filter_adds_the_label(tmp_path: Path) -> None:
     # the SAME added label, but the snapshot's filter does NOT add it (it
     # adds L1) -> no RELEVANT filter claims Money/Bills -> 'human' (a

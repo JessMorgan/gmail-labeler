@@ -642,23 +642,28 @@ gmail-labeler corrections export --out corrections.json   # default: stdout
 ```
 
 `corrections export` writes a faithful RAW dump of the captured Corrections
-— `{message_id, label, kind, attribution}` rows, **no bodies**. "Raw" here
-means *not attribution-filtered* (every row, whatever its attribution), not
-*every stored column* — the artifact carries the correction identity, not
-the `detected_at` stamp. Every row carries its *attribution* (`human` /
+— `{message_id, label, kind, detected_at, attribution}` rows, **no bodies**.
+"Raw" here means *not attribution-filtered* (every row, whatever its
+attribution), not *every stored column* — the dump carries the correction
+identity AND its `detected_at` stamp (so a consumer can rebuild a full
+CorrectionRow; the fold seam needs the stamp) but never the raw message.
+Every row carries its *attribution* (`human` /
 `filter_covered` / `unverifiable`) so the artifact is auditable — you can
 see which adds were withheld and why.
 The builder's fold seam (`apply_corrections_to_records`) ships as a **pure
 function** (it credits only a `human` add), but the export does **not**
 call it, and **nothing wires the dump or the seam into a retrain**. It is
-also **not operator-runnable end-to-end today**: the corpus store is
-append-only (a folded record re-put over an existing id is a no-op, so the
-fold cannot rewrite stored labels) and the checkpoint's sidecar pins the
-corpus fingerprint + split manifest, which a folded corpus changes and
-`train` then refuses on the identity mismatch. Rebuilding a consistent folded
-corpus needs re-fingerprint tooling that is **deferred**; once you have a
-consistent corpus the retrain itself is `train --force` (ADR-0005's
-human-gated retrain — never automatic). Only a `human` add is training
+also **not operator-runnable end-to-end today**: no shipped command invokes
+the fold (it is a library seam, not a CLI verb), and the corpus store is
+append-only — `put()` no-ops on an existing id, so a folded record cannot
+rewrite a message already in the corpus. (It is NOT the fingerprint or the
+checkpoint sidecar that blocks this: the fingerprint covers only the train
+split — corrections come from recent, test-side mail — and `train` does not
+verify a prior checkpoint's sidecar; its only gate is refusing an existing
+checkpoint dir without `--force`.) Producing a folded corpus therefore needs
+tooling that is **deferred**; once such a corpus exists the retrain itself is
+`train --force` (ADR-0005's human-gated retrain — never automatic). Only a
+`human` add is training
 signal: a `filter_covered` add (a Gmail filter verifiably would have
 applied it) and an `unverifiable` add — withheld, not guessed, when
 authorship cannot be determined: no usable filters snapshot (absent or

@@ -74,7 +74,9 @@ table are candidates (the join AC). A ``labelsRemoved`` of a label that
 IS that message's Application label is a 'removed' Correction (a human
 undid our work); a ``labelsAdded`` of a MANAGED-VOCABULARY (graduated,
 non-System) label the daemon did NOT write (no Application row for it)
-is an 'added' Correction (a human did our job — positive signal).
+is an 'added' Correction CANDIDATE — whether it is positive training signal
+depends on its attribution (only ``"human"`` is; ``"filter_covered"`` and
+``"unverifiable"`` — including the crash-replay withhold below — are not).
 ANYTHING else on an applied message — System Labels, non-vocabulary
 labels, a removed NON-applied label, INBOX churn — records NOTHING:
 noise is not correction. An 'added' Correction carries an
@@ -306,15 +308,18 @@ def predict_conformant(
 #: message (the guide's own claim); its historyId is the cursor seed.
 BOOTSTRAP_QUERY = ""
 
-#: The Gmail system label marking the operator's OWN sent mail. The daemon
-#: classifies INCOMING mail; it must never label its own outgoing mail (the
-#: self-labeling / notification-loop hazard the push guide names). A sent
-#: message arrives on the history stream as a messageAdded too — MEDIUM
-#: confidence: a single practitioner report, but the product need to skip
-#: our own outgoing mail holds regardless of which field Gmail signals it
-#: with. "SELF" is a search-query term, not a label id, so the SENT system
-#: label is the machine-checkable signal here (see the fetch-loop guard).
-_OUTGOING_LABEL_IDS = frozenset({"SENT"})
+#: The Gmail system labels marking mail that is NOT incoming mail the daemon
+#: should classify: SENT (the operator's own outgoing), DRAFT (pre-send), and
+#: CHAT (not email). `dataset export` already EXCLUDES DRAFT+CHAT from the
+#: corpus (export.py _EXCLUDED_SYSTEM_LABEL_IDS); labelling them on the live
+#: path would apply ai-applied/tier labels to a draft before the operator even
+#: sends it — an inference target deliberately outside the training
+#: distribution. A sent message arrives on the history stream as a messageAdded
+#: too — MEDIUM confidence: a single practitioner report, but the product need
+#: to skip our own outgoing / non-incoming mail holds regardless of which field
+#: Gmail signals it with. "SELF" is a search-query term, not a label id, so the
+#: system label ids are the machine-checkable signal here (see the guard).
+_OUTGOING_LABEL_IDS = frozenset({"SENT", "DRAFT", "CHAT"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +459,16 @@ def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
     Message id is read; a flat id is tolerated defensively (the
     _label_event_message_id precedent — a wrong shape reads as FEWER
     arrivals, never a bad write, ADR-0005 fail-safe).
+
+    HONEST SCOPE of "arrivals": messagesAdded[] is literally "added to the
+    MAILBOX", which is not identical to "newly received" — a Trash/Spam
+    RESTORE is plausibly reported as an add, so a restored OLD message could
+    still be scored and receive a graduated label it lacks (a narrow
+    retroactivity the field cannot distinguish; the apply command remains the
+    deliberate bulk path). Conversely, if a future wire ever omitted
+    messagesAdded for a true arrival the failure is SILENT (no scoring,
+    visible only as messages=0 in the counter line). Both edges are wire
+    facts to re-confirm at the live opt-in seam, not CI-provable here.
 
     Why NOT the ``historyTypes[]`` SERVER filter: one might ask history.list
     to return only messageAdded records. REJECTED — the correction arm needs
@@ -645,6 +660,10 @@ def _skip_present_pairs(
     it contributes NO pair (we cannot claim a skip-present we could not
     compute), so attribution falls through to the ordinary path."""
     pairs: set[tuple[str, str]] = set()
+    # the zips are strict-safe: predict_conformant already pinned the row COUNT
+    # (== len(fetched)) and each row's WIDTH (== len(vocab)) before we get here,
+    # so strict=True can never fire — noted so it does not silently become
+    # load-bearing if predict_conformant's checks ever move.
     for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
         scores = dict(zip(vocab, score_row, strict=True))
         try:
@@ -655,8 +674,12 @@ def _skip_present_pairs(
                 present=present,
                 system_labels=ctx.system_labels,
             )
-        except ValueError:
-            continue  # the plan loop warns it; no pair claimed
+        except Exception:
+            # match the plan's fail-safe net (plan_message_write catches Exception
+            # → a per-message warning): a lying input contributes NO pair here
+            # (we cannot claim a skip-present we could not compute) AND must not
+            # escape _run_tick to kill daemon_loop — the plan loop warns it below.
+            continue
         for d in decisions:
             if d.band is not None and d.present:
                 pairs.add((message_id, d.label))
@@ -730,20 +753,20 @@ def detect_corrections(
                 continue
             seen.add(key)
             fields = parsed_by_id.get(message_id)
-            if (message_id, name) in skip_present:
-                # S1 C2 (crash-replay window): this tick's plan path SKIPPED
-                # this add as already-present, yet the delta carries a
-                # labelsAdded for it and there is NO Application row. That is
-                # AMBIGUOUS — either the daemon's own landed write whose row
-                # was lost before the commit (a replay), or a human who added
-                # exactly what we would have added. We cannot tell, so it is
-                # WITHHELD as 'unverifiable' (invariant #6, withheld-not-guessed
-                # — the #27 three-way vocabulary makes this a one-line route),
-                # never credited to the human (which would poison human_added
-                # AND the training fold with our own work).
+            attribution = _attribution(ctx, label_id, fields)
+            if attribution == "human" and (message_id, name) in skip_present:
+                # S1 C2 (crash-replay window): _attribution found no filter
+                # explaining the add, so it would credit the HUMAN — but this
+                # tick's plan SKIPPED this add as already-present and there is
+                # NO Application row for it. That makes the human credit
+                # AMBIGUOUS: equally it is the daemon's own landed write whose
+                # row was lost before the commit (a replay). We withhold only
+                # the human credit (invariant #6, withheld-not-guessed); a
+                # PROVEN filter_covered (a filter verifiably authored it) or an
+                # already-unverifiable add is NOT ambiguous here and stands —
+                # downgrading a proof to "unverifiable" would claim an
+                # ignorance we do not have.
                 attribution = "unverifiable"
-            else:
-                attribution = _attribution(ctx, label_id, fields)
             rows.append(
                 CorrectionRow(
                     message_id=message_id,
@@ -888,13 +911,18 @@ def _run_tick(
                     e,
                 )
                 return stop
-            if _OUTGOING_LABEL_IDS & set(raw.label_ids):
-                # S1 sent-mail guard: the operator's OWN sent mail arrives as
-                # a messageAdded too (see _OUTGOING_LABEL_IDS for the
-                # confidence note). It is a counted SKIP — named, never scored,
-                # never written — the same posture as a deleted-message ghost.
+            if outgoing := sorted(_OUTGOING_LABEL_IDS & set(raw.label_ids)):
+                # S1 sent/non-incoming guard: the operator's own SENT/DRAFT
+                # mail and CHAT arrive as a messageAdded too (see
+                # _OUTGOING_LABEL_IDS for the rationale + confidence note). A
+                # counted SKIP — named by the triggering label id (body-free),
+                # never scored, never written — the posture of a ghost skip.
                 skipped += 1
-                log.warning("daemon: skipped message %s: outgoing (SENT)", message_id)
+                log.warning(
+                    "daemon: skipped message %s: non-incoming (%s)",
+                    message_id,
+                    ",".join(outgoing),
+                )
                 continue
             try:
                 data = decode_gmail_raw(raw.raw_b64url)

@@ -154,7 +154,8 @@ Scope:
   steps, verifies locally what it can (client file exists / parses / is
   desktop-type), wires the config + token store, and COMPOSES the existing
   `auth login` loopback flow to sign in; a bare `auth` with no credentials
-  offers it on a terminal (and exits 5 naming it in a script). Onboarding
+  offers it on a terminal (in a script it stays exit 4, naming it — the brief's
+  exit-5 detour was corrected to preserve the contract). Onboarding
   polish, not a gate to training.
 
 **Exit:** high-band labels apply silently; the user works the `ai-med`

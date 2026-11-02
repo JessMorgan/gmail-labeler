@@ -69,7 +69,7 @@ corrections_app = typer.Typer(
 app.add_typer(corrections_app, name="corrections")
 
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
-_INCOMPLETE_EXIT = 5  # operation failed or incomplete (a script cannot prompt)
+_INCOMPLETE_EXIT = 5  # operation failed or incomplete (write/declined/export)
 # Ctrl-C at a prompt exits 130 — the SAME code typer already uses for a raw
 # KeyboardInterrupt (`except KeyboardInterrupt: raise Exit(130)`), so the whole
 # CLI signals "cancelled by signal" identically. (typer's prompt/confirm would
@@ -135,12 +135,17 @@ def auth_status(
         )
         _run_setup_wizard(config)
     else:
+        # F1 (brief corrected at source): an unsigned non-TTY `auth` is an
+        # AUTH-STATE, not an operation failure — it stays exit 4 (auth/config
+        # unusable), the contract scripts have always branched on. The
+        # wizard-entry NAMING stays (it names `auth setup`); only the code is
+        # 4, not 5.
         typer.echo(
             "Not signed in and stdin is not a terminal — run "
             "`gmail-labeler auth setup` interactively.",
             err=True,
         )
-        raise typer.Exit(code=_INCOMPLETE_EXIT)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT)
 
 
 @auth_app.command("setup")

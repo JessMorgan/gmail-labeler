@@ -32,20 +32,21 @@ def test_usage_error_stays_exit_2() -> None:
     assert result.exit_code == 2
 
 
-def test_auth_status_unsigned_non_tty_exits_5_naming_setup(tmp_path: Path) -> None:
-    # Ticket #28 AC5 CHANGED this contract: bare `auth` with no credentials no
-    # longer just exits 4 — it makes the wizard ENTRY decision. In a script
-    # (no TTY, as CliRunner provides) it must not half-prompt: it exits 5 and
-    # names the interactive command. The status is still reported.
+def test_auth_status_reports_and_exits_4_when_unsigned(tmp_path: Path) -> None:
+    # F1 (brief corrected at source): unsigned bare `auth` in a script is an
+    # AUTH-STATE -> exit 4 (auth/config unusable), the contract scripts branch
+    # on. Restored from the ticket's brief-driven exit-5 detour; the wizard-entry
+    # NAMING (`run auth setup`) is kept, only the code is back to 4.
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         f'[gmail]\ntoken_backend = "file"\ntoken_file = "{tmp_path / "tok.json"}"\n',
         encoding="utf-8",
     )
     result = runner.invoke(app, ["auth", "--config", str(cfg)])
-    assert result.exit_code == 5
+    assert result.exit_code == 4
     assert "NOT SIGNED IN" in result.output
-    assert "auth setup" in (result.output + result.stderr)
+    assert "auth login" in result.output  # the original status hint (property restored)
+    assert "auth setup" in (result.output + result.stderr)  # F1: the naming stays
 
 
 def test_auth_config_error_exits_4(tmp_path: Path) -> None:

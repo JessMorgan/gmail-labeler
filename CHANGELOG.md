@@ -12,7 +12,10 @@ does not ship releases yet.
   ADR-0004 — create your own GCP project + desktop OAuth client, point the tool
   at its JSON, wire the token store — then COMPOSES the existing `auth login`
   loopback flow to sign in. A bare `auth` with no credentials offers the wizard
-  on a terminal, and in a script exits 5 naming it (never half-prompts).
+  on a terminal; in a script it stays exit 4 (auth/config unusable) while naming
+  `auth setup` — the ticket's brief proposed exit 5 for that case, but the AC's
+  "exit-code contract preserved" wins and 4 is restored (brief corrected at
+  source).
   - `wizard.py`: the onboarding decision core as a PURE state machine over
     injected prompts + an `EnvironmentProbe` (typer wires the real I/O; the
     whole matrix is tested offline). Declared steps with ids; each verifies

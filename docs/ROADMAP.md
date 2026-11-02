@@ -138,7 +138,7 @@ Scope:
   skip-present makes a re-run idempotent — LANDED (#26);
 - Correction capture (manual fixes on applied mail become the next
   retrain's signal) and `status` (realized precision per graduated label)
-  — LANDED (#27): the daemon's tick classifies `labelAdded`/`labelRemoved`
+  — LANDED (#27): the daemon's tick classifies `labelsAdded`/`labelsRemoved`
   history events against the Applications join (read + local-DB only,
   never writes back; the ignore-boundary records nothing; a corrected
   message is never re-written), the schema-v4 `corrections` table rides

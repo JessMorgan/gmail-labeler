@@ -22,7 +22,8 @@ does not ship releases yet.
     delta's single commit point); `commit_applications` (apply) stays
     rows-only.
   - `daemon.py`: correction DETECTION inside the existing tick — parse
-    `labelAdded`/`labelRemoved` events, classify against the Applications
+    `labelsAdded`/`labelsRemoved` events (the documented Gmail response
+    keys), classify against the Applications
     join (read + local-DB only, never a Gmail write), the ignore-boundary
     (system/non-vocabulary labels, a removed non-applied label) records
     NOTHING, a corrected message is never re-written, and an `added`

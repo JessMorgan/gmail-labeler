@@ -4154,7 +4154,9 @@ def status(
         "label RENAME desyncs the name-keyed join (orphaned corrections); "
         "rows may span artifact versions (per-run binding deferred to #23); "
         "precision assumes unseen-but-removed mail is rare "
-        "(archive-equals-dismiss)"
+        "(archive-equals-dismiss); 'filter-covered' counts only PROVEN "
+        "filter-authored adds (a filter with criteria outside "
+        "from/to/subject is unverifiable and is NOT counted there)"
     )
     if not rows:
         typer.echo("status: no graduated labels (nothing to report)")

@@ -336,59 +336,165 @@ def test_old_mail_label_change_is_not_scored_arrival_still_flows(
     db = _db(tmp_path)
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db) == 0
-    # the old, label-change-only message was NEVER fetched or scored...
+    # the live discriminator: the old, label-change-only message was NEVER
+    # fetched or scored (RED pre-fix: get_message:aa11 appeared in the call
+    # log). An `applications_for_message("aa11")` assert was DROPPED here as
+    # non-discriminating — aa11 carries a labelsAdded correction event, so it
+    # is excluded from writes regardless of banding (a corrected message never
+    # earns an Application row), and its only band (Shipping) is skip-present;
+    # the fetch check above is what actually pins the fix.
     assert "get_message:aa11" not in fake.calls
     # ...while the true arrival flowed through the scoring path normally.
     assert "get_message:aa22" in fake.calls
-    # and the retroactive write is impossible: aa11 earns no Application row at
-    # all (applications_for_message returns a tuple; a truthiness check is the
-    # non-vacuous form — `== []` would never match a tuple).
-    assert not db.applications_for_message("aa11")
     db.close()
 
 
-def test_sent_mail_arrival_is_counted_skip_not_written(
+def test_non_incoming_arrivals_are_counted_skip_not_written(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # S1 sent/non-incoming guard: the operator's OWN sent mail AND a draft
-    # arrive as a messageAdded. Both WOULD score a graduated label (Money/Bills
-    # high on "two\nbody two") — the guard must count-skip them, never write.
-    # (Removing the guard is the mutant: a write for them appears and this pin
-    # dies.) DRAFT is included because export excludes it from the corpus; the
-    # daemon labelling a pre-send draft is the same hazard.
+    # S2 non-incoming guard: the operator's own SENT and DRAFT mail and a CHAT
+    # arrive as a messageAdded, none in INBOX. All WOULD score a graduated label
+    # (Money/Bills high on "two\nbody two") — the guard must count-skip them,
+    # never write. (Removing the guard is a mutant: writes appear and this dies.)
+    # DRAFT/CHAT match the corpus exclusion; SENT is the self-echo id.
     caplog.set_level(logging.WARNING)
     sent = FakeMessage(
-        id="sent01",
+        id="aa66",
         eml=_eml("two", "body two"),
         label_ids=("SENT",),
         thread_id="ts",
         history_id=777,
     )
     draft = FakeMessage(
-        id="dr01",
+        id="aa77",
         eml=_eml("two", "body two"),
         label_ids=("DRAFT",),
         thread_id="td",
         history_id=777,
     )
+    chat = FakeMessage(
+        id="aa88",
+        eml=_eml("two", "body two"),
+        label_ids=("CHAT",),
+        thread_id="tc",
+        history_id=777,
+    )
     fake = FakeGmailClient(
-        messages=[sent, draft],
+        messages=[sent, draft, chat],
         labels=_labels(),
-        history_pages=[_page(_record("sent01", "dr01"))],
+        history_pages=[_page(_record("aa66", "aa77", "aa88"))],
         current_history_id=900,
     )
     db = _db(tmp_path)
     db.set_history_cursor(777)
     assert _run(tmp_path, fake, db=db) == 0
-    # both WERE fetched (the guard reads the label post-fetch)...
-    assert "get_message:sent01" in fake.calls
-    assert "get_message:dr01" in fake.calls
+    # all WERE fetched (the guard reads the label post-fetch)...
+    assert "get_message:aa66" in fake.calls
+    assert "get_message:aa77" in fake.calls
+    assert "get_message:aa88" in fake.calls
     # ...but counted-skipped by name, never written, no rows.
-    assert "skipped message sent01: non-incoming (SENT)" in caplog.text
-    assert "skipped message dr01: non-incoming (DRAFT)" in caplog.text
+    assert "skipped message aa66: non-incoming (SENT)" in caplog.text
+    assert "skipped message aa77: non-incoming (DRAFT)" in caplog.text
+    assert "skipped message aa88: non-incoming (CHAT)" in caplog.text
     assert fake.writes == []
-    assert not db.applications_for_message("sent01")
-    assert not db.applications_for_message("dr01")
+    assert not db.applications_for_message("aa66")
+    assert not db.applications_for_message("aa77")
+    assert not db.applications_for_message("aa88")
+    db.close()
+
+
+def test_inbox_self_addressed_copy_is_scored_not_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # S2 A3 (qwen's probe, now a permanent node): self-addressed mail arrives
+    # as a DISTINCT inbox copy Gmail does NOT tag SENT. An INBOX-only arrival
+    # (no SENT) is arriving mail -> scored normally and written (Money/Bills
+    # high on its text, absent). Guards the guard against ever over-skipping
+    # plain incoming mail; the compound is a NO-OP on this native flow.
+    caplog.set_level(logging.WARNING)
+    inbox = FakeMessage(
+        id="aa33",
+        eml=_eml("two", "body two"),
+        label_ids=("INBOX",),
+        thread_id="ti",
+        history_id=777,
+    )
+    fake = FakeGmailClient(
+        messages=[inbox],
+        labels=_labels(),
+        history_pages=[_page(_record("aa33"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert "get_message:aa33" in fake.calls
+    assert "skipped message aa33" not in caplog.text
+    # scored + written: Money/Bills banded high, not present -> an Application.
+    assert any(r.label == "Money/Bills" for r in db.applications_for_message("aa33"))
+    db.close()
+
+
+def test_drag_restored_sent_message_is_scored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # S2 A4 — THE COMPOUND'S DISCRIMINATING PIN. The only producer of
+    # SENT+INBOX co-occurrence is the human's OWN drag: they pulled a sent
+    # message back into the inbox. It is arriving mail again, so it is SCORED,
+    # not skipped. The plain-set mutant (drop the INBOX exemption) skips it and
+    # this pin DIES — that is the acceptance bar.
+    caplog.set_level(logging.WARNING)
+    drag = FakeMessage(
+        id="aa44",
+        eml=_eml("two", "body two"),
+        label_ids=("SENT", "INBOX"),
+        thread_id="td",
+        history_id=777,
+    )
+    fake = FakeGmailClient(
+        messages=[drag],
+        labels=_labels(),
+        history_pages=[_page(_record("aa44"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert "get_message:aa44" in fake.calls
+    assert "skipped message aa44" not in caplog.text
+    # scored + written despite carrying SENT — the INBOX exemption is what saves it.
+    assert any(r.label == "Money/Bills" for r in db.applications_for_message("aa44"))
+    db.close()
+
+
+def test_user_label_named_sent_is_scored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # S2 A5 (qwen's other probe): the id-guard keys on Gmail label IDS, never
+    # NAMES. A USER label merely named 'sent' (id L9, not the SENT system id)
+    # on an inbox message is ordinary incoming mail -> scored. Proves a name
+    # collision cannot fool the guard (it never matched the id-guard).
+    caplog.set_level(logging.WARNING)
+    labels = [*_labels(), LabelInfo("L9", "sent", "user")]
+    m = FakeMessage(
+        id="aa55",
+        eml=_eml("two", "body two"),
+        label_ids=("INBOX", "L9"),
+        thread_id="tn",
+        history_id=777,
+    )
+    fake = FakeGmailClient(
+        messages=[m],
+        labels=labels,
+        history_pages=[_page(_record("aa55"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    assert "get_message:aa55" in fake.calls
+    assert "skipped message aa55" not in caplog.text
+    assert any(r.label == "Money/Bills" for r in db.applications_for_message("aa55"))
     db.close()
 
 

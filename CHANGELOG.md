@@ -31,14 +31,15 @@ does not ship releases yet.
     attributed (`human` / `filter_covered` / `unverifiable`) via the #22
     mechanism reused: a simulatable filter that verifiably would have
     applied it is `filter_covered`; `unverifiable` (withheld, not credited
-    to the human) is when authorship cannot be determined — no usable
-    filters snapshot (absent or malformed; the `ServingContext.filters is
-    None` case mirroring analyze.py, warned at startup); a relevant filter
-    whose criteria cannot be simulated from the kept fields (outside
-    `from`/`to`/`subject`, or malformed); or an add whose authorship is
-    otherwise undecidable (its message fields were not fetched, or a
-    relevant filter's `addLabelIds` is unreadable — the credit arm reads
-    through the strict `filter_label_ids_strict`) (invariant #6,
+    to the human) is when authorship cannot be determined: no usable
+    filters snapshot (absent or malformed); a relevant filter whose criteria
+    cannot be simulated from the kept fields (outside `from`/`to`/`subject`,
+    or malformed); or an add whose authorship is otherwise undecidable (its
+    message fields were not fetched, or a relevant filter's `addLabelIds` is
+    unreadable). The no-snapshot case is `ServingContext.filters is None`
+    (mirroring analyze.py, warned at startup); the credit arm reads each
+    filter through the strict `filter_label_ids_strict` so an unreadable
+    `addLabelIds` withholds rather than looking irrelevant (invariant #6,
     exclusion-not-guessing; an empty *snapshot* is the attested-none case
     where an `added` is `human`). The 91-node
     daemon suite rode the change verbatim.

@@ -3589,6 +3589,29 @@ def _serve_startup(
             "only).",
             err=True,
         )
+    elif filters_snapshot is not None and command == "daemon":
+        # a snapshot with one or more UNREADABLE filter entries (a present-
+        # but-wrong-shaped action/addLabelIds) makes _attribution withhold
+        # EVERY 'added' (authorship can't be ruled out) — name the count at
+        # startup so the operator is not left with a silent rising
+        # 'unverifiable' and no cause (the #22 bridge-malformed posture:
+        # name it, don't guess; a legitimately action-less filter reads []
+        # and is NOT counted here)
+        unreadable = 0
+        for f in filters_snapshot:
+            try:
+                filter_label_ids_strict(f)
+            except ValueError:
+                unreadable += 1
+        if unreadable:
+            typer.echo(
+                f"daemon: NOTE {unreadable} filter(s) in the snapshot have an "
+                "unreadable action/addLabelIds — their authorship cannot be "
+                "determined, so 'added' Corrections they might explain are "
+                "withheld as 'unverifiable' (not credited as training "
+                "signal). Re-run `dataset export` to refresh the snapshot.",
+                err=True,
+            )
 
     ctx = ServingContext(
         bands=bands_map,
@@ -4059,7 +4082,8 @@ def status(
     bands: str = typer.Option(
         ...,
         "--bands",
-        help="Bands Artifact path (required — the basis-line identity)",
+        help="Bands Artifact path (required — must be the pair this "
+        "graduation table was measured against; a mismatch refuses exit 5)",
     ),
     graduation: str = typer.Option(
         ...,
@@ -4099,7 +4123,8 @@ def status(
     the attribution vocabulary it counted under and the CURRENT
     bands/graduation artifact content hashes and states the honest v1
     caveats: rows can span artifact versions (per-run binding deferred
-    to #23), and precision assumes unseen-but-removed mail is rare
+    to post-merge calibration), and precision assumes
+     unseen-but-removed mail is rare
     (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
     config unusable · 5 store/artifact failure (3 is the project's
     reserved not-implemented code; status never emits it)."""
@@ -4121,8 +4146,8 @@ def status(
         "re-added still counts as removed (the event log is historical truth, "
         "not reconciled state); a Gmail label RENAME desyncs the name-keyed "
         "join (orphaned corrections); rows may span artifact versions "
-        "(per-run binding deferred to #23); precision assumes "
-        "unseen-but-removed mail is rare (archive-equals-dismiss)"
+        "(per-run binding deferred to post-merge calibration); precision "
+        "assumes unseen-but-removed mail is rare (archive-equals-dismiss)"
     )
     # the canonical THREE-cause sentence for 'unverifiable' (F2 item 14) —
     # mirrored verbatim in GLOSSARY / README / CHANGELOG
@@ -4214,8 +4239,16 @@ def status(
     store_db = AppDB(db_path)
     try:
         store_db.open()
-        written_by_label = store_db.application_label_counts()
+        # READ ORDER MATTERS (F2 item 9, the torn-read): these are two
+        # separate autocommit SELECTs, so a daemon delta can commit BETWEEN
+        # them. A 'removed' Correction is only ever detected for an app row
+        # committed in the SAME delta transaction, so reading corrections
+        # FIRST guarantees every removed's app row is present in the LATER
+        # written read (removed <= written holds across the split). Reading
+        # written first would let a delta land a (removed, its app) pair
+        # between the reads and spuriously trip the removed>written refuse.
         correction_stats = store_db.correction_label_stats()
+        written_by_label = store_db.application_label_counts()
     except AppDBError as e:
         typer.echo(f"status failed: state DB: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None

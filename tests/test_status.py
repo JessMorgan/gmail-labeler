@@ -200,7 +200,7 @@ def test_status_source_has_no_client_construction() -> None:
         # A dead reference to any of these in status's source rode the old
         # denylist green; the reviewer's injection probe is the pin's mutant.
         "_load_filters_snapshot",
-        "SIDECAR_FILES",
+        "SIDECAR_LABELS",
         "SIDECAR_FILTERS",
         "write_filters_snapshot",
     ):
@@ -513,3 +513,37 @@ def test_status_bands_graduation_expanduser(
         ],
     )
     assert result.exit_code == 0, result.output
+
+
+def test_status_reads_corrections_before_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 9 (the torn-read): the two aggregate SELECTs are separate
+    # autocommit reads, so a daemon delta can commit BETWEEN them. Reading
+    # corrections FIRST is monotone (a 'removed' rides the same delta
+    # transaction as its app row, so the later written read always sees it)
+    # -- reading written first would let a (removed, its app) pair land
+    # between the reads and spuriously trip the removed>written refuse. Pin
+    # the ORDER (a mutant swapping them back reddens).
+    import gmail_labeler.appdb as appdb_mod
+
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
+    order: list[str] = []
+    real_c = appdb_mod.AppDB.correction_label_stats
+    real_w = appdb_mod.AppDB.application_label_counts
+
+    def spy_c(self: object) -> object:
+        order.append("corrections")
+        return real_c(self)  # pyright: ignore[reportArgumentType]
+
+    def spy_w(self: object) -> object:
+        order.append("written")
+        return real_w(self)  # pyright: ignore[reportArgumentType]
+
+    monkeypatch.setattr(appdb_mod.AppDB, "correction_label_stats", spy_c)
+    monkeypatch.setattr(appdb_mod.AppDB, "application_label_counts", spy_w)
+    result = _status(tmp_path, cfg)
+    assert result.exit_code == 0, result.output
+    assert order == ["corrections", "written"]

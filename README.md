@@ -581,17 +581,23 @@ so it answers even on a sick or offline mailbox. A label with no
 applications yet reports `no data`. The basis line names the current
 bands/graduation artifact hashes and states the honest v1 caveats (rows
 may span artifact versions; precision assumes unseen-but-removed mail is
-rare — archive-equals-dismiss). A `--json` shape is available for
-tooling. Exit codes 0/2/4/5.
+rare — archive-equals-dismiss). The `--bands` and `--graduation` you pass
+must be the **matching pair** (the graduation table records the bands
+artifact it was measured against; a mismatched pair is refused at exit 5,
+not reported under a basis that was never measured together). A `--json`
+shape is available for tooling. Exit codes 0/2/4/5.
 
 ```sh
 gmail-labeler corrections export --out corrections.json   # default: stdout
 ```
 
 `corrections export` writes a faithful RAW dump of the captured Corrections
-— `{message_id, label, kind, attribution}` rows, **no bodies**. Every row
-carries its *attribution* (`human` / `filter_covered` / `unverifiable`) so
-the artifact is auditable — you can see which adds were withheld and why.
+— `{message_id, label, kind, attribution}` rows, **no bodies**. "Raw" here
+means *not attribution-filtered* (every row, whatever its attribution), not
+*every stored column* — the artifact carries the correction identity, not
+the `detected_at` stamp. Every row carries its *attribution* (`human` /
+`filter_covered` / `unverifiable`) so the artifact is auditable — you can
+see which adds were withheld and why.
 The builder's fold seam (`apply_corrections_to_records`) ships as a **pure
 function** (it credits only a `human` add), but the export does **not**
 call it, and **nothing wires the dump or the seam into a retrain** —

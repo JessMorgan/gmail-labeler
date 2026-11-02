@@ -389,6 +389,57 @@ def test_completed_but_not_signed_in_exits_5(
     assert "not signed in" in result.output.lower()
 
 
+def test_status_check_crash_cli_exits_5_no_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_flow: None,
+    headless: None,
+) -> None:
+    # A3 at the CLI layer: an injected status() that RAISES must map to exit 5
+    # (the status-error arm), never a raw traceback (exit 1, off-contract). The
+    # machine-layer test alone left the cli.py status-error->5 arm uncovered.
+    import gmail_labeler.auth as auth_mod
+    from gmail_labeler.auth import AuthStatus
+
+    def _boom(cfg: object) -> AuthStatus:
+        raise RuntimeError(f"status exploded {REFRESH}")
+
+    monkeypatch.setattr(auth_mod, "status", _boom)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = _client_json(tmp_path)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(
+        app, ["auth", "setup", "--config", str(config)], input=_setup_input(client)
+    )
+    assert result.exit_code == 5
+    assert "Traceback" not in result.output
+    assert REFRESH not in result.output  # the crash text is never echoed
+
+
+def test_status_broken_pipe_is_cancel_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_flow: None,
+    headless: None,
+) -> None:
+    # A5 symmetric case (review MINOR): a BrokenPipeError escaping the status
+    # check must reach the CLI's 130 handler, not be caught as a status-error (5).
+    import gmail_labeler.auth as auth_mod
+    from gmail_labeler.auth import AuthStatus
+
+    def _bp(cfg: object) -> AuthStatus:
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(auth_mod, "status", _bp)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = _client_json(tmp_path)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(
+        app, ["auth", "setup", "--config", str(config)], input=_setup_input(client)
+    )
+    assert result.exit_code == 130
+
+
 def test_broken_pipe_stdout_closed_is_cancel_class(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -403,6 +454,29 @@ def test_broken_pipe_stdout_closed_is_cancel_class(
     result = runner.invoke(app, ["auth", "setup", "--config", str(config)], input="")
     assert result.exit_code == 130
     assert "writing" not in (result.output + result.stderr).lower()
+
+
+def test_broken_pipe_in_login_is_cancel_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, headless: None
+) -> None:
+    # A5 (review MINOR): a BrokenPipeError escaping the composed LOGIN (auth.login
+    # prints the auth URL to stdout; a closed pipe there) must reach the CLI's 130
+    # handler, NOT be swallowed by the login arm's `except Exception` as a
+    # console-side sign-in failure (exit 4).
+    import gmail_labeler.auth as auth_mod
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def _broken_login(cfg: object) -> None:
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(auth_mod, "login", _broken_login)
+    client = _client_json(tmp_path)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(
+        app, ["auth", "setup", "--config", str(config)], input=_setup_input(client)
+    )
+    assert result.exit_code == 130
 
 
 def test_auth_explicit_invalid_config_exits_4(tmp_path: Path) -> None:

@@ -30,7 +30,16 @@ does not ship releases yet.
     keyring via the composed login — no free-form token entry is ever offered.
   - Confirm-before-overwrite on the config path (a `resolve()`-compare posture,
     stated; the samefile/fd family is #47's scope). The exit contract gains 130
-    for Ctrl-C at a prompt, matching typer's raw-KeyboardInterrupt posture.
+    for a cancelled run — Ctrl-C (SIGINT) at a prompt AND a closed stdout
+    (`auth setup | head`, a SIGPIPE-class break) both land on 130, keeping the
+    contract a CLOSED set {0,2,3,4,5,130}; 130 is the SIGINT convention reused
+    for the pipe break rather than inventing a new code.
+  - F2 robustness: the project-id shape loop caps at 3 malformed strikes then
+    forces a final skip decision (accept → continue, decline → abort), so the
+    wizard TERMINATES on every input (the old loop could hang on a declined
+    skip); a crashed status check and a failed config write become named
+    `status-error` / `write-error` outcomes (exit 5) instead of escaping the exit
+    contract as a traceback (exit 1).
   - Wording-drift ledger (honesty): the C2-era rewrite silently dropped the
     looked-in-paths + "copy example.toml" hint from the fresh-profile `auth`
     message — the exit code was preserved but the guidance vanished without a

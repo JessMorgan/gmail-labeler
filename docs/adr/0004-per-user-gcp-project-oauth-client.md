@@ -21,7 +21,9 @@ interactive `auth` wizard this ADR promised is now implemented:
 (the client file exists, parses, and is a desktop-type client), wires the config
 and token store, and *composes* the existing `gmail-labeler auth login` loopback
 flow to sign in. It is explicit that Gmail API enablement and the consent
-screen's *In production* mode are NOT locally checkable — the first successful
-sign-in is the real proof of those, not anything it can verify up front. The
+screen's *In production* mode are NOT locally checkable — signing in proves the
+OAuth client and consent, the first Gmail call proves API enablement, and a
+token surviving 7 days proves *In production* mode; none of that is verified up
+front. The
 body's "documented with screenshots" promise is still outstanding: the wizard
 and the README Setup section are text plus console URLs, no screenshots.

@@ -35,11 +35,11 @@ does not ship releases yet.
     contract a CLOSED set {0,2,3,4,5,130}; 130 is the SIGINT convention reused
     for the pipe break rather than inventing a new code.
   - F2 robustness: the project-id shape loop caps at 3 malformed strikes then
-    forces a final skip decision (accept → continue, decline → abort), so the
-    wizard TERMINATES on every input (the old loop could hang on a declined
-    skip); a crashed status check and a failed config write become named
-    `status-error` / `write-error` outcomes (exit 5) instead of escaping the exit
-    contract as a traceback (exit 1).
+    forces a final skip decision (accept → continue, decline → abort), so THAT
+    loop terminates on every input (the old one could hang on a declined skip);
+    a crashed status check and a failed config write become named `status-error`
+    / `write-error` outcomes (exit 5, reported on stderr) instead of escaping the
+    exit contract as a traceback (exit 1).
   - Wording-drift ledger (honesty): the C2-era rewrite silently dropped the
     looked-in-paths + "copy example.toml" hint from the fresh-profile `auth`
     message — the exit code was preserved but the guidance vanished without a

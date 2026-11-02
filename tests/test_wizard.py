@@ -109,6 +109,9 @@ class FakeConfirms:
         # test MUST be scripted by key — an unkeyed confirm is a bug in the
         # test (it would let a default True silently carry a branch). This makes
         # "the decision came from a keyed answer" a REAL property, not a claim.
+        # (The strictness itself is not mutation-pinned — restoring `return True`
+        # stays green because nothing relies on the default, which is the point;
+        # it is a guard so a future test cannot lean on an unkeyed confirm.)
         raise AssertionError(f"unkeyed confirm reached: {text[:60]!r}")
 
 
@@ -492,10 +495,11 @@ def test_status_check_crash_becomes_named_status_error_not_escape() -> None:
     result, rec, _a, _ = _run(actions=actions)
     assert result.outcome == "status-error"
     assert result.signed_in is False
-    assert "status check failed" in result.detail
-    # the raw text is never echoed (type only), and the surface is named
+    assert "status check failed" in result.detail  # the NAMED outcome detail
+    # the machine stays silent on this branch (the diagnosis is the CLI's stderr
+    # surface now) and never echoes the raw text — only the type name is in detail
     assert CLIENT_SECRET not in rec.all_text
-    assert "status check failed" in rec.all_text.lower()
+    assert CLIENT_SECRET not in result.detail
 
 
 def test_completed_wizard_reports_not_signed_in_when_status_says_so() -> None:

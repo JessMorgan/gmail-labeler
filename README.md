@@ -542,7 +542,7 @@ window is only as trustworthy as those dates.
 
 Exit codes: 0 clean (preview or backfill) · 2 usage (missing/invalid
 `--since`) · 4 auth/config (the tier-name collision, and a mid-run auth
-failure incl.) · 5 artifact/store failure, a preview whose Tier Labels are
+failure) · 5 artifact/store failure, a preview whose Tier Labels are
 absent, a lock contention past the busy timeout, or a model/wire failure.
 
 ## Docs

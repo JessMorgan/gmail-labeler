@@ -44,13 +44,15 @@ THE ARMS (the gmail_errors taxonomy, checked not string-matched):
 GmailAuthError propagates (human-gated — the CLI's exit-4 mapping); a
 404 on a message read or a write is a VANISHED message (a backfill over
 years WILL hit deleted mail) — counted SKIPPED, never fatal, delta-free
-(there is no cursor to hold); any OTHER per-message write error HOLDS
-nothing (there is no cursor) — the message stays un-labeled and un-
-rowed, a counted warning, and a RE-RUN picks it up (not in the DB, not
-on the mail — the distinguishing shape, pinned); a model shape defect
-(``predict_conformant`` raising) or a page-read failure ABORTS the run
-(the CLI's exit-5 mapping — the shadow prediction-failure precedent: a
-systematic defect is a bug, not a per-message skip).
+(there is no cursor to hold); any OTHER per-message READ **or** WRITE
+error HOLDS nothing (there is no cursor) — the message stays un-labeled
+and un-rowed, a counted warning, and a RE-RUN picks it up (not in the DB,
+not on the mail — the distinguishing shape, pinned both arms); a model
+shape defect (``predict_conformant`` raising) or a PAGE-LEVEL
+``list_messages`` failure ABORTS the run (the CLI's exit-5 mapping — the
+shadow prediction-failure precedent: a systematic defect is a bug, not a
+per-message skip). A per-message blip is not systematic, so neither the
+read nor the write arm aborts on it.
 
 GRACEFUL SHUTDOWN: ``should_stop`` (the daemon's shared handler helper
 — no third copy) is consulted between messages and between pages; once

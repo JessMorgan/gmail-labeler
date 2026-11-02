@@ -11,6 +11,9 @@ acceptance criterion #1 (a fresh profile, no config, reaches a working
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -324,8 +327,11 @@ def test_setup_config_write_failure_exits_5(
     )
     assert result.exit_code == 5
     assert "Traceback" not in result.output
-    # the diagnosis is on STDERR (the auth-path convention), not silently stdout
+    # F3-3 one-surface: the diagnosis appears EXACTLY ONCE and ONLY on stderr —
+    # a machine-side io.out echo (the old double-print) would land on stdout too.
     assert "could not write" in result.stderr.lower()
+    assert result.stderr.lower().count("could not write") == 1
+    assert "could not write" not in result.stdout.lower()  # NOT on stdout
 
 
 def test_bare_auth_invalid_config_no_flag_exits_4(
@@ -415,7 +421,10 @@ def test_status_check_crash_cli_exits_5_no_traceback(
     )
     assert result.exit_code == 5
     assert "Traceback" not in result.output
-    assert "status check failed" in result.stderr.lower()  # STDERR surface
+    # F3-3 one-surface: exactly once, stderr only (no machine-side stdout echo)
+    assert "status check failed" in result.stderr.lower()
+    assert result.stderr.lower().count("status check failed") == 1
+    assert "status check failed" not in result.stdout.lower()
     assert REFRESH not in result.output  # the crash text is never echoed
 
 
@@ -591,3 +600,78 @@ def test_auth_login_command_still_works(
     result = runner.invoke(app, ["auth", "login", "--config", str(cfg)])
     assert result.exit_code == 0
     assert REFRESH not in result.output
+
+
+# --- the PROCESS-boundary tests (F3 MAJOR) ----------------------------------
+# CliRunner runs the CLI IN-PROCESS, so it always saw the intended exit code.
+# These spawn the real interpreter and assert the code is true at the BOUNDARY —
+# where a buffered stdout that only flushes at shutdown used to turn 130 into 120.
+def _boundary_env(tmp_path: Path) -> dict[str, str]:
+    # run THIS src tree (not a stale install) — the daemon subprocess precedent
+    src = str(Path(cli.__file__).parent.parent)
+    return {
+        **os.environ,
+        "PYTHONPATH": src,
+        "HOME": str(tmp_path),
+        "PYTHONTZPATH": "/nonexistent/tzdb",
+    }
+
+
+def test_boundary_closed_stdout_exits_130(tmp_path: Path) -> None:
+    # `auth setup | head`: the reader closes stdout's read end before the child
+    # flushes. Must exit 130 with NO interpreter-shutdown flush error. Pre-fix
+    # this returned 120 + "Exception ignored on flushing sys.stdout".
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gmail_labeler.cli",
+            "auth",
+            "setup",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_boundary_env(tmp_path),
+        cwd=str(tmp_path),
+    )
+    assert p.stdout is not None and p.stderr is not None  # PIPE was requested
+    p.stdout.close()  # the reader (`head`) is gone
+    err = p.stderr.read().decode()
+    p.stderr.close()
+    rc = p.wait()
+    assert rc == 130, f"expected 130 at the boundary, got {rc}: {err!r}"
+    assert "Exception ignored" not in err
+    assert "BrokenPipeError" not in err
+    assert "Traceback" not in err
+
+
+def test_boundary_lost_stdout_fd_closed_exits_130(tmp_path: Path) -> None:
+    # `auth setup >&-`: fd 1 is CLOSED (sys.stdout is None), not a pipe. Must
+    # exit 130 with a one-line stderr diagnosis — pre-fix it crashed with a
+    # traceback and exited 1 (off the documented 0/2/3/4/5/130 contract).
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gmail_labeler.cli",
+            "auth",
+            "setup",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ],
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=_boundary_env(tmp_path),
+        cwd=str(tmp_path),
+        preexec_fn=lambda: os.close(1),  # close fd 1 in the child, like >&-
+    )
+    assert p.stderr is not None  # PIPE was requested
+    err = p.stderr.read().decode()
+    p.stderr.close()
+    rc = p.wait()
+    assert rc == 130, f"expected 130 for a closed stdout fd, got {rc}: {err!r}"
+    assert "Traceback" not in err
+    assert "stdout is unavailable" in err

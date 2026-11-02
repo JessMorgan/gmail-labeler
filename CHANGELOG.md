@@ -30,10 +30,20 @@ does not ship releases yet.
     keyring via the composed login — no free-form token entry is ever offered.
   - Confirm-before-overwrite on the config path (a `resolve()`-compare posture,
     stated; the samefile/fd family is #47's scope). The exit contract gains 130
-    for a cancelled run — Ctrl-C (SIGINT) at a prompt AND a closed stdout
-    (`auth setup | head`, a SIGPIPE-class break) both land on 130, keeping the
-    contract a CLOSED set {0,2,3,4,5,130}; 130 is the SIGINT convention reused
-    for the pipe break rather than inventing a new code.
+    for a cancelled run — Ctrl-C (SIGINT) at a prompt AND a lost/closed stdout
+    (`auth setup | head` pipe break, or `>&-` with fd 1 closed) all land on 130,
+    keeping the contract a CLOSED set {0,2,3,4,5,130}; 130 is the SIGINT
+    convention reused for the lost-output-channel cases rather than inventing a
+    new code. F3: this is now true at the PROCESS boundary, not just in-process.
+    The pipe break (`| head`) used to return 120 + "Exception ignored on flushing
+    sys.stdout" because the buffered stdout only failed at interpreter shutdown,
+    past the handler — the 130 handler now redirects stdout to /dev/null first so
+    that shutdown flush can neither fail nor print (the load-bearing piece; the
+    wizard's per-line flush is belt-and-suspenders since click.echo flushes too).
+    The lost-stdout case (`>&-`, fd 1 closed so `sys.stdout is None`) used to
+    crash with a `RuntimeError: lost sys.stdout` traceback (exit 1) from the first
+    prompt; it is now caught up front by a `sys.stdout is None` guard that prints
+    a one-line stderr diagnosis and exits 130.
   - F2 robustness: the project-id shape loop caps at 3 malformed strikes then
     forces a final skip decision (accept → continue, decline → abort), so THAT
     loop terminates on every input (the old one could hang on a declined skip);

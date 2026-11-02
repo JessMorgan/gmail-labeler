@@ -31,3 +31,11 @@ does not ship releases yet.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).
+
+### Fixed
+
+- `auth login` on headless boxes: a missing browser no longer aborts the
+  consent flow before the authorization URL is printed — the flow retries
+  browser-less and renders the URL with an `ssh -L` port-forward recipe for
+  completing consent from another machine, on line-buffered stdout so it
+  appears immediately even through `ssh box '… auth login'` or `| tee` (#53).

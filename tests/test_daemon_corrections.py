@@ -19,6 +19,7 @@ import pytest
 
 from gmail_labeler.appdb import AppDB
 from gmail_labeler.applications import ApplicationRow
+from gmail_labeler.cli import _ServeStartup
 from gmail_labeler.daemon import ServingContext, daemon_loop
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import HistoryPage, LabelInfo
@@ -628,3 +629,104 @@ def test_load_filters_snapshot_present_returns_the_list(tmp_path: Path) -> None:
     snap = tmp_path / "filters.json"
     snap.write_text('[{"criteria": {"from": "a@x.com"}}]', encoding="utf-8")
     assert _load_filters_snapshot(snap) == [{"criteria": {"from": "a@x.com"}}]
+
+
+# -- the END-TO-END wiring: the loader's output reaches ServingContext.filters
+# (the unit tests above prove the loader and _attribution each behave; only
+# this proves _serve_startup CONNECTS them — a `... or []` typo at the single
+# production wiring site would otherwise re-open the MAJOR with a green suite)
+
+
+def _startup_with_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    command: str = "daemon",
+    sidecar_text: str | None = None,
+) -> _ServeStartup:
+    """Run the real _serve_startup gates against the shared _prepare corpus
+    (client/model seams monkeypatched, no Gmail), optionally planting a
+    filters.json sidecar in the corpus root; return the startup bundle."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.cli import _serve_startup
+    from test_shadow_cli import (
+        _backlog_messages,
+        _backlog_scores,
+        _prepare,
+        _shadow_cfg,
+        _shadow_factory,
+        _shadow_labels,
+    )
+
+    _prepare(tmp_path, monkeypatch)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.close()  # a real v4 state DB for the fail-fast gate
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    fake = FakeGmailClient(
+        messages=_backlog_messages(),
+        labels=_shadow_labels(),
+        current_history_id=900,
+    )
+    monkeypatch.setattr(cli, "_daemon_client", lambda cfg_: fake)
+    monkeypatch.setattr(
+        cli, "_daemon_model_factory", _shadow_factory(_backlog_scores())
+    )
+    # _prepare/_seed_corpus plants a [] sidecar; the ABSENT case must remove
+    # it (the present cases overwrite it) so the three states are genuinely
+    # distinct at the wiring site
+    sidecar = tmp_path / "corpus" / "filters.json"
+    if sidecar_text is None:
+        sidecar.unlink(missing_ok=True)
+    else:
+        sidecar.write_text(sidecar_text, encoding="utf-8")
+    return _serve_startup(
+        command=command,
+        config=str(cfg),
+        bands=str(tmp_path / "bands.json"),
+        graduation=str(tmp_path / "graduation.json"),
+        db=str(tmp_path / "state.db"),
+    )
+
+
+def test_serve_startup_no_sidecar_yields_unknown_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # the load-bearing wiring: NO sidecar -> ctx.filters is None (UNKNOWN),
+    # NOT [] (which would fail every 'added' open to 'human'); and the daemon
+    # warns at startup that attribution is UNKNOWN
+    startup = _startup_with_sidecar(tmp_path, monkeypatch)  # no sidecar planted
+    assert startup.ctx.filters is None
+    err = capsys.readouterr().err
+    assert "UNKNOWN" in err and "unverifiable" in err
+
+
+def test_serve_startup_empty_sidecar_yields_attested_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # a present [] sidecar -> ctx.filters == [] (the operator's ATTESTATION
+    # of no filters), distinct from the None/unknown case; no warning
+    startup = _startup_with_sidecar(tmp_path, monkeypatch, sidecar_text="[]")
+    assert startup.ctx.filters == []
+    assert "UNKNOWN" not in capsys.readouterr().err
+
+
+def test_serve_startup_malformed_sidecar_yields_unknown_and_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # a corrupt sidecar is UNKNOWN (None), never a masquerading [] — and the
+    # daemon warns
+    startup = _startup_with_sidecar(tmp_path, monkeypatch, sidecar_text="{broken")
+    assert startup.ctx.filters is None
+    assert "UNKNOWN" in capsys.readouterr().err
+
+
+def test_serve_startup_apply_path_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # the UNKNOWN warning is daemon-scoped: apply shares _serve_startup but
+    # never reads the correction arm, so it must NOT print the correction
+    # attribution warning
+    startup = _startup_with_sidecar(tmp_path, monkeypatch, command="apply")
+    assert startup.ctx.filters is None  # the wiring is the same...
+    assert "UNKNOWN" not in capsys.readouterr().err  # ...but apply stays quiet

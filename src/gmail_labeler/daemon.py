@@ -87,8 +87,8 @@ WITHHELD, not guessed, #22's exclusion principle). A MISSING or malformed
 snapshot is UNKNOWN attribution, not "no filters": every 'added' is then
 ``"unverifiable"`` (withheld), and the daemon warns at startup. Only
 ``"human"`` adds are training signal. A 'removed' Correction is always
-attributed ``"human"`` (a human
-removing is human signal regardless of filters — invariant #6).
+attributed ``"human"`` (a human removing is human signal regardless of
+filters — invariant #6).
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
 write for the corrected message). The correction rows ride the SAME
@@ -331,9 +331,11 @@ class ServingContext:
     #   ()    — a snapshot was read and lists NO filters: the operator's
     #           ATTESTATION that none exist, so no relevant filter claims a
     #           label and an 'added' is 'human' (positive signal). This is
-    #           the default, so the #25/#26 ServingContext constructions (and
-    #           their suites) stay behavior-identical — the daemon's
-    #           correction arm is the ONLY reader.
+    #           the default ONLY so the #25/#26 ServingContext constructions
+    #           (and their suites) stay behavior-identical — the daemon's
+    #           correction arm is the ONLY reader. A NEW construction that
+    #           does not KNOW the filters should pass None (fail-closed),
+    #           not the () default (which asserts attested-none).
     #   [...] — the filters; an 'added' whose relevant filter is simulatable
     #           and matches is 'filter_covered'; one whose criteria are
     #           outside {from,to,subject} is 'unverifiable' (withheld).

@@ -319,13 +319,13 @@ def run_apply(
             warnings,
             dry_run,
         )
-        if stop:
-            break  # the batch ran to its commit point; the flag stops the loop
         # the between-PAGES sample (the daemon's shape): a flag that
         # flips after this batch's message loop but before the next page
         # must not pay for another page of Gmail writes — the current
-        # batch already reached its commit point
-        if should_stop():
+        # batch already reached its commit point. `stop` (the loop's own
+        # sample) is subsumed here: the flag is a sticky Event, so a stop
+        # seen mid-batch means should_stop() is True now too
+        if stop or should_stop():
             break
         token = page.next_page_token
         if token is None:

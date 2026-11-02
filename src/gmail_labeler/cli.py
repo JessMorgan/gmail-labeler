@@ -45,12 +45,14 @@ if TYPE_CHECKING:
     from .gmail_client import GmailClient
     from .graduation import GraduationTable
     from .thresholds import BandsArtifact
+    from .wizard import ClientFileState, Prompt
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
     epilog=(
         "Exit codes: 0 ok · 2 usage error · 3 not implemented · "
-        "4 auth/config unusable · 5 operation failed or incomplete"
+        "4 auth/config unusable · 5 operation failed or incomplete · "
+        "130 cancelled (Ctrl-C)"
     ),
     no_args_is_help=True,
 )
@@ -67,6 +69,13 @@ corrections_app = typer.Typer(
 app.add_typer(corrections_app, name="corrections")
 
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
+_INCOMPLETE_EXIT = 5  # operation failed or incomplete (a script cannot prompt)
+# Ctrl-C at a prompt exits 130 — the SAME code typer already uses for a raw
+# KeyboardInterrupt (`except KeyboardInterrupt: raise Exit(130)`), so the whole
+# CLI signals "cancelled by signal" identically. (typer's prompt/confirm would
+# otherwise downgrade a prompt-cancel to Abort→exit 1; the wizard maps it back
+# to 130 — see _typer_ask/_typer_confirm.)
+_CANCEL_EXIT = 130
 # (typer requires concrete annotations: str | None, not Any)
 
 
@@ -75,17 +84,62 @@ def auth_status(
     ctx: typer.Context,
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
-    """Report credential status; `auth login` runs the consent flow."""
+    """Report credential status; `auth login` runs the consent flow, `auth
+    setup` the guided ADR-0004 onboarding."""
     if ctx.invoked_subcommand is not None:
         return
     from .auth import status as _status
+    from .config import ConfigError, load_config
 
-    cfg = _load_config(config)
-    st = _status(cfg)
-    state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
-    typer.echo(f"auth: {state} ({st.backend}) — {st.detail}")
-    if not st.signed_in:
-        raise typer.Exit(code=_AUTH_ERROR_EXIT)
+    # A MISSING config (fresh profile) is "no credentials", not a hard error —
+    # the wizard is the answer. An EXPLICIT --config that is broken stays a
+    # config error (exit 4): the user pointed at a bad path, not a fresh box.
+    if config is not None:
+        try:
+            cfg = load_config(config)
+        except ConfigError as e:
+            typer.echo(f"config error: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
+    else:
+        try:
+            cfg = load_config(None)
+        except ConfigError:
+            cfg = None  # fresh profile: no config found → no credentials
+    if cfg is None:
+        typer.echo("auth: NOT SIGNED IN — no config.toml found")
+    else:
+        st = _status(cfg)
+        state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
+        typer.echo(f"auth: {state} ({st.backend}) — {st.detail}")
+        if st.signed_in:
+            return  # signed in: bare `auth` keeps its status meaning, exit 0
+    # No credentials → the wizard ENTRY-POINT decision. Interactive only on a
+    # real terminal; a script must never half-prompt.
+    if _stdin_is_tty():
+        typer.echo(
+            "Not signed in. Starting the guided setup (ADR-0004) — about 15 "
+            "minutes in the Google console, nothing shared with the maintainer."
+        )
+        _run_setup_wizard(config)
+    else:
+        typer.echo(
+            "Not signed in and stdin is not a terminal — run "
+            "`gmail-labeler auth setup` interactively.",
+            err=True,
+        )
+        raise typer.Exit(code=_INCOMPLETE_EXIT)
+
+
+@auth_app.command("setup")
+def auth_setup(
+    config: str | None = typer.Option(
+        None, "--config", help="Where to WRITE config.toml (default: ./config.toml)"
+    ),
+) -> None:
+    """Guided ADR-0004 onboarding: create your own GCP project + desktop OAuth
+    client and wire the token store, then sign in. Interactive (a TTY); it
+    COMPOSES the existing `auth login` flow rather than forking it."""
+    _run_setup_wizard(config)
 
 
 @auth_app.command("login")
@@ -106,6 +160,151 @@ def auth_login(
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
     typer.echo("auth: signed in, refresh token stored")
+
+
+# --- auth-setup wizard wiring (the CLI side of the pure machine) -------------
+def _stdin_is_tty() -> bool:
+    """Whether bare `auth` may auto-launch the wizard. Kept as a tiny seam so
+    the tests can drive both the interactive and the script path without a
+    controlling terminal."""
+    import sys
+
+    return sys.stdin.isatty()
+
+
+def _project_id_shape_ok(pid: str) -> bool:
+    """GCP project-id SHAPE only (a paste-error guard): 6-30 chars, lowercase
+    letters/digits/hyphens, starting with a letter. The project's EXISTENCE and
+    API enablement are not locally checkable — the wizard says so, never fakes
+    a check."""
+    import re
+
+    return re.fullmatch(r"[a-z][a-z0-9-]{5,29}", pid) is not None
+
+
+class _RealEnvironmentProbe:
+    """The filesystem/keyring facts the wizard may check LOCALLY. Returns
+    verdicts only — never file contents — so secret material cannot reach the
+    pure machine (invariant #8)."""
+
+    def client_file_state(self, path: str) -> ClientFileState:
+        from .wizard import ClientFileState
+
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return ClientFileState.MISSING
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return ClientFileState.MALFORMED
+        if not isinstance(data, dict) or not isinstance(data.get("installed"), dict):
+            return ClientFileState.NOT_DESKTOP  # e.g. a "web" wrapper
+        inst = data["installed"]
+        if not inst.get("client_id") or not inst.get("client_secret"):
+            return ClientFileState.MALFORMED
+        return ClientFileState.DESKTOP_OK
+
+    def project_id_shape_ok(self, pid: str) -> bool:
+        return _project_id_shape_ok(pid)
+
+    def keyring_available(self) -> bool:
+        # reuse the existing keyring posture (tokens.py) — a working backend
+        # answers, a headless box raises TokenStoreError.
+        from .tokens import KeyringStore, TokenStoreError
+
+        try:
+            KeyringStore().probe()
+        except TokenStoreError:
+            return False
+        return True
+
+    def config_target_exists(self, path: Path) -> bool:
+        # resolve()-compare posture, stated: existence is a resolved-path
+        # compare; the samefile/fd caution family is issue #47's scope.
+        try:
+            return Path(path).expanduser().resolve().exists()
+        except OSError:
+            return False
+
+
+def _typer_ask(prompt: Prompt) -> str:
+    from typer.exceptions import Abort
+
+    from .wizard import WizardCancelled
+
+    try:
+        return typer.prompt(prompt.text)
+    except (Abort, KeyboardInterrupt, EOFError):
+        raise WizardCancelled from None
+
+
+def _typer_confirm(text: str) -> bool:
+    from typer.exceptions import Abort
+
+    from .wizard import WizardCancelled
+
+    try:
+        # default=False: an overwrite is never the accidental Enter key.
+        return typer.confirm(text, default=False)
+    except (Abort, KeyboardInterrupt, EOFError):
+        raise WizardCancelled from None
+
+
+def _write_config_toml(target: Path, cfg: Config) -> None:
+    """Write a minimal config.toml carrying ONLY the gmail wiring (paths). No
+    secret values, ever (invariant #8). Absolute paths so the record is
+    unambiguous regardless of the later cwd."""
+    cred = cfg.gmail.credentials_path
+    cred_s = str(cred.expanduser().resolve()) if cred is not None else ""
+    body = (
+        "# gmail-labeler configuration — written by `auth setup` (ADR-0004).\n"
+        "# Secrets are paths only — never tokens, never inline values.\n"
+        "[gmail]\n"
+        f"credentials_path = {json.dumps(cred_s)}\n"
+        f"token_backend = {json.dumps(cfg.gmail.token_backend)}\n"
+        f"token_file = {json.dumps(str(cfg.gmail.token_file.expanduser()))}\n"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+
+def _setup_config_target(config: str | None) -> Path:
+    from .config import ConfigError, find_config
+
+    if config is not None:
+        return Path(config).expanduser()
+    try:
+        return find_config()
+    except ConfigError:
+        return Path.cwd() / "config.toml"
+
+
+def _run_setup_wizard(config: str | None) -> None:
+    """Wire the real I/O + the real auth.login/status/config-writer into the
+    pure machine, then map its outcome onto the CLI exit contract."""
+    from .auth import login as _login
+    from .auth import status as _status
+    from .wizard import WizardCancelled, WizardIO, run_wizard
+
+    target = _setup_config_target(config)
+    io = WizardIO(ask=_typer_ask, confirm=_typer_confirm, out=typer.echo)
+    try:
+        result = run_wizard(
+            probe=_RealEnvironmentProbe(),
+            io=io,
+            login=_login,
+            status=_status,
+            write_config=_write_config_toml,
+            config_target=target,
+        )
+    except WizardCancelled:
+        typer.echo("setup cancelled.", err=True)
+        raise typer.Exit(code=_CANCEL_EXIT) from None
+    if result.outcome == "completed" and result.signed_in:
+        return  # exit 0
+    if result.outcome == "failed":
+        raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
+    raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / incomplete
 
 
 def _write_secret_tight(path: Path, text: str) -> None:

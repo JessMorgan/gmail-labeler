@@ -32,16 +32,20 @@ def test_usage_error_stays_exit_2() -> None:
     assert result.exit_code == 2
 
 
-def test_auth_status_reports_and_exits_4_when_unsigned(tmp_path: Path) -> None:
+def test_auth_status_unsigned_non_tty_exits_5_naming_setup(tmp_path: Path) -> None:
+    # Ticket #28 AC5 CHANGED this contract: bare `auth` with no credentials no
+    # longer just exits 4 — it makes the wizard ENTRY decision. In a script
+    # (no TTY, as CliRunner provides) it must not half-prompt: it exits 5 and
+    # names the interactive command. The status is still reported.
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         f'[gmail]\ntoken_backend = "file"\ntoken_file = "{tmp_path / "tok.json"}"\n',
         encoding="utf-8",
     )
     result = runner.invoke(app, ["auth", "--config", str(cfg)])
-    assert result.exit_code == 4
+    assert result.exit_code == 5
     assert "NOT SIGNED IN" in result.output
-    assert "auth login" in result.output
+    assert "auth setup" in (result.output + result.stderr)
 
 
 def test_auth_config_error_exits_4(tmp_path: Path) -> None:

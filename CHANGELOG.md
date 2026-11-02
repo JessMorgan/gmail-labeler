@@ -31,8 +31,11 @@ does not ship releases yet.
     attributed (`human` / `filter_covered` / `unverifiable`) via the #22
     mechanism reused: a simulatable filter that verifiably would have
     applied it is `filter_covered`, and one whose criteria make authorship
-    undecidable is `unverifiable` — withheld, not credited to the human
-    (invariant #6, exclusion-not-guessing). The 91-node
+    undecidable — OR no usable filters snapshot at all (absent/malformed,
+    the `ServingContext.filters is None` case mirroring analyze.py, warned
+    at startup) — is `unverifiable`, withheld not credited to the human
+    (invariant #6, exclusion-not-guessing; an empty *snapshot* is the
+    attested-none case where an `added` is `human`). The 91-node
     daemon suite rode the change verbatim.
   - `status.py` + the `status` command: per graduated label, realized
     precision = (written − removed)/written from the LOCAL DB only — no

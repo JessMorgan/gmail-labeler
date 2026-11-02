@@ -11,6 +11,7 @@ acceptance criterion #1 (a fresh profile, no config, reaches a working
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -686,12 +687,13 @@ def test_boundary_lost_stdout_fd_closed_exits_130(tmp_path: Path) -> None:
 
 def test_boundary_merged_streams_exits_130(tmp_path: Path) -> None:
     # `auth setup 2>&1 | head`: stdout AND stderr share ONE pipe. When the reader
-    # exits, BOTH fds are dead. The cancel diagnosis is written to STDERR — if that
-    # write EPIPEs out of the handler (or the shutdown flush of stderr fails), the
-    # process exits 1/120, off the closed set (F3 round-2 MAJOR: the earlier fix
-    # silenced fd 1 only). The handlers must retarget BOTH fds so 130 holds even
-    # when the two streams share a pipe. Deterministic in outcome: whichever of the
-    # intro-write (fd 1) or the cancel-echo (fd 2) trips first, both roads exit 130.
+    # exits, BOTH fds are dead and the process must still exit 130 (off the closed
+    # set otherwise — F3 round-2 MAJOR). This closes the read end before the child's
+    # first write, so the child trips fd 1 (the intro) first and takes the
+    # BrokenPipeError branch; it therefore pins the OUTCOME for the both-fds-dead-
+    # at-once shape but is NOT the discriminator for the fd-2 diagnosis fix (the
+    # dead-stderr test below decouples the streams to reach that path and is the
+    # load-bearing pin). Deterministic in outcome: whichever fd trips first, 130.
     read_fd, write_fd = os.pipe()
     p = subprocess.Popen(
         [
@@ -751,3 +753,19 @@ def test_boundary_dead_stderr_cancel_diagnosis_exits_130(tmp_path: Path) -> None
     assert rc == 130, (
         f"expected 130 when the cancel diagnosis hits a dead stderr, got {rc}"
     )
+
+
+def test_silence_output_is_noop_without_real_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The in-process CliRunner gives sys.stdout a StringIO (fileno() raises). The
+    # fileno() guard must make _silence_output a NO-OP there — a hardcoded
+    # dup2(..., 1) would retarget the pytest process's OWN stdout to /dev/null for
+    # the rest of the run (a latent landmine the full suite hides behind pytest's
+    # early reporter dup, and one the round-2 code briefly had). The subprocess
+    # boundary tests above pin the other half: that it DOES retarget a real fd.
+    fd1_before = os.fstat(1)
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    cli._silence_output()
+    assert os.fstat(1) == fd1_before  # the real descriptor was left alone

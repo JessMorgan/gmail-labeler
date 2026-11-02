@@ -63,6 +63,29 @@ mid-sleep SIGTERM exits immediately with the cursor untouched (the
 CLI's sleep is the interruptible one — this module never sleeps by
 itself).
 
+CORRECTION DETECTION (ticket #27; GLOSSARY: Correction): each delta's
+history records also carry ``labelAdded``/``labelRemoved`` events. They
+are classified — read + local-DB only, NEVER a Gmail write — against the
+applications join: only messages ALREADY present in the Applications
+table are candidates (the join AC). A ``labelRemoved`` of a label that
+IS that message's Application label is a 'removed' Correction (a human
+undid our work); a ``labelAdded`` of a MANAGED-VOCABULARY (graduated,
+non-System) label the daemon did NOT write (no Application row for it)
+is an 'added' Correction (a human did our job — positive signal).
+ANYTHING else on an applied message — System Labels, non-vocabulary
+labels, a removed NON-applied label, INBOX churn — records NOTHING:
+noise is not correction. An 'added' Correction whose label a Gmail
+filter would have applied anyway (the #22 ``simulates_filter`` mechanism
+over the offline filters.json snapshot) is recorded RAW with
+``filter_covered`` set; a 'removed' Correction never carries the flag
+(a human removing is human signal regardless of filters — invariant #6).
+A corrected message is NEVER written this delta (the daemon does not
+fight the human's hand-fix — the landmine: detection never produces a
+write for the corrected message). The correction rows ride the SAME
+delta transaction as the Application rows and the cursor (one commit
+point, unchanged); the store's UNIQUE (message_id, label, kind) + INSERT
+OR IGNORE makes a replayed delta's re-detected correction idempotent.
+
 BODIES NEVER (invariant #5): the loop's inputs are ids/labels/scores;
 the fetched body feeds ONLY the in-memory preprocess_text call — every
 log line carries ids, counts, and cursor values. NOTHING here reads
@@ -77,7 +100,8 @@ from collections.abc import Callable, Mapping, Sequence, Sized
 from dataclasses import dataclass
 from datetime import datetime
 
-from .appdb import AppDB, AppDBError
+from .analyze import filter_label_ids, simulates_filter
+from .appdb import AppDB, AppDBError, CorrectionRow
 from .applications import ApplicationRow, WritePlan, plan_message_write
 from .corpus_record import preprocess_text
 from .gmail_client import GmailClient
@@ -282,6 +306,16 @@ class ServingContext:
     id_to_name: Mapping[str, str]
     managed_label_ids: Mapping[str, str]
     tier_label_ids: Mapping[str, str]
+    # the offline filter-attribution snapshot (ticket #27, invariant #6):
+    # the filters.json the export path wrote, read at startup (a LOCAL
+    # file read — never a Gmail call, so the daemon's exact startup-call
+    # pins stand). The correction arm uses it to flag an 'added'
+    # Correction filter_covered; empty (the default) means NO snapshot —
+    # every 'added' Correction then records filter_covered False
+    # (unattributable, honestly disclosed by status). Defaults so the
+    # #25/#26 ServingContext constructions (and their suites) are
+    # behavior-identical — the daemon's correction arm is the ONLY reader.
+    filters: Sequence[Mapping[str, object]] = ()
 
 
 def present_names(ctx: ServingContext, raw_label_ids: Sequence[str]) -> frozenset[str]:
@@ -379,6 +413,154 @@ def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
     return ids
 
 
+def _label_events(
+    records: tuple[dict[str, object], ...],
+) -> list[tuple[str, str, str]]:
+    """The (kind, message_id, label_id) label-change events of one page's
+    history records, in wire order (ticket #27; GLOSSARY: Correction).
+    ``labelAdded``/``labelRemoved`` each carry a list of
+    ``{"id": <message id>, "labelIds": [<label id>, ...]}`` (the
+    codebase's normalized record shape, the ``messages`` convention
+    extended to label changes — the adapter passes record internals
+    raw). kind is 'added' for a labelAdded event, 'removed' for a
+    labelRemoved one. A malformed label-event list is a lying wire —
+    loud permanent (the adapter's shape doctrine, like _message_ids).
+    Records with no label events pass through."""
+    events: list[tuple[str, str, str]] = []
+    for kind, field in (("added", "labelAdded"), ("removed", "labelRemoved")):
+        for record in records:
+            raw = record.get(field)
+            if raw is None:
+                continue
+            if not isinstance(raw, list) or not all(isinstance(e, dict) for e in raw):
+                raise GmailPermanentError(
+                    f"history record {field!r} not a list of objects"
+                )
+            for event in raw:
+                message_id = event.get("id")
+                if not isinstance(message_id, str) or not message_id:
+                    raise GmailPermanentError(
+                        f"history {field} event without a message id"
+                    )
+                label_ids = event.get("labelIds")
+                if not isinstance(label_ids, list) or not all(
+                    isinstance(x, str) for x in label_ids
+                ):
+                    raise GmailPermanentError(
+                        f"history {field} event 'labelIds' not a list of strings"
+                    )
+                for label_id in label_ids:
+                    events.append((kind, message_id, label_id))
+    return events
+
+
+def _filter_covered(
+    ctx: ServingContext,
+    label_id: str,
+    sender: str,
+    recipients: tuple[str, ...],
+    subject: str,
+) -> bool:
+    """Invariant #6 attribution for an 'added' Correction (the #22
+    mechanism, REUSED not forked): True exactly when a filter that adds
+    ``label_id`` SIMULATES True against the message's kept fields. An
+    unverifiable filter (simulates_filter -> None) does NOT flag covered
+    (exclusion, not guessing — we only withhold what we can PROVE a
+    filter authored). No snapshot (ctx.filters empty) -> False."""
+    from types import SimpleNamespace
+
+    rec = SimpleNamespace(sender=sender, recipients=recipients, subject=subject)
+    for filter_ in ctx.filters:
+        if label_id not in filter_label_ids(filter_):
+            continue
+        criteria = filter_.get("criteria")
+        if not isinstance(criteria, dict):
+            continue
+        if simulates_filter(criteria, rec) is True:  # type: ignore[arg-type]
+            return True
+    return False
+
+
+def detect_corrections(
+    records: tuple[dict[str, object], ...],
+    *,
+    ctx: ServingContext,
+    db: AppDB,
+    parsed_by_id: Mapping[str, tuple[str, tuple[str, ...], str]],
+    detected_at: datetime,
+) -> list[CorrectionRow]:
+    """Classify one page's label-change events into Corrections
+    (ticket #27; GLOSSARY: Correction; the module docstring's CORRECTION
+    DETECTION section for the full contract). Only messages PRESENT in
+    the applications join are candidates (the join AC); the ignore
+    boundary (system labels, non-vocabulary labels, a removed
+    non-applied label) records NOTHING. The batch is deduplicated on
+    (message_id, label, kind) so a hand-fix reported by two events of
+    one delta is ONE Correction (the store also refuses a within-batch
+    duplicate — this keeps the batch honest). ``parsed_by_id`` carries
+    (sender, recipients, subject) for the messages fetched this delta
+    (the filter-coverage fields); a correction on a message NOT fetched
+    records filter_covered False (unattributable without the fields)."""
+    # the join: which labels are THIS message's Applications (a name set)
+    applied_cache: dict[str, frozenset[str]] = {}
+
+    def applied_labels(message_id: str) -> frozenset[str]:
+        if message_id not in applied_cache:
+            applied_cache[message_id] = frozenset(
+                row.label for row in db.applications_for_message(message_id)
+            )
+        return applied_cache[message_id]
+
+    rows: list[CorrectionRow] = []
+    seen: set[tuple[str, str, str]] = set()
+    for kind, message_id, label_id in _label_events(records):
+        name = ctx.id_to_name.get(label_id)
+        if name is None:
+            continue  # an unbridged id (a System Label id, an unknown): noise
+        applied = applied_labels(message_id)
+        if not applied:
+            continue  # not in the join — corrections are only for applied mail
+        if kind == "removed":
+            if name not in applied:
+                continue  # a removed NON-applied label records nothing
+            key = (message_id, name, "removed")
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                CorrectionRow(
+                    message_id=message_id,
+                    label=name,
+                    kind="removed",
+                    detected_at=detected_at,
+                    filter_covered=False,
+                )
+            )
+        else:  # 'added'
+            if name in applied:
+                continue  # the daemon wrote it (a row exists) — not a human add
+            if name not in ctx.graduated or name in ctx.system_labels:
+                continue  # non-vocabulary / System Label churn: noise, not signal
+            key = (message_id, name, "added")
+            if key in seen:
+                continue
+            seen.add(key)
+            fields = parsed_by_id.get(message_id)
+            covered = (
+                _filter_covered(ctx, label_id, *fields) if fields is not None else False
+            )
+            rows.append(
+                CorrectionRow(
+                    message_id=message_id,
+                    label=name,
+                    kind="added",
+                    detected_at=detected_at,
+                    filter_covered=covered,
+                )
+            )
+    return rows
+
+
 def _bootstrap_tick(client: GmailClient, db: AppDB) -> bool:
     """Establish the cursor via the prior-art path (no planning, no
     writes — the next tick polls). Returns stop_requested (always
@@ -443,6 +625,11 @@ def _run_tick(
     # daemon call site, pinned by a ticking clock)
     applied_at = clock()
     fetched: list[tuple[str, frozenset[str], str]] = []  # (id, present, text)
+    # the #27 correction-detection inputs, accumulated across the delta's
+    # pages: the raw history records (label events) and the fetched
+    # messages' filter-simulation fields (sender, recipients, subject)
+    all_records: list[dict[str, object]] = []
+    parsed_by_id: dict[str, tuple[str, tuple[str, ...], str]] = {}
     skipped = 0
     token: str | None = None
     new_cursor: int | None = None
@@ -474,6 +661,7 @@ def _run_tick(
             )
             return stop
         new_cursor = page.history_id  # the PAGE's id, never the request's
+        all_records.extend(page.records)  # #27: label events ride the same drain
         try:
             message_ids = _message_ids(page.records)
         except GmailPermanentError as e:
@@ -519,6 +707,13 @@ def _run_tick(
                 continue
             parsed = parse_mime(data)  # never raises (the mime contract)
             present = present_names(ctx, raw.label_ids)  # the SHARED reader
+            # the #27 filter-coverage fields (sender/recipients/subject) for
+            # a correction on THIS message; the body never enters this tuple
+            parsed_by_id[message_id] = (
+                parsed.sender,
+                parsed.recipients,
+                parsed.subject,
+            )
             # the body feeds ONLY this in-memory preprocess (invariant
             # #5 — it never reaches a log line, the DB, or the plan)
             fetched.append(
@@ -531,6 +726,32 @@ def _run_tick(
             break
         if should_stop():
             stop = True  # the delta still drains to its commit point
+
+    # #27 CORRECTION DETECTION (read + local-DB only — never a Gmail
+    # write): classify this delta's label-change events against the
+    # applications join. A corrected message is EXCLUDED from the write
+    # below (the daemon does not fight the human's hand-fix — the landmine
+    # "detection never produces a write for the corrected message, ever").
+    # The correction rows ride the SAME delta transaction as the rows and
+    # the cursor (one commit point, unchanged).
+    try:
+        corrections = detect_corrections(
+            tuple(all_records),
+            ctx=ctx,
+            db=db,
+            parsed_by_id=parsed_by_id,
+            detected_at=applied_at,
+        )
+    except GmailPermanentError as e:
+        # a malformed label-event wire is a lying delta — hold the cursor
+        # (the same posture as a malformed messages list above)
+        log.warning(
+            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
+            cursor,
+            e,
+        )
+        return stop
+    corrected_ids = frozenset(row.message_id for row in corrections)
 
     # the batched predict (the shadow seam: ONE call over the delta's
     # texts, vocab zip like shadow). A model defect is SYSTEMATIC —
@@ -570,6 +791,14 @@ def _run_tick(
     written = 0
     warnings = 0
     for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
+        if message_id in corrected_ids:
+            # #27 landmine: a message carrying a correction event this
+            # delta is NEVER written (the daemon does not re-add a label
+            # the human just removed, nor fight a label they just added).
+            # It was fetched + scored (it flowed through the plan pass),
+            # but no write, no Application row — the correction RECORD is
+            # the only thing this delta books for it.
+            continue
         scores = dict(zip(vocab, score_row, strict=True))
         # the SHARED composition call-shape (compose_plan → the one
         # plan_message_write core); the daemon suite's spy on
@@ -631,15 +860,26 @@ def _run_tick(
         written += 1
         page_rows.extend(plan.rows)
 
-    # THE durable-handling commit point: rows AND cursor in ONE
-    # transaction — COMMIT = handled (invariant #3; the store-side
-    # all-or-nothing is pinned in test_appdb)
+    # THE durable-handling commit point: rows, Corrections AND cursor in
+    # ONE transaction — COMMIT = handled (invariant #3; the store-side
+    # all-or-nothing is pinned in test_appdb). The corrections are the
+    # delta's human hand-fixes detected above (empty when none).
     if new_cursor is None:  # unreachable: every served page set it
         # (the repo rule: a raise, not an assert — python -O strips
         # asserts; the applications.py internal-contradiction precedent)
         raise AssertionError("delta drained without a cursor value")
     try:
-        db.commit_page(page_rows, new_cursor)
+        # The corrections argument is passed ONLY when the delta detected
+        # some. The sealed #25 crash-matrix fakes override commit_page
+        # with the 2-arg (rows, cursor) signature and never carry label
+        # events, so an unconditional 3-arg call would break them verbatim
+        # — passing the third argument only when non-empty keeps those
+        # fakes green while the real AppDB (corrections defaulting to ())
+        # still commits rows + corrections + cursor in ONE transaction.
+        if corrections:
+            db.commit_page(page_rows, new_cursor, corrections)
+        else:
+            db.commit_page(page_rows, new_cursor)
     except AppDBError as e:
         log.warning(
             "daemon: delta failed at cursor %d — cursor held, retry next "
@@ -649,12 +889,14 @@ def _run_tick(
         )
         return stop
     log.info(
-        "daemon: delta handled cursor=%d messages=%d written=%d skipped=%d warnings=%d",
+        "daemon: delta handled cursor=%d messages=%d written=%d skipped=%d "
+        "warnings=%d corrections=%d",
         new_cursor,
         len(fetched),
         written,
         skipped,
         warnings,
+        len(corrections),
     )
     return stop
 

@@ -3532,6 +3532,23 @@ def _serve_startup(
         ):
             managed_label_ids[li.name] = li.id
 
+    # the offline filter-attribution snapshot for the daemon's correction
+    # arm (#27, invariant #6): a LOCAL file read (never a Gmail call — the
+    # startup exact-call pins stand). Best-effort: absent or malformed →
+    # () → every 'added' Correction records filter_covered False
+    # (unattributable, disclosed by status). apply never reads it.
+    from .export import SIDECAR_FILTERS
+
+    filters_snapshot: list[dict[str, object]] = []
+    sidecar = store.root / SIDECAR_FILTERS
+    if sidecar.is_file():
+        try:
+            raw = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (ValueError, OSError, UnicodeDecodeError):
+            raw = None
+        if isinstance(raw, list) and all(isinstance(f, dict) for f in raw):
+            filters_snapshot = [dict(f) for f in raw]
+
     ctx = ServingContext(
         bands=bands_map,
         graduated=graduated,
@@ -3539,6 +3556,7 @@ def _serve_startup(
         id_to_name=id_to_name,
         managed_label_ids=managed_label_ids,
         tier_label_ids=tier_label_ids,
+        filters=filters_snapshot,
     )
     return _ServeStartup(
         cfg=cfg,

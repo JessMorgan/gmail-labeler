@@ -175,12 +175,14 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
             "message_id": "aa11",
             "label": "Money/Bills",
             "kind": "removed",
+            "detected_at": TS.isoformat(),
             "attribution": "human",
         },
         {
             "message_id": "bb22",
             "label": "Shipping",
             "kind": "added",
+            "detected_at": TS.isoformat(),
             "attribution": "filter_covered",
         },
         # F1: the raw dump is AUDITABLE — an unverifiable add is written
@@ -190,11 +192,52 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
             "message_id": "cc33",
             "label": "Shipping",
             "kind": "added",
+            "detected_at": TS.isoformat(),
             "attribution": "unverifiable",
         },
     ]
     # invariant #5: no body/subject/raw key anywhere in the export
     assert "body" not in out_file.read_text(encoding="utf-8").lower()
+
+
+def test_export_round_trips_to_correction_rows(tmp_path: Path) -> None:
+    # S1 C3a: the export carries detected_at (the field the fold seam needs),
+    # so a consumer can reconstruct a FULL CorrectionRow. Re-parse the JSON
+    # into CorrectionRow instances and assert they EQUAL the store's rows —
+    # the round-trip that makes the artifact a faithful training-signal input,
+    # not a lossy summary.
+    seeded = [
+        _corr("aa11", "Money/Bills", "removed"),
+        _corr("bb22", "Shipping", "added", attribution="filter_covered"),
+    ]
+    _seed_corr(tmp_path, seeded)
+    out_file = tmp_path / "corrections.json"
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(out_file)))
+    assert result.exit_code == 0, result.output
+    payload = json.loads(out_file.read_text(encoding="utf-8"))
+    rebuilt = sorted(
+        (
+            CorrectionRow(
+                message_id=r["message_id"],
+                label=r["label"],
+                kind=r["kind"],
+                detected_at=datetime.fromisoformat(r["detected_at"]),
+                attribution=r["attribution"],
+            )
+            for r in payload
+        ),
+        key=lambda c: c.message_id,
+    )
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    stored = sorted(
+        (row for mid in ("aa11", "bb22") for row in db.corrections_for_message(mid)),
+        key=lambda c: c.message_id,
+    )
+    db.close()
+    assert rebuilt == stored
+    # and the detected_at survived the round-trip (the fold needs it)
+    assert all(c.detected_at == TS for c in rebuilt)
 
 
 def test_export_to_stdout(tmp_path: Path) -> None:

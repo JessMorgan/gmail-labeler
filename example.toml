@@ -20,7 +20,7 @@ history_poll_seconds = 30          # daemon polling cadence (ADR-0003)
 # name→Gmail-label-id resolution (gmail_client.ensure_label) — unless a
 # USER label of exactly that name already exists; it is then used as-is
 # (the refusal guards minting only). The daemon calls it at startup
-# (landed, #25); `apply` will too (#26):
+# (landed, #25); `apply` does too (landed, #26):
 applied = "ai-applied"             # umbrella: "the AI contributed something"
 high = "ai-high"                   # high-confidence band
 med = "ai-med"                     # review-me band
@@ -68,11 +68,11 @@ min_precision = 0.9
 # min_precision = 0.95
 
 [store]
-# State DB path (ticket #23): the SQLite file holding the shadow
-# results (and, with the daemon phase, the applications table). It
-# carries ids, probabilities, labels, and run timestamps ONLY — never
-# bodies (invariant #5), so it is publicly attachable. Relative paths
-# resolve against THIS FILE's directory.
+# State DB path (ticket #23): the SQLite file holding the shadow results
+# and — landed with the daemon (#25) and correction capture (#27) — the
+# applications and corrections tables. It carries ids, probabilities,
+# labels, and run timestamps ONLY — never bodies (invariant #5), so it is
+# publicly attachable. Relative paths resolve against THIS FILE's directory.
 # db_path = "./gmail-labeler.db"
 
 [model]

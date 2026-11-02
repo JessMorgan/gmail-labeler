@@ -2,7 +2,7 @@
 
 A SEPARATE suite from the sealed #25 daemon tests (which stay verbatim —
 this file drives the SAME tick with history records that carry
-labelAdded/labelRemoved events, which the #25 fixtures never produce).
+labelsAdded/labelsRemoved events, which the #25 fixtures never produce).
 The heart: detection is read + local-DB only, never writes back to
 Gmail (AC2), the ignore-boundary records nothing, a corrected message is
 never re-written, and the correction rides the delta's one commit point.
@@ -276,7 +276,7 @@ def test_removed_correction_still_human_under_unknown_snapshot(
 
 
 def test_removed_nonapplied_label_records_nothing(tmp_path: Path) -> None:
-    # a labelRemoved of a label that is NOT this message's Application is
+    # a labelsRemoved event for a label that is NOT this message's Application
     # noise (the human removed something we never applied) -> NOTHING
     db = _db(tmp_path)
     _applied(db, "aa22", "Money/Bills", "L2")
@@ -288,8 +288,8 @@ def test_removed_nonapplied_label_records_nothing(tmp_path: Path) -> None:
 
 
 def test_added_nonvocabulary_label_records_nothing(tmp_path: Path) -> None:
-    # a labelAdded of a NON-graduated label (LX=NotGraduated) or a System
-    # Label (INBOX) is not signal -> NOTHING recorded
+    # a labelsAdded event for a NON-graduated label (LX=NotGraduated) or a
+    # System Label (INBOX) is not signal -> NOTHING recorded
     db = _db(tmp_path)
     _applied(db, "aa11", "Shipping", "L1")
     fake = _fake(_page(_record("aa11", added=[("aa11", ["LX"]), ("aa11", ["INBOX"])])))
@@ -299,7 +299,7 @@ def test_added_nonvocabulary_label_records_nothing(tmp_path: Path) -> None:
 
 
 def test_added_label_the_daemon_already_wrote_records_nothing(tmp_path: Path) -> None:
-    # a labelAdded for a label that IS this message's Application (the
+    # a labelsAdded event for a label that IS this message's Application (the
     # daemon wrote it) is NOT a human 'added' -> nothing
     db = _db(tmp_path)
     _applied(db, "aa11", "Shipping", "L1")
@@ -592,7 +592,7 @@ def test_added_correction_unverifiable_when_relevant_filter_lacks_criteria(
 def test_malformed_label_event_holds_cursor(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # a labelAdded that is not a list of objects is a lying wire -> the
+    # a labelsAdded value that is not a list of objects is a lying wire -> the
     # delta HOLDS the cursor (the _message_ids shape doctrine extended to
     # label events), never a raw traceback
     caplog.set_level(logging.WARNING)

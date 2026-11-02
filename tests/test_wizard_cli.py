@@ -151,15 +151,10 @@ def _unsigned_cfg(tmp_path: Path) -> Path:
     return cfg
 
 
-def test_bare_auth_no_creds_non_tty_exits_5_naming_setup(tmp_path: Path) -> None:
-    # a script must never half-prompt: exit 5, names the interactive command
-    cfg = _unsigned_cfg(tmp_path)
-    result = runner.invoke(app, ["auth", "--config", str(cfg)])
-    assert result.exit_code == 5
-    assert "NOT SIGNED IN" in result.output
-    assert "auth setup" in (result.output + result.stderr)
-
-
+# NOTE (F1): the non-TTY-unsigned bare-auth contract (exit 4 + names `auth
+# setup`) is pinned once, in tests/test_cli.py::
+# test_auth_status_reports_and_exits_4_when_unsigned — this suite keeps only
+# the TTY-launch and signed-in pins to avoid duplicating that assertion.
 def test_bare_auth_no_creds_tty_launches_the_wizard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

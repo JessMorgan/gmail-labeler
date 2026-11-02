@@ -510,7 +510,13 @@ completes the current page to its commit point (exit 0); a transient read
 **or** write failure **holds nothing** (there is no cursor to retry
 against) — the message stays un-labeled with a counted warning, and a
 re-run picks it up. Mail that 404s (deleted since your export — a backfill
-over years **will** hit this) is a counted skip, never fatal.
+over years **will** hit this) is a counted skip, never fatal. A
+**quota-limited or partially-degraded mailbox produces warnings, not an
+abort, by design** (the v1 posture: no backoff — the window is walked one
+message at a time and every failure is counted), so the `warnings=N` tail
+line is the tell that a run under-served the window; re-running later picks
+up exactly the missed messages (skip-present, and unwritten labels leave no
+row — the same re-run shape pinned for a single transient failure).
 
 **Concurrency caution (read this before running both at once).** `apply`
 and the daemon share the state DB and the mailbox, and running them

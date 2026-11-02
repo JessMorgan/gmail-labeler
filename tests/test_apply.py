@@ -40,7 +40,11 @@ from gmail_labeler.apply import run_apply
 from gmail_labeler.daemon import ServingContext, daemon_loop
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import HistoryPage, LabelInfo
-from gmail_labeler.gmail_errors import GmailPermanentError, GmailTransientError
+from gmail_labeler.gmail_errors import (
+    GmailPermanentError,
+    GmailRateLimitedError,
+    GmailTransientError,
+)
 from gmail_labeler.model import FakeModel
 
 # the read surface the preview zero-write pin allows (the shadow idiom,
@@ -597,6 +601,74 @@ def test_duplicate_message_id_in_one_page_processed_once(tmp_path: Path) -> None
     assert len([w for w in fake.writes if w["method"] == "apply_labels"]) == 1
     assert len(db.applications_for_message("aa22")) == 1
     db.close()
+
+
+def _hammer_mailbox() -> list[FakeMessage]:
+    # three clean WRITE candidates: Money/Bills absent (INBOX only), so a
+    # successful read composes exactly ONE write — warnings then count one
+    # per message, which is what the posture pin asserts on.
+    return [
+        FakeMessage(
+            id=f"hh{i}",
+            eml=_eml(f"s{i}", f"b{i}"),
+            label_ids=("INBOX",),
+            thread_id=f"t{i}",
+        )
+        for i in (1, 2, 3)
+    ]
+
+
+def _hammer_model() -> FakeModel:
+    # Money/Bills high (0.9 >= the 0.8 band), Shipping low -> one write per
+    # message. Used by the write arm; the read arm never reaches predict.
+    return FakeModel(VOCAB, scores={f"s{i}\nb{i}": (0.9, 0.1) for i in (1, 2, 3)})
+
+
+def test_rate_limited_mailbox_walks_to_end_counted_v1_posture(
+    tmp_path: Path,
+) -> None:
+    # F2 (manager-ruled v1 posture): a quota-limited mailbox
+    # (GmailRateLimitedError, kind=BACKOFF) is walked to the END with
+    # counted warnings — NO abort, NO backoff, exit 0. This is the shape the
+    # cursorless apply path trades for its read/write symmetry (item C): it
+    # hammers the window one message at a time and keeps going. Pinning the
+    # OBSERVABLE (N per-message attempts + warnings=N + written=0 + exit 0)
+    # makes any future posture change (back off, or abort on a BACKOFF-kind
+    # error) a deliberate RED, not a silent drift. Both arms share the one
+    # posture node — the manager's "both arms, one node" structure call.
+    #
+    # READ arm: every get_message 429s -> fetched is EMPTY -> no predict,
+    # no write, no row; three counted warnings; three get_message attempts
+    # (the hammer). Mutant: escalate the read arm on kind=BACKOFF (raise)
+    # -> run_apply propagates -> this node errors (no outcome).
+    fake = FakeGmailClient(messages=_hammer_mailbox(), labels=_labels())
+    for _ in range(3):
+        fake.fail("get_message", GmailRateLimitedError("429", status=429))
+    db = _db(tmp_path)
+    outcome = _run_apply(tmp_path, fake, db=db, dry_run=False, model=_hammer_model())
+    assert outcome.warnings == 3  # counted per message, no abort
+    assert outcome.written == 0 and outcome.rows == 0  # nothing landed
+    assert len([c for c in fake.calls if c.startswith("get_message:")]) == 3
+    assert not [c for c in fake.calls if c.startswith("apply_labels:")]
+    db.close()
+
+    # WRITE arm: reads succeed, every apply_labels 429s -> three composed
+    # writes each HELD as a counted warning (no row — rows record writes
+    # that LANDED), three apply_labels attempts. Mutant: escalate the write
+    # arm on kind=BACKOFF -> propagates -> red.
+    fake2 = FakeGmailClient(messages=_hammer_mailbox(), labels=_labels())
+    for _ in range(3):
+        fake2.fail("apply_labels", GmailRateLimitedError("429", status=429))
+    db2 = _db(tmp_path)
+    outcome2 = _run_apply(tmp_path, fake2, db=db2, dry_run=False, model=_hammer_model())
+    assert outcome2.warnings == 3
+    assert outcome2.written == 0 and outcome2.rows == 0
+    assert len([c for c in fake2.calls if c.startswith("apply_labels:")]) == 3
+    assert len([c for c in fake2.calls if c.startswith("get_message:")]) == 3
+    db2.close()
+    # the re-run-picks-up-the-missed-messages half of this posture is
+    # ALREADY pinned (test_transient_write_failure_holds_nothing_rerun_picks_it_up
+    # + the AC4 re-run idempotency node) — cited here, not re-pinned.
 
 
 # -- landmine: >1-page paging fidelity ----------------------------------------

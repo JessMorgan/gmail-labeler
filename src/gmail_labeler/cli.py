@@ -294,7 +294,8 @@ def _write_config_toml(target: Path, cfg: Config) -> None:
     # matching FileTokenStore.save). The config is paths-only (invariant #8), so
     # it is mode 0644 like example.toml — NOT the 0600 a token file needs. An
     # OSError here (parent is a file, read-only dir, …) propagates and the
-    # caller maps it to exit 5 — never a raw traceback (exit 1).
+    # wizard's write_config catch turns it into a write-error outcome (exit 5) —
+    # never a raw traceback (exit 1).
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
     try:
         os.fchmod(fd, 0o644)
@@ -357,11 +358,11 @@ def _run_setup_wizard(config: str | None) -> None:
         return  # exit 0
     if result.outcome == "failed":
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
+    # write-error / status-error: the machine already echoed the step-level
+    # diagnosis to stdout (one surface, not a duplicate here); just map the code.
     if result.outcome == "write-error":
-        typer.echo(f"setup failed writing {target}: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
     if result.outcome == "status-error":
-        typer.echo(f"setup: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
     # completed-but-not-signed-in, or declined overwrite: operation incomplete.
     raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5

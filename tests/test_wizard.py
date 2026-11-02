@@ -105,7 +105,11 @@ class FakeConfirms:
         for key, val in self.answers.items():
             if key.lower() in text.lower():
                 return val
-        return True  # default yes
+        # Strict: no silent default. Every confirm the machine can reach in a
+        # test MUST be scripted by key — an unkeyed confirm is a bug in the
+        # test (it would let a default True silently carry a branch). This makes
+        # "the decision came from a keyed answer" a REAL property, not a claim.
+        raise AssertionError(f"unkeyed confirm reached: {text[:60]!r}")
 
 
 class Recorder:
@@ -294,9 +298,12 @@ def test_project_id_malformed_retries_without_echoing_the_value() -> None:
     # the malformed value is NEVER echoed back (it is secret-adjacent input)
     assert PROJECT_ID not in rec.all_text
     assert "project" in rec.all_text.lower()
-    # A2: the skip was genuinely OFFERED and driven by the scripted key (not
-    # carried by FakeConfirms' default) — flip-default mutant must now FAIL.
-    assert any("Skip" in s for s in confirms.seen)
+    # A2: FakeConfirms now RAISES on an unkeyed confirm, so the scripted
+    # {"Skip": True} genuinely drives the branch (no silent default carries it).
+    # The project-id HANG is closed by A1's cap (proven by the m2a_uncap
+    # before/after), NOT by a flip-default mutant — flip-default is inert here
+    # precisely because the answer comes from the key, which is the point.
+    assert any("Skip" in s for s in confirms.seen)  # the skip WAS offered
 
 
 def test_project_id_skip_carries_a_plain_consequence() -> None:
@@ -307,7 +314,7 @@ def test_project_id_skip_carries_a_plain_consequence() -> None:
     confirms = FakeConfirms({"Skip": True})
     result, rec, _actions, _ = _run(probe=probe, stdin=stdin, confirms=confirms)
     assert result.outcome == "completed"  # skip is allowed, not fatal
-    assert any("Skip" in s for s in confirms.seen)  # the scripted skip drove it
+    assert any("Skip" in s for s in confirms.seen)  # the skip confirm was offered
     low = rec.all_text.lower()
     # the consequence is stated PLAINLY: enablement is still not checkable
     assert "cannot" in low and "enable" in low

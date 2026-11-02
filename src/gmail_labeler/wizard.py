@@ -161,8 +161,8 @@ def run_wizard(
     # --- project-id (shape check only; NOT enablement) ---------------------
     executed.append("project-id")
     if not _run_project_id(io=io, probe=probe):
-        # capped strikes + the user declined to skip: terminate cleanly (the
-        # machine ends on EVERY input — qwen's hang demonstration is closed).
+        # capped strikes + the user declined to skip: terminate cleanly (this
+        # loop ends on every input — qwen's hang demonstration is closed).
         io.out(
             "  Stopping here — the project-id shape check did not pass and you "
             "chose not to skip it. Nothing was written. The README's manual "
@@ -244,6 +244,11 @@ def run_wizard(
         login(cfg)
     except WizardCancelled:
         raise  # a cancel is not a sign-in failure — let it reach the 130 mapping
+    except BrokenPipeError:
+        # auth.login prints the unverified-app notice / auth URL to stdout; a
+        # closed pipe there must reach the CLI's cancel-class (130) handler, not
+        # be swallowed below as a console-side sign-in failure (exit 4).
+        raise
     except (AuthError, TokenStoreError) as e:
         # These are secret-free BY CONSTRUCTION (auth.py / tokens.py raise them
         # from type names + paths only). We still do not echo the raw text — a
@@ -274,6 +279,8 @@ def run_wizard(
     executed.append("status")
     try:
         st = status(cfg)
+    except BrokenPipeError:
+        raise  # stdout closed mid-check → the CLI's cancel-class (130), not a 5
     except Exception as e:
         # The injected status action crashed — a CHECK failure, not an auth
         # state (the sign-in itself may have stored a token). Name it and let
@@ -338,10 +345,12 @@ def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> bool:
     The value is never echoed and never stored — the config holds no project
     id, so logging one would be a leak (design landmine).
 
-    Returns True to continue, False to abort the wizard. After MAX_STRIKES
+    Returns True to continue, False to abort the wizard. After `max_strikes`
     malformed answers the skip decision is FINAL (accept → continue, decline →
-    abort) so the machine TERMINATES on every input — the old unbounded loop
-    hung when a scripted/declined skip kept re-asking (qwen's demonstration)."""
+    abort), so THIS loop terminates on every input — the old unbounded loop hung
+    when a declined skip kept re-asking (qwen's demonstration). (The client-json
+    loop is likewise bounded only by the user's willingness to supply a valid
+    path; there is no refused decision to force there.)"""
     max_strikes = 3
     strikes = 0
     while True:

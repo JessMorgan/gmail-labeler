@@ -333,8 +333,12 @@ def _run_tick(
     # checkpoint)
     try:
         score_rows = model.predict([text for _, _, text in fetched])
-        # the CONTAINER check precedes the count check (F2 round-2):
-        # len() on a generator would itself raise TypeError
+        # the container must be SIZED — a Model-Protocol conformance
+        # refusal (the Protocol declares tuple[tuple[float, ...], ...]):
+        # materialization would VERIFY an unsized container, but a
+        # generator batch is already off-contract (F3 round-2: this
+        # gate's original len()-protection rationale retired when the
+        # count moved to the materialized rows)
         if not isinstance(score_rows, Sized):
             raise _PredictionShapeError(
                 "the model returned an unsized score-row container "
@@ -352,10 +356,14 @@ def _run_tick(
         # defect (a lying len reached zip(strict=True) outside the arm).
         # Materialized, width AND count read honest lengths and the
         # compose zip can no longer fail on shape. The checks are TOTAL
-        # for the defect classes a checkpoint can produce; residual
-        # pathologies stay documented as such (a vocabulary property
-        # raising a NON-(TypeError/AttributeError); numpy-style scalar
-        # rows would need numbers.Real once the real encoder lands).
+        # for the defect classes a checkpoint can produce; the residual
+        # pathologies (review round-2, named honestly): a container or
+        # row whose __iter__ raises something OUTSIDE the caught set
+        # (TypeError/ValueError/OSError/RuntimeError — e.g. a KeyError
+        # property) still escapes to exit 1; numpy-style scalar rows
+        # would need numbers.Real once the real encoder lands; a Sized
+        # container yielding unboundedly is drained before the count
+        # mismatch fires (pathological; early-len fail-fast deferred).
         try:
             vocab_src = model.vocabulary  # read ONCE (F3 round-2 NIT:
             # the attribute access itself was outside any net)
@@ -401,7 +409,18 @@ def _run_tick(
                 f"the model returned {len(rows)} score rows for "
                 f"{len(fetched)} texts — checkpoint/recipe defect"
             )
-        for row in rows:
+        for raw_row, row in zip(score_rows, rows, strict=True):
+            # F3 closeout (reviewer NIT, probed): a bytes/bytearray row
+            # MATERIALIZES TO INTS (b'\x00\x01' -> (0, 1)) and would
+            # pass the numeric gate — worse than starvation: a garbage
+            # score of 1 could WRITE a label. str rows die on the element
+            # check (chars are not numbers); bytes need the type name at
+            # the row level
+            if isinstance(raw_row, (bytes, bytearray)):
+                raise _PredictionShapeError(
+                    f"a score row is a {type(raw_row).__name__}, not a "
+                    f"numeric sequence — checkpoint/recipe defect"
+                )
             # TYPE NAMES only in every message here (class comment): an
             # element VALUE is an arbitrary string and never interpolates
             if len(row) != vocab_len:

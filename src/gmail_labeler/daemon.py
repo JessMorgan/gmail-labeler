@@ -331,8 +331,9 @@ class ServingContext:
     #   ()    — a snapshot was read and lists NO filters: the operator's
     #           ATTESTATION that none exist, so no relevant filter claims a
     #           label and an 'added' is 'human' (positive signal). The CLI
-    #           passes this EXPLICITLY when it reads a real, empty
-    #           filters.json; the daemon's correction arm is the ONLY reader.
+    #           passes this EXPLICITLY (an empty parsed list) when it reads a
+    #           real, empty filters.json; the daemon's correction arm is the
+    #           ONLY reader.
     #   [...] — the filters; an 'added' whose relevant filter is simulatable
     #           and matches is 'filter_covered'; one whose criteria are
     #           outside {from,to,subject} is 'unverifiable' (withheld).

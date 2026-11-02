@@ -1299,24 +1299,26 @@ class AppDB:
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         try:
-            rows = self._conn.execute(
+            # iterate the CURSOR (not fetchall): the shape check is per-row,
+            # and materializing every Application row into a list for a
+            # display command would spike memory on a large store
+            counts: dict[str, int] = {}
+            for message_id, label in self._conn.execute(
                 "SELECT message_id, label FROM applications"
-            ).fetchall()
+            ):
+                if not _ID_RE.fullmatch(str(message_id)):
+                    raise AppDBError(
+                        f"state DB corrupt (application message_id "
+                        f"{message_id!r} is not 1-64 hex chars): {self.path}"
+                    )
+                if not str(label).strip():
+                    raise AppDBError(
+                        f"state DB corrupt (application label is empty for "
+                        f"message_id {message_id!r}): {self.path}"
+                    )
+                counts[str(label)] = counts.get(str(label), 0) + 1
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
-        counts: dict[str, int] = {}
-        for message_id, label in rows:
-            if not _ID_RE.fullmatch(str(message_id)):
-                raise AppDBError(
-                    f"state DB corrupt (application message_id {message_id!r} "
-                    f"is not 1-64 hex chars): {self.path}"
-                )
-            if not str(label).strip():
-                raise AppDBError(
-                    f"state DB corrupt (application label is empty for "
-                    f"message_id {message_id!r}): {self.path}"
-                )
-            counts[str(label)] = counts.get(str(label), 0) + 1
         return counts
 
     def correction_label_stats(self) -> dict[str, tuple[int, int, int, int]]:
@@ -1336,59 +1338,61 @@ class AppDB:
         row-by-row (not GROUP BY) is what lets it see the message_id."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
+        stats: dict[str, list[int]] = {}
         try:
-            rows = self._conn.execute(
+            # iterate the CURSOR (not fetchall): per-row shape revalidation,
+            # without materializing every correction for a display command
+            for message_id, label, kind, attribution in self._conn.execute(
                 "SELECT message_id, label, kind, attribution FROM corrections"
-            ).fetchall()
+            ):
+                # the SAME shape rules _check_correction_row enforces on the
+                # export path (F2 item 9: a NOT-A-HEX id or empty label must
+                # not be counted by status while the export refuses it)
+                if not _ID_RE.fullmatch(str(message_id)):
+                    raise AppDBError(
+                        f"state DB corrupt (correction message_id {message_id!r} "
+                        f"is not 1-64 hex chars): {self.path}"
+                    )
+                if not str(label).strip():
+                    raise AppDBError(
+                        f"state DB corrupt (correction label is empty for "
+                        f"message_id {message_id!r}): {self.path}"
+                    )
+                if kind not in CORRECTION_KINDS:
+                    # the tamper doctrine: the per-row readers revalidate; the
+                    # aggregate reader must not SILENTLY drop a hand-edited
+                    # kind into a zero bucket — refuse it, named
+                    raise AppDBError(
+                        f"state DB corrupt (correction kind {kind!r} not in "
+                        f"{CORRECTION_KINDS}): {self.path}"
+                    )
+                if attribution not in CORRECTION_ATTRIBUTIONS:
+                    raise AppDBError(
+                        f"state DB corrupt (correction attribution "
+                        f"{attribution!r} not in {CORRECTION_ATTRIBUTIONS}): "
+                        f"{self.path}"
+                    )
+                if kind == "removed" and attribution != "human":
+                    # the SAME removed-always-human rule _check_correction_row
+                    # enforces on the per-row reads — the aggregate reader
+                    # status uses must agree, so a hand-edited removed+withheld
+                    # row is refused NAMED here too, not bucketed as removed
+                    raise AppDBError(
+                        f"state DB corrupt (a 'removed' correction is always "
+                        f"attributed 'human', not {attribution!r}): {self.path}"
+                    )
+                # [removed, added, added_filter_covered, added_unverifiable]
+                bucket = stats.setdefault(str(label), [0, 0, 0, 0])
+                if kind == "removed":
+                    bucket[0] += 1
+                else:  # 'added'
+                    bucket[1] += 1
+                    if attribution == "filter_covered":
+                        bucket[2] += 1
+                    elif attribution == "unverifiable":
+                        bucket[3] += 1
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
-        stats: dict[str, list[int]] = {}
-        for message_id, label, kind, attribution in rows:
-            # the SAME shape rules _check_correction_row enforces on the
-            # export path (F2 item 9: a NOT-A-HEX id or empty label must
-            # not be counted by status while the export refuses it)
-            if not _ID_RE.fullmatch(str(message_id)):
-                raise AppDBError(
-                    f"state DB corrupt (correction message_id {message_id!r} "
-                    f"is not 1-64 hex chars): {self.path}"
-                )
-            if not str(label).strip():
-                raise AppDBError(
-                    f"state DB corrupt (correction label is empty for "
-                    f"message_id {message_id!r}): {self.path}"
-                )
-            if kind not in CORRECTION_KINDS:
-                # the tamper doctrine: the per-row readers revalidate; the
-                # aggregate reader must not SILENTLY drop a hand-edited
-                # kind into a zero bucket — refuse it, named
-                raise AppDBError(
-                    f"state DB corrupt (correction kind {kind!r} not in "
-                    f"{CORRECTION_KINDS}): {self.path}"
-                )
-            if attribution not in CORRECTION_ATTRIBUTIONS:
-                raise AppDBError(
-                    f"state DB corrupt (correction attribution {attribution!r} "
-                    f"not in {CORRECTION_ATTRIBUTIONS}): {self.path}"
-                )
-            if kind == "removed" and attribution != "human":
-                # the SAME removed-always-human rule _check_correction_row
-                # enforces on the per-row reads — the aggregate reader status
-                # uses must agree, so a hand-edited removed+withheld row is
-                # refused NAMED here too, not silently bucketed as removed
-                raise AppDBError(
-                    f"state DB corrupt (a 'removed' correction is always "
-                    f"attributed 'human', not {attribution!r}): {self.path}"
-                )
-            # [removed, added, added_filter_covered, added_unverifiable]
-            bucket = stats.setdefault(str(label), [0, 0, 0, 0])
-            if kind == "removed":
-                bucket[0] += 1
-            else:  # 'added'
-                bucket[1] += 1
-                if attribution == "filter_covered":
-                    bucket[2] += 1
-                elif attribution == "unverifiable":
-                    bucket[3] += 1
         return {
             label: (removed, added, fc, uv)
             for label, (removed, added, fc, uv) in stats.items()

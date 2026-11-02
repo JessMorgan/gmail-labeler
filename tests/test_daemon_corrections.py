@@ -471,6 +471,36 @@ def test_added_correction_unreadable_addlabelids_is_unverifiable(
     db.close()
 
 
+def test_added_correction_unreadable_plus_verifiable_miss_is_unverifiable(
+    tmp_path: Path,
+) -> None:
+    # F2 item 3 MIXED branch (the reviewer's M3 -- the one branch with no
+    # pin): an UNREADABLE filter (addLabelIds a bare string -> saw_unreadable)
+    # sits alongside a READABLE relevant filter whose criteria verifiably MISS
+    # this message. The readable miss alone would say 'human'; the unreadable
+    # filter keeps authorship OPEN -> 'unverifiable' (saw_unverifiable seeds
+    # from saw_unreadable). A mutant dropping that seed (saw_unverifiable =
+    # False) would credit the human -- the exact inversion item 3 closes.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[
+            {"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": "L2"}},
+            {
+                "criteria": {"from": "nobody@x.com"},
+                "action": {"addLabelIds": ["L2"]},
+            },
+        ]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
 def test_label_events_plural_takes_precedence_over_singular() -> None:
     # F2 item 2 (dual-shape double-mint): a record carrying BOTH the plural
     # and the singular key with DIFFERENT labelIds mints events from the
@@ -820,3 +850,34 @@ def test_daemon_command_passes_command_daemon(
     result, _fake = _run_daemon(tmp_path, monkeypatch)
     assert result.exit_code == 0, result.stderr
     assert captured.get("command") == "daemon"
+
+
+def test_serve_startup_unreadable_filter_entry_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # F2 item 3 (diagnosability): a snapshot with an UNREADABLE addLabelIds
+    # (a bare string) makes _attribution withhold every 'added' -- startup
+    # NAMES the count (the #22 bridge-malformed posture), never a silent
+    # rising unverifiable with no cause
+    _startup_with_sidecar(
+        tmp_path,
+        monkeypatch,
+        sidecar_text=(
+            '[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": "L2"}}]'
+        ),
+    )
+    err = capsys.readouterr().err
+    assert "unreadable action/addLabelIds" in err
+    assert "1 filter" in err
+
+
+def test_serve_startup_actionless_filter_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # a legitimately ACTION-LESS filter (no addLabelIds) reads [] (strict
+    # does NOT raise) -- it must NOT trip the unreadable-entry warning
+    _startup_with_sidecar(
+        tmp_path, monkeypatch, sidecar_text='[{"criteria": {"from": "a@x.com"}}]'
+    )
+    err = capsys.readouterr().err
+    assert "unreadable action/addLabelIds" not in err

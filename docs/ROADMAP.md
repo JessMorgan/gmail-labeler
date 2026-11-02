@@ -152,8 +152,8 @@ Scope:
   verb) and the corpus store is append-only (`put()` no-ops on an existing id,
   so a folded record cannot rewrite a message already in the corpus). It is NOT
   the fingerprint/sidecar that blocks this (the fingerprint covers only the
-  train split; corrections are test-side mail; `train` does not verify a prior
-  checkpoint's sidecar — its only gate is `--force` over an existing dir). The
+  train split, and `train` does not verify a prior checkpoint's sidecar — its
+  only gate is `--force` over an existing dir). The
   tooling to produce a folded corpus is the deferred part; the retrain itself is
   `train --force`. No auto-retrain — the human gate holds;
 - the `auth` wizard (ADR-0004) — LANDED (#28): `auth setup` walks the console

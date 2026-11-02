@@ -92,11 +92,13 @@ snapshot is UNKNOWN attribution, not "no filters": every 'added' is then
 attributed ``"human"`` (a human removing is human signal regardless of
 filters — invariant #6). A fourth UNVERIFIABLE trigger (S1 C2): when the
 delta carries a ``labelsAdded`` for a label this tick's plan SKIPPED as
-already-present yet no Application row exists for it, the add is the
+already-present yet no Application row exists for it, the HUMAN credit is the
 crash-replay ambiguity — our own landed write whose row was lost before the
 commit, indistinguishable from a human who added exactly what we would have —
-so it is routed straight to ``"unverifiable"`` (withheld), never credited to
-the human (which would poison human_added and the training fold).
+so a would-be ``"human"`` add is routed to ``"unverifiable"`` (withheld), never
+credited (which would poison human_added and the training fold). It overrides
+ONLY the human credit: a PROVEN ``"filter_covered"`` (a filter verifiably
+authored it) or an already-``"unverifiable"`` add is not ambiguous and stands.
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
 write for the corrected message). The correction rows ride the SAME
@@ -675,10 +677,14 @@ def _skip_present_pairs(
                 system_labels=ctx.system_labels,
             )
         except Exception:
-            # match the plan's fail-safe net (plan_message_write catches Exception
-            # → a per-message warning): a lying input contributes NO pair here
-            # (we cannot claim a skip-present we could not compute) AND must not
-            # escape _run_tick to kill daemon_loop — the plan loop warns it below.
+            # a lying input contributes NO pair here (we cannot claim a
+            # skip-present we could not compute) AND must not escape _run_tick to
+            # kill daemon_loop — the plan loop turns the same input into a
+            # per-message warning. Netting Exception (not just ValueError) is the
+            # defensive choice; unlike plan_message_write we do NOT re-raise
+            # AssertionError, but that divergence is unreachable: would_apply's
+            # refusals are all ValueError (a lying score/band/vocab), never the
+            # internal-contradiction AssertionError the plan guards against.
             continue
         for d in decisions:
             if d.band is not None and d.present:

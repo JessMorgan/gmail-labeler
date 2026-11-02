@@ -147,7 +147,9 @@ Correction, for every label, is withheld until the snapshot is clean; or a
 crash-replay ambiguity — the delta carries a `labelsAdded` for a label this
 tick SKIPPED as already-present yet no Application row exists for it, so the
 daemon's own landed write whose row was lost before the commit is
-indistinguishable from a human who added exactly what we would have) — the
+indistinguishable from a human who added exactly what we would have (this
+withhold applies to the would-be *human* credit only; a proven *filter-covered*
+add for the same event stands) — the
 same *exclusion, not guessing* principle that governs
 `dataset analyze` (#22): guessing either way is what that doctrine forbids.
 A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation

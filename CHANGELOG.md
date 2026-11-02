@@ -829,14 +829,17 @@ does not ship releases yet.
   mail' and the ROADMAP Never-list). The scoring set is now `messagesAdded[]`;
   the fake's history fixtures emit the documented shape (arrivals carry
   generic stubs AND `messagesAdded`; a modify carries `labelsAdded` but no
-  `messagesAdded`) so the fixture can no longer mirror the code. A sent-mail
-  guard counts-skips the operator's own SENT arrivals.
+  `messagesAdded`) so the fixture can no longer mirror the code. A non-incoming
+  guard counts-skips the operator's own SENT/DRAFT arrivals and CHAT (matching
+  the corpus's DRAFT/CHAT exclusion).
 - Stack review S1 — the crash-replay window cannot fake a human's hand: a
   `labelsAdded` for a label this tick skipped as already-present with no
   Application row (the daemon's own landed write whose row was lost before
-  the commit) is AMBIGUOUS and is now attributed `unverifiable` (withheld),
-  not `human` — crediting it would poison `human_added` and the training fold
-  (invariant #6). GLOSSARY / README / the daemon docstrings gain this fourth
+  the commit) makes the would-be `human` credit AMBIGUOUS, so it is attributed
+  `unverifiable` (withheld) rather than `human` — crediting it would poison
+  `human_added` and the training fold (invariant #6). The withhold overrides
+  ONLY the human credit; a proven `filter_covered` add for the same event
+  stands. GLOSSARY / README / the daemon docstrings gain this fourth
   unverifiable cause.
 
 ### Changed

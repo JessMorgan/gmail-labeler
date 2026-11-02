@@ -423,9 +423,12 @@ non-404 error therefore retries loudly forever: the loud hold beats
 silent label loss). A per-message failure (a deleted message, corrupt
 raw) means NO write for that message (invariant #1's fail-safe) with a
 counted warning naming the message id and the typed error, never the
-body; the delta's cursor still advances. A lying model row (score rows
-that do not match the delta) is SYSTEMATIC, not per-message: the whole
-delta holds and retries — its cursor does NOT advance.
+body; the delta's cursor still advances. A STRUCTURALLY lying model
+row (container, count, width, or element type) is SYSTEMATIC, not
+per-message: the whole delta holds and retries — its cursor does NOT
+advance. An out-of-range score VALUE is different: the plan's
+per-message fail-safe catches it (counted warning, no write), and the
+delta's cursor still advances.
 Message bodies never enter the database, the warnings, or any log
 (invariant #5) — the state DB stays publicly attachable.
 

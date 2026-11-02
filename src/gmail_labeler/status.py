@@ -20,7 +20,9 @@ The math (design decision 4, v1 honest-and-simple):
 - ``precision`` = (written - removed) / written, or ``None`` ('no data')
   when the label has no Applications yet. The join gate makes
   ``removed <= written`` (a 'removed' Correction exists only for an
-  applied (message, label), deduped), so precision never goes negative;
+  applied (message, label), deduped), so precision never goes negative on
+  an honest store; a tampered DB where ``removed > written`` is refused
+  NAMED (``PrecisionInvariantError`` → CLI exit 5), never clamped to 0.0;
 - ``added`` / ``added_filter_covered`` / ``added_unverifiable`` = the
   positive-signal Corrections and the two invariant-#6 WITHHELD slices: a
   Gmail filter verifiably applied it (``filter_covered``), or authorship
@@ -41,7 +43,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-__all__ = ["LabelPrecision", "compute_precision"]
+__all__ = ["LabelPrecision", "PrecisionInvariantError", "compute_precision"]
+
+
+class PrecisionInvariantError(Exception):
+    """compute_precision found ``removed > written`` for a label — a state
+    the join gate makes impossible on an honest store, so this names a
+    hand-edited/corrupt DB. The CLI maps it to exit 5 (refused, named)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,11 +84,25 @@ def compute_precision(
     (removed, added, added_filter_covered, added_unverifiable) (the store's
     ``correction_label_stats``). A graduated label with no Applications
     reports 'no data' (precision None); one with no Corrections reports
-    precision 1.0 (everything applied is still standing)."""
+    precision 1.0 (everything applied is still standing).
+
+    Raises ``PrecisionInvariantError`` when ``removed > written`` for a
+    label: the join gate keeps ``removed <= written`` on the honest path
+    (a 'removed' Correction exists only for an applied (message, label),
+    deduped), so a violation is a hand-edited/corrupt store — refused
+    NAMED, never clamped to 0.0 (a clamp would hide the corruption behind
+    a plausible-looking precision)."""
     out: list[LabelPrecision] = []
     for label in sorted(graduated):
         written = written_by_label.get(label, 0)
         removed, added, added_fc, added_uv = correction_stats.get(label, (0, 0, 0, 0))
+        if removed > written:
+            raise PrecisionInvariantError(
+                f"label {label!r}: {removed} 'removed' Corrections exceed "
+                f"{written} Application rows — the join gate makes this "
+                "impossible on an honest store; the state DB is corrupt "
+                "(refusing, not clamping)"
+            )
         precision = (written - removed) / written if written > 0 else None
         out.append(
             LabelPrecision(

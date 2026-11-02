@@ -4070,7 +4070,11 @@ def status(
     and the two local artifacts (bands/graduation) and nothing else, so
     it answers on a sick or offline mailbox (an UNAUTHENTICATED config
     still works — there is no auth gate here, by design; the AC pins it
-    with a no-client call). Bodies never enter the output (invariant #5):
+    with a no-client call). It NEVER CREATES a state DB (a missing --db is
+    a refusal, not an empty store), but opening an EXISTING older-version
+    one runs the standard atomic schema migration (a v1/v2/v3 file comes
+    back at the current version — a write, the same transition every other
+    command's open performs). Bodies never enter the output (invariant #5):
     labels, counts and rates only.
 
     Per graduated label: written (Application rows), removed (matching
@@ -4090,7 +4094,7 @@ def status(
     reserved not-implemented code; status never emits it)."""
     from .appdb import AppDB, AppDBError
     from .graduation import GraduationTable
-    from .status import compute_precision
+    from .status import PrecisionInvariantError, compute_precision
     from .thresholds import BandsArtifact
 
     for flag, target in (("--bands", bands), ("--graduation", graduation)):
@@ -4150,7 +4154,13 @@ def status(
     finally:
         store_db.close()
 
-    rows = compute_precision(graduated, written_by_label, correction_stats)
+    try:
+        rows = compute_precision(graduated, written_by_label, correction_stats)
+    except PrecisionInvariantError as e:
+        # a tampered store (removed > written): refuse named at exit 5,
+        # never print a negative precision (F2 item 9)
+        typer.echo(f"status failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     if as_json:
         payload = {

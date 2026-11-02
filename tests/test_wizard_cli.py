@@ -324,6 +324,8 @@ def test_setup_config_write_failure_exits_5(
     )
     assert result.exit_code == 5
     assert "Traceback" not in result.output
+    # the diagnosis is on STDERR (the auth-path convention), not silently stdout
+    assert "could not write" in result.stderr.lower()
 
 
 def test_bare_auth_invalid_config_no_flag_exits_4(
@@ -413,6 +415,7 @@ def test_status_check_crash_cli_exits_5_no_traceback(
     )
     assert result.exit_code == 5
     assert "Traceback" not in result.output
+    assert "status check failed" in result.stderr.lower()  # STDERR surface
     assert REFRESH not in result.output  # the crash text is never echoed
 
 

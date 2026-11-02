@@ -225,16 +225,14 @@ def run_wizard(
         # a file, read-only dir, …) is an operation failure (exit 5). A
         # BrokenPipeError from the OUTPUT sink is NOT caught here — io.out is
         # outside this try — so the CLI can tell "stdout closed mid-run" apart
-        # from "the write failed" (the old broad catch mislabeled the former).
-        io.out(
-            f"  Could not write {config_target} ({type(e).__name__}) — nothing "
-            "was signed in. Fix the path/permissions and re-run `auth setup`."
-        )
+        # from "the write failed". The diagnosis is reported on STDERR by the CLI
+        # (consistent with every other auth-path error), not echoed here.
         return WizardResult(
             outcome="write-error",
             signed_in=False,
             steps=tuple(executed),
-            detail=f"config write failed ({type(e).__name__})",
+            detail=f"could not write {config_target} ({type(e).__name__}) — "
+            "nothing was signed in; fix the path/permissions and re-run",
         )
     io.out(f"  wrote {config_target}")
 
@@ -283,18 +281,15 @@ def run_wizard(
         raise  # stdout closed mid-check → the CLI's cancel-class (130), not a 5
     except Exception as e:
         # The injected status action crashed — a CHECK failure, not an auth
-        # state (the sign-in itself may have stored a token). Name it and let
-        # the CLI exit 5; never let it escape as a raw traceback (exit 1, off
-        # the 0/2/4/5/130 contract).
-        io.out(
-            f"  The status check failed ({type(e).__name__}). Sign-in may have "
-            "worked — run `gmail-labeler auth status` to check."
-        )
+        # state (the sign-in itself may have stored a token). The CLI reports it
+        # on STDERR (consistent with the auth-path errors) and exits 5; it never
+        # escapes as a raw traceback (exit 1, off the 0/2/4/5/130 contract).
         return WizardResult(
             outcome="status-error",
             signed_in=False,
             steps=tuple(executed),
-            detail=f"status check failed ({type(e).__name__})",
+            detail=f"status check failed ({type(e).__name__}) — sign-in may have "
+            "worked; run `gmail-labeler auth status` to check",
         )
     io.out(
         f"auth: {'signed in' if st.signed_in else 'NOT signed in'} "

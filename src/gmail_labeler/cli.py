@@ -358,11 +358,13 @@ def _run_setup_wizard(config: str | None) -> None:
         return  # exit 0
     if result.outcome == "failed":
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
-    # write-error / status-error: the machine already echoed the step-level
-    # diagnosis to stdout (one surface, not a duplicate here); just map the code.
+    # write-error / status-error: reported on STDERR (consistent with config
+    # error / setup cancelled / the non-TTY message), one surface, then exit 5.
     if result.outcome == "write-error":
+        typer.echo(f"setup: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
     if result.outcome == "status-error":
+        typer.echo(f"setup: {result.detail}", err=True)
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
     # completed-but-not-signed-in, or declined overwrite: operation incomplete.
     raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5

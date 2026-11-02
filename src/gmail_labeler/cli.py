@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeGuard
 
 import typer
 
@@ -299,6 +299,10 @@ def dataset_import_gyb(
         raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
 
 
+def _is_str_keyed_dict(obj: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(obj, dict) and all(isinstance(k, str) for k in obj)
+
+
 def _load_attribution(
     store_root: Path, *, assume_no_filters: bool
 ) -> tuple[AttributionPosture, list[dict[str, object]] | None, dict[str, str]]:
@@ -317,23 +321,23 @@ def _load_attribution(
         if assume_no_filters:
             return "attested-none", [], {}
         return "missing", None, {}
-    raw = json.loads(sidecar.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
+    raw_filters = json.loads(sidecar.read_text(encoding="utf-8"))
+    if not isinstance(raw_filters, list):
         raise ValueError("filters snapshot is not a list")
     filters: list[dict[str, object]] = []
-    for item in raw:
-        if not isinstance(item, dict) or not all(isinstance(k, str) for k in item):
+    for item in raw_filters:
+        if not _is_str_keyed_dict(item):
             raise ValueError("filter entry is not a string-keyed object")
         filters.append({str(k): v for k, v in item.items()})
     id_to_name: dict[str, str] = {}
     labels_path = store_root / SIDECAR_LABELS
     if labels_path.is_file():
-        raw_map = json.loads(labels_path.read_text(encoding="utf-8"))
-        if not isinstance(raw_map, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in raw_map.items()
+        raw_labels = json.loads(labels_path.read_text(encoding="utf-8"))
+        if not _is_str_keyed_dict(raw_labels) or not all(
+            isinstance(v, str) for v in raw_labels.values()
         ):
             raise ValueError("labels snapshot is not an id->name object")
-        id_to_name = {str(k): str(v) for k, v in raw_map.items()}
+        id_to_name = {str(k): str(v) for k, v in raw_labels.items()}
     needed: set[str] = set()
     for f in filters:
         action = f.get("action")
@@ -362,7 +366,9 @@ def _load_attribution(
 
 @dataset_app.command("analyze")
 def dataset_analyze(
-    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    config_file: str | None = typer.Option(
+        None, "--config", help="Path to config.toml"
+    ),
     recent_months: int = typer.Option(
         24, "--recent-months", min=1, help="Recency window for candidate gates"
     ),
@@ -388,7 +394,7 @@ def dataset_analyze(
     from .analyze import analyze_corpus
     from .corpus_store import CorpusError, CorpusStore
 
-    cfg = _load_config(config)
+    cfg = _load_config(config_file)
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         # a config typo is an operation failure, NOT an "empty mailbox"
@@ -435,7 +441,12 @@ def dataset_analyze(
         min_total=min_total,
         min_recent=min_recent,
     )
-    if summary.messages:  # empty corpus: the friendly line IS the advice
+    # The posture NOTEs below matter only when there is mail to report on.
+    # For an empty corpus the human path already ends with the
+    # "corpus is empty — run dataset export/import-gyb first" line, and the
+    # --json path prints no human report on stdout — its payload carries the
+    # posture in filters_posture; NOTEs here would just bury the advice.
+    if summary.messages:
         if posture == "bridge-incomplete":
             typer.echo(
                 "NOTE: filters.json label ids are not all present in "

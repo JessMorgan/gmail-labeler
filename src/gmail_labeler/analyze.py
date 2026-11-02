@@ -157,6 +157,53 @@ def _simulates(criteria: Mapping[str, object], record: CorpusRecord) -> bool | N
     return True
 
 
+def _attribute_filters(
+    filters: Sequence[Mapping[str, object]],
+    members: Mapping[str, Sequence[CorpusRecord]],
+    id_to_name: Mapping[str, str],
+) -> tuple[dict[str, set[str]], dict[str, int]]:
+    """Invariant #6 filter accounting: per-label attributed message ids and
+    unverifiable-filter counts, seeded for every label in ``members`` — the
+    caller guarantees ``members`` is keyed exactly by ``labels_seen``, so
+    this covers every key the metrics loop reads. Iteration follows the
+    filters' own order — deterministic, like the rest of this module."""
+    attributed: dict[str, set[str]] = {name: set() for name in members}
+    unreliable: dict[str, int] = {name: 0 for name in members}
+    for filter_ in filters:
+        raw_criteria = filter_.get("criteria")
+        # absent criteria = a real empty-criteria filter (matches all,
+        # simulatable); a PRESENT non-mapping is snapshot corruption —
+        # match-all would mislabel it 'filter-covered', so name it
+        malformed_criteria = raw_criteria is not None and not isinstance(
+            raw_criteria, Mapping
+        )
+        criteria: Mapping[str, object] = (
+            {}
+            if raw_criteria is None or not isinstance(raw_criteria, Mapping)
+            else cast(Mapping[str, object], raw_criteria)
+        )
+        names = [
+            id_to_name.get(label_id, f"id:{label_id}")
+            for label_id in _filter_label_names(filter_)
+        ]
+        for name in names:
+            if name not in members:
+                continue
+            if malformed_criteria:
+                unreliable[name] += 1
+                continue
+            verdicts = [_simulates(criteria, rec) for rec in members[name]]
+            if None in verdicts:
+                # this filter unverifiably touches this label — on ANY
+                # message: the whole label becomes unverifiable
+                unreliable[name] += 1
+            else:
+                for rec, hit in zip(members[name], verdicts, strict=True):
+                    if hit:
+                        attributed[name].add(rec.id)
+    return attributed, unreliable
+
+
 def analyze_corpus(
     records: Sequence[CorpusRecord],
     *,
@@ -193,43 +240,15 @@ def analyze_corpus(
     members: dict[str, list[CorpusRecord]] = {name: [] for name in labels_seen}
     for rec in records:
         for name in rec.labels:
-            members.setdefault(name, []).append(rec)
+            members[name].append(rec)
 
-    attributed: dict[str, set[str]] = {name: set() for name in labels_seen}
-    unreliable: dict[str, int] = {name: 0 for name in labels_seen}
+    attributed: dict[str, set[str]]
+    unreliable: dict[str, int]
     if filters:
-        for filter_ in filters:
-            raw_criteria = filter_.get("criteria")
-            # absent criteria = a real empty-criteria filter (matches all,
-            # simulatable); a PRESENT non-mapping is snapshot corruption —
-            # match-all would mislabel it 'filter-covered', so name it
-            malformed_criteria = raw_criteria is not None and not isinstance(
-                raw_criteria, Mapping
-            )
-            criteria: Mapping[str, object] = (
-                {}
-                if raw_criteria is None or not isinstance(raw_criteria, Mapping)
-                else cast(Mapping[str, object], raw_criteria)
-            )
-            names = [
-                id_to_name.get(label_id, f"id:{label_id}")
-                for label_id in _filter_label_names(filter_)
-            ]
-            for name in names:
-                if name not in members:
-                    continue
-                if malformed_criteria:
-                    unreliable[name] += 1
-                    continue
-                verdicts = [_simulates(criteria, rec) for rec in members[name]]
-                if None in verdicts:
-                    # this filter unverifiably touches this label — on ANY
-                    # message: the whole label becomes unverifiable
-                    unreliable[name] += 1
-                else:
-                    for rec, hit in zip(members[name], verdicts, strict=True):
-                        if hit:
-                            attributed[name].add(rec.id)
+        attributed, unreliable = _attribute_filters(filters, members, id_to_name)
+    else:
+        attributed = {name: set() for name in labels_seen}
+        unreliable = {name: 0 for name in labels_seen}
 
     metrics: list[LabelMetrics] = []
     for name in labels_seen:

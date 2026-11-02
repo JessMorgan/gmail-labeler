@@ -892,6 +892,18 @@ def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "no filters.json snapshot" not in result.stderr
     assert "corpus is empty" in result.stdout
+    # the --json quadrant: no human advice line exists to bury, and the
+    # NOTEs stay suppressed too — the payload's filters_posture field IS
+    # the machine-readable posture ('missing': no sidecar in this fixture)
+    json_result = runner.invoke(
+        app,
+        ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path)), "--json"],
+    )
+    assert json_result.exit_code == 0
+    assert "corpus is empty" not in json_result.stdout
+    assert "no filters.json snapshot" not in json_result.stderr
+    payload = json.loads(json_result.stdout)
+    assert payload["summary"]["filters_posture"] == "missing"
 
 
 def test_analyze_nonobject_action_rejected(tmp_path: Path) -> None:

@@ -18,11 +18,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
-from gmail_labeler.appdb import AppDB, CorrectionRow
+from gmail_labeler.appdb import CORRECTION_ATTRIBUTIONS, AppDB, CorrectionRow
 from gmail_labeler.applications import ApplicationRow
 from gmail_labeler.cli import app
 from gmail_labeler.status import compute_precision
-from test_shadow_cli import _prepare, _shadow_cfg
+from test_shadow_cli import _eval_factory, _prepare, _shadow_cfg, _test_side_scores
 
 runner = CliRunner()
 TS = datetime(2026, 11, 1, 12, 0, 0, tzinfo=UTC)
@@ -378,3 +378,128 @@ def test_status_missing_db_is_5(tmp_path: Path, monkeypatch) -> None:
     )
     assert result.exit_code == 5
     assert not (tmp_path / "does-not-exist.db").exists()  # NOT created
+
+
+# -- F2: bands/graduation cross-check, json basis, expanduser ------------------
+
+
+def _status_with(tmp_path: Path, cfg: Path, bands: Path, graduation: Path) -> Result:
+    return runner.invoke(
+        app,
+        [
+            "status",
+            "--config",
+            str(cfg),
+            "--bands",
+            str(bands),
+            "--graduation",
+            str(graduation),
+            "--db",
+            str(tmp_path / "state.db"),
+        ],
+    )
+
+
+def test_status_refuses_mismatched_bands_graduation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 7: a mismatched --bands/--graduation pair must REFUSE named
+    # (exit 5), not print a basis line claiming a pairing never measured
+    # together. Build a SECOND valid bands artifact with different content
+    # (an altered score set flips a band) whose hash != what the graduation
+    # table recorded.
+    import gmail_labeler.cli as cli
+
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])  # the DB must exist
+    altered = dict(_test_side_scores())
+    altered["subject 6\nbody 6"] = (0.99, 0.01)  # flips a target -> new hash
+    monkeypatch.setattr(cli, "_eval_model_factory", _eval_factory(altered))
+    bands2 = tmp_path / "bands2.json"
+    assert (
+        runner.invoke(
+            app, ["eval", "--config", str(cfg), "--bands", str(bands2)]
+        ).exit_code
+        == 0
+    )
+    result = _status_with(tmp_path, cfg, bands2, tmp_path / "graduation.json")
+    assert result.exit_code == 5, result.output
+    assert "NOT the bands artifact" in result.output
+
+
+def test_status_matching_pair_still_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the cross-check must NOT break the honest matching pair (regression
+    # guard for item 7): the _prepare bands/graduation pair answers exit 0
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
+    result = _status_with(
+        tmp_path, cfg, tmp_path / "bands.json", tmp_path / "graduation.json"
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_status_json_basis_full_caveats_and_vocab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 8: the --json basis carries the FULL caveat set (not just the
+    # 2-item stub) AND the attribution vocabulary rendered from the constant
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
+    result = _status(tmp_path, cfg, extra=("--json",))
+    assert result.exit_code == 0, result.output
+    basis = json.loads(result.output)["basis"]
+    # the full caveat set: rows-vs-deduped units, re-add posture, rename
+    # desync, artifact-versions, archive-equals-dismiss
+    for needle in ("Application ROWS", "re-added", "RENAME", "archive-equals"):
+        assert needle in basis["caveat"], needle
+    # the vocabulary is RENDERED from CORRECTION_ATTRIBUTIONS (not a literal)
+    assert basis["attribution_vocabulary"] == list(CORRECTION_ATTRIBUTIONS)
+    assert "addLabelIds is unreadable" in basis["unverifiable_causes"]
+
+
+def test_status_note_vocab_tracks_the_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 8 (the drift pin): the TEXT NOTE must render the EXACT joined
+    # CORRECTION_ATTRIBUTIONS vocabulary. Checking each value appears
+    # SEPARATELY is too weak -- 'unverifiable' also occurs in the 3-cause
+    # sentence, so a hardcoded vocab list would still pass. Assert the whole
+    # rendered string is present: a hardcoded NOTE (or a constant change not
+    # propagated to the NOTE) reddens here.
+    _prepare(tmp_path, monkeypatch)
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
+    result = _status(tmp_path, cfg)
+    assert result.exit_code == 0, result.output
+    assert " / ".join(CORRECTION_ATTRIBUTIONS) in result.output
+
+
+def test_status_bands_graduation_expanduser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 12: --bands/--graduation expand ~ like --db does (a literal
+    # '~/' would be a nonsense path -> exit 5)
+    _prepare(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _shadow_cfg(tmp_path, store=f'db_path = "{tmp_path / "state.db"}"')
+    _seed(tmp_path, [_app_row("Money/Bills", "aa11")], [])
+    result = runner.invoke(
+        app,
+        [
+            "status",
+            "--config",
+            str(cfg),
+            "--bands",
+            "~/bands.json",
+            "--graduation",
+            "~/graduation.json",
+            "--db",
+            str(tmp_path / "state.db"),
+        ],
+    )
+    assert result.exit_code == 0, result.output

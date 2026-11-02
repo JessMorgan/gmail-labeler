@@ -794,3 +794,29 @@ def test_serve_startup_apply_path_does_not_warn(
     startup = _startup_with_sidecar(tmp_path, monkeypatch, command="apply")
     assert startup.ctx.filters is None  # the wiring is the same...
     assert "UNKNOWN" not in capsys.readouterr().err  # ...but apply stays quiet
+
+
+def test_daemon_command_passes_command_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F2 item 13: the startup UNKNOWN warning is gated on command=="daemon".
+    # The F1 wiring pins call _serve_startup DIRECTLY with command="daemon",
+    # so mutating the daemon COMMAND's own literal to "serve" rode the whole
+    # suite green (the reviewer's mut4). Pin the PRODUCTION call site: capture
+    # the command kwarg the daemon command hands _serve_startup.
+    import gmail_labeler.cli as cli
+    from test_daemon_cli import _run_daemon
+    from test_shadow_cli import _prepare
+
+    _prepare(tmp_path, monkeypatch)
+    captured: dict[str, str] = {}
+    real = cli._serve_startup
+
+    def spy(*, command: str, **kw: Any) -> Any:
+        captured["command"] = command
+        return real(command=command, **kw)
+
+    monkeypatch.setattr(cli, "_serve_startup", spy)
+    result, _fake = _run_daemon(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.stderr
+    assert captured.get("command") == "daemon"

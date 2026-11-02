@@ -10,6 +10,7 @@ acceptance criterion #1 (a fresh profile, no config, reaches a working
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -646,6 +647,12 @@ def test_boundary_closed_stdout_exits_130(tmp_path: Path) -> None:
     assert "Exception ignored" not in err
     assert "BrokenPipeError" not in err
     assert "Traceback" not in err
+    # Self-validating: 130 is ALSO what the EOF-cancel path returns (stdin is
+    # DEVNULL), so a bare rc check would pass even if the pipe never broke. The
+    # closed-stdout handler prints NO "setup cancelled." line (unlike the cancel
+    # path), so its absence proves the child actually hit the BrokenPipeError
+    # branch — a future speed-up that let the prompt EOF first would fail here.
+    assert "setup cancelled" not in err
 
 
 def test_boundary_lost_stdout_fd_closed_exits_130(tmp_path: Path) -> None:
@@ -675,3 +682,72 @@ def test_boundary_lost_stdout_fd_closed_exits_130(tmp_path: Path) -> None:
     assert rc == 130, f"expected 130 for a closed stdout fd, got {rc}: {err!r}"
     assert "Traceback" not in err
     assert "stdout is unavailable" in err
+
+
+def test_boundary_merged_streams_exits_130(tmp_path: Path) -> None:
+    # `auth setup 2>&1 | head`: stdout AND stderr share ONE pipe. When the reader
+    # exits, BOTH fds are dead. The cancel diagnosis is written to STDERR — if that
+    # write EPIPEs out of the handler (or the shutdown flush of stderr fails), the
+    # process exits 1/120, off the closed set (F3 round-2 MAJOR: the earlier fix
+    # silenced fd 1 only). The handlers must retarget BOTH fds so 130 holds even
+    # when the two streams share a pipe. Deterministic in outcome: whichever of the
+    # intro-write (fd 1) or the cancel-echo (fd 2) trips first, both roads exit 130.
+    read_fd, write_fd = os.pipe()
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gmail_labeler.cli",
+            "auth",
+            "setup",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=write_fd,
+        stderr=write_fd,  # the SAME pipe as stdout, like `2>&1`
+        env=_boundary_env(tmp_path),
+        cwd=str(tmp_path),
+    )
+    os.close(write_fd)  # parent drops its write-end dup
+    os.close(read_fd)  # the reader (`head`) is gone -> both child fds EPIPE on write
+    rc = p.wait()
+    assert rc == 130, f"expected 130 with merged streams, got {rc}"
+
+
+def test_boundary_dead_stderr_cancel_diagnosis_exits_130(tmp_path: Path) -> None:
+    # The load-bearing pin for the F3 round-2 MAJOR. deepseek's strace showed the
+    # real failure was `write(2, "setup cancelled.") = -1 EPIPE` — the CANCEL
+    # diagnosis going to a dead stderr. To reach that path deterministically the
+    # two streams must be decoupled: stdout stays a live pipe (so the intro write
+    # SUCCEEDS and no BrokenPipeError fires there), while stderr's reader is closed
+    # so the first prompt's EOF -> cancel -> diagnosis echo hits a dead fd 2. The
+    # handler must swallow that EPIPE and retarget both fds, or the process exits 1.
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
+    p = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "gmail_labeler.cli",
+            "auth",
+            "setup",
+            "--config",
+            str(tmp_path / "config.toml"),
+        ],
+        stdin=subprocess.DEVNULL,  # the prompt EOFs -> WizardCancelled
+        stdout=out_w,
+        stderr=err_w,
+        env=_boundary_env(tmp_path),
+        cwd=str(tmp_path),
+    )
+    os.close(out_w)
+    os.close(err_w)  # parent drops its write-end dups
+    os.close(err_r)  # stderr reader gone -> the cancel echo to fd 2 EPIPEs
+    with contextlib.suppress(OSError):
+        os.read(out_r, 65536)  # drain the intro so the stdout write never blocks
+    os.close(out_r)
+    rc = p.wait()
+    assert rc == 130, (
+        f"expected 130 when the cancel diagnosis hits a dead stderr, got {rc}"
+    )

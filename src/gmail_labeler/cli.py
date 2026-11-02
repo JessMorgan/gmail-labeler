@@ -336,16 +336,32 @@ def _echo_out(text: str) -> None:
         sys.stdout.flush()
 
 
-def _silence_stdout() -> None:
-    """Point the process's stdout fd at /dev/null so the interpreter's shutdown
-    flush can neither fail (BrokenPipeError -> exit 120) nor print. Called from
-    the broken/closed-stdout handlers before raising Exit(130)."""
-    import sys
-
+def _silence_output() -> None:
+    """Retarget BOTH the stdout (fd 1) and stderr (fd 2) descriptors at /dev/null
+    so the interpreter's shutdown flush of either can neither fail (BrokenPipeError
+    -> exit 120) nor print. Called before every cancel/incomplete Exit so the exit
+    code we chose is what the PROCESS actually returns — including the merged-
+    stream case (`auth setup 2>&1 | head`) where stderr SHARES the dead pipe and a
+    diagnosis echo to fd 2 would otherwise EPIPE out of the handler (exit 1). dup2
+    onto a closed fd (`>&-`) simply recreates it as /dev/null, which is harmless."""
     with contextlib.suppress(OSError):
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
         os.close(devnull)
+
+
+def _echo_err(text: str) -> None:
+    """Write a diagnosis to stderr, tolerating a closed/broken stderr. In the
+    merged `2>&1 | head` case fd 2 IS the dead pipe, so the write raises
+    BrokenPipeError; letting it escape would turn the intended exit code into 1.
+    If the channel is gone the user cannot see the line anyway."""
+    import sys
+
+    if sys.stderr is None:  # `2>&-`: no stderr channel at all
+        return
+    with contextlib.suppress(BrokenPipeError):
+        typer.echo(text, err=True)
 
 
 def _run_setup_wizard(config: str | None) -> None:
@@ -362,10 +378,10 @@ def _run_setup_wizard(config: str | None) -> None:
         # the wizard has no channel to display on. One-line stderr diagnosis, then
         # the cancel-class 130 — the same "output channel gone" abort as a closed
         # pipe (F3 MINOR: previously this crashed with a traceback -> exit 1).
-        typer.echo(
-            "setup: stdout is unavailable (closed); the interactive wizard cannot run.",
-            err=True,
+        _echo_err(
+            "setup: stdout is unavailable (closed); the interactive wizard cannot run."
         )
+        _silence_output()
         raise typer.Exit(code=_CANCEL_EXIT)
 
     target = _setup_config_target(config)
@@ -380,14 +396,20 @@ def _run_setup_wizard(config: str | None) -> None:
             config_target=target,
         )
     except WizardCancelled:
-        typer.echo("setup cancelled.", err=True)
+        # The diagnosis goes to STDERR, which in the merged `2>&1 | head` case is
+        # the SAME dead pipe — so the echo must be BrokenPipe-safe (_echo_err) and
+        # both fds silenced before the Exit, or the write(2, "setup cancelled.")
+        # EPIPEs out of this handler and the process exits 1 (F3 round-2 MAJOR:
+        # the closed set must hold at the boundary even when stderr shares the pipe).
+        _echo_err("setup cancelled.")
+        _silence_output()
         raise typer.Exit(code=_CANCEL_EXIT) from None
     except BrokenPipeError:
         # stdout closed mid-run (`auth setup | head`): the pipe is gone. Redirect
-        # stdout to devnull FIRST so the interpreter's shutdown flush can neither
-        # fail nor print — otherwise the intended 130 becomes 120 (F3 MAJOR: the
-        # code must be true at the PROCESS boundary, not just in-process). NOT a
-        # config-write failure (that is caught machine-side as write-error).
+        # BOTH output fds to devnull so neither the shutdown flush nor a later
+        # stderr write can fail — otherwise the intended 130 becomes 120/1 (F3
+        # MAJOR: the code must be true at the PROCESS boundary, not just in-
+        # process). NOT a config-write failure (that is caught machine-side).
         #
         # The `>&-` case (fd 1 CLOSED, not a pipe) is handled earlier by the
         # `sys.stdout is None` guard, which fires before any prompt; a `try/
@@ -395,7 +417,7 @@ def _run_setup_wizard(config: str | None) -> None:
         # typer.echo does not raise on a None stdout, and typer.prompt's
         # "lost sys.stdout" is pre-empted by that guard), so it is deliberately
         # NOT added — no dead code, no fragile message matching.
-        _silence_stdout()
+        _silence_output()
         raise typer.Exit(code=_CANCEL_EXIT) from None
     # Explicit elif chain with a loud else: a new Outcome literal must NOT
     # silently fall through to exit 5 (F3-4c — fail loudly on unmapped outcomes).
@@ -406,10 +428,12 @@ def _run_setup_wizard(config: str | None) -> None:
     elif result.outcome == "failed":
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
     elif result.outcome == "write-error":
-        typer.echo(f"setup: {result.detail}", err=True)
+        _echo_err(f"setup: {result.detail}")
+        _silence_output()
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
     elif result.outcome == "status-error":
-        typer.echo(f"setup: {result.detail}", err=True)
+        _echo_err(f"setup: {result.detail}")
+        _silence_output()
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
     elif result.outcome == "aborted":
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / capped

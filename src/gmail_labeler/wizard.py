@@ -443,8 +443,10 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str | None:
         if strikes >= max_strikes:
             io.out(
                 "  Stopping here — I could not verify a desktop client after "
-                f"{max_strikes} tries. Nothing was written. The README's manual "
-                "setup covers the same steps if you'd rather drive them yourself."
+                f"{max_strikes} tries. Nothing was written. Re-run "
+                "`gmail-labeler auth setup` once you know where the Desktop-app "
+                "client JSON landed; the README's manual setup covers the same "
+                "steps if you'd rather drive them yourself."
             )
             return None
         # else: re-ask (bounded — at most max_strikes rejects before the abort)

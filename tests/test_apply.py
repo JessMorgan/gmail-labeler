@@ -530,6 +530,53 @@ def test_transient_write_failure_holds_nothing_rerun_picks_it_up(
 # -- landmine: >1-page paging fidelity ----------------------------------------
 
 
+def test_stop_between_pages_does_not_pay_for_another_page(tmp_path: Path) -> None:
+    # the between-PAGES should_stop sample (the daemon's shape): a flag
+    # that flips AFTER a batch's message loop but before the next page
+    # must stop the loop — the current batch reached its commit point, so
+    # no further Gmail writes. Mutant: drop the between-pages check and
+    # page 2 is fetched, scored, WRITTEN and committed (batches=2)
+    msgs = [
+        FakeMessage(
+            id="aa22", eml=_eml("two", "body two"), label_ids=("INBOX",), thread_id="t2"
+        ),
+        FakeMessage(
+            id="aa44",
+            eml=_eml("four", "body four"),
+            label_ids=("INBOX",),
+            thread_id="t4",
+        ),
+    ]
+    scores = {
+        "two\nbody two": (0.9, 0.1),  # Money/Bills high → write
+        "four\nbody four": (0.2, 0.9),  # Shipping high → write
+    }
+    fake = FakeGmailClient(messages=msgs, labels=_labels(), page_size=1)
+    db = _db(tmp_path)
+    calls: list[int] = []
+
+    def stop_after_first_page() -> bool:
+        # the batch-1 message-loop sample returns False (the batch
+        # completes); the between-pages sample (the 2nd call) returns True
+        calls.append(1)
+        return len(calls) >= 2
+
+    outcome = run_apply(
+        client=fake,
+        db=db,
+        model=FakeModel(VOCAB, scores=scores),
+        ctx=_ctx(),
+        query="after:0",
+        clock=lambda: TS,
+        should_stop=stop_after_first_page,
+        dry_run=False,
+    )
+    assert outcome.batches == 1  # page 2 never processed
+    assert outcome.written == 1  # only aa22 landed; aa44's page was not paid for
+    assert "get_message:aa44" not in fake.calls
+    db.close()
+
+
 def test_preview_pages_through_multiple_pages(tmp_path: Path) -> None:
     # the wire pageToken chain: a preview over >1 page must page correctly
     # (idle/last-page behavior mirrors history paging fidelity)

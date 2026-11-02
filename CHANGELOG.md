@@ -31,6 +31,11 @@ does not ship releases yet.
   - Confirm-before-overwrite on the config path (a `resolve()`-compare posture,
     stated; the samefile/fd family is #47's scope). The exit contract gains 130
     for Ctrl-C at a prompt, matching typer's raw-KeyboardInterrupt posture.
+  - Wording-drift ledger (honesty): the C2-era rewrite silently dropped the
+    looked-in-paths + "copy example.toml" hint from the fresh-profile `auth`
+    message — the exit code was preserved but the guidance vanished without a
+    note. F2 restores the informative text (still exit 4). Recorded so both the
+    drift and its fix are on the ledger.
   - README Setup now leads with the wizard (the manual steps remain as a
     collapsible fallback); ADR-0004's Status note is updated in the same commit
     it explicitly awaited.

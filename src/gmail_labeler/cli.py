@@ -3579,8 +3579,9 @@ def _serve_startup(
             f"{store.root / SIDECAR_FILTERS} — correction attribution is "
             "UNKNOWN, so every 'added' Correction is withheld as "
             "'unverifiable' (not credited as training signal). Run "
-            "`dataset export` against this store to enable filter "
-            "attribution.",
+            "`dataset export` against this store and RESTART the daemon to "
+            "enable filter attribution (the snapshot is read at startup "
+            "only).",
             err=True,
         )
 

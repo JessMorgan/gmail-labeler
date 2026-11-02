@@ -841,7 +841,7 @@ class AppDB:
         try:
             # ONE transaction (the record_run precedent): the context
             # manager commits rows AND cursor together, and rolls back
-            # BOTH on any failure — a half-committed page (rows without
+            # BOTH on any failure — a half-committed delta (rows without
             # the cursor) would double-write the rows on replay (the
             # atomicity pin: test_commit_page_rolls_back_rows_and_cursor)
             with self._conn:

@@ -52,7 +52,7 @@ app = typer.Typer(
     epilog=(
         "Exit codes: 0 ok · 2 usage error · 3 not implemented · "
         "4 auth/config unusable · 5 operation failed or incomplete · "
-        "130 cancelled (Ctrl-C) or the output channel was lost"
+        "130 cancelled (Ctrl-C)"
     ),
     no_args_is_help=True,
 )

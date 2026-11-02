@@ -1,10 +1,10 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add apply/status (absent until wired, which surfaces as a
-usage error). Phase 0 subcommands, the Phase 1 ``train``/``eval``/
-``shadow`` commands, and the Phase 2 ``daemon`` (ticket #25) are wired
-as they are implemented. Exit 3 is reserved for wired-but-stubbed
+the Phase 1 ``train``/``eval``/``shadow`` commands, the Phase 2 ``daemon``
+(ticket #25), and the Phase 2 ``apply`` bulk path (ticket #26) are wired
+as they are implemented; ``status`` remains absent until wired (which
+surfaces as a usage error). Exit 3 is reserved for wired-but-stubbed
 commands and currently UNREACHABLE — no command is stubbed; scripts can
 branch on 0/2/4/5 today.
 """
@@ -3169,6 +3169,7 @@ def _serve_startup(
     bands: str,
     graduation: str,
     db: str | None,
+    mint_labels: bool = True,
 ) -> _ServeStartup:
     """The daemon's gates-first startup, extracted VERBATIM (ticket #26):
     identity gates run FIRST (the shadow-run shape: checkpoint, Graduation
@@ -3180,7 +3181,19 @@ def _serve_startup(
     daemon and the apply path — the seams are shared, not forked. The
     daemon command and the apply command are the only callers; the
     daemon's poll loop and the apply batch both consume the returned
-    bundle unchanged."""
+    bundle unchanged.
+
+    ``mint_labels`` is the preview's read-only discipline (ticket #26
+    AC1): the daemon and the ``apply --apply`` backfill pass True (the
+    get-or-create ensure_label, the daemon's sealed behavior — a
+    System-Label name collision still refuses at exit 4). A dry PREVIEW
+    passes False: the Tier Label names resolve by LOOKUP ONLY (the
+    already-listed labels), and a name the mailbox does not carry hits
+    the MINT GUARD — refused NAMED (exit 5), never silently created (a
+    preview performs zero wire writes, so it cannot mint its own Tier
+    Labels; the operator runs ``apply --apply``/``daemon`` or creates
+    them first). The collision case is still a config error (exit 4, the
+    same rename diagnosis ensure_label gives)."""
     from .auth import AuthError
     from .corpus_record import corpus_fingerprint
     from .corpus_store import CorpusError, CorpusStore
@@ -3446,6 +3459,47 @@ def _serve_startup(
         ("high", cfg.labels.high),
         ("med", cfg.labels.med),
     ):
+        if not mint_labels:
+            # the preview's MINT GUARD (AC1): a dry run never creates a
+            # label, so the Tier Label names resolve by LOOKUP ONLY. An
+            # exact-case USER label of the name is used as-is (the same
+            # get ensure_label would take); a System-Label name-sake is
+            # the config error it always was (exit 4, the rename
+            # diagnosis); an ABSENT name is refused NAMED (exit 5) — the
+            # preview cannot mint the label it needs to compose a
+            # faithful plan, so it says so instead of writing
+            hit = next(
+                (li for li in labels if li.name == name and li.type == "user"), None
+            )
+            if hit is not None:
+                tier_label_ids[tier_constants[key]] = hit.id
+                continue
+            collide = next(
+                (
+                    li
+                    for li in labels
+                    if li.type == "system" and li.name.casefold() == name.casefold()
+                ),
+                None,
+            )
+            if collide is not None:
+                typer.echo(
+                    f"{command} failed: [labels] {key} = {name!r} refused: "
+                    f"{name!r} collides with a System Label name in the "
+                    "mailbox — rename [labels] applied/high/med (System "
+                    f"Labels are never write targets) \u2014 rename [labels] "
+                    f"{key} and restart",
+                    err=True,
+                )
+                raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+            typer.echo(
+                f"{command} failed: [labels] {key} = {name!r} is not present "
+                "in the mailbox \u2014 a preview does not create Tier Labels; "
+                "run `apply --apply` (or `daemon`) to create it, or create "
+                "it yourself",
+                err=True,
+            )
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
         try:
             tier_label_ids[tier_constants[key]] = client.ensure_label(name)
         except ValueError as e:
@@ -3617,6 +3671,206 @@ def daemon(
         daemon_log.setLevel(previous_log_level)
         _restore_shutdown_handlers(previous_handlers)
         store_db.close()
+
+
+@app.command("apply")
+def apply_cmd(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — the calibrated Threshold Bands)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — only GRADUATED labels apply)",
+    ),
+    since: str = typer.Option(
+        ...,
+        "--since",
+        help=(
+            "ISO date (YYYY-MM-DD): the Backfill boundary — process mail "
+            "from that day onward (the named day is INCLUDED — the cutoff "
+            "is UTC midnight of it). REQUIRED: the only bulk path never "
+            "guesses its own window"
+        ),
+    ),
+    apply_flag: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Perform the backfill (write graduated labels + record "
+            "Applications). WITHOUT it: a dry preview that scores the "
+            "window and writes NOTHING"
+        ),
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+) -> None:
+    """Preview or backfill graduated labels over HISTORICAL mail since
+    ``--since`` — the ONLY bulk path, always an explicit human decision
+    (ticket #26; GLOSSARY: Application, Backfill).
+
+    Without ``--apply`` this is a dry preview: it scores the window and
+    reports the would-apply lines (id + label names + band/tier + scores)
+    and performs ZERO Gmail writes (AC1). With ``--apply`` it backfills:
+    the SAME decision core the daemon runs (``applications.
+    plan_message_write`` — one core, no second implementation, AC2), the
+    write-first ordering identical to the daemon, and Applications
+    recorded identically to daemon-applied ones (AC3). skip-present makes
+    a re-run idempotent (AC4): a label that already landed reads present,
+    composes an empty plan, earns no second write and no duplicate row.
+
+    The wire query is ``after:<epoch-seconds>`` ONLY — deliberately
+    WITHOUT ``in:inbox`` (backfill targets historical mail, which is
+    mostly archived); the epoch form is the unambiguous one (a calendar
+    date in an API query is midnight PST, not the UTC boundary). The
+    cutoff reuses the shadow-run rule (``_backlog_cutoff``: UTC midnight
+    of the named day). apply NEVER reads or writes the daemon's history
+    cursor (invariant #3 is the daemon's alone); a mid-run SIGTERM
+    completes the current batch to its commit point (the shared shutdown
+    handler), and a transient write failure holds NOTHING — the message
+    stays un-labeled and a re-run picks it up.
+
+    Records in the window lacking a Date Provenance stamp (pre-#17
+    corpora) surface ONE counted warning at the boundary (AC5): the
+    date-based window is only as trustworthy as the dates. Bodies never
+    enter the DB or any log (invariant #5). Exit codes: 0 clean · 2
+    usage · 4 auth/config (incl. the tier-name collision) · 5 artifact/
+    store failure, a preview whose Tier Labels are absent, or a model /
+    wire failure."""
+    import logging
+    import sys
+
+    from .appdb import AppDB, AppDBError
+    from .apply import run_apply
+    from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES
+    from .gmail_errors import GmailAuthError, GmailError
+
+    # --since is REQUIRED (the only bulk path never guesses its window);
+    # typer rejects an absent option itself. Strict ISO (strptime, not
+    # the lenient 3.11+ fromisoformat — the shadow-run precedent): a
+    # non-ISO value is a usage error (exit 2)
+    try:
+        since_date = datetime.strptime(since, "%Y-%m-%d").date()
+    except ValueError:
+        typer.echo(
+            f"apply failed: --since {since!r} is not an ISO date (YYYY-MM-DD)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    now = _now()
+    cutoff_dt = _backlog_cutoff(since_date, now)  # UTC midnight of the named day
+    # the backfill query: after:<epoch-seconds> ONLY — no in:inbox (the
+    # window is historical mail, mostly archived; the epoch form is the
+    # unambiguous one per #23's primary-source doctrine)
+    query = f"after:{int(cutoff_dt.timestamp())}"
+
+    # the gates-first startup, SHARED with the daemon (_serve_startup):
+    # a dry preview FORBIDS minting Tier Labels (mint_labels=False — the
+    # AC1 zero-write discipline: a preview that needs a label it lacks
+    # fails named, never silently creates); the backfill resolves them via
+    # ensure_label exactly as the daemon does
+    startup = _serve_startup(
+        command="apply",
+        config=config,
+        bands=bands,
+        graduation=graduation,
+        db=db,
+        mint_labels=apply_flag,
+    )
+    client = startup.client
+    model = startup.model
+    ctx = startup.ctx
+    db_path = startup.db_path
+
+    # AC5: the --since boundary is a DATE; a corpus record whose date has
+    # no server-authoritative provenance stamp (pre-#17 lines read as
+    # "unknown") cannot be trusted to sit on the right side of it. ONE
+    # counted warning at the boundary (never per-message spam)
+    unprovenanced = sum(
+        1
+        for rec in startup.records
+        if rec.date >= cutoff_dt
+        and rec.date_provenance not in SERVER_AUTHORITATIVE_PROVENANCES
+    )
+    if unprovenanced:
+        typer.echo(
+            f"apply: WARNING {unprovenanced} corpus record(s) dated at or "
+            f"after the --since boundary ({cutoff_dt.date()}) lack a "
+            "server-authoritative Date Provenance stamp — the date-based "
+            "window is only as trustworthy as those dates (GLOSSARY: Date "
+            "Provenance)",
+            err=True,
+        )
+
+    typer.echo(
+        f"apply: {'backfill' if apply_flag else 'preview'} query={query!r} "
+        f"serving {len(ctx.graduated)} graduated label(s); db {db_path}",
+        err=True,
+    )
+    stop_flag = threading.Event()
+    previous_handlers = _install_shutdown_handlers(stop_flag)
+    # the preview lines and per-batch counters are INFO on the apply
+    # logger; install a stderr handler so they reach the operator (the
+    # daemon's F2 MINOR 7 precedent), removed in the finally
+    store_db = AppDB(db_path)
+    apply_log = logging.getLogger("gmail_labeler.apply")
+    log_handler = logging.StreamHandler(sys.stderr)
+    log_handler.setLevel(logging.INFO)
+    previous_log_level = apply_log.level
+    apply_log.setLevel(logging.INFO)
+    apply_log.addHandler(log_handler)
+    try:
+        store_db.open()
+        outcome = run_apply(
+            client=client,
+            db=store_db,
+            model=model,
+            ctx=ctx,
+            query=query,
+            clock=_now,
+            should_stop=stop_flag.is_set,
+            dry_run=not apply_flag,
+        )
+    except GmailAuthError as e:
+        # the propagating human-gated arm (exit 4, never a traceback)
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        # a page-read failure: apply has no cursor to resume from, so the
+        # honest posture is a loud stop (a re-run re-pages, skip-present
+        # idempotent)
+        typer.echo(f"apply failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except AppDBError as e:
+        typer.echo(f"apply failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        # a model shape defect or a model-raised failure: the cause is
+        # named by CLASS only (a model error may quote the scored TEXT,
+        # which carries the body — invariant #5)
+        typer.echo(
+            f"apply failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        apply_log.removeHandler(log_handler)
+        apply_log.setLevel(previous_log_level)
+        _restore_shutdown_handlers(previous_handlers)
+        store_db.close()
+    typer.echo(
+        f"apply: {'backfill' if apply_flag else 'preview'} done "
+        f"batches={outcome.batches} messages={outcome.messages} "
+        f"written={outcome.written} skipped={outcome.skipped} "
+        f"warnings={outcome.warnings} rows={outcome.rows}",
+        err=True,
+    )
 
 
 if __name__ == "__main__":

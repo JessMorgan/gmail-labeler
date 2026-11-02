@@ -830,8 +830,9 @@ does not ship releases yet.
   the fake's history fixtures emit the documented shape (arrivals carry
   generic stubs AND `messagesAdded`; a modify carries `labelsAdded` but no
   `messagesAdded`) so the fixture can no longer mirror the code. A non-incoming
-  guard counts-skips the operator's own SENT/DRAFT arrivals and CHAT (matching
-  the corpus's DRAFT/CHAT exclusion).
+  guard counts-skips SENT/DRAFT/CHAT arrivals that are NOT also in INBOX (the id
+  set is a SUPERSET of the corpus's DRAFT/CHAT exclusion — SENT is here for the
+  self-echo reason, not a corpus one; the INBOX exemption landed in S2).
 - Stack review S1 — the crash-replay window cannot fake a human's hand: a
   `labelsAdded` for a label this tick skipped as already-present with no
   Application row (the daemon's own landed write whose row was lost before
@@ -841,6 +842,20 @@ does not ship releases yet.
   ONLY the human credit; a proven `filter_covered` add for the same event
   stands. GLOSSARY / README / the daemon docstrings gain this fourth
   unverifiable cause.
+- Stack review S2 — the non-incoming guard is COMPOUND: a SENT/DRAFT/CHAT
+  message is skipped only when it is NOT also in INBOX, so a message the human
+  dragged back into the inbox (the sole producer of SENT+INBOX co-occurrence —
+  native self-addressed mail arrives as a distinct copy Gmail does not tag SENT,
+  and a user label merely named 'sent' never matches the id-guard) is scored,
+  not silently under-labelled. Manager-sustained over a reviewer disagreement
+  (deepseek: a wrong-skip is the rank-one starvation class and the compound
+  costs zero native coverage; qwen, dissenting: own outgoing is not
+  incoming-from-others mail) — both verified the compound is a no-op on every
+  native flow. The guard is daemon-scoped (ROADMAP permits `apply` to label
+  non-incoming mail); `_OUTGOING_LABEL_IDS` renamed `NON_INCOMING_LABEL_IDS`.
+  The per-label rationale split (DRAFT/CHAT never-legitimate-targets vs SENT
+  self-echo) replaces the earlier "outside the training distribution" claim,
+  which was false — export's `in:anywhere` query puts sent mail IN the corpus.
 
 ### Changed
 

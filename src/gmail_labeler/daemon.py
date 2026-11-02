@@ -310,18 +310,44 @@ def predict_conformant(
 #: message (the guide's own claim); its historyId is the cursor seed.
 BOOTSTRAP_QUERY = ""
 
-#: The Gmail system labels marking mail that is NOT incoming mail the daemon
-#: should classify: SENT (the operator's own outgoing), DRAFT (pre-send), and
-#: CHAT (not email). `dataset export` already EXCLUDES DRAFT+CHAT from the
-#: corpus (export.py _EXCLUDED_SYSTEM_LABEL_IDS); labelling them on the live
-#: path would apply ai-applied/tier labels to a draft before the operator even
-#: sends it — an inference target deliberately outside the training
-#: distribution. A sent message arrives on the history stream as a messageAdded
-#: too — MEDIUM confidence: a single practitioner report, but the product need
-#: to skip our own outgoing / non-incoming mail holds regardless of which field
-#: Gmail signals it with. "SELF" is a search-query term, not a label id, so the
-#: system label ids are the machine-checkable signal here (see the guard).
-_OUTGOING_LABEL_IDS = frozenset({"SENT", "DRAFT", "CHAT"})
+#: System label ids marking mail that is NOT incoming-from-others mail the
+#: daemon should score. The skip is COMPOUND (see the fetch-loop guard): a
+#: message is skipped iff it carries one of these ids AND is NOT also in INBOX.
+#:
+#: Per-label reason (the two ids earn their place differently):
+#:   DRAFT / CHAT — never legitimate classification targets; the corpus already
+#:     hard-excludes them (export.py _EXCLUDED_SYSTEM_LABEL_IDS), so scoring a
+#:     pre-send draft or a chat would feed the model an inference target it was
+#:     never trained on.
+#:   SENT — a SELF-ECHO guard, not a corpus-exclusion one: our own
+#:     apply_labels writes and the operator's sent mail arrive on the history
+#:     stream as a messageAdded too (the push guide's notification-loop hazard;
+#:     MEDIUM confidence — a single practitioner report, but the need to not
+#:     re-score our own writes holds regardless of the field Gmail signals it
+#:     with). SENT is NOT corpus-excluded — export's DEFAULT_QUERY is
+#:     `in:anywhere …`, which INCLUDES sent mail — so it is wrong to call it
+#:     "outside the training distribution"; it is here to stop the daemon
+#:     labelling the operator's own outgoing mail, nothing more. "SELF" is a
+#:     search-query term, not a label id, so the SENT system id is the
+#:     machine-checkable signal.
+#:
+#: WHY THE INBOX EXEMPTION (the compound) — the manager SUSTAINED this over a
+#: reviewer disagreement, both families heard:
+#:   deepseek: a PLAIN set silently under-labels the ONE construct where the
+#:     human's own hand put a SENT-tagged message back in the inbox (a drag);
+#:     a wrong-skip is the rank-one starvation class, and the compound costs
+#:     zero native coverage.
+#:   qwen (dissent, recorded not erased): the plain skip is correct because our
+#:     own outgoing is not incoming-from-others mail.
+#: Both INDEPENDENTLY verified the compound is a NO-OP on every NATIVE Gmail
+#: flow: self-addressed mail arrives as a DISTINCT inbox copy Gmail does NOT
+#: tag SENT, and a user label merely NAMED 'sent' never matches the id-guard
+#: (it keys on label IDS). So the only producer of SENT+INBOX co-occurrence is
+#: the human's own drag — and README scopes the daemon to "scores arriving
+#: mail" (line 19), which a dragged-back message is once it is in the inbox.
+#: The guard is DAEMON-SCOPED only: ROADMAP's Never-list (line 206) explicitly
+#: permits the deliberate `apply` command to label non-incoming mail.
+NON_INCOMING_LABEL_IDS = frozenset({"SENT", "DRAFT", "CHAT"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,11 +482,15 @@ def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
     LABELING (README 'scores arriving mail'; ROADMAP Never: no retroactive
     labeling except via the deliberate `apply` command). Records carrying
     only labels/threadThreads/messages[]-without-messagesAdded have no
-    arrival event and pass through; a MALFORMED messagesAdded list is a
-    lying wire — loud permanent (the adapter's shape doctrine). The nested
-    Message id is read; a flat id is tolerated defensively (the
-    _label_event_message_id precedent — a wrong shape reads as FEWER
-    arrivals, never a bad write, ADR-0005 fail-safe).
+    arrival event and pass through. Two distinct failure shapes, two
+    postures: a record with NO ``messagesAdded`` (a label-only modify) simply
+    contributes FEWER arrivals — it passes through, the cursor advances,
+    never a bad write (ADR-0005 fail-safe); but a ``messagesAdded`` LIST that
+    is present yet MALFORMED (not a list of objects) or whose event carries
+    NO id at all is the loud-permanent OTHER half — it raises and the fetch
+    loop HOLDS the cursor (a lying arrival wire is never silently under-read).
+    The nested Message id is read; a flat id is tolerated defensively (the
+    _label_event_message_id precedent).
 
     HONEST SCOPE of "arrivals": messagesAdded[] is literally "added to the
     MAILBOX", which is not identical to "newly received" — a Trash/Spam
@@ -917,17 +947,20 @@ def _run_tick(
                     e,
                 )
                 return stop
-            if outgoing := sorted(_OUTGOING_LABEL_IDS & set(raw.label_ids)):
-                # S1 sent/non-incoming guard: the operator's own SENT/DRAFT
-                # mail and CHAT arrive as a messageAdded too (see
-                # _OUTGOING_LABEL_IDS for the rationale + confidence note). A
-                # counted SKIP — named by the triggering label id (body-free),
-                # never scored, never written — the posture of a ghost skip.
+            label_ids = set(raw.label_ids)
+            non_incoming = sorted(NON_INCOMING_LABEL_IDS & label_ids)
+            if non_incoming and "INBOX" not in label_ids:
+                # S2 non-incoming guard (see NON_INCOMING_LABEL_IDS for the
+                # per-label rationale + the sustained ruling on the INBOX
+                # exemption). A counted SKIP — named by the triggering label id
+                # (body-free), never scored, never written — the posture of a
+                # ghost skip. A SENT message the human dragged back into the
+                # inbox (SENT+INBOX) is NOT skipped: it is arriving mail again.
                 skipped += 1
                 log.warning(
                     "daemon: skipped message %s: non-incoming (%s)",
                     message_id,
-                    ",".join(outgoing),
+                    ",".join(non_incoming),
                 )
                 continue
             try:

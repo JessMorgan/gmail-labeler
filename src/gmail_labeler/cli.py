@@ -337,18 +337,31 @@ def _echo_out(text: str) -> None:
 
 
 def _silence_output() -> None:
-    """Retarget BOTH the stdout (fd 1) and stderr (fd 2) descriptors at /dev/null
-    so the interpreter's shutdown flush of either can neither fail (BrokenPipeError
-    -> exit 120) nor print. Called before every cancel/incomplete Exit so the exit
-    code we chose is what the PROCESS actually returns — including the merged-
-    stream case (`auth setup 2>&1 | head`) where stderr SHARES the dead pipe and a
-    diagnosis echo to fd 2 would otherwise EPIPE out of the handler (exit 1). dup2
-    onto a closed fd (`>&-`) simply recreates it as /dev/null, which is harmless."""
-    with contextlib.suppress(OSError):
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
-        os.close(devnull)
+    """Retarget the real stdout (fd 1) / stderr (fd 2) descriptors at /dev/null so
+    the interpreter's shutdown flush of either can neither fail (BrokenPipeError ->
+    exit 120) nor print, before a cancel/incomplete Exit — including the merged
+    `auth setup 2>&1 | head` case where stderr SHARES the dead pipe and a diagnosis
+    echo to fd 2 would otherwise EPIPE out of the handler (exit 1).
+
+    It is guarded on fileno(): the operation is only correct for the REAL fd 1/2.
+    Under the in-process CliRunner, sys.stdout is a StringIO (no fd) or a harness
+    pipe (fd != 1), so this is a deliberate NO-OP there — the exit code is captured
+    directly and there is no interpreter shutdown to break, and a hardcoded
+    dup2(…, 1) would clobber the test process's own stdout for the rest of the run.
+    In the real subprocess (a pipe/terminal on fd 1/2) both are retargeted."""
+    import sys
+
+    for stream, want in ((sys.stdout, 1), (sys.stderr, 2)):
+        try:
+            fd = stream.fileno()  # None -> AttributeError; StringIO -> ValueError
+        except (AttributeError, OSError, ValueError):
+            continue
+        if fd != want:  # redirected / harness stream: not the real descriptor
+            continue
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, fd)
+            os.close(devnull)
 
 
 def _echo_err(text: str) -> None:
@@ -421,11 +434,17 @@ def _run_setup_wizard(config: str | None) -> None:
         raise typer.Exit(code=_CANCEL_EXIT) from None
     # Explicit elif chain with a loud else: a new Outcome literal must NOT
     # silently fall through to exit 5 (F3-4c — fail loudly on unmapped outcomes).
+    # Every non-zero Exit routes through _silence_output so the closed set holds at
+    # the boundary uniformly (a no-op under CliRunner; a real retarget in the
+    # subprocess). The echo-free arms below write nothing, but silencing keeps the
+    # invariant "every non-zero Exit retargets both fds" true by construction.
     if result.outcome == "completed" and result.signed_in:
         return  # exit 0
     elif result.outcome == "completed":
+        _silence_output()
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — finished but NOT signed in
     elif result.outcome == "failed":
+        _silence_output()
         raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
     elif result.outcome == "write-error":
         _echo_err(f"setup: {result.detail}")
@@ -436,6 +455,7 @@ def _run_setup_wizard(config: str | None) -> None:
         _silence_output()
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
     elif result.outcome == "aborted":
+        _silence_output()
         raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / capped
     else:
         raise AssertionError(f"unmapped wizard outcome: {result.outcome!r}")

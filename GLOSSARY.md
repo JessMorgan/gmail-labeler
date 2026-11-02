@@ -7,7 +7,7 @@ strictly-local model, trained on the owner's own labeling history.
 
 **Managed Label**:
 One of the small set of content labels the owner permits the system to apply.
-All other labels are untouchable. All other labels are untouchable.
+All other labels are untouchable.
 _Avoid_: target label, predicted label
 
 **Tier Label**:

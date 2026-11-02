@@ -774,7 +774,7 @@ def test_v2_db_with_only_applications_is_ours(tmp_path: Path) -> None:
     conn.close()
     db = AppDB(db_path)
     db.open()  # no refusal; shadow_results is created if-missing
-    db.record_applications([_app_row()])
+    db.commit_applications([_app_row()])
     assert len(db.applications_for_message("aa")) == 1
     db.close()
 
@@ -783,7 +783,7 @@ def test_applications_coeexists_with_unknown_tables(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     db = AppDB(db_path)
     db.open()
-    db.record_applications([_app_row()])
+    db.commit_applications([_app_row()])
     db.close()
     conn = sqlite3.connect(str(db_path))
     conn.execute("CREATE TABLE other_app_data (id INTEGER PRIMARY KEY)")
@@ -795,10 +795,10 @@ def test_applications_coeexists_with_unknown_tables(tmp_path: Path) -> None:
     db2.close()
 
 
-def test_record_applications_roundtrip(tmp_path: Path) -> None:
+def test_commit_applications_roundtrip(tmp_path: Path) -> None:
     db = AppDB(tmp_path / "state.db")
     db.open()
-    count = db.record_applications(
+    count = db.commit_applications(
         [
             _app_row("bb", "Money/Bills", "Label_2", 0.7, "med", "ai-med"),
             _app_row("aa", "Shipping", "Label_1", 0.9, "high", "ai-high"),
@@ -822,28 +822,19 @@ def test_record_applications_roundtrip(tmp_path: Path) -> None:
     db2.close()
 
 
-def test_record_applications_empty_is_refused(tmp_path: Path) -> None:
-    # like record_run: an empty batch is refused at the writer
-    db = AppDB(tmp_path / "state.db")
-    db.open()
-    with pytest.raises(AppDBError, match="no rows"):
-        db.record_applications([])
-    db.close()
-
-
-def test_record_applications_allows_reapplication_history(tmp_path: Path) -> None:
+def test_commit_applications_allows_reapplication_history(tmp_path: Path) -> None:
     # NO PK on (message_id, label): a label manually removed and later
     # re-earned earns a NEW Application — the audit history is the
     # operator's, not a uniqueness constraint
     db = AppDB(tmp_path / "state.db")
     db.open()
-    db.record_applications([_app_row()])
-    db.record_applications([_app_row(applied_at=TS.replace(hour=13))])
+    db.commit_applications([_app_row()])
+    db.commit_applications([_app_row(applied_at=TS.replace(hour=13))])
     assert len(db.applications_for_message("aa")) == 2
     db.close()
 
 
-def test_record_applications_row_validation(tmp_path: Path) -> None:
+def test_commit_applications_row_validation(tmp_path: Path) -> None:
     db = AppDB(tmp_path / "state.db")
     db.open()
     bad: list[tuple[ApplicationRow, str]] = [
@@ -874,20 +865,22 @@ def test_record_applications_row_validation(tmp_path: Path) -> None:
     ]
     for row, cause in bad:
         with pytest.raises(AppDBError, match=cause):
-            db.record_applications([row])
+            db.commit_applications([row])
     # duplicate (message_id, label) WITHIN one batch is a composition bug
     with pytest.raises(AppDBError, match="duplicate"):
-        db.record_applications([_app_row(), _app_row(label_id="Label_2")])
+        db.commit_applications([_app_row(), _app_row(label_id="Label_2")])
     assert db.applications_for_message("aa") == ()  # nothing half-written
     db.close()
 
 
-def test_record_applications_one_transaction(tmp_path: Path) -> None:
+def test_commit_applications_rolls_back_leaves_prior_batch_intact(
+    tmp_path: Path,
+) -> None:
     # the crash-safety contract (record_run's): a mid-batch INSERT
     # failure rolls back the whole batch — no half rows
     db = AppDB(tmp_path / "state.db")
     db.open()
-    db.record_applications([_app_row("aa")])
+    db.commit_applications([_app_row("aa")])
 
     class _FlakyConn:
         # delegating proxy: the next executemany raises (a simulated
@@ -913,7 +906,7 @@ def test_record_applications_one_transaction(tmp_path: Path) -> None:
     assert real_conn is not None
     db._conn = _FlakyConn(real_conn)  # type: ignore[assignment]
     with pytest.raises(AppDBError, match="disk full"):
-        db.record_applications([_app_row("bb"), _app_row("cc")])
+        db.commit_applications([_app_row("bb"), _app_row("cc")])
     db._conn = real_conn
     assert len(db.applications_for_message("aa")) == 1  # prior batch intact
     assert db.applications_for_message("bb") == ()  # rolled back
@@ -944,7 +937,7 @@ def test_applications_read_revalidates_tampered_rows(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     db = AppDB(db_path)
     db.open()
-    db.record_applications([_app_row()])
+    db.commit_applications([_app_row()])
     db.close()
     conn = sqlite3.connect(str(db_path))
     conn.execute("UPDATE applications SET band = 'low'")
@@ -961,7 +954,7 @@ def test_applications_tampered_applied_at_is_corrupt(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     db = AppDB(db_path)
     db.open()
-    db.record_applications([_app_row()])
+    db.commit_applications([_app_row()])
     db.close()
     conn = sqlite3.connect(str(db_path))
     conn.execute("UPDATE applications SET applied_at = 'not-a-date'")
@@ -1361,7 +1354,7 @@ def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:
 
 def test_commit_page_empty_rows_still_advances_cursor(tmp_path: Path) -> None:
     # a delta whose messages all composed EMPTY plans (skip-present /
-    # no-band) still advances the cursor — record_applications'
+    # no-band) still advances the cursor — commit_applications'
     # empty-batch refusal is deliberately NOT inherited here: the delta
     # WAS handled, the cursor must move
     db = AppDB(tmp_path / "state.db")
@@ -1413,7 +1406,7 @@ def test_commit_page_rolls_back_rows_and_cursor_together(tmp_path: Path) -> None
 
 
 def test_commit_page_refusals_write_nothing(tmp_path: Path) -> None:
-    # refusals BEFORE the transaction (the record_applications doctrine
+    # refusals BEFORE the transaction (the same row/dup doctrine
     # + the cursor refusals): a lying row, a within-batch duplicate, a
     # bad cursor — nothing lands, the cursor untouched
     db = AppDB(tmp_path / "state.db")
@@ -1484,13 +1477,16 @@ def test_commit_applications_rows_land_cursor_untouched(tmp_path: Path) -> None:
 
 
 def test_commit_applications_empty_batch_refused(tmp_path: Path) -> None:
-    # the record_applications refusal, NOT commit_page's empty-tolerance:
-    # apply has no cursor to advance in exchange for an empty batch, so
-    # an empty commit is a caller bug (the plan's no-call-on-empty rule
-    # means a real apply batch always carries a row)
+    # the #24 empty-batch refusal kept here, NOT commit_page's
+    # empty-tolerance: apply has no cursor to advance in exchange for an
+    # empty batch, so an empty commit is a caller bug (the plan's
+    # no-call-on-empty rule means a real apply batch always carries a row).
+    # The match is the EXACT method message ("commit_applications: no
+    # rows") — a bare "no rows" would also match commit_page's sibling
+    # wording and let the wrong method's refusal pass the pin.
     db = AppDB(tmp_path / "state.db")
     db.open()
-    with pytest.raises(AppDBError, match="no rows"):
+    with pytest.raises(AppDBError, match="commit_applications: no rows"):
         db.commit_applications([])
     db.close()
 
@@ -1682,7 +1678,7 @@ def test_v1_migration_crash_mid_transition_leaves_clean_v1(
     assert _versions(db_path) == [3]
     _run_ts, rows = db2.load_run("run-1")  # shadow history SURVIVES
     assert len(rows) == 1
-    db2.record_applications([_app_row()])  # fully usable v3
+    db2.commit_applications([_app_row()])  # fully usable v3
     db2.close()
 
 

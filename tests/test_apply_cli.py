@@ -191,41 +191,90 @@ def test_preview_missing_tier_label_fails_named_not_mints(
     assert fake.writes == []
 
 
+def test_preview_collision_refusal_exit_4_names_the_labels_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # item E: the preview's collision arm (exit 4) had NO test. A dry run
+    # whose configured Tier Label name casefold-matches a System Label (and
+    # has no exact-case USER label of that name) is the CONFIG error it is
+    # on the daemon path too — exit 4, naming the ONE offending [labels]
+    # key. ai-applied resolves (a real user label), ai-high collides.
+    _prepare(tmp_path, monkeypatch)
+    labels = [
+        *_shadow_labels(),
+        LabelInfo("LA", "ai-applied", "user"),  # applied resolves
+        LabelInfo("IMPORTANT", "ai-high", "system"),  # high collides
+    ]
+    fake = FakeGmailClient(messages=_backlog_messages(), labels=labels)
+    result, _ = _run_apply_cli(tmp_path, monkeypatch, fake=fake)
+    assert result.exit_code == 4
+    assert "[labels] high" in result.stderr
+    assert "collides with a System Label" in result.stderr
+    # the diagnostic names the OFFENDING key once, no three-key list
+    assert "[labels] applied/high/med" not in result.stderr
+    assert result.stderr.count("rename [labels]") == 1
+    # and it is a preview: nothing was minted
+    assert fake.writes == []
+
+
 # -- AC5: the provenance warning at the --since boundary ----------------------
 
 
 def test_provenance_warning_one_counted_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # AC5: a corpus record dated at/after the --since boundary whose date
-    # lacks a server-authoritative provenance stamp (a pre-#17 "unknown")
-    # surfaces ONE named warning with the count (never per-message spam)
+    # AC5: corpus records dated at/after the --since boundary whose dates
+    # lack a server-authoritative provenance stamp (pre-#17 "unknown" or
+    # the sender-claimed "mime_date") surface ONE named warning naming the
+    # COUNT — never per-record spam. NON-VACUOUS on the axes a single-
+    # record fixture let through: THREE unprovenanced in-window records (a
+    # per-record-spam mutant survives a one-record fixture); a PROVENANCED
+    # in-window record (must not inflate the count); an unprovenanced
+    # record BEFORE the boundary (must not be counted at all).
     _prepare(tmp_path, monkeypatch)
-    # rewrite ONE in-window corpus record to lack provenance (append-only
-    # doctrine: a pre-#17 line simply has no date_provenance field)
-    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+    from gmail_labeler.corpus_record import CorpusRecord, DateProvenance, body_hash
     from gmail_labeler.corpus_store import CorpusStore
 
     store = CorpusStore(tmp_path / "corpus")
-    rec = CorpusRecord(
-        id="ffff000000000001",
-        date=datetime(2026, 10, 15, tzinfo=UTC),  # inside the --since window
-        subject="old",
-        sender="x@y.z",
-        recipients=("me@x.y",),
-        labels=("Shipping",),
-        body_hash=body_hash("b"),
-        source="api",
-        date_provenance="unknown",  # the pre-#17 state
-    )
-    store.put(rec, "b")
+
+    def _rec(rid: str, dt: datetime, prov: DateProvenance) -> None:
+        store.put(
+            CorpusRecord(
+                id=rid,
+                date=dt,
+                subject="s",
+                sender="x@y.z",
+                recipients=("me@x.y",),
+                labels=("Shipping",),
+                body_hash=body_hash("b"),
+                source="api",
+                date_provenance=prov,
+            ),
+            "b",
+        )
+
+    noon = lambda d: datetime(2026, 10, d, 12, 0, 0, tzinfo=UTC)  # noqa: E731
+    # three unprovenanced, strictly inside the --since window (>= Oct-1 midnight)
+    _rec("ffff000000000001", noon(5), "unknown")
+    _rec("ffff000000000002", noon(15), "unknown")
+    _rec("ffff000000000003", noon(20), "mime_date")  # sender-claimed: NOT authoritative
+    # one PROVENANCED in-window (must NOT be counted)
+    _rec("ffff000000000004", noon(10), "internal_date")
+    # one unprovenanced but strictly BEFORE the boundary (must NOT be counted)
+    _rec("ffff000000000005", datetime(2026, 9, 15, 12, 0, 0, tzinfo=UTC), "unknown")
+
     result, _ = _run_apply_cli(tmp_path, monkeypatch)
     assert result.exit_code == 0, result.stderr
     assert "lack a" in result.stderr and "Date Provenance" in result.stderr
-    assert "1 corpus record" in result.stderr  # the count, ONE line
-    # not spam: exactly ONE warning line (the phrase appears twice inside
-    # the single line, so count the line's distinctive prefix)
+    # not spam: exactly ONE warning line regardless of the record count
     assert result.stderr.count("apply: WARNING") == 1
+    # the named count is the THREE unprovenanced in-window records — not
+    # the provenanced one, not the pre-boundary one (a wrong predicate or a
+    # per-record loop both miscount / mis-line)
+    import re
+
+    m = re.search(r"WARNING (\d+) corpus record", result.stderr)
+    assert m is not None and int(m.group(1)) == 3
 
 
 # -- the exit-code contract ---------------------------------------------------
@@ -262,6 +311,36 @@ def test_apply_auth_gate_exit_4(
     result, _ = _run_apply_cli(tmp_path, monkeypatch, client_factory=_boom)
     assert result.exit_code == 4
     assert "auth:" in result.stderr
+
+
+def test_apply_auth_gate_precedes_state_db_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # item J (the inherited ordering gap): _serve_startup runs the AUTH
+    # gate BEFORE the fail-fast state-DB validation — a not-signed-in run
+    # must not pay the store work (nor leak a store diagnosis over an auth
+    # fault). With BOTH broken (a corrupt DB AND an auth-failing client),
+    # the auth refusal (exit 4) must WIN; a mutant that swaps the two
+    # statements lands exit 5. The daemon suite does not pin this combined
+    # condition (each arm alone passes either order), so it is closed here
+    # at the shared helper, exercised through the apply CLI.
+    _prepare(tmp_path, monkeypatch)
+    from gmail_labeler.auth import AuthError
+
+    def _boom(cfg_: object) -> None:
+        raise AuthError("not signed in")
+
+    corrupt = tmp_path / "corrupt.db"
+    corrupt.write_bytes(b"not a sqlite file")
+    result, _ = _run_apply_cli(
+        tmp_path,
+        monkeypatch,
+        client_factory=_boom,
+        extra=("--since", "2026-10-01", "--db", str(corrupt)),
+    )
+    assert result.exit_code == 4  # auth wins, NOT the store's 5
+    assert "auth:" in result.stderr
+    assert "state DB" not in result.stderr
 
 
 def test_apply_midrun_auth_error_exit_4(

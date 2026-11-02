@@ -26,6 +26,7 @@ headline pins:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -97,16 +98,33 @@ def _scores() -> dict[str, tuple[float, ...]]:
 
 
 def _ctx(**over: Any) -> ServingContext:
-    base: dict[str, Any] = {
-        "bands": {"Money/Bills": (0.8, 0.6), "Shipping": (0.8, 0.6)},
-        "graduated": frozenset({"Money/Bills", "Shipping"}),
-        "system_labels": frozenset({"INBOX"}),
-        "id_to_name": {"L1": "Shipping", "L2": "Money/Bills"},
-        "managed_label_ids": {"Money/Bills": "L2", "Shipping": "L1"},
-        "tier_label_ids": {"ai-applied": "LA", "ai-high": "LH", "ai-med": "LM"},
-    }
-    base.update(over)
-    return ServingContext(**base)  # pyright: ignore[reportArgumentType]
+    # typed locals (no `# pyright: ignore`): the **over unpack into a
+    # dict[str, Any] then ServingContext(**base) forced an argument-type
+    # suppression; naming each field's type lets pyright check the call
+    bands: Mapping[str, tuple[float | None, float | None]] = over.get(
+        "bands", {"Money/Bills": (0.8, 0.6), "Shipping": (0.8, 0.6)}
+    )
+    graduated: frozenset[str] = over.get(
+        "graduated", frozenset({"Money/Bills", "Shipping"})
+    )
+    system_labels: frozenset[str] = over.get("system_labels", frozenset({"INBOX"}))
+    id_to_name: Mapping[str, str] = over.get(
+        "id_to_name", {"L1": "Shipping", "L2": "Money/Bills"}
+    )
+    managed_label_ids: Mapping[str, str] = over.get(
+        "managed_label_ids", {"Money/Bills": "L2", "Shipping": "L1"}
+    )
+    tier_label_ids: Mapping[str, str] = over.get(
+        "tier_label_ids", {"ai-applied": "LA", "ai-high": "LH", "ai-med": "LM"}
+    )
+    return ServingContext(
+        bands=bands,
+        graduated=graduated,
+        system_labels=system_labels,
+        id_to_name=id_to_name,
+        managed_label_ids=managed_label_ids,
+        tier_label_ids=tier_label_ids,
+    )
 
 
 def _db(tmp_path: Path) -> AppDB:

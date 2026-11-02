@@ -70,6 +70,16 @@ def test_unverifiable_added_excluded_from_human_signal() -> None:
     assert r.human_added == 1  # 4 - 1 - 2 (the withheld slices never count)
 
 
+def test_removed_exceeding_written_is_refused_not_clamped() -> None:
+    # F2 item 9: the join gate keeps removed<=written on an honest store,
+    # so removed>written is a corrupt DB -- compute_precision REFUSES named
+    # (PrecisionInvariantError), it does NOT emit a negative precision.
+    from gmail_labeler.status import PrecisionInvariantError
+
+    with pytest.raises(PrecisionInvariantError, match="exceed"):
+        compute_precision(frozenset({"A"}), {"A": 1}, {"A": (3, 0, 0, 0)})
+
+
 def test_graduated_label_with_no_corrections_is_perfect() -> None:
     rows = compute_precision(frozenset({"A"}), {"A": 7}, {})
     assert rows[0].precision == 1.0 and rows[0].removed == 0

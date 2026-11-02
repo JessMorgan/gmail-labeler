@@ -622,14 +622,14 @@ class AppDB:
                 if (
                     versions == {1}
                     and SCHEMA_VERSION >= 2
-                    and not {"applications", "daemon_state"} & tables
+                    and not {"applications", "daemon_state", "corrections"} & tables
                 ):
                     # the legacy v1 stamp (the state #23 shipped): the
                     # migratable exception to the hard gate — the caller
                     # runs the single-row restamp INSIDE the one
                     # transition transaction (the crash story, module
                     # docstring); v3 creates applications AND
-                    # daemon_state on the way
+                    # daemon_state on the way (and v4 corrections)
                     from_version = 1
                 elif versions == {1} and SCHEMA_VERSION >= 2:
                     # {1} WITH a later-version table is inconsistent: no
@@ -637,9 +637,14 @@ class AppDB:
                     # since the atomic transition (F1) — this is a
                     # TAMPER guard. The refusal message names the
                     # offending table(s) and the recovery (manual stamp
-                    # to the current version, or delete).
+                    # to the current version, or delete). corrections is
+                    # v4-only, so a {1}+corrections mix offends exactly as
+                    # the others do (F2 item 5 — the sealed {2}+daemon_state
+                    # doctrine extended to the v4 table).
                     offenders = sorted(
-                        t for t in ("applications", "daemon_state") if t in tables
+                        t
+                        for t in ("applications", "daemon_state", "corrections")
+                        if t in tables
                     )
                     raise AppDBError(
                         f"state DB schema_version [1] is stamped v1 but "
@@ -652,7 +657,7 @@ class AppDB:
                 elif (
                     versions == {2}
                     and SCHEMA_VERSION >= 3
-                    and "daemon_state" not in tables
+                    and not {"daemon_state", "corrections"} & tables
                 ):
                     # the legacy v2 stamp (the state #24 shipped): the
                     # migratable exception — the caller runs the
@@ -660,13 +665,18 @@ class AppDB:
                     # transaction (daemon_state rides the create-all)
                     from_version = 2
                 elif versions == {2} and SCHEMA_VERSION >= 3:
-                    # {2} WITH a daemon_state table is inconsistent: no
-                    # v2 tool ever wrote one, and no crash reaches it
-                    # since the atomic transition (the v2→v3 crash pin)
-                    # — TAMPER guard, recovery named
+                    # {2} WITH a v3/v4-only table (daemon_state or
+                    # corrections) is inconsistent: no v2 tool ever wrote
+                    # one, and no crash reaches it since the atomic
+                    # transition (the v2→v3 crash pin) — TAMPER guard,
+                    # recovery named (F2 item 5: corrections offends exactly
+                    # as daemon_state does)
+                    offenders = sorted(
+                        t for t in ("daemon_state", "corrections") if t in tables
+                    )
                     raise AppDBError(
                         f"state DB schema_version [2] is stamped v2 but "
-                        f"carries a daemon_state table (a v2 tool never "
+                        f"carries {' and '.join(offenders)} (a v2 tool never "
                         f"wrote one) — inconsistent, refusing: {self.path} "
                         f"— recovery: run UPDATE schema_version SET version "
                         f"= {SCHEMA_VERSION} manually, or delete the file "
@@ -1281,16 +1291,33 @@ class AppDB:
         """The number of Application rows per label (the realized-
         precision DENOMINATOR — 'written'), from the LOCAL DB only (no
         Gmail call). Labels with no rows are absent (not zero-filled) —
-        the caller reports the graduated set and treats absent as 0."""
+        the caller reports the graduated set and treats absent as 0.
+
+        Reader doctrine (F2 item 9): revalidates every row's message_id /
+        label shape (the same rules the applications read path enforces),
+        so a hand-made row is refused NAMED here, never silently counted."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT label, COUNT(*) FROM applications GROUP BY label"
+                "SELECT message_id, label FROM applications"
             ).fetchall()
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
-        return {label: count for label, count in rows}
+        counts: dict[str, int] = {}
+        for message_id, label in rows:
+            if not _ID_RE.fullmatch(str(message_id)):
+                raise AppDBError(
+                    f"state DB corrupt (application message_id {message_id!r} "
+                    f"is not 1-64 hex chars): {self.path}"
+                )
+            if not str(label).strip():
+                raise AppDBError(
+                    f"state DB corrupt (application label is empty for "
+                    f"message_id {message_id!r}): {self.path}"
+                )
+            counts[str(label)] = counts.get(str(label), 0) + 1
+        return counts
 
     def correction_label_stats(self) -> dict[str, tuple[int, int, int, int]]:
         """Per label the (removed, added, added_filter_covered,
@@ -1299,18 +1326,37 @@ class AppDB:
         ``added_unverifiable``) are EXCLUDED from the human signal and
         disclosed separately by status. A label with no Corrections is
         absent. 'removed' is always attributed 'human' (invariant #6), so
-        it is not sliced by attribution."""
+        it is not sliced by attribution.
+
+        Reader doctrine (F2 item 9): this aggregate revalidates EVERY row
+        — the message_id/label shape, the kind/attribution vocabularies,
+        and removed-always-human — exactly as the per-row export path
+        (_correction_rows → _check_correction_row) does, so a hand-made
+        row is refused NAMED here too, never silently counted. Iterating
+        row-by-row (not GROUP BY) is what lets it see the message_id."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         try:
             rows = self._conn.execute(
-                "SELECT label, kind, attribution, COUNT(*) FROM corrections "
-                "GROUP BY label, kind, attribution"
+                "SELECT message_id, label, kind, attribution FROM corrections"
             ).fetchall()
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
         stats: dict[str, list[int]] = {}
-        for label, kind, attribution, count in rows:
+        for message_id, label, kind, attribution in rows:
+            # the SAME shape rules _check_correction_row enforces on the
+            # export path (F2 item 9: a NOT-A-HEX id or empty label must
+            # not be counted by status while the export refuses it)
+            if not _ID_RE.fullmatch(str(message_id)):
+                raise AppDBError(
+                    f"state DB corrupt (correction message_id {message_id!r} "
+                    f"is not 1-64 hex chars): {self.path}"
+                )
+            if not str(label).strip():
+                raise AppDBError(
+                    f"state DB corrupt (correction label is empty for "
+                    f"message_id {message_id!r}): {self.path}"
+                )
             if kind not in CORRECTION_KINDS:
                 # the tamper doctrine: the per-row readers revalidate; the
                 # aggregate reader must not SILENTLY drop a hand-edited
@@ -1334,15 +1380,15 @@ class AppDB:
                     f"attributed 'human', not {attribution!r}): {self.path}"
                 )
             # [removed, added, added_filter_covered, added_unverifiable]
-            bucket = stats.setdefault(label, [0, 0, 0, 0])
+            bucket = stats.setdefault(str(label), [0, 0, 0, 0])
             if kind == "removed":
-                bucket[0] += count
+                bucket[0] += 1
             else:  # 'added'
-                bucket[1] += count
+                bucket[1] += 1
                 if attribution == "filter_covered":
-                    bucket[2] += count
+                    bucket[2] += 1
                 elif attribution == "unverifiable":
-                    bucket[3] += count
+                    bucket[3] += 1
         return {
             label: (removed, added, fc, uv)
             for label, (removed, added, fc, uv) in stats.items()

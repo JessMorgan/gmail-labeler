@@ -448,6 +448,58 @@ def test_added_correction_unverifiable_when_filter_criteria_outside(
     db.close()
 
 
+def test_added_correction_unreadable_addlabelids_is_unverifiable(
+    tmp_path: Path,
+) -> None:
+    # F2 item 3 (entry-level #6 inversion): the reviewer's exact probe -- a
+    # relevant filter whose addLabelIds is a bare STRING 'L2' (wrong shape).
+    # The LENIENT reader saw zero ids -> the filter looked irrelevant -> the
+    # add was credited HUMAN. The STRICT reader (analyze's, shared with the
+    # builder + CLI bridge) refuses it, so authorship is undecidable ->
+    # 'unverifiable' (withheld, not guessed -- #22).
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": "L2"}}]
+    )
+    assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
+def test_label_events_plural_takes_precedence_over_singular() -> None:
+    # F2 item 2 (dual-shape double-mint): a record carrying BOTH the plural
+    # and the singular key with DIFFERENT labelIds mints events from the
+    # PLURAL only -- the singular is a fallback read ONLY when the plural is
+    # absent, never additive (reading both would double-mint one hand-fix).
+    from gmail_labeler.daemon import _label_events
+
+    rec = {
+        "id": 1,
+        "messages": [{"id": "aa11", "threadId": "t1"}],
+        "labelsAdded": [{"message": {"id": "aa11"}, "labelIds": ["L2"]}],
+        "labelAdded": [{"message": {"id": "aa11"}, "labelIds": ["L1"]}],
+    }
+    assert _label_events((rec,)) == [("added", "aa11", "L2")]
+
+
+def test_label_events_singular_read_only_when_plural_absent() -> None:
+    # the fallback still works: with NO plural key the singular IS read (the
+    # defensive tolerance for the design brief's named shape)
+    from gmail_labeler.daemon import _label_events
+
+    rec = {
+        "id": 1,
+        "messages": [{"id": "aa11", "threadId": "t1"}],
+        "labelRemoved": [{"message": {"id": "aa11"}, "labelIds": ["L1"]}],
+    }
+    assert _label_events((rec,)) == [("removed", "aa11", "L1")]
+
+
 def test_added_correction_unverifiable_when_fields_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -587,6 +639,18 @@ def test_flat_id_label_event_is_tolerated(tmp_path: Path) -> None:
     assert _tick(tmp_path, fake, db) == 0
     assert len(db.corrections_for_message("aa22")) == 1
     db.close()
+
+
+def test_serving_context_filters_default_is_none_fail_closed() -> None:
+    # F2 item 1: the DEFAULT is None (fail-closed) -- a ServingContext
+    # construction that does not KNOW the filters withholds every 'added'
+    # rather than crediting it to the human. The old ()-default was only a
+    # suite-riding convenience (dead now the wiring is pinned); a revert to
+    # () would make an omitted-filters construction fail OPEN.
+    import dataclasses
+
+    fld = {f.name: f for f in dataclasses.fields(ServingContext)}["filters"]
+    assert fld.default is None
 
 
 # -- the startup snapshot reader (the None-vs-attested-none wiring) -----------

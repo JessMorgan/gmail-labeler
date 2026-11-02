@@ -1922,6 +1922,45 @@ def test_v3_stamp_with_corrections_table_is_refused(tmp_path: Path) -> None:
     assert "UPDATE schema_version SET version = 4" in str(exc.value)
 
 
+def _add_corrections_table(db_path: Path) -> None:
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE corrections (message_id TEXT, label TEXT, kind TEXT, "
+        "detected_at TEXT, attribution TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_v1_stamp_with_corrections_table_is_refused(tmp_path: Path) -> None:
+    # F2 item 5 (the adoption asymmetry): corrections is v4-only, so a
+    # {1}-WITH-corrections mix offends exactly like {1}+applications --
+    # a v1 tool never wrote one. It must REFUSE named, NOT be adopted-and-
+    # restamped (the reviewer probed the old guard, which only listed
+    # applications/daemon_state as offenders)
+    db_path = tmp_path / "state.db"
+    _v1_db(db_path)
+    _add_corrections_table(db_path)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[1\]") as exc:
+        db.open()
+    assert "corrections" in str(exc.value)
+    assert "UPDATE schema_version SET version = 4" in str(exc.value)
+
+
+def test_v2_stamp_with_corrections_table_is_refused(tmp_path: Path) -> None:
+    # F2 item 5: {2}+corrections offends like the sealed {2}+daemon_state
+    # doctrine -- a v2 tool never wrote a v4 table; refuse named, not adopt
+    db_path = tmp_path / "state.db"
+    _v2_db(db_path)
+    _add_corrections_table(db_path)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[2\]") as exc:
+        db.open()
+    assert "corrections" in str(exc.value)
+    assert "UPDATE schema_version SET version = 4" in str(exc.value)
+
+
 def test_wrong_shape_corrections_is_refused(tmp_path: Path) -> None:
     # the ownership gate EXTENDED to the v4 table (the applications /
     # daemon_state pattern): a same-named corrections with the wrong
@@ -2143,11 +2182,35 @@ def test_replayed_correction_event_produces_no_duplicate_row(
     db = AppDB(tmp_path / "state.db")
     db.open()
     db.set_history_cursor(10)
-    corr = _corr_row(message_id="aa", label="Shipping", kind="removed")
-    db.commit_page([_app_row(message_id="aa")], 20, [corr])
-    # replay: the SAME correction re-detected on a later delta
-    db.commit_page([], 30, [corr])
-    assert len(db.corrections_for_message("aa")) == 1  # STATE: one row, not two
+    # the FIRST detection carries detected_at=early + attribution=filter_covered;
+    # the replay re-detects the SAME (message_id, label, kind) but with a
+    # LATER stamp and a DIFFERENT attribution. INSERT OR IGNORE keeps the
+    # first row's bytes; an INSERT OR REPLACE mutant would silently rewrite
+    # detected_at/attribution while leaving the COUNT at 1 (what the old
+    # count-only pin could not see).
+    early = datetime(2026, 11, 1, 9, 0, 0, tzinfo=UTC)
+    late = datetime(2026, 11, 1, 18, 0, 0, tzinfo=UTC)
+    first = _corr_row(
+        message_id="aa",
+        label="Shipping",
+        kind="added",
+        detected_at=early,
+        attribution="filter_covered",
+    )
+    db.commit_page([_app_row(message_id="aa")], 20, [first])
+    replay = _corr_row(
+        message_id="aa",
+        label="Shipping",
+        kind="added",
+        detected_at=late,
+        attribution="human",
+    )
+    # replay: the SAME (message_id, label, kind) re-detected on a later delta
+    db.commit_page([], 30, [replay])
+    rows = db.corrections_for_message("aa")
+    assert len(rows) == 1  # STATE: one row, not two
+    assert rows[0].detected_at == early  # the FIRST stamp survived the replay
+    assert rows[0].attribution == "filter_covered"  # NOT overwritten to 'human'
     assert db.get_history_cursor() == 30  # the replay advanced the cursor
     db.close()
 
@@ -2352,4 +2415,45 @@ def test_correction_label_stats_rejects_tampered_removed_attribution(
     db2.open()
     with pytest.raises(AppDBError, match="always attributed 'human'"):
         db2.correction_label_stats()
+    db2.close()
+
+
+def test_correction_label_stats_rejects_non_hex_message_id(tmp_path: Path) -> None:
+    # F2 item 9 (unify reader doctrine): the export path refuses a
+    # NOT-A-HEX message_id via _check_correction_row; the AGGREGATE reader
+    # status uses must agree -- a hand-made bad id is refused NAMED here,
+    # never silently counted into a label's precision stats
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    db.commit_page([], 20, [_corr_row(message_id="aa", kind="added")])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE corrections SET message_id = 'not-hex!'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="not 1-64 hex chars"):
+        db2.correction_label_stats()
+    db2.close()
+
+
+def test_application_label_counts_rejects_non_hex_message_id(tmp_path: Path) -> None:
+    # the written-side aggregate carries the SAME shape doctrine (a corrupt
+    # applications id is refused NAMED, not counted into the denominator)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.commit_applications([_app_row(message_id="aa", label="Shipping")])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE applications SET message_id = 'not-hex!'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="not 1-64 hex chars"):
+        db2.application_label_counts()
     db2.close()

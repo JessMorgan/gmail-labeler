@@ -110,7 +110,7 @@ from collections.abc import Callable, Mapping, Sequence, Sized
 from dataclasses import dataclass
 from datetime import datetime
 
-from .analyze import filter_label_ids, simulates_filter
+from .analyze import filter_label_ids_strict, simulates_filter
 from .appdb import AppDB, AppDBError, CorrectionRow
 from .applications import ApplicationRow, WritePlan, plan_message_write
 from .corpus_record import preprocess_text
@@ -330,16 +330,18 @@ class ServingContext:
     #           removes, one level up). The CLI warns at startup.
     #   ()    — a snapshot was read and lists NO filters: the operator's
     #           ATTESTATION that none exist, so no relevant filter claims a
-    #           label and an 'added' is 'human' (positive signal). This is
-    #           the default ONLY so the #25/#26 ServingContext constructions
-    #           (and their suites) stay behavior-identical — the daemon's
-    #           correction arm is the ONLY reader. A NEW construction that
-    #           does not KNOW the filters should pass None (fail-closed),
-    #           not the () default (which asserts attested-none).
+    #           label and an 'added' is 'human' (positive signal). The CLI
+    #           passes this EXPLICITLY when it reads a real, empty
+    #           filters.json; the daemon's correction arm is the ONLY reader.
     #   [...] — the filters; an 'added' whose relevant filter is simulatable
     #           and matches is 'filter_covered'; one whose criteria are
     #           outside {from,to,subject} is 'unverifiable' (withheld).
-    filters: Sequence[Mapping[str, object]] | None = ()
+    # The DEFAULT is None (fail-closed): a construction that does not KNOW
+    # the filters withholds every 'added' rather than crediting it to the
+    # human. An attested-none snapshot is passed EXPLICITLY as () by the
+    # CLI (it read a real, empty filters.json); the old ()-default was only
+    # ever a suite-riding convenience and is dead now the wiring is pinned.
+    filters: Sequence[Mapping[str, object]] | None = None
 
 
 def present_names(ctx: ServingContext, raw_label_ids: Sequence[str]) -> frozenset[str]:
@@ -468,39 +470,44 @@ def _label_events(
     each a list of ``{"message": {"id": ...}, "labelIds": [...]}``. The
     adapter passes record internals RAW (gmail_client.history), so this
     is the ONLY place the shape is interpreted. We read the plural keys
-    (correct) and ALSO the singular ones (defensive — the locked design
-    named them; harmless if absent), and tolerate both ``message.id`` and
-    a flat ``id`` (see _label_event_message_id). kind is 'added' for a
-    labelsAdded event, 'removed' for a labelsRemoved one. A malformed
-    label-event list is a lying wire — loud permanent (the _message_ids
-    shape doctrine). Records with no label events pass through."""
+    (correct) and fall back to the singular ones ONLY when the plural is
+    ABSENT (defensive — the locked design named them; harmless if absent),
+    and tolerate both ``message.id`` and a flat ``id`` (see
+    _label_event_message_id). The singular is NOT additive: a record
+    carrying BOTH a plural and a singular key (a lying / hand-made wire)
+    mints events from the PLURAL only — reading both would double-mint,
+    contradicting the fail-safe (a wrong shape must read as FEWER events,
+    never a bad write). kind is 'added' for a labelsAdded event, 'removed'
+    for a labelsRemoved one. A malformed label-event list is a lying wire —
+    loud permanent (the _message_ids shape doctrine). Records with no label
+    events pass through."""
     events: list[tuple[str, str, str]] = []
-    for kind, fields in (
-        ("added", ("labelsAdded", "labelAdded")),
-        ("removed", ("labelsRemoved", "labelRemoved")),
+    for kind, plural, singular in (
+        ("added", "labelsAdded", "labelAdded"),
+        ("removed", "labelsRemoved", "labelRemoved"),
     ):
         for record in records:
-            for field in fields:
-                raw = record.get(field)
-                if raw is None:
-                    continue
-                if not isinstance(raw, list) or not all(
-                    isinstance(e, dict) for e in raw
+            # plural present (even an empty list) wins outright; the
+            # singular is a fallback read ONLY when the plural is absent
+            field = plural if record.get(plural) is not None else singular
+            raw = record.get(field)
+            if raw is None:
+                continue
+            if not isinstance(raw, list) or not all(isinstance(e, dict) for e in raw):
+                raise GmailPermanentError(
+                    f"history record {field!r} not a list of objects"
+                )
+            for event in raw:
+                message_id = _label_event_message_id(event, field)
+                label_ids = event.get("labelIds")
+                if not isinstance(label_ids, list) or not all(
+                    isinstance(x, str) for x in label_ids
                 ):
                     raise GmailPermanentError(
-                        f"history record {field!r} not a list of objects"
+                        f"history {field} event 'labelIds' not a list of strings"
                     )
-                for event in raw:
-                    message_id = _label_event_message_id(event, field)
-                    label_ids = event.get("labelIds")
-                    if not isinstance(label_ids, list) or not all(
-                        isinstance(x, str) for x in label_ids
-                    ):
-                        raise GmailPermanentError(
-                            f"history {field} event 'labelIds' not a list of strings"
-                        )
-                    for label_id in label_ids:
-                        events.append((kind, message_id, label_id))
+                for label_id in label_ids:
+                    events.append((kind, message_id, label_id))
     return events
 
 
@@ -511,35 +518,56 @@ def _attribution(
 ) -> str:
     """Invariant #6 attribution for an 'added' Correction (the #22
     mechanism, REUSED not forked) — one of CORRECTION_ATTRIBUTIONS:
-    - ``"human"`` — no filter adds this label, or every relevant filter is
-      verifiable and does NOT match this message: the human added it
+    - ``"human"`` — a relevant filter verifiably does NOT explain the add
+      (no readable filter adds this label, or every relevant filter is
+      simulatable and does not match this message): the human added it
       (positive training signal);
     - ``"filter_covered"`` — a relevant filter verifiably WOULD have added
       it (``simulates_filter`` True): withheld from the human credit and
       the corpus fold (the export dump still shows it, attributed);
-    - ``"unverifiable"`` — a relevant filter's criteria are outside the
-      simulatable set (``simulates_filter`` None), OR the message's fields
-      were unavailable so authorship cannot be determined: WITHHELD, not
-      guessed (#22's exclusion principle — the old bool INVERTED this by
-      defaulting an unverifiable add to the human).
-    ``ctx.filters is None`` (NO usable snapshot — absent or malformed) ->
-    attribution is UNKNOWN -> 'unverifiable' for every 'added' (we cannot
-    tell a filter-authored add from a human one; #22's exclusion principle,
-    the same posture as analyze.py's ``filters=None``). An attested-empty
-    snapshot (``()``) is NOT this case — it means "no filters exist", so an
-    'added' is 'human'."""
+    - ``"unverifiable"`` — withheld, not guessed, when authorship cannot be
+      determined: no usable filters snapshot (absent or malformed); a
+      relevant filter whose criteria cannot be simulated from the kept
+      fields (outside ``from``/``to``/``subject``, or malformed); or an add
+      whose authorship is otherwise undecidable (its message fields were
+      not fetched, or a relevant filter's ``addLabelIds`` is unreadable).
+    The credit arm reads each filter's added labels through the STRICT
+    ``filter_label_ids_strict`` (analyze's, the same one the builder and
+    the CLI bridge check use): an unreadable ``addLabelIds`` must NOT
+    contribute zero ids and let the filter look irrelevant (that lenient
+    read was an entry-level inversion of #6 — it credited the human for an
+    add a malformed filter may well have authored); an unreadable filter
+    therefore withholds the add as 'unverifiable', the #22 posture. An
+    attested-empty snapshot (``()``) is NOT the no-snapshot case — it means
+    "no filters exist", so an 'added' is 'human'."""
     from types import SimpleNamespace
 
     if ctx.filters is None:
         return "unverifiable"  # no snapshot -> authorship unknown -> withhold
-    relevant = [f for f in ctx.filters if label_id in filter_label_ids(f)]
+    relevant: list[Mapping[str, object]] = []
+    saw_unreadable = False
+    for filter_ in ctx.filters:
+        try:
+            ids = filter_label_ids_strict(filter_)
+        except ValueError:
+            # unreadable addLabelIds: we cannot tell which labels this
+            # filter adds, so we cannot rule it out as the author -> the
+            # add is withheld, NOT credited to the human (#22)
+            saw_unreadable = True
+            continue
+        if label_id in ids:
+            relevant.append(filter_)
     if not relevant:
-        return "human"  # no filter claims this label -> the human added it
+        # no READABLE filter claims the label, but an unreadable one might
+        # have -> undecidable, not 'human'
+        return "unverifiable" if saw_unreadable else "human"
     if fields is None:
         return "unverifiable"  # a relevant filter exists but nothing to check
     sender, recipients, subject = fields
     rec = SimpleNamespace(sender=sender, recipients=recipients, subject=subject)
-    saw_unverifiable = False
+    # an unreadable filter keeps authorship open even if a readable one
+    # verifiably misses; a PROVEN match (filter_covered) still beats unknown
+    saw_unverifiable = saw_unreadable
     for filter_ in relevant:
         criteria = filter_.get("criteria")
         if not isinstance(criteria, dict):

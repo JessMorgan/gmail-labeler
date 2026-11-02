@@ -4,11 +4,13 @@ Ticket #28. The wizard walks a new user from a fresh profile to a working
 `auth status`: create your own GCP project + desktop OAuth client, point the
 tool at the client JSON, wire the token store, sign in. This module is the
 DECISION CORE only — every branch is a function of (scripted answers, probed
-facts). It never reads a file, imports the OAuth flow, touches the keyring, or
-calls typer: the CLI (``cli.py``) injects real prompts + a real
+facts). It performs NO filesystem, network, or keyring I/O and never imports
+typer or the OAuth flow: the CLI (``cli.py``) injects real prompts + a real
 ``EnvironmentProbe`` + the real ``auth.login``/``auth.status``/config writer,
 and the tests drive the whole matrix offline through fakes (the AC's
-"testable offline: pure over injected prompts/answers").
+"testable offline: pure over injected prompts/answers"). (The one environment
+touch is `Path.expanduser()`, an `$HOME` lookup — not a file read; the AST
+purity pin bans the real I/O surface, not that.)
 
 Two design rules the pins enforce:
 
@@ -54,7 +56,7 @@ STEP_IDS: tuple[str, ...] = (
     "status",
 )
 
-Outcome = Literal["completed", "failed", "aborted"]
+Outcome = Literal["completed", "failed", "aborted", "status-error", "write-error"]
 
 
 class ClientFileState(Enum):
@@ -158,7 +160,20 @@ def run_wizard(
 
     # --- project-id (shape check only; NOT enablement) ---------------------
     executed.append("project-id")
-    _run_project_id(io=io, probe=probe)
+    if not _run_project_id(io=io, probe=probe):
+        # capped strikes + the user declined to skip: terminate cleanly (the
+        # machine ends on EVERY input — qwen's hang demonstration is closed).
+        io.out(
+            "  Stopping here — the project-id shape check did not pass and you "
+            "chose not to skip it. Nothing was written. The README's manual "
+            "setup covers the same steps if you'd rather drive them yourself."
+        )
+        return WizardResult(
+            outcome="aborted",
+            signed_in=False,
+            steps=tuple(executed),
+            detail="project-id shape check not passed (manual setup suggested)",
+        )
 
     # --- client-json (exists / parses / desktop-type) ----------------------
     executed.append("client-json")
@@ -203,7 +218,24 @@ def run_wizard(
             steps=tuple(executed),
             detail="config not written (overwrite declined)",
         )
-    write_config(config_target, cfg)
+    try:
+        write_config(config_target, cfg)
+    except OSError as e:
+        # Narrowed to THIS call (review A5): a config-write failure (parent is
+        # a file, read-only dir, …) is an operation failure (exit 5). A
+        # BrokenPipeError from the OUTPUT sink is NOT caught here — io.out is
+        # outside this try — so the CLI can tell "stdout closed mid-run" apart
+        # from "the write failed" (the old broad catch mislabeled the former).
+        io.out(
+            f"  Could not write {config_target} ({type(e).__name__}) — nothing "
+            "was signed in. Fix the path/permissions and re-run `auth setup`."
+        )
+        return WizardResult(
+            outcome="write-error",
+            signed_in=False,
+            steps=tuple(executed),
+            detail=f"config write failed ({type(e).__name__})",
+        )
     io.out(f"  wrote {config_target}")
 
     # --- login (COMPOSES the existing auth.login flow) ---------------------
@@ -240,7 +272,23 @@ def run_wizard(
 
     # --- status ------------------------------------------------------------
     executed.append("status")
-    st = status(cfg)
+    try:
+        st = status(cfg)
+    except Exception as e:
+        # The injected status action crashed — a CHECK failure, not an auth
+        # state (the sign-in itself may have stored a token). Name it and let
+        # the CLI exit 5; never let it escape as a raw traceback (exit 1, off
+        # the 0/2/4/5/130 contract).
+        io.out(
+            f"  The status check failed ({type(e).__name__}). Sign-in may have "
+            "worked — run `gmail-labeler auth status` to check."
+        )
+        return WizardResult(
+            outcome="status-error",
+            signed_in=False,
+            steps=tuple(executed),
+            detail=f"status check failed ({type(e).__name__})",
+        )
     io.out(
         f"auth: {'signed in' if st.signed_in else 'NOT signed in'} "
         f"({st.backend}) — {st.detail}"
@@ -285,11 +333,17 @@ def _emit_intro(io: WizardIO) -> None:
     )
 
 
-def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> None:
+def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> bool:
     """Collect the project id and check its SHAPE only (a paste-error guard).
     The value is never echoed and never stored — the config holds no project
-    id, so logging one would be a leak (design landmine)."""
-    attempts = 0
+    id, so logging one would be a leak (design landmine).
+
+    Returns True to continue, False to abort the wizard. After MAX_STRIKES
+    malformed answers the skip decision is FINAL (accept → continue, decline →
+    abort) so the machine TERMINATES on every input — the old unbounded loop
+    hung when a scripted/declined skip kept re-asking (qwen's demonstration)."""
+    max_strikes = 3
+    strikes = 0
     while True:
         pid = io.ask(
             Prompt(
@@ -299,24 +353,30 @@ def _run_project_id(*, io: WizardIO, probe: EnvironmentProbe) -> None:
         )
         if probe.project_id_shape_ok(pid):
             io.out("  project id looks well-formed (shape only — I can't reach it)")
-            return
+            return True
+        strikes += 1
         io.out(
             "  That doesn't look like a GCP project id (lowercase letters, digits,\n"
             "  and hyphens; 6-30 chars, starting with a letter). I won't echo it back."
         )
-        attempts += 1
-        if attempts >= 2 and io.confirm(
-            "Skip the project-id shape check and continue? (It's only a "
-            "paste-error guard — I cannot verify API enablement or the "
-            "project's existence from here either way.)"
-        ):
-            io.out(
-                "  Continuing without the shape check. Remember: I cannot verify "
-                "the Gmail API is enabled or the consent screen is In production "
-                "— the first Gmail call proves enablement, not anything here."
-            )
-            return
-        # else: keep looping (re-ask)
+        if strikes >= max_strikes:
+            # cap reached — the skip decision is FINAL (no more re-asks).
+            if io.confirm(
+                "Skip the project-id shape check and continue? (It's only a "
+                "paste-error guard — I cannot verify API enablement or the "
+                "project's existence from here either way.) Answer no to stop "
+                "and use the manual setup instead."
+            ):
+                io.out(
+                    "  Continuing without the shape check. Remember: I cannot "
+                    "verify the Gmail API is enabled or the consent screen is In "
+                    "production — the first Gmail call proves enablement, not "
+                    "anything here."
+                )
+                return True
+            return False
+        # else: re-ask (bounded — at most max_strikes malformed before the
+        # forced decision)
 
 
 def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
@@ -342,9 +402,10 @@ def _run_client_json(*, io: WizardIO, probe: EnvironmentProbe) -> str:
             )
         elif state is ClientFileState.MALFORMED:
             io.out(
-                f"  {path} is not a complete desktop client — it is not valid "
-                "JSON, or it is missing client_id/client_secret. Re-download the "
-                "client file (it is a .json Google generated — don't hand-edit it)."
+                f"  {path} is not a usable desktop client — it is unreadable "
+                "(check its file permissions), not valid JSON, or missing "
+                "client_id/client_secret; if the file itself is wrong, "
+                "re-download it (Google generates it — don't hand-edit it)."
             )
         else:  # NOT_DESKTOP
             io.out(

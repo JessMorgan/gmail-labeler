@@ -339,8 +339,11 @@ def test_bare_auth_invalid_config_no_flag_exits_4(
     monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
     result = runner.invoke(app, ["auth"])
     assert result.exit_code == 4
-    assert "config error" in (result.output + result.stderr)
-    assert "no config.toml found" not in result.output  # the false claim is gone
+    out = result.output + result.stderr
+    assert (
+        "config error" in out and "invalid config" in out
+    )  # identical to the --config arm
+    assert "no config.toml found" not in out  # the false claim is gone
 
 
 def test_setup_declined_overwrite_exits_5_and_writes_nothing(
@@ -356,6 +359,63 @@ def test_setup_declined_overwrite_exits_5_and_writes_nothing(
     )
     assert result.exit_code == 5  # incomplete (declined)
     assert config.read_text(encoding="utf-8") == original  # NOT overwritten
+
+
+def test_completed_but_not_signed_in_exits_5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_flow: None,
+    headless: None,
+) -> None:
+    # A4: the "green status this ticket sells" surface. login succeeds but the
+    # status check reports NOT signed in -> the wizard must NOT claim success:
+    # exit 5 + the honest "not signed in" line (mutant: hardcode signed_in=True
+    # in the result -> this reddens to exit 0).
+    import gmail_labeler.auth as auth_mod
+    from gmail_labeler.auth import AuthStatus
+
+    monkeypatch.setattr(
+        auth_mod,
+        "status",
+        lambda cfg: AuthStatus(False, "file", "stored token incomplete"),
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    client = _client_json(tmp_path)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(
+        app, ["auth", "setup", "--config", str(config)], input=_setup_input(client)
+    )
+    assert result.exit_code == 5
+    assert "not signed in" in result.output.lower()
+
+
+def test_broken_pipe_stdout_closed_is_cancel_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A5: `auth setup | head` closes stdout mid-run -> BrokenPipeError from the
+    # output sink. Cancel-class (130), NOT mislabeled "setup failed writing
+    # config.toml" (the old broad OSError catch's lie — nothing was being written).
+    def _broken(text: str) -> None:
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(cli, "_echo_out", _broken)
+    config = tmp_path / "config.toml"
+    result = runner.invoke(app, ["auth", "setup", "--config", str(config)], input="")
+    assert result.exit_code == 130
+    assert "writing" not in (result.output + result.stderr).lower()
+
+
+def test_auth_explicit_invalid_config_exits_4(tmp_path: Path) -> None:
+    # A6: an EXPLICIT --config that exists but is INVALID refuses identically to
+    # the discovered-path arm — exit 4 + "config error"/"invalid config", never
+    # the "no config.toml found" false claim (m3 survivor now pinned).
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[gmail]\nbogus_key = "x"\n', encoding="utf-8")
+    result = runner.invoke(app, ["auth", "--config", str(cfg)])
+    assert result.exit_code == 4
+    out = result.output + result.stderr
+    assert "config error" in out and "invalid config" in out
+    assert "no config.toml found" not in out
 
 
 # --- the real probe's local checks (adapter side) ---------------------------

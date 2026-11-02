@@ -122,9 +122,10 @@ class Recorder:
 
 @dataclass
 class FakeActions:
-    """Records write_config/login/status wiring; login may be told to fail."""
+    """Records write_config/login/status wiring; login/status may be told to fail."""
 
     login_error: Exception | None = None
+    status_error: Exception | None = None
     login_called: list[Config] = field(default_factory=list)
     written: list[tuple[Path, Config]] = field(default_factory=list)
     signed_in: bool = True
@@ -135,6 +136,8 @@ class FakeActions:
             raise self.login_error
 
     def status(self, cfg: Config) -> AuthStatus:
+        if self.status_error is not None:
+            raise self.status_error
         return AuthStatus(
             signed_in=self.signed_in,
             backend="keyring",
@@ -268,11 +271,14 @@ def test_project_id_malformed_retries_without_echoing_the_value() -> None:
     stdin = FakeStdin(
         answers={"project-id": [PROJECT_ID, PROJECT_ID], "client-json": [CLIENT_PATH]}
     )
-    confirms = FakeConfirms({"skip": True})  # accept the skip-with-consequence
+    confirms = FakeConfirms({"Skip": True})  # explicit key matching the prompt
     _result, rec, _actions, _ = _run(probe=probe, stdin=stdin, confirms=confirms)
     # the malformed value is NEVER echoed back (it is secret-adjacent input)
     assert PROJECT_ID not in rec.all_text
     assert "project" in rec.all_text.lower()
+    # A2: the skip was genuinely OFFERED and driven by the scripted key (not
+    # carried by FakeConfirms' default) — flip-default mutant must now FAIL.
+    assert any("Skip" in s for s in confirms.seen)
 
 
 def test_project_id_skip_carries_a_plain_consequence() -> None:
@@ -280,12 +286,33 @@ def test_project_id_skip_carries_a_plain_consequence() -> None:
     stdin = FakeStdin(
         answers={"project-id": [PROJECT_ID, PROJECT_ID], "client-json": [CLIENT_PATH]}
     )
-    confirms = FakeConfirms({"skip": True})
+    confirms = FakeConfirms({"Skip": True})
     result, rec, _actions, _ = _run(probe=probe, stdin=stdin, confirms=confirms)
     assert result.outcome == "completed"  # skip is allowed, not fatal
+    assert any("Skip" in s for s in confirms.seen)  # the scripted skip drove it
     low = rec.all_text.lower()
     # the consequence is stated PLAINLY: enablement is still not checkable
     assert "cannot" in low and "enable" in low
+
+
+def test_project_id_cap_terminates_on_declined_skip() -> None:
+    # A1 (qwen's hang demonstration closed): 4 malformed strikes with the skip
+    # DECLINED must TERMINATE (aborted), not loop forever. The cap forces the
+    # decision at strike 3, so a 4th answer is never consumed.
+    probe = FakeProbe(project_ok=False)
+    stdin = FakeStdin(
+        answers={
+            "project-id": [PROJECT_ID] * 4,  # more than the cap would consume
+            "client-json": [CLIENT_PATH],
+        }
+    )
+    confirms = FakeConfirms({"Skip": False})  # decline the forced skip
+    result, _rec, actions, _ = _run(probe=probe, stdin=stdin, confirms=confirms)
+    assert result.outcome == "aborted"  # terminated, not hung
+    assert result.steps == ("intro", "project-id")  # never reached client-json
+    assert actions.written == []  # nothing written
+    # the loop asked exactly max_strikes (3) times, then forced the decision
+    assert stdin.seen.count("project-id") == 3
 
 
 # --- NO verification theater (the AC's honesty clause) -----------------------
@@ -431,6 +458,30 @@ def test_cancel_during_login_propagates_not_reported_as_failure() -> None:
             write_config=actions.write_config,
             config_target=CONFIG_TARGET,
         )
+
+
+def test_status_check_crash_becomes_named_status_error_not_escape() -> None:
+    # A3: an exception escaping the injected status action must NOT break the
+    # exit contract (raw traceback -> exit 1). It becomes a NAMED status-error.
+    actions = FakeActions(status_error=RuntimeError(f"boom {CLIENT_SECRET}"))
+    result, rec, _a, _ = _run(actions=actions)
+    assert result.outcome == "status-error"
+    assert result.signed_in is False
+    assert "status check failed" in result.detail
+    # the raw text is never echoed (type only), and the surface is named
+    assert CLIENT_SECRET not in rec.all_text
+    assert "status check failed" in rec.all_text.lower()
+
+
+def test_completed_wizard_reports_not_signed_in_when_status_says_so() -> None:
+    # A4: the honesty branch — login succeeded but status reports signed_in=False
+    # through the WHOLE completed wizard. The machine must NOT hardcode green.
+    actions = FakeActions(signed_in=False)
+    result, rec, _a, _ = _run(actions=actions)
+    assert result.outcome == "completed"  # steps ran to the end
+    assert result.signed_in is False  # NOT hardcoded True
+    tail = rec.all_text.split("auth:", 1)[1].lower()  # the status line
+    assert "not signed in" in tail  # line-swap mutant (prints "signed in") reddens
 
 
 # --- secret discipline: sentinels absent from ALL output + detail ------------

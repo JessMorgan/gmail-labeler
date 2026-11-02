@@ -73,7 +73,7 @@ cli._now seam doctrine, #23/#24).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sized
+from collections.abc import Callable, Mapping, Sized
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -92,11 +92,13 @@ log = logging.getLogger("gmail_labeler.daemon")
 
 
 class _PredictionShapeError(ValueError):
-    # SELF-AUTHORED prediction-shape defects (row count / row width):
-    # the message is built from COUNTS only — structurally body-free —
-    # so it is safe to log verbatim. Model-raised errors stay class-only
-    # in the log (a model error may quote the scored text, which carries
-    # the body — invariant #5).
+    # SELF-AUTHORED prediction-shape defects (container, count, width,
+    # element type): the message is built from COUNTS and TYPE NAMES
+    # only — never an element VALUE (a lying score element is an
+    # arbitrary string and must not reach a log line) — structurally
+    # body-free, safe to log verbatim. Model-raised errors stay
+    # class-only in the log (a model error may quote the scored text,
+    # which carries the body — invariant #5).
     pass
 
 
@@ -343,23 +345,29 @@ def _run_tick(
                 f"the model returned {len(score_rows)} score rows for "
                 f"{len(fetched)} texts — checkpoint/recipe defect"
             )
-        # the row WIDTH check lives HERE (inside the guarded arm): a
-        # lying checkpoint with the right count but a misaligned row
-        # would otherwise raise from the compose zip OUTSIDE the net and
-        # kill the loop. Divergence from shadow's one-shot posture (cli.py
-        # treats a width defect as exit-1 'a bug'): the daemon is a
-        # long-lived service — hold, warn, keep the cursor.
-        # Sized checks FIRST (F2 MINOR 1 + round-2): a flat vector
-        # served as the whole batch (len == texts but rows are floats)
-        # raised TypeError from len(row), and an unsized CONTAINER or a
-        # non-iterable vocabulary from their len/tuple calls — all
-        # outside the caught tuple, exit 1. Every shape defect lands in
-        # _PredictionShapeError territory: the checks are TOTAL for the
-        # defect classes a checkpoint can produce (the review round's
-        # marginal Sized-but-not-iterable row is covered by the Iterable
-        # term below; a vocabulary whose __iter__ raises something other
-        # than TypeError stays the documented residual — pathological
-        # by construction, deferred).
+        # Divergence from shadow's one-shot posture (cli.py treats a
+        # width defect as exit-1 'a bug'): the daemon is a long-lived
+        # service — hold, warn, keep the cursor. F3 MINOR 1: the rows
+        # are MATERIALIZED INSIDE this arm (as the vocabulary already
+        # was) — the compose zip outside it was the escape: a
+        # Sized+Iterable row with a lying __len__ or a raising __iter__
+        # blew up at the zip line, exit 1. Materialized, the width check
+        # reads honest lengths and the zip can no longer fail on shape.
+        # The checks are TOTAL for the defect classes a checkpoint can
+        # produce; a vocabulary whose __iter__ raises a NON-TypeError
+        # stays the documented residual (pathological by construction).
+        if isinstance(model.vocabulary, (str, bytes)):
+            # F3 MINOR 2 (the deterministic-starvation hole, ds probe):
+            # a stray str vocabulary (tuple('ab') passes EVERY structural
+            # check) plus string score rows sailed through into the
+            # plan's per-message fail-safe — warnings every tick, ZERO
+            # writes, the cursor ADVANCING forever: label starvation by a
+            # model that can never score anything, invisible behind busy
+            # warnings. A str/bytes vocabulary is a named shape defect.
+            raise _PredictionShapeError(
+                "the model vocabulary is a str/bytes, not a label "
+                "sequence — checkpoint/recipe defect"
+            )
         try:
             vocab = tuple(model.vocabulary)  # materialized ONCE (the
             # compose zip below rides this, never the live attribute)
@@ -369,17 +377,30 @@ def _run_tick(
                 f"— checkpoint/recipe defect"
             ) from e
         vocab_len = len(vocab)
-        if any(
-            not isinstance(row, Sized)
-            or not isinstance(row, Iterable)
-            or len(row) != vocab_len
-            for row in score_rows
-        ):
+        try:
+            rows = [tuple(row) for row in score_rows]
+        except TypeError as e:
             raise _PredictionShapeError(
                 f"a score row does not align to the {vocab_len}-label "
-                f"vocabulary (an unsized row counts as misaligned) — "
-                f"checkpoint/recipe defect"
-            )
+                f"vocabulary (unmaterializable row: {type(e).__name__}) "
+                f"— checkpoint/recipe defect"
+            ) from e
+        for row in rows:
+            # TYPE NAMES only in every message here (class comment): an
+            # element VALUE is an arbitrary string and never interpolates
+            if len(row) != vocab_len:
+                raise _PredictionShapeError(
+                    f"a score row does not align to the {vocab_len}-label "
+                    f"vocabulary — checkpoint/recipe defect"
+                )
+            for element in row:
+                if isinstance(element, bool) or not isinstance(element, (int, float)):
+                    # F3 MINOR 2: '0.9' passes every structural check and
+                    # poisons the plan; bool is NOT a number here
+                    raise _PredictionShapeError(
+                        f"a score element is not numeric "
+                        f"({type(element).__name__}) — checkpoint/recipe defect"
+                    )
     except _PredictionShapeError as e:
         # self-authored, counts-only message: safe to log verbatim
         log.warning(
@@ -407,9 +428,7 @@ def _run_tick(
     page_rows: list[ApplicationRow] = []
     written = 0
     warnings = 0
-    for (message_id, present, _text), score_row in zip(
-        fetched, score_rows, strict=True
-    ):
+    for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
         scores = dict(zip(vocab, score_row, strict=True))
         plan = plan_message_write(
             message_id,

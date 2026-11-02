@@ -602,6 +602,33 @@ def test_get_message_refuses_an_unpersistable_history_id_at_the_wire() -> None:
     assert ok.get_message("aa").history_id == MAX_PERSISTABLE_HISTORY_ID
 
 
+def test_history_refuses_an_unpersistable_history_id_at_the_wire() -> None:
+    # F3 MAJOR (both families' mutant H/C5): the HistoryPage site had
+    # the _opt_history_id WIRING but NO falsifier — reverting the line
+    # left the full suite green and reopened the write-then-hold-forever
+    # seam (wire-legal historyId=2**63 page: the delta's writes land,
+    # the store refuses the commit, the cursor is pinned forever). This
+    # node is the symmetric twin of the E2 RawMessage falsifier, driven
+    # through client.history() itself.
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    client = _rest(
+        payload={
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID + 1),
+            "history": [],
+        }
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        client.history(1)
+    ok = _rest(
+        payload={
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID),
+            "history": [],
+        }
+    )
+    assert ok.history(1).history_id == MAX_PERSISTABLE_HISTORY_ID
+
+
 def test_history_id_parse_bound_equals_the_store_bound(tmp_path: Path) -> None:
     # the anti-drift pin: the parse ceiling and the store ceiling are
     # the SAME number, stated in two modules (layering keeps them

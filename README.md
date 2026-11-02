@@ -70,6 +70,25 @@ Every user brings their own GCP project and desktop-app OAuth client
 (ADR-0004) — roughly 15 minutes in Google's console, nothing shared with
 us.
 
+**Run the guided wizard.** It walks you through the console steps, verifies
+what it *can* check on your machine (the client file exists, parses, and is a
+*desktop*-type client), wires `config.toml` and the token store, and finishes
+by signing you in:
+
+```sh
+gmail-labeler auth setup
+```
+
+Running plain `gmail-labeler auth` on a terminal with no credentials yet offers
+the same wizard. It is honest about its limits: it **cannot** check from your
+machine whether the Gmail API is enabled or the consent screen is set to *In
+production* — the first successful sign-in is the real proof of those, not
+anything it can verify up front. It never asks for your token; the refresh
+token goes to your OS keyring via the existing `auth login` flow.
+
+<details>
+<summary>Manual setup — the same steps, if you'd rather drive them yourself</summary>
+
 1. Create a project in [Google Cloud Console](https://console.cloud.google.com/)
    and enable the **Gmail API** in it.
 2. Create an **OAuth client ID** of type **Desktop app** and download its
@@ -88,6 +107,8 @@ us.
    token lands in your OS keyring (set `token_backend = "file"` on headless
    boxes — see [example.toml](example.toml)).
 6. `gmail-labeler auth` should report `SIGNED IN`.
+
+</details>
 
 The token grants one scope (`gmail.modify`); token values never appear in
 logs, config, or the corpus.
@@ -113,7 +134,8 @@ land without a keyring.
 ## CLI
 
 ```sh
-gmail-labeler auth                    # credential status
+gmail-labeler auth                    # credential status (offers the wizard if unsigned)
+gmail-labeler auth setup              # guided ADR-0004 onboarding (GCP project + OAuth client)
 gmail-labeler auth login              # one-time desktop OAuth consent flow
 gmail-labeler dataset export          # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)

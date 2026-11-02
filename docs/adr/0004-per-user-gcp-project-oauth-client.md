@@ -13,10 +13,15 @@ data path for no capability the API lacks. Users pay ~15 minutes of console
 clicking and one "unverified app" warning screen — documented with
 screenshots — and in return nothing is centralized on the maintainer.
 
-Status note (Phase 0 landed, 2026-10): the decision above stands unchanged. The
-interactive `auth` wizard mentioned in this ADR is NOT implemented — the
-one-shot `gmail-labeler auth login` loopback flow plus the README Setup
-section is today's guidance. The body's "documented with screenshots" promise is likewise
-outstanding — the Setup section is text-only until the wizard work
-lands. Building the wizard (or amending this ADR's
-wording) remains open; until then no document should claim it exists.
+Status note (updated with the wizard, 2026-11 — ticket #28): the decision above
+stands unchanged — every user still brings their OWN GCP project and desktop
+OAuth client; the wizard automates the wiring, not the project ownership. The
+interactive `auth` wizard this ADR promised is now implemented:
+`gmail-labeler auth setup` walks the console steps, verifies locally what it can
+(the client file exists, parses, and is a desktop-type client), wires the config
+and token store, and *composes* the existing `gmail-labeler auth login` loopback
+flow to sign in. It is explicit that Gmail API enablement and the consent
+screen's *In production* mode are NOT locally checkable — the first successful
+sign-in is the real proof of those, not anything it can verify up front. The
+body's "documented with screenshots" promise is still outstanding: the wizard
+and the README Setup section are text plus console URLs, no screenshots.

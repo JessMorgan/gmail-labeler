@@ -143,7 +143,11 @@ malformed); or an add whose authorship is otherwise undecidable (its
 message fields were not fetched, or a filter's `addLabelIds` is unreadable —
 which is GLOBAL, not per-filter: we cannot read which labels that entry
 adds, so we cannot rule it out as any add's author, and every 'added'
-Correction, for every label, is withheld until the snapshot is clean) — the
+Correction, for every label, is withheld until the snapshot is clean; or a
+crash-replay ambiguity — the delta carries a `labelsAdded` for a label this
+tick SKIPPED as already-present yet no Application row exists for it, so the
+daemon's own landed write whose row was lost before the commit is
+indistinguishable from a human who added exactly what we would have) — the
 same *exclusion, not guessing* principle that governs
 `dataset analyze` (#22): guessing either way is what that doctrine forbids.
 A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation

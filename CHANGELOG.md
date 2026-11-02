@@ -816,6 +816,29 @@ does not ship releases yet.
   Phase 1 → Phase 2 → explicitly-parked Phase 3); the README's
   phase-plan pointer now links there.
 
+### Fixed
+
+- Stack review S1 — the daemon scores ARRIVALS, not every changed message
+  (whole-stack pass; no ticket, PR refs #13): the scoring set read the
+  generic `messages[]` history field, which the Gmail reference describes as
+  "messages CHANGED in this record" and deprecates in favour of the
+  change-type fields. A label-only change to OLD mail — a user relabel, or
+  the daemon's OWN `apply_labels` echo — therefore re-enrolled that message
+  for scoring, and per-label skip-present does not block a DIFFERENT
+  graduated tier → retroactive labeling (violating README 'scores arriving
+  mail' and the ROADMAP Never-list). The scoring set is now `messagesAdded[]`;
+  the fake's history fixtures emit the documented shape (arrivals carry
+  generic stubs AND `messagesAdded`; a modify carries `labelsAdded` but no
+  `messagesAdded`) so the fixture can no longer mirror the code. A sent-mail
+  guard counts-skips the operator's own SENT arrivals.
+- Stack review S1 — the crash-replay window cannot fake a human's hand: a
+  `labelsAdded` for a label this tick skipped as already-present with no
+  Application row (the daemon's own landed write whose row was lost before
+  the commit) is AMBIGUOUS and is now attributed `unverifiable` (withheld),
+  not `human` — crediting it would poison `human_added` and the training fold
+  (invariant #6). GLOSSARY / README / the daemon docstrings gain this fourth
+  unverifiable cause.
+
 ### Changed
 
 - `HfModel.predict` is batched (ticket #20, #19's deferral): eval is

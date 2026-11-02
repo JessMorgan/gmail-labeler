@@ -650,7 +650,10 @@ authorship is otherwise undecidable (its message fields were not fetched,
 or a filter's `addLabelIds` is unreadable — which is GLOBAL, not per-filter:
 we cannot read which labels that entry adds, so we cannot rule it out as any
 add's author, and every 'added' Correction, for every label, is withheld
-until the snapshot is clean) — are both excluded,
+until the snapshot is clean; or a crash-replay ambiguity — a `labelsAdded`
+for a label this tick skipped as already-present with no Application row,
+indistinguishable from the daemon's own landed write whose row was lost
+before the commit) — are both excluded,
 the *exclusion, not guessing* principle `dataset analyze` follows (#22).
 `status` discloses each withheld slice as its own count.
 

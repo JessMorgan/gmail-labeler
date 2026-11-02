@@ -2229,3 +2229,24 @@ def test_correction_kinds_vocabulary_is_the_documented_pair() -> None:
     # the CHECK vocabulary's Python mirror is exactly the two GLOSSARY
     # kinds (a drift here would silently widen or narrow the vocabulary)
     assert CORRECTION_KINDS == ("removed", "added")
+
+
+def test_correction_label_stats_rejects_tampered_kind(tmp_path: Path) -> None:
+    # the aggregate reader status uses must revalidate too: a hand-edited
+    # kind is refused NAMED, not silently dropped into a zero bucket
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    db.commit_page([], 20, [_corr_row(message_id="aa", kind="removed")])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute("UPDATE corrections SET kind = 'bogus'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="correction kind 'bogus' not in"):
+        db2.correction_label_stats()
+    db2.close()

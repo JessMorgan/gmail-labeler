@@ -52,7 +52,7 @@ app = typer.Typer(
     epilog=(
         "Exit codes: 0 ok · 2 usage error · 3 not implemented · "
         "4 auth/config unusable · 5 operation failed or incomplete · "
-        "130 cancelled (Ctrl-C)"
+        "130 cancelled (Ctrl-C) or the output channel was lost"
     ),
     no_args_is_help=True,
 )
@@ -327,7 +327,7 @@ def _echo_out(text: str) -> None:
 
     The explicit flush is belt-and-suspenders: click.echo already flushes, so a
     `| head` break fires in-run here (a mutant removing this flush SURVIVED — the
-    load-bearing boundary fix is _silence_stdout, not the flush). The None guard
+    load-bearing boundary fix is _silence_output, not the flush). The None guard
     covers `>&-`, where sys.stdout is None and .flush() would raise AttributeError."""
     import sys
 
@@ -343,20 +343,32 @@ def _silence_output() -> None:
     `auth setup 2>&1 | head` case where stderr SHARES the dead pipe and a diagnosis
     echo to fd 2 would otherwise EPIPE out of the handler (exit 1).
 
-    It is guarded on fileno(): the operation is only correct for the REAL fd 1/2.
-    Under the in-process CliRunner, sys.stdout is a StringIO (no fd) or a harness
-    pipe (fd != 1), so this is a deliberate NO-OP there — the exit code is captured
-    directly and there is no interpreter shutdown to break, and a hardcoded
-    dup2(…, 1) would clobber the test process's own stdout for the rest of the run.
-    In the real subprocess (a pipe/terminal on fd 1/2) both are retargeted."""
+    It is guarded on fileno(): the retarget is only correct for the REAL fd 1/2.
+    Under the in-process CliRunner sys.stdout is a BytesIO/StringIO whose fileno()
+    RAISES, so the except branch skips it — a deliberate NO-OP (the exit code is
+    captured directly and there is no interpreter shutdown to break; a hardcoded
+    dup2(…, 1/2) would clobber the test process's own stdout/stderr for the rest of
+    the run). In the real subprocess (a pipe/terminal on fd 1/2) both are retargeted.
+
+    The `fd != want` arm below is forward-defence for a harness that hands us a
+    stream wrapping a real pipe fd that is NOT 1/2; it is UNREACHABLE in the current
+    test matrix (verified: no node reaches it — CliRunner's stream raises on fileno,
+    the subprocess streams report exactly 1/2). A stream reporting an fd that is
+    itself already closed (a stale-fd dup, which could leave a shutdown-flush exit
+    120) is likewise not reachable from this entry point — Python binds
+    sys.stdout/stderr to None when fd 1/2 is closed at startup — so no extra guard."""
     import sys
 
     for stream, want in ((sys.stdout, 1), (sys.stderr, 2)):
         try:
-            fd = stream.fileno()  # None -> AttributeError; StringIO -> ValueError
+            fd = stream.fileno()  # None -> AttributeError; BytesIO -> ValueError
         except (AttributeError, OSError, ValueError):
             continue
-        if fd != want:  # redirected / harness stream: not the real descriptor
+        if fd != want:
+            # Forward-defence for a stream wrapping a real pipe fd that is not 1/2.
+            # UNREACHABLE in the current matrix (CliRunner raises on fileno; the
+            # subprocess streams report exactly 1/2) — kept so a future redirected-fd
+            # harness cannot trip a real-fd clobber.
             continue
         with contextlib.suppress(OSError):
             devnull = os.open(os.devnull, os.O_WRONLY)

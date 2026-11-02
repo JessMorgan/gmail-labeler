@@ -62,7 +62,7 @@ you would.
    new messages in-process, and applies graduated labels with Tier
    Labels — additive only, already-present labels never touched. Your
    manual corrections are captured as training signal for the next
-   round (Phase 2, landing).
+   round (Phase 2, landed).
 
 ## Setup
 
@@ -409,13 +409,15 @@ gmail-labeler shadow report
 ```
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
-auth/config unusable · `5` operation failed or incomplete. `status` and
+auth/config unusable · `5` operation failed or incomplete · `130`
+cancelled (Ctrl-C) or the output channel was lost (`auth setup`).
+`status` and
 `corrections export` are wired (ticket #27) and read the local state DB
 only — no Gmail call, no auth gate, so they answer on a sick or offline
 mailbox (`status` uses 0/2/4/5; `3` stays reserved for wired-but-stubbed
 commands and is currently unreachable).
-Scripts can branch on 0/2/4/5 today; a `1` means an unhandled crash —
-that's a bug, please report it.
+Scripts can branch on 0/2/4/5 today (plus `130` from `auth setup`); a
+`1` means an unhandled crash — that's a bug, please report it.
 
 ### Running the daemon (Phase 2)
 

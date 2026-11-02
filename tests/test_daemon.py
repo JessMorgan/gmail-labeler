@@ -987,8 +987,13 @@ def test_prediction_str_vocabulary_starvation_holds(
     class _StrVocabModel:
         vocabulary = "ab"  # tuple('ab') would pass Sized/width checks
 
-        def predict(self, texts):  # (the ds probe shape: '01' rows)
-            return tuple("01" for _ in texts)
+        def predict(self, texts):  # NUMERIC rows (review round-2):
+            # with '01' rows the numeric-element check would ALSO hold,
+            # masking which guard does the work — numeric rows make the
+            # 777-vs-900 CURSOR assertion the discriminator: only the
+            # str/bytes guard stands between this shape and the
+            # advance-forever starvation the ds probe executed
+            return tuple((0.9, 0.1) for _ in texts)
 
     fake = FakeGmailClient(
         messages=_messages(),
@@ -1028,6 +1033,105 @@ def test_prediction_non_numeric_element_holds(
     assert _run(tmp_path, fake, db=db, model=_StrElements()) == 0
     assert db.get_history_cursor() == 777
     assert "not numeric" in caplog.text
+    db.close()
+
+
+def test_prediction_bool_element_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 round-2 (reviewer MINOR): bool is an int subclass but NOT a
+    # number here — without the bool term, bool rows pass the numeric
+    # gate and the cursor advances with zero writes (probed). This node
+    # is the bool term's falsifier.
+    caplog.set_level(logging.WARNING)
+
+    class _BoolRows:
+        vocabulary = ("Money/Bills", "Shipping")
+
+        def predict(self, texts):
+            return tuple((True, False) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_BoolRows()) == 0
+    assert db.get_history_cursor() == 777
+    assert "not numeric" in caplog.text
+    db.close()
+
+
+def test_prediction_lying_len_container_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 round-2 (reviewer MAJOR, the container twin of MINOR 1): the
+    # count check trusted the UN-materialized container's __len__ — a
+    # lying len reached zip(strict=True) OUTSIDE the guard (exit 1,
+    # both directions probed). The count now rides the materialized
+    # rows; both too-few and too-many hold.
+    caplog.set_level(logging.WARNING)
+
+    class _LyingContainer:
+        def __init__(self, n_yield: int) -> None:
+            self._n = n_yield
+
+        def __len__(self) -> int:
+            return 2  # claims the fetched count
+
+        def __iter__(self):
+            for _ in range(self._n):
+                yield (0.9, 0.1)
+
+    for n_yield in (1, 3):  # too few AND too many
+        caplog.clear()
+        fake = FakeGmailClient(
+            messages=_messages(),
+            labels=_labels(),
+            history_pages=[_page(_record("aa11"), _record("aa22"))],
+            current_history_id=900,
+        )
+        db = _db(tmp_path)
+        db.set_history_cursor(777)
+
+        class _Model:  # fresh class per iteration: n binds n_yield
+            vocabulary = ("Money/Bills", "Shipping")
+            n = n_yield
+
+            def predict(self, texts):
+                return _LyingContainer(self.n)
+
+        assert _run(tmp_path, fake, db=db, model=_Model()) == 0
+        assert db.get_history_cursor() == 777  # held, not zip-escaped
+        assert "score rows for 2 texts" in caplog.text
+        db.close()
+
+
+def test_prediction_missing_vocabulary_holds(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F3 round-2 NIT: the attribute access itself was outside any net —
+    # a model object without .vocabulary escaped as AttributeError
+    caplog.set_level(logging.WARNING)
+
+    class _NoVocab:
+        def predict(self, texts):
+            return tuple((0.9, 0.1) for _ in texts)
+
+    fake = FakeGmailClient(
+        messages=_messages(),
+        labels=_labels(),
+        history_pages=[_page(_record("aa22"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db, model=_NoVocab()) == 0
+    assert db.get_history_cursor() == 777
+    assert "no vocabulary attribute" in caplog.text
     db.close()
 
 

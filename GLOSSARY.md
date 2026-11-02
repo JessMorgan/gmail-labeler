@@ -157,10 +157,12 @@ Applications yet reports `no data`. The basis line names the current
 bands/graduation artifact content hashes and states the v1 caveats
 (rows may span artifact versions; precision assumes unseen-but-removed
 mail is rare — archive-equals-dismiss). The `added` counts are attributed
-under the Correction attribution vocabulary (*human* / *filter-covered* /
-*unverifiable*), which the basis line lists verbatim so a future
-vocabulary change is visible on the line; both withheld slices are
-disclosed as their own counts and excluded from the human signal.
+under the Correction attribution vocabulary — the stored/emitted literals
+`human` / `filter_covered` / `unverifiable` (prose hyphenates them as
+"filter-covered"; the column value is the underscore form) — which the
+basis line lists verbatim so a future vocabulary change is visible on the
+line; both withheld slices are disclosed as their own counts and excluded
+from the human signal.
 _Avoid_: accuracy (this is realized, in-production precision, not eval)
 
 **Shadow Pass**:

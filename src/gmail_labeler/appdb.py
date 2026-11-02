@@ -197,8 +197,10 @@ class CorrectionRow:
     (a simulatable filter verifiably would have added it: withheld), or
     ``"unverifiable"`` (authorship cannot be determined: WITHHELD, not
     guessed — #22's exclusion principle). Only ``"human"`` adds are
-    training signal and enter the export; ``status`` discloses the
-    filter-covered and unverifiable slices as their own withheld counts. A
+    training signal (the builder's fold seam credits only those); the
+    ``corrections export`` dump is faithful/auditable and carries every
+    row's attribution, and ``status`` discloses the filter-covered and
+    unverifiable slices as their own withheld counts. A
     'removed' Correction is ALWAYS ``"human"`` (a human removing is human
     signal regardless of filters — invariant #6)."""
 
@@ -1321,6 +1323,15 @@ class AppDB:
                 raise AppDBError(
                     f"state DB corrupt (correction attribution {attribution!r} "
                     f"not in {CORRECTION_ATTRIBUTIONS}): {self.path}"
+                )
+            if kind == "removed" and attribution != "human":
+                # the SAME removed-always-human rule _check_correction_row
+                # enforces on the per-row reads — the aggregate reader status
+                # uses must agree, so a hand-edited removed+withheld row is
+                # refused NAMED here too, not silently bucketed as removed
+                raise AppDBError(
+                    f"state DB corrupt (a 'removed' correction is always "
+                    f"attributed 'human', not {attribution!r}): {self.path}"
                 )
             # [removed, added, added_filter_covered, added_unverifiable]
             bucket = stats.setdefault(label, [0, 0, 0, 0])

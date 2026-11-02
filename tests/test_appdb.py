@@ -2327,3 +2327,29 @@ def test_correction_label_stats_rejects_tampered_kind(tmp_path: Path) -> None:
     with pytest.raises(AppDBError, match="correction kind 'bogus' not in"):
         db2.correction_label_stats()
     db2.close()
+
+
+def test_correction_label_stats_rejects_tampered_removed_attribution(
+    tmp_path: Path,
+) -> None:
+    # the aggregate reader agrees with the per-row reader on the
+    # removed-always-human rule: a hand-edited removed+unverifiable row is
+    # refused NAMED by correction_label_stats too (the two tamper paths
+    # must not diverge, even though the numbers are unaffected because a
+    # removed row never enters a withheld bucket)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    db.commit_page([], 20, [_corr_row(message_id="aa", kind="removed")])
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute("UPDATE corrections SET attribution = 'unverifiable'")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="always attributed 'human'"):
+        db2.correction_label_stats()
+    db2.close()

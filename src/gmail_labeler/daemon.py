@@ -502,7 +502,8 @@ def _attribution(
       verifiable and does NOT match this message: the human added it
       (positive training signal);
     - ``"filter_covered"`` — a relevant filter verifiably WOULD have added
-      it (``simulates_filter`` True): withheld from human credit + export;
+      it (``simulates_filter`` True): withheld from the human credit and
+      the corpus fold (the export dump still shows it, attributed);
     - ``"unverifiable"`` — a relevant filter's criteria are outside the
       simulatable set (``simulates_filter`` None), OR the message's fields
       were unavailable so authorship cannot be determined: WITHHELD, not

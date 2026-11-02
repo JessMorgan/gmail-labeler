@@ -469,12 +469,11 @@ the reserved not-implemented arm.
 ### Backfilling historical mail (`apply`, Phase 2)
 
 `apply --since <YYYY-MM-DD> [--apply]` is the **only bulk path**
-(ticket #26): it backfills graduated labels over mail older than the
-daemon's cursor — the mail that arrived before the daemon ever ran, or
-that a cursor expiry left un-processed. It is **always an explicit human
-decision, never automatic**: the daemon never invokes it (there is a
-test that greps `daemon.py` for any reference to the apply machinery and
-fails if one appears).
+(ticket #26): it backfills graduated labels over the mail the `--since`
+window selects. It is **always an explicit human decision, never
+automatic**: the daemon never invokes it (there is a test that greps
+`daemon.py` for any reference to the apply machinery and fails if one
+appears).
 
 Without `--apply` it is a **dry preview**: it scores the window and
 prints, per message, the id, the would-be label names, the band/tier, and
@@ -488,7 +487,11 @@ backfill.
 window. It parses through the same UTC-midnight rule as `shadow run`
 (the named day is INCLUDED), and the Gmail query is `after:<epoch-seconds>`
 **without** `in:inbox`: backfill targets historical mail, which is mostly
-archived out of the inbox.
+archived out of the inbox. The window is `after:<epoch>` and so **unbounded
+upward** — it reaches right up to the newest message and therefore
+**overlaps whatever the live daemon is also processing**; that overlap is
+allowed and safe (skip-present makes both paths idempotent on the same
+mail), but see the concurrency caution below.
 
 The backfill runs the **exact same decision core** as the live daemon —
 `applications.plan_message_write` (imported, never re-implemented; a test
@@ -503,19 +506,32 @@ already landed reads present, composes an empty plan, and earns no second
 write and no duplicate Application row. `apply` has **no history cursor**
 — it never reads or writes the daemon's `daemon_state` table, so a live
 daemon's cursor is untouched across a whole backfill. A mid-run `SIGTERM`
-completes the current page to its commit point (exit 0); a transient
-write failure **holds nothing** (there is no cursor to retry against) —
-the message stays un-labeled with a counted warning, and a re-run picks
-it up. Mail that 404s (deleted since your export — a backfill over years
-**will** hit this) is a counted skip, never fatal.
+completes the current page to its commit point (exit 0); a transient read
+**or** write failure **holds nothing** (there is no cursor to retry
+against) — the message stays un-labeled with a counted warning, and a
+re-run picks it up. Mail that 404s (deleted since your export — a backfill
+over years **will** hit this) is a counted skip, never fatal.
 
-**Concurrency caution.** `apply` and the daemon both write to the same
-state DB and the same mailbox. SQLite serializes their short transactions,
-and both paths are idempotent (skip-present), so running them at once
-will not corrupt the DB or double-write a label — but it is **still not
-recommended**: the two paths will race to score the same recent mail,
-wasting work and interleaving their logs. Stop the daemon before a
-backfill, or point `apply` at a window the daemon has not reached.
+**Concurrency caution (read this before running both at once).** `apply`
+and the daemon share the state DB and the mailbox, and running them
+together is **not recommended** — the exposure is honest, not benign:
+
+- **Duplicate audit rows are possible.** The `applications` table has no
+  UNIQUE constraint on `(message_id, label)` (the v1 posture: a
+  re-earned label is legitimate history). If the daemon and a backfill
+  score the SAME message and BOTH decide to add the SAME absent label,
+  each lands its own Gmail write (idempotent on Gmail's side — adding a
+  present label is a no-op) **and** its own audit row, so you can see two
+  `applications` rows for one `(message, label)`. The Gmail truth stays
+  correct; the audit table is the noisier one.
+- **A lock can abort the backfill.** SQLite serializes the short
+  transactions, but past the default 5-second busy timeout a contended
+  write raises `database is locked` — which surfaces as exit 5 **mid-
+  backfill** (the pages already committed stand; a re-run picks up the
+  rest).
+
+Stop the daemon before a backfill, or point `apply` at a `--since` window
+the daemon has not reached.
 
 **Date-provenance warning (AC5).** The `--since` boundary is a date, and
 a corpus record whose date has no server-authoritative provenance stamp
@@ -525,8 +541,9 @@ after the boundary, prints **one** counted warning — the date-based
 window is only as trustworthy as those dates.
 
 Exit codes: 0 clean (preview or backfill) · 2 usage (missing/invalid
-`--since`) · 4 auth/config (the tier-name collision) · 5 artifact/store
-failure, a preview whose Tier Labels are absent, or a model/wire failure.
+`--since`) · 4 auth/config (the tier-name collision, and a mid-run auth
+failure incl.) · 5 artifact/store failure, a preview whose Tier Labels are
+absent, a lock contention past the busy timeout, or a model/wire failure.
 
 ## Docs
 

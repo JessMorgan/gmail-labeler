@@ -206,11 +206,13 @@ default `shadow run` window (90 days) includes recent arrivals as well as the
 older history — it is "recent mailbox", not strictly "pre-existing".
 
 **Backfill**:
-Applying graduated labels to Backlog mail — the historical window the
-daemon's live cursor never covered (mail that arrived before the daemon
-ever ran, or that a cursor expiry left un-processed). The `apply --since
-[--apply]` command is the ONLY path that does it, and it is always an
-explicit human decision, never automatic (the daemon never invokes it).
+Applying graduated labels to Backlog mail through a `--since`-defined
+window (`after:<epoch>`, unbounded upward — so it reaches recent mail and
+MAY overlap what the live daemon also processes; the overlap is allowed
+and idempotent via skip-present, but running both at once is not
+recommended — see README). The `apply --since [--apply]` command is the
+ONLY path that does it, and it is always an explicit human decision, never
+automatic (the daemon never invokes it).
 A Backfill reuses the daemon's exact decision core and records
 Applications identically to daemon-applied ones (only the `source` column
 differs); it carries NO history cursor (invariant #3 is the daemon's

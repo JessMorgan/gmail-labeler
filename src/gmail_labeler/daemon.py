@@ -299,6 +299,16 @@ def predict_conformant(
 #: message (the guide's own claim); its historyId is the cursor seed.
 BOOTSTRAP_QUERY = ""
 
+#: The Gmail system label marking the operator's OWN sent mail. The daemon
+#: classifies INCOMING mail; it must never label its own outgoing mail (the
+#: self-labeling / notification-loop hazard the push guide names). A sent
+#: message arrives on the history stream as a messageAdded too — MEDIUM
+#: confidence: a single practitioner report, but the product need to skip
+#: our own outgoing mail holds regardless of which field Gmail signals it
+#: with. "SELF" is a search-query term, not a label id, so the SENT system
+#: label is the machine-checkable signal here (see the fetch-loop guard).
+_OUTGOING_LABEL_IDS = frozenset({"SENT"})
+
 
 @dataclass(frozen=True, slots=True)
 class ServingContext:
@@ -416,25 +426,48 @@ def bootstrap_cursor(client: GmailClient) -> int | None:
 
 
 def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
-    """The message-event ids of one page's history records, in wire
-    order, deduplicated (a message touched twice in one delta is
-    processed once — the present-set read makes the later event's state
-    authoritative either way). Records carrying only labels/threadThreads
-    have no message events and pass through; a MALFORMED messages list
-    is a lying wire — loud permanent (the adapter's shape doctrine)."""
+    """The ARRIVAL message-event ids of one page's history records, in wire
+    order, deduplicated (a message touched twice in one delta is processed
+    once — the present-set read makes the later event's state authoritative
+    either way).
+
+    ARRIVALS ONLY — the scoring set is ``messagesAdded[]``, NOT the generic
+    ``messages[]`` field. The Gmail users.history reference describes the
+    generic field as "List of messages changed in this history record" and
+    explicitly recommends the specific change-type fields instead; ``
+    messagesAdded[]`` is "Messages added to the mailbox" (arrivals). Reading
+    the generic field re-enrolled OLD mail that merely got a label change —
+    a user archive/relabel, or the daemon's OWN apply_labels echo (the push
+    guide's notification-loop warning) — for scoring, which is RETROACTIVE
+    LABELING (README 'scores arriving mail'; ROADMAP Never: no retroactive
+    labeling except via the deliberate `apply` command). Records carrying
+    only labels/threadThreads/messages[]-without-messagesAdded have no
+    arrival event and pass through; a MALFORMED messagesAdded list is a
+    lying wire — loud permanent (the adapter's shape doctrine). The nested
+    Message id is read; a flat id is tolerated defensively (the
+    _label_event_message_id precedent — a wrong shape reads as FEWER
+    arrivals, never a bad write, ADR-0005 fail-safe).
+
+    Why NOT the ``historyTypes[]`` SERVER filter: one might ask history.list
+    to return only messageAdded records. REJECTED — the correction arm needs
+    the SAME delta's labelsAdded/labelsRemoved events, and a type-suppressed
+    list's cursor-advance semantics are undocumented (does the cursor still
+    cover the suppressed records?). We read the full delta and select arrivals
+    client-side, so the correction join and the cursor stay on one honest
+    stream."""
     ids: list[str] = []
     for record in records:
-        events = record.get("messages")
+        events = record.get("messagesAdded")
         if events is None:
             continue
         if not isinstance(events, list) or not all(
             isinstance(event, dict) for event in events
         ):
-            raise GmailPermanentError("history record 'messages' not a list of objects")
+            raise GmailPermanentError(
+                "history record 'messagesAdded' not a list of objects"
+            )
         for event in events:
-            message_id = event.get("id")
-            if not isinstance(message_id, str) or not message_id:
-                raise GmailPermanentError("history message event without a message id")
+            message_id = _label_event_message_id(event, "messagesAdded")
             if message_id not in ids:
                 ids.append(message_id)
     return ids
@@ -797,6 +830,14 @@ def _run_tick(
                     e,
                 )
                 return stop
+            if _OUTGOING_LABEL_IDS & set(raw.label_ids):
+                # S1 sent-mail guard: the operator's OWN sent mail arrives as
+                # a messageAdded too (see _OUTGOING_LABEL_IDS for the
+                # confidence note). It is a counted SKIP — named, never scored,
+                # never written — the same posture as a deleted-message ghost.
+                skipped += 1
+                log.warning("daemon: skipped message %s: outgoing (SENT)", message_id)
+                continue
             try:
                 data = decode_gmail_raw(raw.raw_b64url)
             except ValueError as e:  # UnicodeEncodeError IS a ValueError

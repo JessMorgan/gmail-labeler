@@ -279,6 +279,10 @@ def test_one_daemon_tick_and_one_apply_batch_land_identical_plans(
                             {"id": "aa11", "threadId": "t1"},
                             {"id": "aa22", "threadId": "t2"},
                         ],
+                        "messagesAdded": [
+                            {"message": {"id": "aa11", "threadId": "t1"}},
+                            {"message": {"id": "aa22", "threadId": "t2"}},
+                        ],
                     },
                 ),
             )

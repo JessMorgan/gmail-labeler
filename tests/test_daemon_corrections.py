@@ -99,10 +99,18 @@ def _record(
     # the REAL Gmail wire shape (discovery rev 20261026): PLURAL
     # labelsAdded/labelsRemoved, each element nesting the Message under
     # 'message' (id at message.id). This is what the adapter delivers raw.
+    # A POSITIONAL id here is an ARRIVAL (S1): it rides BOTH the generic
+    # messages[] stubs AND messagesAdded[] — the field the daemon scores.
+    # Label-only events (added/removed) with NO positional id are old-mail
+    # changes: they carry no messagesAdded and are never scored.
     rec: dict[str, object] = {
         "id": hid,
         "messages": [{"id": m, "threadId": f"t{m}"} for m in message_ids],
     }
+    if message_ids:
+        rec["messagesAdded"] = [
+            {"message": {"id": m, "threadId": f"t{m}"}} for m in message_ids
+        ]
     if added:
         rec["labelsAdded"] = [
             {"message": {"id": m}, "labelIds": lids} for m, lids in added

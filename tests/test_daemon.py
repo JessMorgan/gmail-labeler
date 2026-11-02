@@ -107,9 +107,18 @@ def _ctx(**over: Any) -> ServingContext:
 
 
 def _record(*message_ids: str, hid: int = 1) -> dict[str, object]:
+    # The DOCUMENTED Gmail history shape for an ARRIVAL (discovery rev
+    # 20261026): the generic ``messages[]`` field carries id+threadId STUBS
+    # (the docs say embedded messages "typically" carry only those) AND the
+    # change-type ``messagesAdded[]`` nests the Message. A positional id here
+    # IS an arrival; the daemon scores messagesAdded[] (S1 — never the
+    # generic field), so the scripted mailbox rides verbatim.
     return {
         "id": hid,
         "messages": [{"id": m, "threadId": f"t{m}"} for m in message_ids],
+        "messagesAdded": [
+            {"message": {"id": m, "threadId": f"t{m}"}} for m in message_ids
+        ],
     }
 
 
@@ -286,6 +295,117 @@ def test_page_writes_first_then_commits_rows_and_cursor(tmp_path: Path) -> None:
     ]
     assert rows[0].applied_at == TS
     db.close()
+
+
+def test_old_mail_label_change_is_not_scored_arrival_still_flows(
+    tmp_path: Path,
+) -> None:
+    # S1 MAJOR (whole-stack review, perspective B): the Gmail history
+    # reference describes the generic ``messages[]`` field as "List of
+    # messages CHANGED in this history record" and recommends the specific
+    # change-type fields instead. A label-only change to OLD mail rides the
+    # wire as generic messages[] + labelsAdded with NO messagesAdded; the
+    # daemon's OWN apply_labels echoes the same shape (the push guide's
+    # notification-loop warning). Reading the generic field re-enrolled that
+    # old message for SCORING -> retroactive labeling (README 'scores
+    # arriving mail'; ROADMAP Never). The scoring set is ARRIVALS only:
+    # messagesAdded[]. A true arrival in the same delta still flows.
+    fake = FakeGmailClient(
+        messages=_messages(),  # aa11 (Shipping applied), aa22 (nothing present)
+        labels=_labels(),
+        history_pages=[
+            _page(
+                # OLD mail aa11 got Money/Bills (L2) added by a user — a
+                # MODIFY: generic messages[] + labelsAdded, NO messagesAdded.
+                {
+                    "id": 1,
+                    "messages": [{"id": "aa11", "threadId": "t1"}],
+                    "labelsAdded": [{"message": {"id": "aa11"}, "labelIds": ["L2"]}],
+                },
+                # a TRUE arrival: aa22 in messagesAdded (the generic stub rides
+                # too, exactly as the documented wire emits both).
+                {
+                    "id": 2,
+                    "messages": [{"id": "aa22", "threadId": "t2"}],
+                    "messagesAdded": [{"message": {"id": "aa22", "threadId": "t2"}}],
+                },
+            )
+        ],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    # the old, label-change-only message was NEVER fetched or scored...
+    assert "get_message:aa11" not in fake.calls
+    # ...while the true arrival flowed through the scoring path normally.
+    assert "get_message:aa22" in fake.calls
+    # and the retroactive write is impossible: aa11 earns no Application row.
+    assert db.applications_for_message("aa11") == [] or all(
+        r.label != "Money/Bills" for r in db.applications_for_message("aa11")
+    )
+    db.close()
+
+
+def test_sent_mail_arrival_is_counted_skip_not_written(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # S1 sent-mail guard: the operator's OWN sent mail arrives as a
+    # messageAdded too. This one WOULD score a graduated label (Money/Bills
+    # high on "two\nbody two") — the guard must count-skip it after the
+    # fetch, never write it. (Removing the guard is the mutant: a write for
+    # sent01 appears and this pin dies.)
+    caplog.set_level(logging.WARNING)
+    sent = FakeMessage(
+        id="sent01",
+        eml=_eml("two", "body two"),
+        label_ids=("SENT",),
+        thread_id="ts",
+        history_id=777,
+    )
+    fake = FakeGmailClient(
+        messages=[sent],
+        labels=_labels(),
+        history_pages=[_page(_record("sent01"))],
+        current_history_id=900,
+    )
+    db = _db(tmp_path)
+    db.set_history_cursor(777)
+    assert _run(tmp_path, fake, db=db) == 0
+    # it WAS fetched (the guard reads the label post-fetch)...
+    assert "get_message:sent01" in fake.calls
+    # ...but counted-skipped by name, never written, no rows.
+    assert "skipped message sent01: outgoing" in caplog.text
+    assert fake.writes == []
+    assert not db.applications_for_message("sent01")
+    db.close()
+
+
+def test_fake_history_records_are_wire_faithful() -> None:
+    # S1 fake-fidelity (the #27 adapter-conformance discipline): the fixture
+    # must model the WIRE, not the code. An ARRIVAL carries BOTH the generic
+    # messages[] STUBS (id+threadId only — the docs say embedded messages
+    # 'typically' carry just those) AND the change-type messagesAdded[]
+    # (nested message). A label-only change to old mail (a user relabel or the
+    # daemon's own apply echo) carries labelsAdded but NO messagesAdded. Pin
+    # each documented field's presence/absence per event type, and pin that
+    # the daemon scores ONLY the arrival — the exact discrimination the old
+    # generic-field fixture could not express.
+    from gmail_labeler.daemon import _message_ids
+
+    arrival = _record("aa22")
+    assert arrival["messages"] == [{"id": "aa22", "threadId": "taa22"}]  # stubs only
+    assert arrival["messagesAdded"] == [
+        {"message": {"id": "aa22", "threadId": "taa22"}}
+    ]
+    modify = {
+        "id": 1,
+        "messages": [{"id": "aa11", "threadId": "t1"}],
+        "labelsAdded": [{"message": {"id": "aa11"}, "labelIds": ["L2"]}],
+    }
+    assert "messagesAdded" not in modify  # a modify is NOT an arrival
+    assert _message_ids((arrival,)) == ["aa22"]  # the arrival scores
+    assert _message_ids((modify,)) == []  # the old-mail change does NOT
 
 
 def test_skip_present_message_no_write_no_rows_cursor_advances(
@@ -589,16 +709,19 @@ def test_label_only_records_pass_through_and_delta_commits(tmp_path: Path) -> No
     db.close()
 
 
-def test_malformed_messages_not_a_list_holds_cursor(
+def test_malformed_messages_added_not_a_list_holds_cursor(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F1 round 2: the sibling malformed shape — messages present but
-    # not a list of objects — is the same lying-wire hold arm
+    # F1 round 2 (S1-retargeted): the malformed arrival-event shape —
+    # messagesAdded present but not a list of objects — is the same
+    # lying-wire hold arm. (It read the generic messages[] before S1 moved
+    # the scoring set to messagesAdded[]; the PROPERTY — a malformed
+    # arrival wire holds the cursor — is unchanged.)
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
         messages=_messages(),
         labels=_labels(),
-        history_pages=[_page({"id": 1, "messages": "not-a-list"})],
+        history_pages=[_page({"id": 1, "messagesAdded": "not-a-list"})],
         current_history_id=900,
     )
     db = _db(tmp_path)
@@ -791,14 +914,17 @@ def test_get_message_auth_error_propagates(tmp_path: Path) -> None:
 def test_malformed_messages_list_holds_cursor(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # F1 MINOR 1: a history record whose messages event carries no id is
-    # a lying wire — the typed permanent from _message_ids routes to
-    # the HOLD arm (never a skip: the whole delta is untrustworthy)
+    # F1 MINOR 1 (S1-retargeted): a history record whose ARRIVAL event
+    # (messagesAdded) carries no message id is a lying wire — the typed
+    # permanent from _message_ids routes to the HOLD arm (never a skip:
+    # the whole delta is untrustworthy). (S1 moved the scoring set to
+    # messagesAdded[]; the PROPERTY — a malformed arrival wire holds — is
+    # unchanged.)
     caplog.set_level(logging.WARNING)
     fake = FakeGmailClient(
         messages=_messages(),
         labels=_labels(),
-        history_pages=[_page({"id": 1, "messages": [{"threadId": "tx"}]})],
+        history_pages=[_page({"id": 1, "messagesAdded": [{"threadId": "tx"}]})],
         current_history_id=900,
     )
     db = _db(tmp_path)
@@ -2321,8 +2447,10 @@ _CHILD_SCRIPT = textwrap.dedent(
         msgs.append(FakeMessage(id=m["id"], eml=eml, label_ids=tuple(m["label_ids"]),
                                 history_id=777))
     scores = {"one\\nbody one": (0.2, 0.95), "two\\nbody two": (0.9, 0.1)}
-    records = ({"id": 1, "messages": [
-        {"id": i, "threadId": "t" + i} for i in ("aa11", "aa22")]},)
+    records = ({"id": 1,
+                "messages": [{"id": i, "threadId": "t" + i} for i in ("aa11", "aa22")],
+                "messagesAdded": [{"message": {"id": i, "threadId": "t" + i}}
+                                  for i in ("aa11", "aa22")]},)
     pages = [HistoryPage(history_id=None, next_page_token=None,
                          records=records)]
     fake = FakeGmailClient(messages=msgs, labels=[

@@ -37,6 +37,7 @@ from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES, DateProvenance
 from .labels import label_path, path_is_at_or_under
 
 if TYPE_CHECKING:
+    from .appdb import CorrectionRow
     from .corpus_record import CorpusRecord
 
 #: Split Manifest format version (GLOSSARY: Split Manifest). Bump on any
@@ -642,3 +643,43 @@ def _bridge_hash(
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def apply_corrections_to_records(
+    records: Sequence[CorpusRecord],
+    corrections: Sequence[CorrectionRow],
+) -> list[CorpusRecord]:
+    """Fold Corrections into the corpus records as training signal — the
+    builder's COMPOSITION seam (ticket #27): the result feeds
+    ``build_dataset``'s existing ``records`` input; it does NOT fork the
+    builder. A 'removed' Correction drops the label from the message's
+    training labels (a human undid our application — a negative signal);
+    an 'added' Correction adds it (a human did our job — a positive
+    signal). A filter-covered 'added' is EXCLUDED (invariant #6: a Gmail
+    filter authored it, not the human, so it is not trainable signal).
+
+    Pure + deterministic (CODING-STANDARDS): a record with no correction
+    passes through UNCHANGED (identity-preserving); corrected records get
+    their labels re-sorted (the corpus_record label-path order). NO
+    bodies are read or written (invariant #5) — a Correction carries only
+    (message_id, label, kind, filter_covered). This is a PRE-PROCESSING
+    composition a HUMAN-GATED retrain opts into; nothing here retrains."""
+    adds: dict[str, set[str]] = {}
+    removes: dict[str, set[str]] = {}
+    for c in corrections:
+        if c.kind == "added":
+            if c.filter_covered:
+                continue  # invariant #6: filter-authored, not human signal
+            adds.setdefault(c.message_id, set()).add(c.label)
+        elif c.kind == "removed":
+            removes.setdefault(c.message_id, set()).add(c.label)
+    out: list[CorpusRecord] = []
+    for rec in records:
+        a = adds.get(rec.id)
+        r = removes.get(rec.id)
+        if not a and not r:
+            out.append(rec)  # identity-preserving for untouched records
+            continue
+        labels = (set(rec.labels) - (r or set())) | (a or set())
+        out.append(replace(rec, labels=tuple(sorted(labels))))
+    return out

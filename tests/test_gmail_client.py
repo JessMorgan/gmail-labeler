@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -238,6 +239,37 @@ def test_rest_history_page_history_id_is_string_on_wire() -> None:
     client = _rest({"historyId": "42", "history": [{"messagesAdded": []}]})
     h = client.history(7)
     assert h.history_id == 42 and len(h.records) == 1
+
+
+def test_rest_get_message_parses_history_id() -> None:
+    # #25 C2 (the sync-guide bootstrap source): the Message resource's
+    # historyId — the per-message history record id the daemon stores as
+    # its starting cursor — parsed as int64 (string on the wire, the
+    # _opt_int64 doctrine)
+    client = _rest(
+        {"id": "a1", "threadId": "t", "labelIds": [], "raw": "abc", "historyId": "777"}
+    )
+    assert client.get_message("a1").history_id == 777
+
+
+def test_rest_get_message_history_id_absent_or_malformed() -> None:
+    # absence is TOLERATED (the internalDate doctrine: never trust
+    # presence — the consumer's bootstrap-failure branch is the point);
+    # present-and-malformed is loud permanent (a corrupt cursor value
+    # must never reach the poll loop)
+    client = _rest({"id": "a1", "threadId": "t", "labelIds": [], "raw": "abc"})
+    assert client.get_message("a1").history_id is None
+    bad = _rest(
+        {
+            "id": "a1",
+            "threadId": "t",
+            "labelIds": [],
+            "raw": "abc",
+            "historyId": "-5",
+        }
+    )
+    with pytest.raises(GmailPermanentError):
+        bad.get_message("a1")
 
 
 def test_rest_filters_keep_bool_and_int_criteria() -> None:
@@ -481,6 +513,148 @@ def test_reason_falls_back_to_own_reason_when_errors_lacks_one() -> None:
     assert _error_reason(err) == "userRateLimitExceeded"  # type: ignore[union-attr]
 
 
+def test_opt_int64_caps_at_the_uint64_wire_range() -> None:
+    # F1 MINOR 4: the 20-digit regex admitted "99999999999999999999"
+    # (ABOVE uint64) clean through the parser in review. The parsed
+    # value must fit uint64 (wire semantics); the STORE's SQLite signed
+    # bound is a DIFFERENT named constant (appdb._MAX_SQLITE_INTEGER)
+    from gmail_labeler.gmail_client import UINT64_MAX, _opt_int64
+
+    assert _opt_int64({"h": str(UINT64_MAX)}, "h") == UINT64_MAX
+    with pytest.raises(GmailPermanentError, match="uint64 wire range"):
+        _opt_int64({"h": "99999999999999999999"}, "h")
+    with pytest.raises(GmailPermanentError, match="uint64 wire range"):
+        _opt_int64({"h": UINT64_MAX + 1}, "h")  # the real-int branch too
+
+
+def test_fake_history_404s_both_expiry_directions() -> None:
+    # F1 MINOR 5: the fake models BOTH window failures — a cursor
+    # AHEAD of the mailbox (pre-existing) and, the REAL production
+    # direction, a cursor BEHIND the retention floor: the history.list
+    # reference documents the 404 for a startHistoryId "invalid or out
+    # of date" (the daemon-side arm test rides the floor)
+    fake = FakeGmailClient(current_history_id=900, retention_floor=850)
+    with pytest.raises(GmailPermanentError, match="outside the retained"):
+        fake.history(901)
+    with pytest.raises(GmailPermanentError, match="invalid or out of date"):
+        fake.history(400)
+    # floor unset (the default): no new refusal — sealed fixtures intact
+    plain = FakeGmailClient(
+        history_pages=[HistoryPage(history_id=None, next_page_token=None, records=())],
+        current_history_id=900,
+    )
+    plain.history(1)
+
+
+def test_opt_history_id_caps_at_the_persistable_bound() -> None:
+    # F2 MINOR 5 (the wire->store seam): a wire-LEGAL uint64 historyId
+    # beyond SQLite's signed max would make the daemon write a delta's
+    # mail and then hold that cursor FOREVER on the store-side refusal.
+    # The parse site refuses it NAMED instead; the store never sees it
+    # (bootstrap rides the same arm: the 'cannot establish' hold names
+    # it, never exit 5).
+    from gmail_labeler.gmail_client import (
+        MAX_PERSISTABLE_HISTORY_ID,
+        _opt_history_id,
+    )
+
+    assert (
+        _opt_history_id({"h": str(MAX_PERSISTABLE_HISTORY_ID)}, "h")
+        == MAX_PERSISTABLE_HISTORY_ID
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        _opt_history_id({"h": str(MAX_PERSISTABLE_HISTORY_ID + 1)}, "h")
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        _opt_history_id({"h": MAX_PERSISTABLE_HISTORY_ID + 1}, "h")
+
+
+def test_get_message_refuses_an_unpersistable_history_id_at_the_wire() -> None:
+    # F2 round-2 MAJOR (the reviewer's executed probe): the RawMessage
+    # site is the ONLY source of the bootstrap cursor seed — the cap
+    # must ride it too, or a wire-legal 2**63 historyId parses clean,
+    # bootstrap returns it, and the CLI lands on exit 5 at the store
+    # (the shipped docstring promised the 'cannot establish' hold
+    # instead). The F2 swap silently no-opped here (a replace without
+    # an assert); this node is the falsifier.
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    client = _rest(
+        payload={
+            "id": "aa",
+            "threadId": "t",
+            "labelIds": ["INBOX"],
+            "raw": "aGk",
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID + 1),
+        }
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        client.get_message("aa")
+    # the top persistable value still parses (the boundary, wire-side)
+    ok = _rest(
+        payload={
+            "id": "aa",
+            "threadId": "t",
+            "labelIds": ["INBOX"],
+            "raw": "aGk",
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID),
+        }
+    )
+    assert ok.get_message("aa").history_id == MAX_PERSISTABLE_HISTORY_ID
+
+
+def test_history_refuses_an_unpersistable_history_id_at_the_wire() -> None:
+    # F3 MAJOR (both families' mutant H/C5): the HistoryPage site had
+    # the _opt_history_id WIRING but NO falsifier — reverting the line
+    # left the full suite green and reopened the write-then-hold-forever
+    # seam (wire-legal historyId=2**63 page: the delta's writes land,
+    # the store refuses the commit, the cursor is pinned forever). This
+    # node is the symmetric twin of the E2 RawMessage falsifier, driven
+    # through client.history() itself.
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    client = _rest(
+        payload={
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID + 1),
+            "history": [],
+        }
+    )
+    with pytest.raises(GmailPermanentError, match="persistable historyId bound"):
+        client.history(1)
+    ok = _rest(
+        payload={
+            "historyId": str(MAX_PERSISTABLE_HISTORY_ID),
+            "history": [],
+        }
+    )
+    assert ok.history(1).history_id == MAX_PERSISTABLE_HISTORY_ID
+
+
+def test_history_id_parse_bound_equals_the_store_bound(tmp_path: Path) -> None:
+    # the anti-drift pin: the parse ceiling and the store ceiling are
+    # the SAME number, stated in two modules (layering keeps them
+    # separate — the store must not import the adapter and vice versa);
+    # drift here would reopen the F2 seam from one side. The boundary
+    # is EXERCISED wire-side to store-side: the top parsed value must
+    # round-trip through set_history_cursor.
+    from gmail_labeler.appdb import _MAX_SQLITE_INTEGER, AppDB
+    from gmail_labeler.gmail_client import MAX_PERSISTABLE_HISTORY_ID
+
+    assert MAX_PERSISTABLE_HISTORY_ID == _MAX_SQLITE_INTEGER
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.set_history_cursor(MAX_PERSISTABLE_HISTORY_ID)
+    assert db.get_history_cursor() == MAX_PERSISTABLE_HISTORY_ID
+    db.close()
+
+
+def test_fake_refuses_retention_floor_above_the_mailbox() -> None:
+    # F2 NIT: a floor above current_history_id makes EVERY poll an
+    # out-of-date 404 (endless resync) — the fake refuses the scripted
+    # lie at construction (the review probe hit exactly this state)
+    with pytest.raises(ValueError, match="above current_history_id"):
+        FakeGmailClient(current_history_id=100, retention_floor=500)
+
+
 def test_fake_history_idle_never_regresses_cursor() -> None:
     fake = FakeGmailClient(
         history_pages=[HistoryPage(history_id=98765, next_page_token=None, records=())]
@@ -488,6 +662,35 @@ def test_fake_history_idle_never_regresses_cursor() -> None:
     fake.history(1)
     idle = fake.history(98765)
     assert idle.history_id is not None and idle.history_id >= 98765
+
+
+def test_fake_history_rewalk_replays_and_the_token_guard_survives() -> None:
+    # #25 review round: the RE-WALK rule (a token-less call from the
+    # held cursor re-serves the scripted window) must not mask a
+    # genuine skip — the TOKEN guard has to survive it
+    pages = [
+        HistoryPage(
+            history_id=None,
+            next_page_token="p1",
+            records=({"messages": [{"id": "a1"}]},),
+        ),
+        HistoryPage(history_id=None, next_page_token=None, records=()),
+    ]
+    fake = FakeGmailClient(history_pages=pages, current_history_id=50)
+    first = fake.history(10)
+    assert first.next_page_token == "p1"
+    # re-walk: token-less, SAME start id, mid-chain → replays from the
+    # walk's first page (the held-cursor replay the daemon relies on)
+    replay = fake.history(10)
+    assert replay.next_page_token == "p1"
+    # a wrong token mid-chain still trips the typed 400 (the skip catch)
+    with pytest.raises(GmailPermanentError, match="skip/replay misuse"):
+        fake.history(10, "bogus")
+    # a token-less call under a DIFFERENT start id is a fresh poll from
+    # a different cursor (the re-bootstrap flow): a new walk, the script
+    # continues from its current position (page 2)
+    fresh = fake.history(20)
+    assert fresh.next_page_token is None
 
 
 @pytest.mark.parametrize(
@@ -1070,12 +1273,57 @@ def test_fake_list_labels_returns_a_copy() -> None:
 def test_fake_list_filters_returns_a_copy() -> None:
     # F3 review MINOR: the same trap, ONE METHOD BELOW — list_filters
     # handed out the live filters_list (the REST adapter builds fresh
-    # FilterInfo per call; the copy rationale holds word-for-word).
-    # #25/#26 ride this fake; the read surfaces must be symmetric
+    # FilterInfo per call; the copy rationale holds word-for-word AT
+    # LIST LEVEL — the FilterInfo NESTED criteria/action dicts remain
+    # shared, REST parity does not extend to them).
+    # #25/#26 ride this fake; the read surfaces must be list-level copies
     fake = FakeGmailClient(filters=[FilterInfo(id="f1", criteria={"from": "x"})])
     returned = fake.list_filters()
     returned.clear()
     assert fake.filters_list == [FilterInfo(id="f1", criteria={"from": "x"})]
+
+
+def test_protocol_ensure_label_docstring_carries_the_startup_contract() -> None:
+    # #25 C0 (the F3 residual cell, folded into this ticket's opener):
+    # the PROTOCOL docstring is the load-bearing surface #25's startup
+    # resolution codes against standalone — it must state the RETURN
+    # (the Gmail label id), the RAISE TYPE (a BARE ValueError, not the
+    # gmail_errors taxonomy — the exit-4 mapping excepts ValueError
+    # explicitly), and the precedence word ("otherwise": the refusal
+    # guards MINTING a look-alike only). Whitespace-normalized: the
+    # prose wraps lines, the contract does not. The module header's
+    # error-surface claim must carry the SAME exception (the review
+    # round's synced-text finding: an unscoped "taxonomy only" header
+    # contradicted the very claim this commit added).
+    import gmail_labeler.gmail_client as gmail_client_module
+
+    doc = " ".join((GmailClient.ensure_label.__doc__ or "").split())
+    assert "Returns the Gmail label id" in doc
+    assert "BARE ValueError" in doc
+    assert "otherwise," in doc
+    module_doc = " ".join((gmail_client_module.__doc__ or "").split()).lower()
+    assert "bare ``valueerror``" in module_doc
+
+
+def test_fake_read_surface_comment_says_list_level_copy() -> None:
+    # #25 C0 (the F3 residual cell) + the review round's pin-scope
+    # MINOR: the fake's list_filters comment claimed the read surfaces
+    # stay "symmetric" — overstated: the copy is LIST-LEVEL (the
+    # FilterInfo nested criteria/action dicts remain shared; safety
+    # rests on the documented nested-mutation ban). POSITIVE pin (the
+    # wording is present) AND the negative ban (the word must not
+    # survive in the fake's source — the direct-assertion precedent:
+    # test_executescript_is_banned_from_appdb_production_source). The
+    # ban is intentionally NARROW: it scopes to fake_gmail.py only;
+    # the ordinary English word stays legal everywhere else (the
+    # test_graduation_cli prose proves it).
+    import gmail_labeler.fake_gmail as fake_module
+
+    source = Path(fake_module.__file__).read_text(encoding="utf-8")
+    normalized = " ".join(source.split())
+    assert "LIST-LEVEL COPY" in normalized
+    assert "NESTED" in normalized and "REMAIN SHARED" in normalized
+    assert "symmetric" not in source
 
 
 def test_fake_ensure_label_refuses_system_namesakes() -> None:

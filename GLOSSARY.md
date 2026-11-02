@@ -25,10 +25,10 @@ umbrella plus the best band tier to every write, and
 `gmail_client.ensure_label` ships the name→Gmail-label-id resolution
 (get-or-create: an existing USER label of exactly that name is used
 as-is; a casefolded System Label name-sake is refused named — the
-refusal guards minting a look-alike only; the daemon / `apply` startup
-of #25/#26 calls it once per configured name). The live write itself
-lands with the daemon / `apply` CLI (#25/#26); the shadow report still
-attaches no labels.
+refusal guards minting a look-alike only; the daemon's startup calls
+it once per configured name (#25), `apply` will too (#26)). The
+daemon's live write landed with #25, the `apply` bulk path lands with
+#26; the shadow report still attaches no labels.
 _Avoid_: confidence label, meta label
 
 **Application**:
@@ -42,10 +42,12 @@ med; a skip-present label earns no band tier, it is not applied). That
 composition (umbrella + one band tier) SHIPS at the library level
 (ticket #24): `applications.plan_message_write` composes it from the
 tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
-ships the name→id resolution; the daemon / `apply` startup of #25/#26
-calls it once per configured name). The Application is ALL-OR-NOTHING
+ships the name→id resolution; the daemon's startup calls it once per
+configured name (#25), `apply` will too (#26)). The Application is ALL-OR-NOTHING
 per message: a data-path compose error means NO write for that message
-plus a counted id-only warning (caller bugs and internal guards raise
+plus a counted warning naming the message id and the plan detail
+(label and score where the failure shape carries them; structurally
+body-free — invariant #5; caller bugs and internal guards raise
 — and still write nothing; invariant #1's fail-safe), and nothing new
 earned — skip-present included — means an empty plan and no API call at
 all (invariant #2). Band tiers ACCUMULATE across Applications (accepted
@@ -53,8 +55,8 @@ v1 policy): "exactly one band Tier Label" is PER-APPLICATION — a later
 Application can add a DIFFERENT band tier to the same message (a
 med-band Application on a message already carrying `ai-high` adds
 `ai-med`); additive-only never corrects the old one, so the audit truth
-is the Applications table, not the tier labels. The live write itself
-lands with the daemon / `apply` CLI (#25/#26). The shadow report is a
+is the Applications table, not the tier labels. The daemon's live write
+landed with #25; the `apply` bulk path (#26) reuses the same plan. The shadow report is a
 PREVIEW, not an Application: it renders the band tier NAME for would-be
 rows and attaches no labels (no umbrella, no band tier on the wire).
 _Avoid_: auto-label (the event, not the label)
@@ -144,17 +146,57 @@ _Avoid_: shadow summary, evaluation report
 **state DB**:
 The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`;
 overridden per-command by the `--db` flag) holding the `shadow_results`
-table (run id, message id, label, probability, band, run timestamp) and
-the `applications` table (ticket #24, schema v2: message id, label, label
+table (run id, message id, label, probability, band, run timestamp), the
+`applications` table (ticket #24, schema v2: message id, label, label
 id, score, band, tier, applied-at, source — the join corrections and
-`status` read). It carries ids, probabilities, labels, and timestamps
-ONLY — never bodies (invariant #5) — so it is publicly attachable. One
-transaction per write (a crash leaves no half rows), and every schema
-transition is one transaction too — fresh create+stamp, the live v1
-DB's single-row v1→v2 restamp, self-heals — so a crash leaves the file
-fully prior-state or fully new-state, never the intermediate; a foreign
-schema_version is refused.
+`status` read), and the `daemon_state` table (ticket #25, schema v3: the
+single-row History Cursor). It carries ids, probabilities, labels,
+timestamps, and the cursor ONLY — never bodies (invariant #5) — so it is
+publicly attachable. One transaction per write (a crash leaves no half
+rows), and every schema transition is one transaction too — fresh
+create+stamp, the live v1 DB's v1→v2 and the v2 DB's v2→v3 single-row
+restamps, self-heals — so a crash leaves the file fully prior-state or
+fully new-state, never the intermediate; a foreign schema_version is
+refused.
 _Avoid_: shadow DB, label DB
+
+**History Cursor**:
+The Gmail mailbox history record id (`historyId`) the daemon syncs from:
+everything that changed after it is unprocessed. Stored in the state DB's
+`daemon_state` single-row table (schema v3). ESTABLISHED (no page
+involved) by the documented full-sync bootstrap — the per-message
+`historyId` of the most recent message (the export path's own read
+pair: `list_messages` + `get_message`), and re-established the same way
+after an expiry — and ADVANCED only through Durable Handling. Wire truth:
+every page of a history delta carries the mailbox's CURRENT id, not a
+per-page watermark, so the cursor takes the id from the delta's FINAL
+response. An expired cursor (history 404 — Gmail retains records for
+typically a week or more, occasionally far less) forces a re-bootstrap:
+the daemon names the gap in a warning, and the mail that arrived during
+it was NOT processed (review it with the Shadow Pass or `apply`).
+_Avoid_: token, offset (it is a mailbox-wide watermark, not a query cursor)
+
+**Durable Handling**:
+The daemon's per-delta commit contract (invariant #3): a poll's delta
+(all pages drained through the token chain) is durably handled exactly
+when the ONE state-DB transaction carrying the delta's Application rows
+AND the History Cursor advance has COMMITTED — commit = handled. The
+delta is the unit because every page's `historyId` is the mailbox's
+CURRENT id: committing per-page would persist the current id before the
+later pages are handled. The ordering is locked: the Gmail writes land
+FIRST (additive-only `apply_labels`), then the single transaction
+(`appdb.commit_page`). A crash before the commit replays the delta from
+the held cursor, and the replay converges via skip-present: an
+already-written label is now present, so the plan composes empty — no
+second write, no duplicate row. That pin IS the safety proof: the Gmail
+write cannot ride a database transaction, so skip-present idempotency is
+the mechanism, and the crash matrix proves it (including a real process
+kill). The documented face of the same design: a write that landed
+inside a delta that fails to commit — a crash, or a mid-delta write
+error that holds the cursor — leaves its audit row uncommitted (the
+Gmail truth stands; the row is not re-added) — the audit truth is the
+Applications table plus the mailbox, not a guaranteed 1:1.
+_Avoid_: checkpoint (the encoder's artifact owns that word)
 
 **Backlog**:
 The pre-existing mailbox history, as opposed to newly-arriving mail. The

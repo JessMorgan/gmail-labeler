@@ -1,12 +1,12 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add apply/daemon/status (absent until wired, which
-surfaces as a usage error). Phase 0 subcommands, the Phase 1
-``train``/``eval`` commands, and the Phase 1 exit ``shadow`` commands
-are wired as they are implemented. Exit 3 is reserved for
-wired-but-stubbed commands and currently UNREACHABLE — no command is
-stubbed; scripts can branch on 0/2/4/5 today.
+later phases add apply/status (absent until wired, which surfaces as a
+usage error). Phase 0 subcommands, the Phase 1 ``train``/``eval``/
+``shadow`` commands, and the Phase 2 ``daemon`` (ticket #25) are wired
+as they are implemented. Exit 3 is reserved for wired-but-stubbed
+commands and currently UNREACHABLE — no command is stubbed; scripts can
+branch on 0/2/4/5 today.
 """
 
 from __future__ import annotations
@@ -15,13 +15,16 @@ import contextlib
 import dataclasses
 import json
 import os
+import signal
 import tempfile
+import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from types import FrameType
+from typing import TYPE_CHECKING, Any, Literal
 
 import typer
 
@@ -2108,19 +2111,21 @@ def _check_store_db_path(db_path: Path, cfg: Config, command: str, origin: str) 
             raise typer.Exit(code=2) from None
 
 
-def _validate_store_db(db_path: Path) -> None:
+def _validate_store_db(db_path: Path, command: str = "shadow run") -> None:
     """S5: validate the state DB FAIL-FAST (open + ownership + version)
     before any network work — a foreign/corrupt/foreign-version DB is
     refused (exit 5) before we pay for list_labels/list_messages. The
     connection is closed immediately (validation only); the write
-    re-opens it at the store step."""
+    re-opens it at the store step. ``command`` names the calling
+    command in the refusal (the daemon reuses the gate; the shadow
+    default keeps its sealed message verbatim)."""
     from .appdb import AppDB, AppDBError
 
     db = AppDB(db_path)
     try:
         db.open()
     except (AppDBError, OSError) as e:
-        typer.echo(f"shadow run failed: state DB unusable: {e}", err=True)
+        typer.echo(f"{command} failed: state DB unusable: {e}", err=True)
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     finally:
         db.close()
@@ -3054,6 +3059,478 @@ def shadow_report(
             f"not-applied={s['not_applied']} "
             f"(would-be: high={s['would_be_high']} med={s['would_be_med']})"
         )
+
+
+# -- daemon (ticket #25): poll, decide, write ---------------------------------
+
+
+def _daemon_client(config: Config) -> GmailClient:
+    """Client factory seam: tests inject FakeGmailClient here (the
+    offline spine, invariant #9). The daemon is the WRITE path — the
+    full Protocol surface (history polling, apply_labels, ensure_label)."""
+    from .auth import credentials as build_credentials
+    from .gmail_client import GmailRestClient
+
+    return GmailRestClient(build_credentials(config))
+
+
+def _daemon_model_factory(checkpoint_dir: Path, vocabulary: tuple[str, ...]) -> Model:
+    """Model factory seam for ``daemon`` (the ``load_model`` factory
+    shape): tests inject a FakeModel producer. The real implementation
+    lazy-imports the ``train/`` recipe (torch — the optional extra), so
+    the CLI module itself stays importable without torch."""
+    from train.recipe import load_hf_model
+
+    return load_hf_model(checkpoint_dir, vocabulary)
+
+
+def _sleep_until_stopped(flag: threading.Event, seconds: float) -> None:
+    """The interruptible poll sleep (AC: mid-sleep SIGTERM → immediate
+    exit): ``Event.wait`` returns the MOMENT the signal handler sets the
+    flag — no polling chunk, no real time.sleep in the loop's contract."""
+    flag.wait(timeout=seconds)
+
+
+_PreviousHandlers = dict[
+    signal.Signals, Callable[[int, FrameType | None], Any] | int | None
+]
+
+
+def _install_shutdown_handlers(flag: threading.Event) -> _PreviousHandlers:
+    """SIGTERM + SIGINT set the stop flag (the loop consults it between
+    messages, between pages, and around the sleep; the current delta
+    still runs to its commit point). Returns the previous dispositions
+    for the finally-restore (a daemon run must not leak handlers)."""
+
+    def handler(signum: int, frame: FrameType | None) -> None:
+        flag.set()
+
+    previous: _PreviousHandlers = {}
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, handler)
+    except BaseException:
+        # a mid-install failure (a non-main thread, a platform
+        # refusal) must not leave the earlier handler installed
+        for sig, prior in previous.items():
+            signal.signal(sig, prior)
+        raise
+    return previous
+
+
+def _restore_shutdown_handlers(previous: _PreviousHandlers) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+@app.command("daemon")
+def daemon(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — the calibrated Threshold Bands)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — only GRADUATED labels apply)",
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+) -> None:
+    """Poll the Gmail History API (~[gmail] history_poll_seconds),
+    score arriving mail, and APPLY only graduated labels — additive
+    only, skip-present, Tier Labels on every Application (ticket #25;
+    GLOSSARY: Durable Handling).
+
+    The cursor is persisted ONLY after the delta's events are durably
+    handled (invariant #3): the Gmail writes land first, then ONE
+    transaction carries the delta's Application rows AND the cursor
+    advance — COMMIT = handled; a kill before the commit replays the
+    delta and skip-present makes the retry idempotent (daemon.py).
+    Identity gates run FIRST (the shadow-run shape: checkpoint,
+    Graduation Table, Bands Artifact), then the three configured Tier
+    Label names resolve ONCE via ensure_label (a System-Label name
+    collision refuses AT MINT at exit 4, naming the [labels] key: an
+    existing exact-case USER label of that name is reused first). SIGTERM/
+    SIGINT shut down gracefully: the current delta completes to its
+    commit point, exit 0 (the handlers wrap the LOOP only: Ctrl-C
+    during the startup gates/corpus read keeps the default
+    disposition — nothing is open yet, so nothing needs unwinding).
+    Bodies never enter the DB or any log (invariant #5). Exit
+    codes: 0 clean stop · 2 usage · 4 auth/config (incl. the tier-name
+    collision) · 5 artifact/store failure, startup tier-resolution wire
+    failure, or a loop I/O failure."""
+    import logging
+    import sys
+
+    from .appdb import AppDB, AppDBError
+    from .auth import AuthError
+    from .corpus_record import corpus_fingerprint
+    from .corpus_store import CorpusError, CorpusStore
+    from .daemon import ServingContext, daemon_loop
+    from .dataset_build import SplitManifest
+    from .gmail_errors import GmailAuthError, GmailError
+    from .model import (
+        MANIFEST_FILENAME,
+        THRESHOLDS_SOURCE_NONE,
+        CheckpointRefusedError,
+        ExpectedIdentity,
+        load_model,
+    )
+    from .tiers import TIER_APPLIED, TIER_HIGH, TIER_MED
+    from .tokens import TokenStoreError
+
+    # usage refusals up front (exit 2, before any work — the shadow
+    # precedent): an empty --bands/--graduation would degenerate to
+    # Path("") and fail awkwardly mid-run
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if not target.strip():
+            typer.echo(f"daemon failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+
+    # PROJECT exit-code contract (cli epilog + every command suite):
+    # config load failure is 4 (auth/config unusable) — _load_config's
+    # own mapping; the daemon does not fork the contract
+    cfg = _load_config(config)
+    db_path = _resolve_db_path(cfg, db, "daemon")
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, "daemon", db_origin)
+    # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
+    # pay the corpus-scale identity work below
+    try:
+        client = _daemon_client(cfg)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+
+    # S5: the state DB validated FAIL-FAST before any network work
+    _validate_store_db(db_path, command="daemon")
+
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        typer.echo(
+            f"daemon failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset export/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        records = list(store.iter_records())
+    except (CorpusError, OSError, UnicodeDecodeError):
+        typer.echo("daemon failed: records unreadable", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if not records:
+        typer.echo(
+            "daemon failed: corpus is empty \u2014 run dataset export/import-gyb first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the checkpoint (identity gate, the shadow shape): the materialized
+    # manifest is the split's authority (invariant #7)
+    checkpoint_dir = cfg.model.checkpoint_dir
+    manifest_path = checkpoint_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        typer.echo(
+            f"daemon failed: checkpoint {checkpoint_dir} has no "
+            f"{MANIFEST_FILENAME} \u2014 no verifiable split identity "
+            "(run train first)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        manifest = SplitManifest.from_json(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        typer.echo(
+            f"daemon failed: checkpoint manifest unreadable or tampered: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    expected = ExpectedIdentity(
+        vocabulary=manifest.vocabulary,
+        corpus_fingerprint=corpus_fingerprint(records, manifest.train_ids),
+        split_manifest_hash=manifest.content_hash,
+        thresholds_source=THRESHOLDS_SOURCE_NONE,
+        encoder_id=cfg.model.encoder,
+    )
+    try:
+        model = load_model(checkpoint_dir, expected, _daemon_model_factory)
+    except CheckpointRefusedError as e:
+        typer.echo(
+            f"daemon failed: checkpoint refused ({', '.join(e.fields)}) "
+            "\u2014 no silent fallback; rebuild the checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ImportError as e:
+        typer.echo(
+            f"daemon failed: the model recipe is unavailable ({e}) "
+            "\u2014 install the optional extra: `uv sync --extra train` "
+            "(if it is already installed, the recipe import itself is "
+            "broken \u2014 report it)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        typer.echo(f"daemon failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if model.vocabulary != manifest.vocabulary:
+        typer.echo(
+            "daemon failed: the model's vocabulary does not match the "
+            "manifest's \u2014 refusing to score against a lying column "
+            "order",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the Bands Artifact + the Graduation Table (identity gates, the
+    # shadow shape — cause naming per #22's doctrine)
+    from .graduation import GraduationRefusedError, GraduationTable, verify_graduation
+    from .thresholds import BandsArtifact, BandsRefusedError, verify_bands
+
+    bands_path = Path(bands)
+    if not bands_path.is_file():
+        typer.echo(
+            f"daemon failed: no bands artifact at {bands_path} \u2014 "
+            "run `eval --bands` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        bands_text = bands_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"daemon failed: bands artifact at {bands_path} is unreadable "
+            "(I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"daemon failed: bands artifact at {bands_path} is not valid "
+            "UTF-8 \u2014 it does not parse as a Bands Artifact",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        artifact = BandsArtifact.from_json(bands_text)
+    except ValueError as e:
+        typer.echo(
+            f"daemon failed: bands artifact at {bands_path} does not parse "
+            f"as a Bands Artifact: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_bands(
+            artifact,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+        )
+    except BandsRefusedError as e:
+        typer.echo(
+            f"daemon failed: bands artifact refused ({', '.join(e.fields)}) "
+            "\u2014 it disagrees with this checkpoint/eval; re-run "
+            "`eval --bands` against this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"daemon failed: bands verification failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    graduation_path = Path(graduation)
+    if not graduation_path.is_file():
+        typer.echo(
+            f"daemon failed: no graduation table at {graduation_path} "
+            "\u2014 run `eval --graduation --confirm-graduation` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        graduation_text = graduation_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"daemon failed: graduation table at {graduation_path} is "
+            "unreadable (I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"daemon failed: graduation table at {graduation_path} is not "
+            "valid UTF-8 \u2014 it does not parse as a Graduation Table",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        table = GraduationTable.from_json(graduation_text)
+    except ValueError as e:
+        typer.echo(
+            f"daemon failed: graduation table at {graduation_path} does not "
+            f"parse as a Graduation Table: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_graduation(
+            table,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+            bands_content_hash=artifact.content_hash,
+        )
+    except GraduationRefusedError as e:
+        typer.echo(
+            f"daemon failed: graduation table refused ({', '.join(e.fields)}) "
+            "\u2014 it disagrees with this checkpoint/eval/bands; re-run "
+            "`eval --graduation` against this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"daemon failed: graduation verification failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the label bridge (presence + System Labels — the read path)
+    try:
+        labels = client.list_labels()
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"daemon failed: label list failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    id_to_name = {li.id: li.name for li in labels}
+    system_names = frozenset(li.name for li in labels if li.type == "system")
+    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
+    bands_map = {entry.label: (entry.high, entry.med) for entry in artifact.labels}
+
+    # STARTUP tier resolution: the three configured [labels] names →
+    # Gmail label ids ONCE (ensure_label: get-or-create; the Q1 ruling
+    # keeps the signature and pays one list round-trip per name). The
+    # collision refusal is a BARE ValueError (the C0 Protocol contract —
+    # NOT the gmail_errors taxonomy): it maps to exit 4 (config error)
+    # and names the offending [labels] KEY (the #24 carryover — a bare
+    # ValueError would otherwise land as exit-1 'a bug').
+    tier_constants = {"applied": TIER_APPLIED, "high": TIER_HIGH, "med": TIER_MED}
+    tier_label_ids: dict[str, str] = {}
+    for key, name in (
+        ("applied", cfg.labels.applied),
+        ("high", cfg.labels.high),
+        ("med", cfg.labels.med),
+    ):
+        try:
+            tier_label_ids[tier_constants[key]] = client.ensure_label(name)
+        except ValueError as e:
+            typer.echo(
+                f"daemon failed: [labels] {key} = {name!r} refused: {e} "
+                f"\u2014 rename [labels] {key} and restart",
+                err=True,
+            )
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailAuthError as e:
+            # ensure_label's own round-trips (list + create) are WIRE
+            # calls: they take the SAME arms as every other client call
+            # site (the review round's blocker — they escaped the
+            # ValueError-only arm to exit 1); auth is human-gated (4)
+            typer.echo(f"auth: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailError as e:
+            # transient/permanent wire failure at startup resolution:
+            # operation failure (5), named, never a traceback
+            typer.echo(f"daemon failed: tier label resolution failed: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    # the Managed Label name→id map for the would-apply names (the
+    # bridge, user labels only, exact-case first hit wins — the plan's
+    # _resolve_id fail-safes any name absent here)
+    managed_label_ids: dict[str, str] = {}
+    for li in labels:
+        if (
+            li.type == "user"
+            and li.name in graduated
+            and li.name not in managed_label_ids
+        ):
+            managed_label_ids[li.name] = li.id
+
+    ctx = ServingContext(
+        bands=bands_map,
+        graduated=graduated,
+        system_labels=system_names,
+        id_to_name=id_to_name,
+        managed_label_ids=managed_label_ids,
+        tier_label_ids=tier_label_ids,
+    )
+    typer.echo(
+        f"daemon: serving {len(graduated)} graduated label(s); poll "
+        f"{cfg.gmail.history_poll_seconds}s; db {db_path}",
+        err=True,
+    )
+    stop_flag = threading.Event()
+    previous_handlers = _install_shutdown_handlers(stop_flag)
+    # OPERATOR VISIBILITY (F2 MINOR 7): the per-delta counter line is
+    # INFO, and an unconfigured root logger shows WARNING+ only
+    # (logging.lastResort) — the daemon installs a stderr handler for
+    # ITS logger so the counter line reaches the operator; the finally
+    # removes it (a daemon run must not leak handlers, the signal
+    # precedent above). caplog pins keep working: propagation to the
+    # root is untouched.
+    store_db = AppDB(db_path)
+    daemon_log = logging.getLogger("gmail_labeler.daemon")
+    log_handler = logging.StreamHandler(sys.stderr)
+    log_handler.setLevel(logging.INFO)
+    previous_log_level = daemon_log.level
+    # propagation stays ON (the caplog pins ride it); today no root
+    # handler exists, so nothing double-prints (verified in review)
+    daemon_log.setLevel(logging.INFO)
+    daemon_log.addHandler(log_handler)
+    try:
+        store_db.open()
+        daemon_loop(
+            client=client,
+            db=store_db,
+            model=model,
+            ctx=ctx,
+            poll_seconds=cfg.gmail.history_poll_seconds,
+            clock=_now,
+            sleep=lambda seconds: _sleep_until_stopped(stop_flag, seconds),
+            should_stop=stop_flag.is_set,
+        )
+        typer.echo("daemon: stopped", err=True)
+    except GmailAuthError as e:
+        # the loop's propagating human-gated arm (exit 4, never a
+        # traceback; the cursor stands where it was — the loop holds it)
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except AppDBError as e:
+        # the store refusal family (a tampered cursor row, an I/O
+        # failure at the serve-time open): operation failure, named
+        typer.echo(f"daemon failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except OSError as e:
+        # a bare I/O failure from anywhere in the loop (not necessarily
+        # the state DB): the cause is named neutrally — a "state DB"
+        # diagnosis over a network fault would be a lie (review finding)
+        typer.echo(f"daemon failed: I/O failure: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        daemon_log.removeHandler(log_handler)
+        daemon_log.setLevel(previous_log_level)
+        _restore_shutdown_handlers(previous_handlers)
+        store_db.close()
 
 
 if __name__ == "__main__":

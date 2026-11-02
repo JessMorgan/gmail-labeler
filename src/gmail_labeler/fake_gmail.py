@@ -38,6 +38,12 @@ class FakeMessage:
     # omitted (consumer tolerance branch); an int => served (authority
     # branch). Export tests exercise BOTH.
     internal_date_ms: int | None = None
+    # Message.historyId (the per-message history record id — #25's
+    # cursor-bootstrap source): SAME doctrine — serve exactly what is
+    # set, None omits the field (the daemon's bootstrap-failure branch
+    # rides it). Not defaulted to current_history_id: a fake that
+    # invents presence cannot exercise the tolerance branch.
+    history_id: int | None = None
 
 
 class FakeGmailClient:
@@ -55,7 +61,15 @@ class FakeGmailClient:
       consumed on first use (then that call succeeds — fail-once semantics);
     - history serves an explicit page list honoring page_token, then a
       configurable current id (the real API echoes its CURRENT historyId, it
-      does not repeat your start id);
+      does not repeat your start id); with ``retention_floor`` set, a start
+      id BELOW the floor answers the typed 404 of an out-of-date cursor
+      (the real expiry direction, F1: daemon down past retention — the
+      history.list reference documents 404 when startHistoryId is
+      "invalid or out of date");
+    - list_messages serves SCRIPTED order by default; with
+      ``documented_order=True`` it sorts by ``internal_date_ms`` DESC,
+      modeling the documented reverse-chronological order (every message
+      must carry the field; see the method docstring);
     - call log enables exact-behavior assertions (no silent extra fetches);
     - write calls (ticket #24: apply_labels, ensure_label) append to the
       SAME call log — the shadow zero-write pin (calls ⊆ read surface)
@@ -80,9 +94,34 @@ class FakeGmailClient:
         page_size: int = 500,
         history_pages: list[HistoryPage] | None = None,
         current_history_id: int | None = None,
+        retention_floor: int | None = None,
+        documented_order: bool = False,
     ) -> None:
         self.messages = {m.id: m for m in messages or []}
-        self.order = [m.id for m in messages or []]
+        self.retention_floor = retention_floor
+        if documented_order:
+            # model the documented reverse-chronological order (F1):
+            # newest internalDate first. A fake that silently sorted
+            # None timestamps to the top would be inventing recency
+            # — refuse instead.
+            missing = sorted(m.id for m in messages or [] if m.internal_date_ms is None)
+            if missing:
+                raise ValueError(
+                    f"documented_order needs internal_date_ms on every "
+                    f"message (missing on {missing})"
+                )
+            self.order = [
+                m.id
+                for m in sorted(
+                    messages or [],
+                    key=lambda m: (
+                        m.internal_date_ms if m.internal_date_ms is not None else 0
+                    ),  # None refused above; explicit guard, not truthiness
+                    reverse=True,
+                )
+            ]
+        else:
+            self.order = [m.id for m in messages or []]
         # list() copy (F2 review NIT, pre-existing trap): ensure_label
         # CREATES append here — an aliased caller list would mutate a
         # shared #25 fixture behind its back
@@ -101,8 +140,20 @@ class FakeGmailClient:
             ]
             current_history_id = max(ids, default=1)
         self.current_history_id = current_history_id
+        if retention_floor is not None and retention_floor > current_history_id:
+            # a floor above the mailbox's own id makes EVERY poll an
+            # out-of-date 404 (endless resync) — a scripted lie the fake
+            # refuses to tell (F2 NIT: the review probe hit exactly this)
+            raise ValueError(
+                f"retention_floor {retention_floor} is above current_history_id "
+                f"{current_history_id}: every start id would be out of date"
+            )
         self._history_index = 0
         self._history_expected: str | None = None
+        # the re-walk tracker (#25): which start id owns the current walk
+        # and where in the script that walk began
+        self._walk_start: int | None = None
+        self._walk_start_index = 0
         self._failures: dict[str, list[GmailError]] = {}
         self.calls: list[str] = []
         # successful write calls with their full body snapshots (the
@@ -157,12 +208,26 @@ class FakeGmailClient:
     def list_filters(self) -> list[FilterInfo]:
         self.calls.append("list_filters")
         self._maybe_fail("list_filters")
-        # a COPY too (F3 review): the read surfaces stay symmetric —
-        # the REST adapter builds fresh FilterInfo per call; #25/#26
-        # ride this fake
+        # a LIST-LEVEL COPY too (F3 review): the read surfaces stay
+        # list-level-copy safe — the REST adapter builds fresh
+        # FilterInfo per call; #25/#26 ride this fake. The NESTED
+        # criteria/action dicts REMAIN SHARED (REST rebuilds them per
+        # call; safety rests on the documented nested-mutation ban —
+        # FilterInfo.__post_init__)
         return list(self.filters_list)
 
     def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:
+        """The real API's documented order (List Gmail messages guide,
+        https://developers.google.com/workspace/gmail/api/guides/list-messages):
+        "The returned ``messages`` objects are listed in reverse
+        chronological order (newest first)." The fake serves SCRIPTED
+        order by default (export fixtures pin it); pass
+        ``documented_order=True`` to have the fake APPLY that order
+        (sort by internal_date_ms desc) — the #25 bootstrap pins ride
+        it to prove the seed anchors on the newest message. The sort
+        key is a STAND-IN for the recency the list response itself does
+        not carry: stubs are id + threadId only, the real API orders
+        server-side by internalDate."""
         self.calls.append(f"list_messages:{query}:{page_token or ''}")
         self._maybe_fail("list_messages")
         if page_token is None:
@@ -195,6 +260,7 @@ class FakeGmailClient:
             label_ids=m.label_ids,
             internal_date_ms=m.internal_date_ms,  # None = wire-faithful raw shape
             raw_b64url=base64.urlsafe_b64encode(m.eml).decode("ascii").rstrip("="),
+            history_id=m.history_id,  # None = field omitted (same doctrine)
         )
 
     def history(
@@ -207,7 +273,18 @@ class FakeGmailClient:
         (a skip/replay mismatch is a typed error — invariant #3 tests drive
         exactly this). Once the sequence is exhausted, the real API returns
         an empty delta carrying its CURRENT historyId (cursor advance), and
-        so do we — never an echo of the caller's start id."""
+        so do we — never an echo of the caller's start id.
+
+        RE-WALK (crash-recovery replay, #25): a token-less call is a
+        walk — with the SAME start id as the previous walk it REPLAYS
+        from that walk's first page (the real API is stateless per
+        request: polling again from a HELD cursor re-serves the retained
+        window, ADR-0003's "the next poll replays the gap"); with a
+        DIFFERENT start id it is a FRESH poll from a different cursor
+        (a re-bootstrap) and the script continues from its current
+        position. The typed 400 guard stays for every TOKEN mismatch
+        (a stale or wrong pageToken, a chain resumed under a different
+        token) — the skip/replay catch the guard exists for."""
         self.calls.append(f"history:{start_history_id}:{page_token or ''}")
         self._maybe_fail("history")
         if start_history_id < 1:
@@ -224,12 +301,37 @@ class FakeGmailClient:
                 f"window (current: {self.current_history_id})",
                 status=404,
             )
-        if page_token != self._history_expected:
+        if self.retention_floor is not None and start_history_id < self.retention_floor:
+            # THE REAL EXPIRY DIRECTION (F1, both families): the daemon was
+            # down past Gmail's retention and the cursor is BEHIND the
+            # window. Wire basis: the history.list reference documents the
+            # 404 for a startHistoryId that is "invalid or out of date"
+            # (https://developers.google.com/workspace/gmail/api/reference/
+            # rest/v1/users.history/list) — the out-of-date half is
+            # exactly this arm
+            raise GmailPermanentError(
+                f"startHistoryId {start_history_id} is invalid or out of "
+                f"date (retention floor: {self.retention_floor})",
+                status=404,
+            )
+        if page_token is None:
+            if (
+                start_history_id == self._walk_start
+                and self._history_index > self._walk_start_index
+            ):
+                # re-walk from the held cursor: the window re-serves from
+                # the walk's first page (see the docstring)
+                self._history_index = self._walk_start_index
+                self._history_expected = None
+        elif page_token != self._history_expected:
             raise GmailPermanentError(
                 f"history page token {page_token!r} != expected "
                 f"{self._history_expected!r} (skip/replay misuse)",
                 status=400,
             )
+        if page_token is None:
+            self._walk_start = start_history_id
+            self._walk_start_index = self._history_index
         if self._history_index < len(self._history_pages):
             page = self._history_pages[self._history_index]
             nxt = page.next_page_token

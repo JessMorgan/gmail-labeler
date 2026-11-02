@@ -10,7 +10,10 @@ System Label name-sake is refused named — the refusal guards minting a
 look-alike only — invoked from the daemon/apply startup only, never the
 Shadow Pass).
 Both live behind the same Protocol (FakeGmailClient is the test spine —
-invariant #9). Errors surface via gmail_errors taxonomy only.
+invariant #9). Errors surface via the gmail_errors taxonomy — the ONE
+documented exception is ``ensure_label``'s config refusal, a bare
+``ValueError`` (see its docstring; the daemon/apply exit-4 mapping
+excepts ValueError explicitly).
 
 Wire-shape rule (verified against the Gmail v1 discovery schema): int64 /
 uint64 fields (internalDate, historyId) arrive as STRINGS — googleapiclient
@@ -94,6 +97,13 @@ class RawMessage:
     # (export does); never trust presence.
     internal_date_ms: int | None
     raw_b64url: str
+    # The per-message history record id (Message.historyId — "the ID of
+    # the last history record that modified this message"): the sync
+    # guide's documented cursor-bootstrap source for the daemon (#25 —
+    # full sync stores the most recent message's historyId). Same
+    # presence doctrine as internal_date_ms: tolerate absence, never
+    # trust presence.
+    history_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +147,14 @@ class GmailClient(Protocol):
 
     def ensure_label(self, name: str) -> str:
         """Get-or-create a USER label by exact name (daemon/apply
-        startup only — never the Shadow Pass). An existing USER label of
-        exactly that name is used as-is; a casefolded System Label
-        name-sake is refused named — the refusal guards minting a
-        look-alike only; a concurrent-create 409 self-heals by
-        re-listing once."""
+        startup only — never the Shadow Pass). Returns the Gmail label
+        id. An existing USER label of exactly that name is used as-is;
+        otherwise, a casefolded System Label name-sake is refused named
+        — the refusal guards minting a look-alike only, and the raise
+        is a BARE ValueError (not the gmail_errors taxonomy: a caller
+        mapping startup refusals to an exit code must except ValueError
+        explicitly); a concurrent-create 409 self-heals by re-listing
+        once."""
         ...
 
 
@@ -267,6 +280,7 @@ class GmailRestClient:
             label_ids=_str_list(data, "labelIds"),
             internal_date_ms=_opt_int64(data, "internalDate"),
             raw_b64url=_raw_nonempty(data),  # absent OR empty: loud
+            history_id=_opt_history_id(data, "historyId"),
         )
 
     def history(
@@ -298,7 +312,7 @@ class GmailRestClient:
         ):
             raise GmailPermanentError("response field 'history' not a list of objects")
         return HistoryPage(
-            history_id=_opt_int64(data, "historyId"),
+            history_id=_opt_history_id(data, "historyId"),
             next_page_token=_token(data),
             records=tuple(records),
         )
@@ -431,7 +445,38 @@ def _token(obj: dict[str, object]) -> str | None:
     raise GmailPermanentError(f"malformed nextPageToken ({type(value).__name__})")
 
 
+#: The wire's unsigned-64-bit ceiling (F1: the 20-digit regex admits
+#: values ABOVE uint64 — "99999999999999999999" parsed clean through
+#: the parser in review). The STORE's bound is SQLite's SIGNED max
+#: (appdb._MAX_SQLITE_INTEGER) — different values, each named once.
+UINT64_MAX = 2**64 - 1
 _UINT_RE = re.compile(r"[0-9]{1,20}")
+
+#: The PERSISTABLE historyId ceiling (F2 wire→store seam): SQLite's
+#: signed INTEGER max — the state DB cannot store a cursor beyond it
+#: (appdb._MAX_SQLITE_INTEGER is the same value at the bind site; the
+#: equality is pinned in test_gmail_client so the two cannot drift).
+#: Values beyond signed-64 cannot be persisted by us at all, so the
+#: parse site refuses them NAMED: refusing at the boundary beats the
+#: daemon writing a delta's mail and then holding that delta FOREVER
+#: on the store-side refusal. Bootstrap rides the same arm: the
+#: 'cannot establish cursor' hold names it next tick (never exit 5
+#: — the store never sees the value).
+MAX_PERSISTABLE_HISTORY_ID = 2**63 - 1
+
+
+def _opt_history_id(obj: dict[str, object], key: str) -> int | None:
+    """historyId fields: the uint64 wire parse PLUS the persistable cap
+    (see MAX_PERSISTABLE_HISTORY_ID for the why and the bootstrap
+    asymmetry)."""
+    value = _opt_int64(obj, key)
+    if value is not None and value > MAX_PERSISTABLE_HISTORY_ID:
+        raise GmailPermanentError(
+            f"response field {key!r}={value} exceeds the persistable "
+            f"historyId bound ({MAX_PERSISTABLE_HISTORY_ID}): this tool "
+            f"could never store it as a cursor"
+        )
+    return value
 
 
 def _opt_int64(obj: dict[str, object], key: str) -> int | None:
@@ -447,14 +492,27 @@ def _opt_int64(obj: dict[str, object], key: str) -> int | None:
     if isinstance(value, int):  # tolerate servers that send real ints
         if value < 0:
             raise GmailPermanentError(f"response field {key!r} not an unsigned integer")
+        if value > UINT64_MAX:  # the F1 range cap (see UINT64_MAX)
+            raise GmailPermanentError(
+                f"response field {key!r} outside the uint64 wire range "
+                f"(0..{UINT64_MAX})"
+            )
         return value
     if isinstance(value, str):
         # STRICT unsigned decimal only: " 42 ", "+42", "-42" are corrupt
         # cursor values (a negative historyId must never silently advance
-        # anything), not parseable-but-weird inputs.
+        # anything), not parseable-but-weird inputs. The regex's 20-digit
+        # width is NOT a range check: the parsed value must fit uint64
+        # (F1 — a lying value beyond it is refused, never truncated).
         if not _UINT_RE.fullmatch(value):
             raise GmailPermanentError(f"response field {key!r} not an unsigned integer")
-        return int(value)
+        parsed = int(value)
+        if parsed > UINT64_MAX:
+            raise GmailPermanentError(
+                f"response field {key!r} outside the uint64 wire range "
+                f"(0..{UINT64_MAX})"
+            )
+        return parsed
     raise GmailPermanentError(f"response field {key!r} not an integer")
 
 

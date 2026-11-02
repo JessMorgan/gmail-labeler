@@ -8,6 +8,36 @@ does not ship releases yet.
 
 ### Added
 
+- Correction capture + `status` (ticket #27): the daemon records your
+  hand-fixes of applied mail as training signal, and `status` answers
+  "is it working?" with realized precision from the local store alone.
+  - `appdb`: the schema-v4 `corrections` table — rows
+    (message_id, label, kind ∈ {removed, added}, detected_at,
+    filter_covered) with the kind CHECK-vocabularyd like SOURCES, a
+    UNIQUE (message_id, label, kind) dedupe index and a (label,
+    message_id) join index. The v3→v4 migration rides the #24/#25 atomic
+    single-row-restamp machinery (both crash directions + the
+    {3}-with-corrections tamper refusal, recovery named). `commit_page`
+    now carries rows + Corrections + cursor in ONE transaction (the
+    delta's single commit point); `commit_applications` (apply) stays
+    rows-only.
+  - `daemon.py`: correction DETECTION inside the existing tick — parse
+    `labelAdded`/`labelRemoved` events, classify against the Applications
+    join (read + local-DB only, never a Gmail write), the ignore-boundary
+    (system/non-vocabulary labels, a removed non-applied label) records
+    NOTHING, a corrected message is never re-written, and an `added`
+    whose label a Gmail filter would have applied is flagged
+    `filter_covered` (invariant #6, the #22 mechanism reused). The 91-node
+    daemon suite rode the change verbatim.
+  - `status.py` + the `status` command: per graduated label, realized
+    precision = (written − removed)/written from the LOCAL DB only — no
+    Gmail call, no auth gate (it answers offline); `--json`; the basis
+    line names the artifact hashes + the v1 caveats. Exit 0/2/4/5.
+  - `corrections export`: the captured Corrections as future training
+    signal ({message_id, label, kind, filter_covered}, no bodies) through
+    `dataset_build.apply_corrections_to_records` — the builder's
+    composition seam (no fork). NO auto-retrain (the human gate holds;
+    grep-pinned: no call path from status/export to any train entry).
 - `apply --since [--apply]`: the only bulk path (ticket #26) — a
   human-gated preview/backfill of graduated labels over historical mail,
   reusing the daemon's exact decision core.

@@ -118,9 +118,37 @@ The remaining reason codes name themselves: `no-filter-snapshot`,
 _Avoid_: auto-excluded, shadow-flagged
 
 **Correction**:
-A later manual label edit by the owner on a message the system applied to
-(removing an applied label or adding one it missed), captured as new training
-signal.
+A later manual label edit by the owner on a message the system already
+applied to, captured as new training signal for the next *human-gated*
+retrain. Only messages PRESENT in the Applications join are candidates;
+the daemon detects Corrections by READING history events + the local
+join and NEVER writes back to Gmail. Two kinds (the store's CHECK
+vocabulary):
+*removed* — a label that is that message's Application label disappears
+(the human undid our work — a negative signal); *added* — a
+managed-vocabulary (graduated, non-System) label appears on an applied
+message that the daemon did not write (the human did our job — a
+positive signal). **Ignore boundary:** anything else on an applied
+message — System Labels, non-vocabulary labels, a removed NON-applied
+label, INBOX churn — records NOTHING (noise is not correction). A
+*filter-covered* `added` (a Gmail filter would have applied it —
+invariant #6) is recorded raw with that flag and EXCLUDED from the
+realized-precision math and the training signal; a `removed` is NEVER
+filter-excluded (a human removing is human signal regardless of
+filters). A corrected message is never re-written by the daemon.
+_Avoid_: feedback, undo
+
+**Status**:
+The `status` command's answer to "is it working?": per graduated label,
+*realized precision* = (written − removed) / written, where `written` is
+the Application rows and `removed` the matching `removed` Corrections,
+derived from the LOCAL Corrections + Applications store ALONE — no Gmail
+call, no auth (it answers on a sick or offline mailbox). A label with no
+Applications yet reports `no data`. The basis line names the current
+bands/graduation artifact content hashes and states the v1 caveats
+(rows may span artifact versions; precision assumes unseen-but-removed
+mail is rare — archive-equals-dismiss).
+_Avoid_: accuracy (this is realized, in-production precision, not eval)
 
 **Shadow Pass**:
 Running predictions on messages and recording them locally without any Gmail

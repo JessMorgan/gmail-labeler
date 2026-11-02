@@ -137,7 +137,17 @@ Scope:
   daemon's one decision core and records Applications identically, and
   skip-present makes a re-run idempotent — LANDED (#26);
 - Correction capture (manual fixes on applied mail become the next
-  retrain's signal) and `status` (realized precision per graduated label);
+  retrain's signal) and `status` (realized precision per graduated label)
+  — LANDED (#27): the daemon's tick classifies `labelAdded`/`labelRemoved`
+  history events against the Applications join (read + local-DB only,
+  never writes back; the ignore-boundary records nothing; a corrected
+  message is never re-written), the schema-v4 `corrections` table rides
+  the atomic-transition machinery (rows + corrections + cursor commit in
+  ONE transaction, the UNIQUE (message_id, label, kind) dedupe makes a
+  replayed event idempotent), `status` reports realized precision from the
+  local store alone (no Gmail call, no auth gate), and `corrections
+  export` emits the signal through the builder's composition seam — no
+  auto-retrain (the human gate holds);
 - the `auth` wizard (ADR-0004) — ships in Phase 0's spirit but is
   scheduled in Phase 2 (it is onboarding polish, not a gate to training).
 

@@ -14,20 +14,18 @@ not fabricated — the temporal split (invariant #7) starts honest.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import logging
-import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
+from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord, body_hash, utc_datetime
-from .corpus_store import CorpusError, CorpusStore
-from .corpus_store import _fsync_dir as _fsync_dir
+from .corpus_store import CorpusStore
 from .gmail_client import FilterInfo, GmailClient
 from .gmail_errors import BACKOFF, RETRY, GmailAuthError, GmailError
 from .labels import normalize_label_names
@@ -218,11 +216,6 @@ def _export_one(
     return "written" if added else "present"
 
 
-SIDECAR_FILTERS = "filters.json"
-SIDECAR_LABELS = "labels.json"  # id->name snapshot: filters speak ids, the
-# corpus speaks names — attribution (invariant #6) needs the bridge offline
-
-
 def fetch_settings(
     client: GmailClient,
     *,
@@ -263,48 +256,10 @@ def write_filters_snapshot(store: CorpusStore, filters: list[FilterInfo]) -> Non
     payload = json.dumps(
         [dataclasses.asdict(f) for f in filters], indent=0, sort_keys=True
     )
-    _write_snapshot_atomic(store, SIDECAR_FILTERS, payload)
+    store.write_snapshot(SIDECAR_FILTERS, payload)
 
 
 def write_labels_snapshot(store: CorpusStore, id_to_name: Mapping[str, str]) -> None:
     """labels.json: the id->name bridge (same offline-attribution purpose)."""
     payload = json.dumps(dict(sorted(id_to_name.items())), indent=0, sort_keys=True)
-    _write_snapshot_atomic(store, SIDECAR_LABELS, payload)
-
-
-def _write_snapshot_atomic(store: CorpusStore, name: str, payload: str) -> None:
-    """Created 0600 at the fd (never 0644-then-chmod), fsynced, atomically
-    replaced; any OS failure is a CorpusError (CLI's typed exit-5 surface)."""
-    tmp = store.root / (name + ".tmp")
-    try:
-        if not store.root.is_dir():
-            # leaf only: intermediate ancestors follow umask, same
-            # documented semantics as the token store
-            store.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(store.root, 0o700)  # secret material from the FIRST byte
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)  # tighten a pre-existing tmp (O_CREAT trap)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fd = -1  # owned by the file object now
-                fh.write(payload)
-                fh.flush()
-                os.fsync(fh.fileno())
-        except OSError:
-            with contextlib.suppress(OSError):  # no partial-tmp litter
-                tmp.unlink(missing_ok=True)
-            raise
-        finally:
-            if fd >= 0:  # fchmod/write failure would otherwise leak the fd
-                os.close(fd)
-        os.replace(tmp, store.root / name)
-        # a FAILED os.replace deliberately leaves the complete, 0600 tmp:
-        # the next run re-writes it in place (O_TRUNC) and renames it away
-        # — the same never-read-a-partial-state guarantee as the corpus
-        # index, by rewrite-and-rename rather than tail repair
-    except OSError as e:
-        raise CorpusError(
-            f"corpus snapshot {name!r} unwritable ({type(e).__name__})"
-        ) from None
-    with contextlib.suppress(OSError):  # rename durability, best-effort
-        _fsync_dir(store.root)
+    store.write_snapshot(SIDECAR_LABELS, payload)

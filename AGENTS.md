@@ -26,7 +26,7 @@ what is wired vs. planned, and each gains detail as its phase lands.
 ## Layout
 
 - `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
-  `corpus_store`, `mime_extract`, `analyze`, `auth`, `tokens`,
+  `corpus_store`, `mime_extract`, `analyze`, `attribution`, `auth`, `tokens`,
   `gmail_client`, `gmail_errors`, `fake_gmail`, `export`, `gyb_import`,
   `cli`. Planned (later phases): model core (`dataset` build,
   `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.

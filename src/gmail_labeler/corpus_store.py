@@ -3,10 +3,13 @@
 Layout under a corpus directory:
   records.jsonl        one CorpusRecord per line, appended, keyed by id
   bodies/<id[:2]>/<id>.txt   body text sharded by id prefix
+  filters.json / labels.json   attribution snapshot sidecars; the store
+                owns their durable I/O surface (read_snapshot/write_snapshot)
 
 Durability and integrity contract:
   - files are created 0600 (and fchmod'd on rewrite, closing the
     pre-0600-revision migration hole); corpus dirs 0700 on the write path.
+    Snapshot writes are atomic (tmp+fsync+rename, never a partial read).
     Opening a store NEVER mutates permissions (a read-only command pointed
     at a misconfigured corpus.dir must not clamp someone's $HOME): call
     enforce_modes() from write-side commands (export/apply/daemon startup)
@@ -31,11 +34,13 @@ time; no cross-process locking. Do not iterate and write concurrently.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
 
+from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord
 from .corpus_record import body_hash as _body_hash
 
@@ -50,6 +55,10 @@ _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 _TAIL_CHUNK = 8192
 _MAX_TAIL_SCAN = 1 << 20
+
+# Corpus-root attribution snapshots (invariant #6 sidecars): the names come
+# from the pure attribution module — one source of truth for the corpus format.
+_SIDECAR_NAMES = (SIDECAR_FILTERS, SIDECAR_LABELS)
 
 
 class CorpusStore:
@@ -237,18 +246,82 @@ class CorpusStore:
             )
         return path
 
+    # -- corpus-root snapshot files (attribution sidecars) ----------------
+
+    def _snapshot_path(self, name: str) -> Path:
+        # Bare-filename contract, _body_path-style containment intent (lexical
+        # is right here: a bare name needs no resolve()); the sidecars live
+        # directly in the corpus root, traversal names are a caller bug and
+        # never touch the filesystem. (Path("..").name is ".." itself, so the
+        # dot names need their own rejection; a NUL would escape os.open as
+        # an untyped ValueError.)
+        if not name or name in (".", "..") or "\x00" in name or Path(name).name != name:
+            raise CorpusError(f"corpus: snapshot name {name!r} is not a bare filename")
+        return self.root / name
+
+    def read_snapshot(self, name: str) -> str | None:
+        """Text of a corpus-root snapshot file; None when absent."""
+        path = self._snapshot_path(name)
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+
+    def write_snapshot(self, name: str, payload: str) -> None:
+        """Created 0600 at the fd (never 0644-then-chmod), fsynced, atomically
+        replaced; any OS failure is a CorpusError (CLI's typed exit-5 surface)."""
+        final = self._snapshot_path(name)
+        tmp = self.root / (name + ".tmp")
+        try:
+            if not self.root.is_dir():
+                # leaf only: intermediate ancestors follow umask, same
+                # documented semantics as the token store
+                self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                os.chmod(self.root, 0o700)  # secret material from the FIRST byte
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)  # tighten a pre-existing tmp (O_CREAT trap)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fd = -1  # owned by the file object now
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except OSError:
+                with contextlib.suppress(OSError):  # no partial-tmp litter
+                    tmp.unlink(missing_ok=True)
+                raise
+            finally:
+                if fd >= 0:  # fchmod/write failure would otherwise leak the fd
+                    os.close(fd)
+            os.replace(tmp, final)
+            # a FAILED os.replace deliberately leaves the complete, 0600 tmp:
+            # the next run re-writes it in place (O_TRUNC) and renames it away
+            # — the same never-read-a-partial-state guarantee as the corpus
+            # index, by rewrite-and-rename rather than tail repair
+        except OSError as e:
+            raise CorpusError(
+                f"corpus snapshot {name!r} unwritable ({type(e).__name__})"
+            ) from None
+        with contextlib.suppress(OSError):  # rename durability, best-effort
+            _fsync_dir(self.root)
+
     # -- permissions (SECURITY.md: corpus material is secret) --------------
 
     def enforce_modes(self) -> None:
         """Harden the corpus tree: dirs 0700, every file 0600 (one bounded
-        walk of ~256 shard dirs). Call from WRITE-side commands at startup
-        (export/apply/daemon) — not from read-only tools."""
+        walk of ~256 shard dirs, plus the root-level snapshot sidecars and
+        their stray ``*.tmp`` remnants). Call from WRITE-side commands at
+        startup (export/apply/daemon) — not from read-only tools."""
         if not self.root.is_dir():
             return
         _chmod_if(self.root, _DIR_MODE)
         records = self._records_path
         if records.is_file():
             _chmod_if(records, _FILE_MODE)
+        for name in _SIDECAR_NAMES:
+            sidecar = self.root / name
+            if sidecar.is_file():
+                _chmod_if(sidecar, _FILE_MODE)
+        for remnant in self.root.glob("*.tmp"):  # stray snapshot tmp litter
+            if remnant.is_file():
+                _chmod_if(remnant, _FILE_MODE)
         if self._bodies_dir.is_dir():
             _chmod_if(self._bodies_dir, _DIR_MODE)
             for shard in self._bodies_dir.iterdir():
@@ -261,10 +334,13 @@ class CorpusStore:
 
     def verify_modes(self) -> list[str]:
         """Non-destructive check for group/world-readable STRUCTURAL paths
-        (root, bodies/, records index) — not a full-tree scan; call
-        enforce_modes() from write-side commands for the whole tree."""
+        (root, bodies/, records index, snapshot sidecars) — not a full-tree
+        scan; call enforce_modes() from write-side commands for the whole
+        tree."""
         offenders: list[str] = []
-        for p in (self.root, self._bodies_dir, self._records_path):
+        paths = [self.root, self._bodies_dir, self._records_path]
+        paths += [self.root / name for name in _SIDECAR_NAMES]
+        for p in paths:
             try:
                 if p.exists() and p.stat().st_mode & 0o077:
                     offenders.append(str(p))

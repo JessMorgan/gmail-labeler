@@ -438,6 +438,7 @@ version = "0.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "google-api-python-client" },
+    { name = "google-auth-httplib2" },
     { name = "google-auth-oauthlib" },
     { name = "httplib2" },
     { name = "keyring" },
@@ -457,6 +458,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "google-api-python-client", specifier = ">=2.201" },
+    { name = "google-auth-httplib2", specifier = ">=0.2" },
     { name = "google-auth-oauthlib", specifier = ">=1.5" },
     { name = "httplib2", specifier = ">=0.22" },
     { name = "keyring", specifier = ">=25.7" },

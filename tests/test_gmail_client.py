@@ -660,6 +660,7 @@ def test_fake_history_cursor_guards() -> None:
 
 def test_rest_client_transport_is_timeout_bounded(monkeypatch) -> None:
     import googleapiclient.discovery as discovery
+    import httplib2
 
     seen: dict[str, object] = {}
 
@@ -675,12 +676,76 @@ def test_rest_client_transport_is_timeout_bounded(monkeypatch) -> None:
     monkeypatch.setattr(discovery, "build", fake_build)
     client = GmailRestClient(object(), http=sentinel)
     client._svc()
+    # seam contract (#56): an injected http is the caller's authorized
+    # transport — it rides to build() VERBATIM, never re-wrapped
     assert seen["http"] is sentinel
 
     seen.clear()
-    GmailRestClient(object())._svc()  # default path
+    creds = object()
+    GmailRestClient(creds)._svc()  # default path
     default_http = seen["http"]
     assert getattr(default_http, "timeout", None) == 30.0
+    # #56: build() forbids http+credentials, so the default transport is
+    # the AuthorizedHttp WE compose — the bound rides its INNER httplib2
+    # (the getattr above only passes via AuthorizedHttp.timeout's proxy;
+    # without the isinstance pin a bare un-wrapped Http would too), and it
+    # carries THIS client's credentials (a wrong-auth wiring is the same
+    # failure class #56 came from: only caught live)
+    from google_auth_httplib2 import AuthorizedHttp
+
+    assert isinstance(default_http, AuthorizedHttp)
+    assert default_http.credentials is creds
+    assert isinstance(default_http.http, httplib2.Http)
+    assert default_http.http.timeout == 30.0
+
+
+# -- #56: default build path, REAL construction, offline ---------------------
+
+
+def test_default_build_path_constructs_offline(monkeypatch) -> None:
+    """#56 RED pin: build(http=…, credentials=…) is mutually exclusive in
+    google-api-python-client 2.x — the FIRST live `dataset export` died in
+    _svc() with a raw ValueError, bypassing the typed taxonomy. This runs
+    the real build with no spy and no injection: static discovery +
+    cache_discovery=False keep construction offline, and the patched
+    httplib2 transport turns any network attempt into a loud test failure
+    (invariant #9)."""
+    import httplib2
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.http import HttpRequest
+
+    def _no_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("offline: no network in tests (invariant #9)")
+
+    monkeypatch.setattr(httplib2.Http, "request", _no_network)
+
+    creds = Credentials(
+        "fake",
+        client_id="cid",
+        client_secret="sec",  # fake, offline, never refreshed
+        token_uri="https://token.invalid",
+    )
+    client = GmailRestClient(creds)
+    svc = client._svc()
+    # request-object construction is pure (discovery-schema bound method):
+    # an HttpRequest comes back without a single byte leaving the process
+    assert isinstance(svc.users().messages().list(userId="me"), HttpRequest)
+
+
+def test_build_service_precedence_over_http_seam() -> None:
+    # __init__ contract: build_service replaces the WHOLE default build and
+    # ignores the http seam (#56: precedence unchanged by the fix)
+    seen: list[object] = []
+    service = object()
+
+    def build(creds: object) -> Any:
+        seen.append(creds)
+        return service
+
+    creds = object()
+    client = GmailRestClient(creds, build_service=build, http=object())
+    assert client._svc() is service
+    assert seen == [creds]
 
 
 def test_filterinfo_isolates_the_source_dict() -> None:

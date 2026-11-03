@@ -34,6 +34,11 @@ does not ship releases yet.
 
 ### Fixed
 
+- `dataset export` no longer dies on its first live call: the REST client's
+  default transport now composes `AuthorizedHttp` around a timeout-bounded
+  httplib2 and hands `build()` only `http` — google-api-python-client 2.x
+  rejects `http`+`credentials` as mutually exclusive, which surfaced as a
+  raw `ValueError` bypassing the typed error taxonomy (#56).
 - `auth login` on headless boxes: a missing browser no longer aborts the
   consent flow before the authorization URL is printed — the flow retries
   browser-less and renders the URL with an `ssh -L` port-forward recipe for

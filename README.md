@@ -21,8 +21,10 @@ confident, reviewably when it isn't.
 > only bulk path, a human-gated `--since` preview/backfill over historical
 > mail that reuses the daemon's exact decision core. Phase 2's exit
 > posture: high-band labels apply silently; you work the `ai-med`
-> queue. Correction capture / `status` follow — see the phase
-> plan in [docs/ROADMAP.md](docs/ROADMAP.md).
+> queue. Correction capture and `status` are wired (ticket #27): the
+> daemon records your hand-fixes as training signal and `status`
+> answers "is it working?" from the local store. See
+> [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
 
@@ -382,10 +384,11 @@ gmail-labeler shadow report
 ```
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
-auth/config unusable · `5` operation failed or incomplete.
-`status` is a frozen command name that arrives in a later phase (not
-wired yet) — until it is, it exits `2` as an unknown command; `3` is
-reserved for wired-but-stubbed commands and currently unreachable.
+auth/config unusable · `5` operation failed or incomplete. `status` and
+`corrections export` are wired (ticket #27) and read the local state DB
+only — no Gmail call, no auth gate, so they answer on a sick or offline
+mailbox (`status` uses 0/2/4/5; `3` stays reserved for wired-but-stubbed
+commands and is currently unreachable).
 Scripts can branch on 0/2/4/5 today; a `1` means an unhandled crash —
 that's a bug, please report it.
 
@@ -553,6 +556,65 @@ Exit codes: 0 clean (preview or backfill) · 2 usage (missing/invalid
 `--since`) · 4 auth/config (the tier-name collision, and a mid-run auth
 failure) · 5 artifact/store failure, a preview whose Tier Labels are
 absent, a lock contention past the busy timeout, or a model/wire failure.
+
+### Watching it work (`status`, `corrections export`, Phase 2)
+
+When you hand-fix applied mail — remove a label the tool put there, or
+add one it missed — the daemon captures that as a **Correction** against
+the Applications join, on its normal poll (no extra Gmail calls; the
+correction path is read + local-DB only, and it never writes back). A
+`removed` is a negative signal (you undid our work); an `added` of a
+graduated label we did not write is positive signal — but only when a
+Gmail filter verifiably did **not** author it (see the *attribution*
+below; with no filters snapshot the daemon can't tell, so it withholds the
+add rather than guess). System-label and non-vocabulary churn is ignored —
+noise is not correction.
+
+```sh
+gmail-labeler status --bands bands.json --graduation graduation.json
+```
+
+`status` answers **"is it working?"** with **realized precision** per
+graduated label — `(written − removed) / written` — computed from the
+local store **alone**: it makes **no Gmail call** and needs **no auth**,
+so it answers even on a sick or offline mailbox. A label with no
+applications yet reports `no data`. The basis line names the current
+bands/graduation artifact hashes and states the honest v1 caveats (rows
+may span artifact versions; precision assumes unseen-but-removed mail is
+rare — archive-equals-dismiss). The `--bands` and `--graduation` you pass
+must be the **matching pair** (the graduation table records the bands
+artifact it was measured against; a mismatched pair is refused at exit 5,
+not reported under a basis that was never measured together). A `--json`
+shape is available for tooling. Exit codes 0/2/4/5.
+
+```sh
+gmail-labeler corrections export --out corrections.json   # default: stdout
+```
+
+`corrections export` writes a faithful RAW dump of the captured Corrections
+— `{message_id, label, kind, attribution}` rows, **no bodies**. "Raw" here
+means *not attribution-filtered* (every row, whatever its attribution), not
+*every stored column* — the artifact carries the correction identity, not
+the `detected_at` stamp. Every row carries its *attribution* (`human` /
+`filter_covered` / `unverifiable`) so the artifact is auditable — you can
+see which adds were withheld and why.
+The builder's fold seam (`apply_corrections_to_records`) ships as a **pure
+function** (it credits only a `human` add), but the export does **not**
+call it, and **nothing wires the dump or the seam into a retrain** —
+folding them into the corpus and running a retrain is the **deferred human
+step** (ADR-0005's human-gated retrain). Only a `human` add is training
+signal: a `filter_covered` add (a Gmail filter verifiably would have
+applied it) and an `unverifiable` add — withheld, not guessed, when
+authorship cannot be determined: no usable filters snapshot (absent or
+malformed); a relevant filter whose criteria cannot be simulated from the
+kept fields (outside `from`/`to`/`subject`, or malformed); or an add whose
+authorship is otherwise undecidable (its message fields were not fetched,
+or a filter's `addLabelIds` is unreadable — which is GLOBAL, not per-filter:
+we cannot read which labels that entry adds, so we cannot rule it out as any
+add's author, and every 'added' Correction, for every label, is withheld
+until the snapshot is clean) — are both excluded,
+the *exclusion, not guessing* principle `dataset analyze` follows (#22).
+`status` discloses each withheld slice as its own count.
 
 ## Docs
 

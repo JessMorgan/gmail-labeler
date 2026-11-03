@@ -60,6 +60,12 @@ app.add_typer(dataset_app, name="dataset")
 auth_app = typer.Typer(help="Gmail OAuth credential (ADR-0004).", no_args_is_help=False)
 app.add_typer(auth_app, name="auth")
 
+corrections_app = typer.Typer(
+    help="Corrections: the human hand-fixes captured as training signal.",
+    no_args_is_help=True,
+)
+app.add_typer(corrections_app, name="corrections")
+
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
 # (typer requires concrete annotations: str | None, not Any)
 
@@ -118,7 +124,7 @@ def _write_secret_tight(path: Path, text: str) -> None:
         fh.write(text)
 
 
-def _write_out_report(out: str, file_text: str) -> None:
+def _write_out_report(out: str, file_text: str, *, label: str = "eval") -> None:
     """The eval ``--out`` write: 0600 from creation, EXCLUSIVE staging
     + atomic replace — a failure leaves any PREVIOUS report at the
     path intact, and no fd can leak. The staging file is
@@ -138,11 +144,13 @@ def _write_out_report(out: str, file_text: str) -> None:
     write failure) still REPLACES a previous report file — the report
     is the run's output, and the refusal is about the artifacts, not
     the report (in --json mode the file lands at the payload emit,
-    which is after the acts — the bytes are the same). Raises OSError
+    which is after the acts — the bytes are the same). ``label`` names
+    the announcing command (default "eval"; corrections export passes
+    its own name so the NOTICE is not misattributed). Raises OSError
     on failure (the caller maps it to exit 5)."""
     target = Path(out)
     if target.exists():
-        typer.echo(f"eval: NOTICE: replacing existing {out}", err=True)
+        typer.echo(f"{label}: NOTICE: replacing existing {out}", err=True)
     fd, staging_name = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
     staging = Path(staging_name)
     try:
@@ -2844,8 +2852,10 @@ def shadow_report(
 
     The verdicts are bound to the bands/graduation artifacts AS OF THE
     RUN — the report does NOT re-verify them (a basis disclosure, in
-    the header + the ``basis`` payload field). Hash persistence is
-    deferred to #26-27 (the status/corrections surface); re-run
+    the header + the ``basis`` payload field). Per-run hash PERSISTENCE
+    is deferred to post-merge calibration; the shipped interim mechanism
+    is the `status` basis line (#27), which names the current
+    bands/graduation content hashes and cross-checks the pair. Re-run
     ``shadow run`` after any retrain/recalibration to refresh the
     basis.
     """
@@ -3007,9 +3017,10 @@ def shadow_report(
 
     # the basis disclosure (T3): the verdicts are bound to the
     # bands/graduation artifacts AS OF THE RUN — the report does NOT
-    # re-verify them (hash persistence is deferred to #26-27, when the
-    # status/corrections surface needs it). A retrain/recalibration
-    # moves the basis; re-run shadow run to refresh.
+    # re-verify them (per-run hash persistence is deferred to post-merge
+    # calibration; the shipped interim mechanism is the `status` basis line
+    # (#27), which names the current hashes and cross-checks the pair). A
+    # retrain/recalibration moves the basis; re-run shadow run to refresh.
     basis = {
         "note": (
             "verdicts bound to the bands/graduation artifacts as of the "
@@ -3163,6 +3174,32 @@ class _ServeStartup:
     # would let a caller mutate the "immutable" bundle's records in place
     # (the AC5 provenance scan reads them; the daemon ignores them)
     records: tuple[CorpusRecord, ...]
+
+
+def _load_filters_snapshot(sidecar: Path) -> list[dict[str, object]] | None:
+    """Read the offline filter-attribution snapshot for the daemon's
+    correction arm (#27, invariant #6). A LOCAL file read — never a Gmail
+    call, so the startup exact-call pins stand. THREE outcomes, mirroring
+    analyze.py's ``filters=None`` posture (the #22 mechanism reused):
+    - ``None`` — the sidecar is ABSENT or malformed: attribution is
+      UNKNOWN, so an 'added' Correction must be withheld as 'unverifiable'
+      rather than credited to the human (a missing snapshot is NOT an
+      attestation that no filter exists — that fail-open is what F1
+      removes);
+    - ``[]`` — the sidecar is present and lists no filters: the operator's
+      ATTESTATION that none exist (an 'added' is then 'human' signal);
+    - ``[filter, ...]`` — the parsed snapshot.
+    A malformed file is ``None`` (unknown), never ``[]`` (a corrupt file
+    must not masquerade as an attested-empty one)."""
+    if not sidecar.is_file():
+        return None
+    try:
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
+    if isinstance(raw, list) and all(isinstance(f, dict) for f in raw):
+        return [dict(f) for f in raw]
+    return None
 
 
 def _serve_startup(
@@ -3532,6 +3569,63 @@ def _serve_startup(
         ):
             managed_label_ids[li.name] = li.id
 
+    # the offline filter-attribution snapshot for the daemon's correction
+    # arm (#27, invariant #6): a LOCAL file read (never a Gmail call — the
+    # startup exact-call pins stand). _load_filters_snapshot distinguishes
+    # UNKNOWN (None: absent or malformed — an 'added' is withheld as
+    # 'unverifiable', NOT credited to the human) from ATTESTED-NONE ([]: the
+    # operator ran the export and has no filters — an 'added' is 'human').
+    # The old code collapsed absent/malformed into [], failing open exactly
+    # as the bool F1 removed did, one level up. apply never reads it.
+    filters_snapshot = _load_filters_snapshot(store.root / SIDECAR_FILTERS)
+    if filters_snapshot is None and command == "daemon":
+        typer.echo(
+            f"daemon: NOTE no usable filters snapshot at "
+            f"{store.root / SIDECAR_FILTERS} — correction attribution is "
+            "UNKNOWN, so every 'added' Correction is withheld as "
+            "'unverifiable' (not credited as training signal). Run "
+            "`dataset export` against this store and RESTART the daemon to "
+            "enable filter attribution (the snapshot is read at startup "
+            "only).",
+            err=True,
+        )
+    elif filters_snapshot is not None and command == "daemon":
+        # a snapshot with one or more UNREADABLE filter entries (a present-
+        # but-wrong-shaped action/addLabelIds) makes _attribution withhold
+        # EVERY 'added' (authorship can't be ruled out) — name the entries at
+        # startup so the operator is not left with a silent rising
+        # 'unverifiable' and no cause (the #22 bridge-malformed posture:
+        # name it, don't guess). Entries are named by 1-based INDEX + which
+        # FIELD is unreadable (the strict reader's ValueError names
+        # action/addLabelIds, NEVER a value — a from:/to: criterion is a mail
+        # address and must not reach the log, invariant #5 adjacent); a
+        # legitimately action-less filter reads [] and is NOT counted here.
+        unreadable_entries: list[str] = []
+        for idx, f in enumerate(filters_snapshot, start=1):
+            try:
+                filter_label_ids_strict(f)
+            except ValueError as e:
+                unreadable_entries.append(f"#{idx}: {e}")
+        if unreadable_entries:
+            n = len(unreadable_entries)
+            noun = "entry" if n == 1 else "entries"
+            verb = "has" if n == 1 else "have"
+            typer.echo(
+                f"daemon: NOTE {n} filter {noun} in the snapshot {verb} an "
+                f"unreadable action/addLabelIds (1-based entry numbers, "
+                f"entry #1 is the first filter in the snapshot: "
+                f"{'; '.join(unreadable_entries)}) — authorship cannot be "
+                "determined, so every 'added' Correction, for every label, "
+                "is withheld until the snapshot is clean (an add a readable "
+                "filter provably covers is still attributed 'filter_covered' "
+                "and remains withheld). If the sidecar was hand-edited into a "
+                "bad shape, re-run `dataset export` and RESTART the daemon "
+                "(the snapshot is read at startup only); if the malformation "
+                "came off the wire, export reproduces it — fix the filter in "
+                "Gmail instead.",
+                err=True,
+            )
+
     ctx = ServingContext(
         bands=bands_map,
         graduated=graduated,
@@ -3539,6 +3633,7 @@ def _serve_startup(
         id_to_name=id_to_name,
         managed_label_ids=managed_label_ids,
         tier_label_ids=tier_label_ids,
+        filters=filters_snapshot,
     )
     return _ServeStartup(
         cfg=cfg,
@@ -3870,6 +3965,365 @@ def apply_cmd(
         f"warnings={outcome.warnings} rows={outcome.rows}",
         err=True,
     )
+
+
+@corrections_app.command("export")
+def corrections_export(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+    out: str = typer.Option("-", "--out", help="Output file path (default: stdout)"),
+    fmt: str = typer.Option("json", "--format", help="Export format (json)"),
+) -> None:
+    """Export the recorded Corrections as future TRAINING SIGNAL: a JSON
+    list of ``{message_id, label, kind, attribution}`` (ticket #27;
+    GLOSSARY: Correction). This is a faithful RAW dump — every row is
+    written with its attribution so the artifact is auditable (you can see
+    WHICH adds were withheld and why); the actual signal-filtering is the
+    builder's correction-folding seam's single job (it drops every
+    non-'human' 'added' before the corpus ever sees it). Reads the LOCAL
+    state DB only — no Gmail call — and NEVER retrains: this writes an
+    artifact; folding it into the corpus is a composition point a human
+    opts into, and running a retrain is a SEPARATE human decision (the
+    AC's no-auto-retrain gate). NO
+    bodies (invariant #5): the export carries ids/labels/kinds/attributions
+    only. Exit contract 0/2/4/5."""
+    from .appdb import AppDB, AppDBError
+
+    if fmt != "json":
+        typer.echo(
+            f"corrections export failed: --format {fmt!r} unsupported (only json)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+
+    # NO auth gate, NO client: the export is a LOCAL DB read (like status)
+    cfg = _load_config(config)
+    db_path = _resolve_db_path(cfg, db, "corrections export")
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, "corrections export", db_origin)
+    # the export READS the store — refuse a typo'd --db rather than
+    # silently create an empty DB and export [] with exit 0
+    if not db_path.exists():
+        typer.echo(
+            f"corrections export failed: no state DB at {db_path} — the "
+            "export reads the store, it does not create one (run the daemon "
+            "first, or check --db)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    _validate_store_db(db_path, command="corrections export")
+
+    store_db = AppDB(db_path)
+    try:
+        store_db.open()
+        rows = store_db.all_corrections()
+    except AppDBError as e:
+        typer.echo(f"corrections export failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        store_db.close()
+
+    payload = [
+        {
+            "message_id": r.message_id,
+            "label": r.label,
+            "kind": r.kind,
+            "attribution": r.attribution,
+        }
+        for r in rows
+    ]
+    text = json.dumps(payload, indent=2, sort_keys=True)
+    if out == "-":
+        typer.echo(text)
+        return
+
+    # --out is a WRITE target — guard it like `eval` guards its outputs.
+    # The headline danger: --out naming the state DB would overwrite the
+    # SQLite file with JSON and destroy the corrections + cursor (only a
+    # full resync recovers). Refuse that, plus the identity-file roots and
+    # an existing directory, BEFORE writing. ~ is expanded here so a
+    # `--out ~/c.json` names the same file the guards compare and the write
+    # lands (F2 item 12: parity with --db, which expands via _resolve_db_path).
+    out = str(Path(out).expanduser())
+    out_path = Path(out).resolve()
+    if out_path == db_path.resolve():
+        typer.echo(
+            f"corrections export failed: --out {out!r} is the state DB path "
+            f"— exporting there would DESTROY the corrections + cursor "
+            f"(choose a different file)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    for root, what in (
+        (cfg.model.checkpoint_dir.resolve(), "the checkpoint directory"),
+        (Path(cfg.corpus.dir).resolve(), "the corpus store"),
+    ):
+        if out_path == root or root in out_path.parents:
+            typer.echo(
+                f"corrections export failed: --out {out!r} lives inside "
+                f"{what} ({root}) — refusing to write there",
+                err=True,
+            )
+            raise typer.Exit(code=2) from None
+    if out_path.is_dir():
+        typer.echo(
+            f"corrections export failed: --out {out!r} names an existing "
+            f"directory — the target is a file",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    # the SAME 0600 + mkstemp/fsync/os.replace atomic write + clobber NOTICE
+    # `eval` uses (F2 item 6: the claim this guarded "like eval" was false
+    # while it was a bare 0664 write_text beside a 0600 store)
+    try:
+        _write_out_report(out, text + "\n", label="corrections export")
+    except OSError as e:
+        # an unwritable target is an operation failure (5), NOT the exit-1
+        # FileNotFoundError traceback the contract forbids (README: a `1`
+        # is an unhandled crash)
+        typer.echo(f"corrections export failed: cannot write {out!r}: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+
+@app.command("status")
+def status(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — must be the pair this "
+        "graduation table was measured against; a mismatch refuses exit 5)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — the graduated label set)",
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output"),
+) -> None:
+    """Answer "is it working?" with realized precision per graduated
+    label — derived from the LOCAL Corrections + Applications store
+    ALONE (ticket #27; GLOSSARY: Correction, Status).
+
+    ``status`` performs NO Gmail call on ANY path: it reads the state DB
+    and the two local artifacts (bands/graduation) and nothing else, so
+    it answers on a sick or offline mailbox (an UNAUTHENTICATED config
+    still works — there is no auth gate here, by design; the AC pins it
+    with a no-client call). It NEVER CREATES a state DB (a missing --db is
+    a refusal, not an empty store), but opening an EXISTING older-version
+    one runs the standard atomic schema migration (a v1/v2/v3 file comes
+    back at the current version — a write, the same transition every other
+    command's open performs). Bodies never enter the output (invariant #5):
+    labels, counts and rates only.
+
+    Per graduated label: written (Application rows), removed (matching
+    'removed' Corrections), precision = (written - removed)/written or
+    'no data' when nothing is applied yet, and the positive-signal
+    added Corrections split into the two withheld slices — 'filter-covered'
+    (a Gmail filter verifiably would have applied it) and 'unverifiable'
+    (a relevant filter makes authorship undecidable, so it is withheld not
+    credited — invariant #6 / #22's exclusion-not-guessing) — BOTH
+    EXCLUDED from the net human signal and disclosed. The basis line names
+    the attribution vocabulary it counted under and the CURRENT
+    bands/graduation artifact content hashes and states the honest v1
+    caveats: rows can span artifact versions (per-run binding deferred
+    to post-merge calibration), and precision assumes unseen-but-removed
+    mail is rare (archive-equals-dismiss). Exit contract: 0 answered · 2 usage · 4
+    config unusable · 5 store/artifact failure (3 is the project's
+    reserved not-implemented code; status never emits it)."""
+    from .appdb import CORRECTION_ATTRIBUTIONS, AppDB, AppDBError
+    from .graduation import GraduationTable
+    from .status import PrecisionInvariantError, compute_precision
+    from .thresholds import BandsArtifact
+
+    # The status caveat + attribution vocabulary, built ONCE and shared by
+    # the text NOTE and the --json basis so the two surfaces can never
+    # drift (F2 item 8). The vocabulary is RENDERED from CORRECTION_ATTRIBUTIONS
+    # — not a literal — so a future vocabulary change shows up on the line
+    # (the drift-pin asserts every constant value reaches the rendered text).
+    _vocab = " / ".join(CORRECTION_ATTRIBUTIONS)
+    _caveat = (
+        "'written' counts Application ROWS (a re-earned label is a new row, "
+        "so written can exceed the number of distinct messages) while "
+        "'removed' is deduped per (message,label); a label removed then later "
+        "re-added still counts as removed (the event log is historical truth, "
+        "not reconciled state); a Gmail label RENAME desyncs the name-keyed "
+        "join (orphaned corrections); rows may span artifact versions "
+        "(per-run binding deferred to post-merge calibration); precision "
+        "assumes unseen-but-removed mail is rare (archive-equals-dismiss)"
+    )
+    # the canonical THREE-cause sentence for 'unverifiable' (F2 item 14) —
+    # mirrored verbatim in GLOSSARY / README / CHANGELOG
+    _unverifiable_causes = (
+        "no usable filters snapshot (absent or malformed); a relevant filter "
+        "whose criteria cannot be simulated from the kept fields (outside "
+        "from/to/subject, or malformed); or an add whose authorship is "
+        "otherwise undecidable (its message fields were not fetched, or a "
+        "filter's addLabelIds is unreadable — which is GLOBAL: every 'added' "
+        "Correction, for every label, is withheld until the snapshot is clean)"
+    )
+    _attribution_note = (
+        f"'added' counts are attributed under the corrections vocabulary "
+        f"({_vocab} — a future vocabulary change would change these lines): "
+        f"an 'added' is 'unverifiable' — withheld, not guessed — when "
+        f"authorship cannot be determined: {_unverifiable_causes}. A "
+        f"'filter-covered' add (a simulatable filter verifiably would have "
+        f"applied it) is likewise withheld. Both slices are excluded from the "
+        f"human signal, not guessed."
+    )
+
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if not target.strip():
+            typer.echo(f"status failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+    # ~ is expanded for the artifact paths too (F2 item 12: parity with
+    # --db, which expands via _resolve_db_path — a `--bands ~/b.json` must
+    # name the file the operator meant, not a literal '~/' exit-5 miss)
+    bands = str(Path(bands).expanduser())
+    graduation = str(Path(graduation).expanduser())
+
+    # NO auth gate, NO client, NO model, NO corpus: status is the DB-only
+    # face (the AC — it must answer offline on a sick mailbox)
+    cfg = _load_config(config)  # config load failure -> exit 4 (its own mapping)
+    db_path = _resolve_db_path(cfg, db, "status")
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, "status", db_origin)
+    # status READS the store — it must not silently CREATE one on a typo'd
+    # --db (which would answer 'no data' with exit 0 and hide the mistake)
+    if not db_path.exists():
+        typer.echo(
+            f"status failed: no state DB at {db_path} — status reads the "
+            "store, it does not create one (run the daemon/apply first, or "
+            "check --db)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    _validate_store_db(db_path, command="status")
+
+    # the two artifacts (LOCAL reads; from_json self-validates the content
+    # hash — a corrupt/foreign file refuses to exit 5, never a traceback)
+    try:
+        table = GraduationTable.from_json(Path(graduation).read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"status failed: graduation table {graduation!r} unreadable or "
+            f"not a Graduation Table: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        artifact = BandsArtifact.from_json(Path(bands).read_text(encoding="utf-8"))
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        typer.echo(
+            f"status failed: bands artifact {bands!r} unreadable or not a "
+            f"Bands Artifact: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the bands/graduation PAIRING cross-check (F2 item 7): the Graduation
+    # Table records the bands artifact it was MEASURED against
+    # (bands_content_hash). A mismatched --bands/--graduation pair would
+    # otherwise print a basis line claiming a pairing that was never
+    # measured together — this finally makes --bands load-bearing (it was
+    # only ever displayed). Refuse NAMED at exit 5.
+    if artifact.content_hash != table.bands_content_hash:
+        typer.echo(
+            f"status failed: --bands {bands!r} (content_hash "
+            f"{artifact.content_hash[:12]}) is NOT the bands artifact this "
+            f"graduation table was measured against (bands_content_hash "
+            f"{table.bands_content_hash[:12]}) — pass the matching pair "
+            "(re-run `eval --bands`/`eval --graduation` together)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
+
+    store_db = AppDB(db_path)
+    try:
+        store_db.open()
+        # READ ORDER MATTERS (F2 item 9, the torn-read): these are two
+        # separate autocommit SELECTs, so a daemon delta can commit BETWEEN
+        # them. Reading corrections FIRST is sound because `applications` is
+        # INSERT-only (no UPDATE/DELETE/DROP anywhere in src/) and a 'removed'
+        # Correction is only ever detected for an app row ALREADY in the join
+        # (normally an EARLIER delta). So any removed visible in the
+        # corrections read (T1) has an app row committed at <= T1, and the
+        # later written read (T2 >= T1) necessarily includes it -> removed <=
+        # written across the split. Reading written FIRST would let a delta
+        # land a (removed, its app) pair between the reads and spuriously
+        # trip the removed>written refuse. Do NOT "simplify" the order back.
+        correction_stats = store_db.correction_label_stats()
+        written_by_label = store_db.application_label_counts()
+    except AppDBError as e:
+        typer.echo(f"status failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        store_db.close()
+
+    try:
+        rows = compute_precision(
+            graduated, written_by_label, correction_stats, db_path=str(db_path)
+        )
+    except PrecisionInvariantError as e:
+        # a tampered store (removed > written): refuse named at exit 5,
+        # never print a negative precision (F2 item 9)
+        typer.echo(f"status failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    if as_json:
+        payload = {
+            "basis": {
+                "bands_content_hash": artifact.content_hash,
+                "graduation_content_hash": table.content_hash,
+                "caveat": _caveat,
+                "attribution_vocabulary": list(CORRECTION_ATTRIBUTIONS),
+                "unverifiable_causes": _unverifiable_causes,
+            },
+            "labels": [
+                {
+                    "label": r.label,
+                    "written": r.written,
+                    "removed": r.removed,
+                    "precision": r.precision,
+                    "added": r.added,
+                    "added_filter_covered": r.added_filter_covered,
+                    "added_unverifiable": r.added_unverifiable,
+                    "human_added": r.human_added,
+                }
+                for r in rows
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    typer.echo(
+        f"status: {len(rows)} graduated label(s) · basis bands="
+        f"{artifact.content_hash[:12]} graduation={table.content_hash[:12]}"
+    )
+    typer.echo(f"status: NOTE v1 caveats — {_caveat}; {_attribution_note}")
+    if not rows:
+        typer.echo("status: no graduated labels (nothing to report)")
+        return
+    for r in rows:
+        precision = "no data" if r.precision is None else f"{r.precision:.2f}"
+        typer.echo(
+            f"  {r.label}: written={r.written} removed={r.removed} "
+            f"precision={precision} added={r.added} "
+            f"(filter-covered={r.added_filter_covered} "
+            f"unverifiable={r.added_unverifiable} "
+            f"human={r.human_added})"
+        )
 
 
 if __name__ == "__main__":

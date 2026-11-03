@@ -118,9 +118,61 @@ The remaining reason codes name themselves: `no-filter-snapshot`,
 _Avoid_: auto-excluded, shadow-flagged
 
 **Correction**:
-A later manual label edit by the owner on a message the system applied to
-(removing an applied label or adding one it missed), captured as new training
-signal.
+A later manual label edit by the owner on a message the system already
+applied to, captured as new training signal for the next *human-gated*
+retrain. Only messages PRESENT in the Applications join are candidates;
+the daemon detects Corrections by READING history events + the local
+join and NEVER writes back to Gmail. Two kinds (the store's CHECK
+vocabulary):
+*removed* — a label that is that message's Application label disappears
+(the human undid our work — a negative signal); *added* — a
+managed-vocabulary (graduated, non-System) label appears on an applied
+message that the daemon did not write (the human did our job — a
+positive signal). **Ignore boundary:** anything else on an applied
+message — System Labels, non-vocabulary labels, a removed NON-applied
+label, INBOX churn — records NOTHING (noise is not correction). An
+`added` carries an *attribution* (the store's CHECK vocabulary: *human*,
+*filter-covered*, *unverifiable*) deciding WHO it is credited to:
+*filter-covered* — a simulatable (from/to/subject) Gmail filter verifiably
+would have applied it (invariant #6), withheld from the realized-precision
+human signal and the training fold; *unverifiable* — withheld, not credited
+to the human, when authorship cannot be determined: no usable filters
+snapshot (absent or malformed); a relevant filter whose criteria cannot be
+simulated from the kept fields (outside `from`/`to`/`subject`, or
+malformed); or an add whose authorship is otherwise undecidable (its
+message fields were not fetched, or a filter's `addLabelIds` is unreadable —
+which is GLOBAL, not per-filter: we cannot read which labels that entry
+adds, so we cannot rule it out as any add's author, and every 'added'
+Correction, for every label, is withheld until the snapshot is clean) — the
+same *exclusion, not guessing* principle that governs
+`dataset analyze` (#22): guessing either way is what that doctrine forbids.
+A missing snapshot is therefore attribution-UNKNOWN, **not** an attestation
+that no filter exists (an empty *snapshot* — the operator ran the export
+and has none — is the attested-none case where an `added` is *human*).
+Only a *human* `added` (an attested snapshot with no relevant filter, or a
+verifiable one that does not match) is positive training signal. A
+`removed` is ALWAYS *human* (a human removing is human signal regardless of
+filters). `status` discloses each withheld slice as its own count. A
+corrected message is never re-written by the daemon.
+_Avoid_: feedback, undo
+
+**Status**:
+The `status` command's answer to "is it working?": per graduated label,
+*realized precision* = (written − removed) / written, where `written` is
+the Application rows and `removed` the matching `removed` Corrections,
+derived from the LOCAL Corrections + Applications store ALONE — no Gmail
+call, no auth (it answers on a sick or offline mailbox). A label with no
+Applications yet reports `no data`. The basis line names the current
+bands/graduation artifact content hashes and states the v1 caveats
+(rows may span artifact versions; precision assumes unseen-but-removed
+mail is rare — archive-equals-dismiss). The `added` counts are attributed
+under the Correction attribution vocabulary — the stored/emitted literals
+`human` / `filter_covered` / `unverifiable` (prose hyphenates them as
+"filter-covered"; the column value is the underscore form) — which the
+basis line lists verbatim so a future vocabulary change is visible on the
+line; both withheld slices are disclosed as their own counts and excluded
+from the human signal.
+_Avoid_: accuracy (this is realized, in-production precision, not eval)
 
 **Shadow Pass**:
 Running predictions on messages and recording them locally without any Gmail
@@ -334,7 +386,7 @@ discipline), and a consumer verifying it against a disagreeing
 checkpoint/eval REFUSES it (every field checked independently, all
 disagreements named). The config's per-label band targets
 (`[bands]`) ride in its per-label effective targets (provenance). The
-shadow pass and the daemon (later phases) read it.
+shadow pass and the daemon (shipped) read it.
 _Avoid_: bands file, threshold config
 
 **Graduation Table**:

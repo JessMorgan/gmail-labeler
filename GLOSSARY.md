@@ -177,6 +177,23 @@ implementation, invariant #7). Deterministic and diff-friendly (same
 inputs → byte-identical); message bodies never enter it.
 _Avoid_: eval table, metric dump
 
+**Bands Artifact**:
+The versioned JSON artifact `eval --bands` writes (opt-in — a bare
+`eval` never writes it; the recompute posture: `train`/`eval` are the
+only recomputers, and only `eval` writes the artifact). It carries the
+calibrated per-label Threshold Bands — the high/med thresholds chosen
+from the candidate grid, or the explicit no-band state with its named
+reason — bound to the checkpoint identity (vocabulary hash, corpus
+fingerprint, split manifest hash, encoder id: the Checkpoint Sidecar's
+fields, mirrored) and the eval identity (split date, test example
+count); its content hash covers every field (the SplitManifest
+discipline), and a consumer verifying it against a disagreeing
+checkpoint/eval REFUSES it (every field checked independently, all
+disagreements named). The config's per-label band targets
+(`[bands]`) ride in its per-label effective targets (provenance). The
+shadow pass and the daemon (later phases) read it.
+_Avoid_: bands file, threshold config
+
 **Model (seam)**:
 The `Model` Protocol — batch predict → per-label sigmoid scores over the
 checkpoint's Label-Path vocabulary (row i ↔ text i, column j ↔

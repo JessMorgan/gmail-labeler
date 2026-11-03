@@ -42,7 +42,13 @@ checkpoint sidecar identity + loader refusal, the `train/` recipe
 (torch optional extra, smoke/gpu markers), and the `train` command
 (#19); the `eval` command — per-label precision/recall at candidate
 thresholds on the temporal test split, sidecar-validated checkpoint,
-test-side membership rebuilt through the Split Manifest (#20).
+test-side membership rebuilt through the Split Manifest (#20);
+per-label threshold calibration — the pure core (highest qualifying
+candidate threshold per band, explicit no-band state with named
+reasons, undefined-precision cells never meet a target), the versioned
+Bands Artifact bound to checkpoint + eval identity (refused on any
+disagreement), the config's `[bands]` per-label overrides, and
+`eval --bands` as the only writer (recompute posture, #21).
 
 Scope:
 

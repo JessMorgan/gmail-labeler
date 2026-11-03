@@ -159,6 +159,42 @@ class GmailClient(Protocol):
         ...
 
 
+# -- the read-only label-resolution half (shared by ensure_label and the
+#    apply preview's mint guard — ticket #26 F1: the two-pass resolution
+#    was forked into THREE places (REST ensure_label, the fake's copy, and
+#    the CLI guard); these pure functions are the ONE home) -------------
+
+
+def find_user_label(labels: Sequence[LabelInfo], name: str) -> str | None:
+    """The exact-case USER label id for ``name``, or ``None`` — the READ
+    half of ``ensure_label``'s resolution: no mint, no refusal. An
+    existing exact-case USER label is always reused (pass 1's contract);
+    a case-differing or System label does NOT match here (exact-case, the
+    labels.py space contract). ``ensure_label`` rides this as its get-or-
+    create hit; the apply preview's mint guard rides it to resolve Tier
+    Label names WITHOUT creating anything."""
+    for label in labels:
+        if label.name == name and label.type == "user":
+            return label.id
+    return None
+
+
+def system_label_namesake(labels: Sequence[LabelInfo], name: str) -> str | None:
+    """The name of a System Label whose name CASEFOLD-matches ``name``, or
+    ``None`` — the collision DETECTION half (pass 2). It only reports the
+    clash; the CALLER decides the refusal (``ensure_label`` raises the bare
+    ValueError; the apply preview guard maps it to exit 4). Detecting, not
+    refusing, is what lets the daemon's mint and the preview's read-only
+    guard share ONE collision rule (the labels.py case-insensitive
+    exception: the visual trap is the same whichever way Gmail's rule
+    falls)."""
+    wanted = name.casefold()
+    for label in labels:
+        if label.type == "system" and label.name.casefold() == wanted:
+            return label.name
+    return None
+
+
 class GmailRestClient:
     """googleapiclient-backed adapter. The transport is injected
     (build_service replaces the whole default build; http is the caller's
@@ -380,26 +416,24 @@ class GmailRestClient:
         name is STILL not ours to see, the original refusal stands (no
         retry loop)."""
         labels = self.list_labels()
-        wanted = name.casefold()
-        for label in labels:  # pass 1: the exact-case get-or-create hit
-            if label.name == name and label.type == "user":
-                return label.id
-        for label in labels:  # pass 2 (F2 review): the collision guard
-            # runs AFTER the user-hit pass — an EXISTING exact-case user
-            # label is always reused (deterministic regardless of the
-            # list order); the guard only prevents MINTING a look-alike
-            if label.type == "system" and label.name.casefold() == wanted:
-                # CASEFOLDED (F2): the Gmail REST reference documents the
-                # 409 duplicate-name refusal but not a case rule, and CI
-                # cannot ask the live API — belt-and-braces: the visual
-                # trap is the same whichever way Gmail's rule falls (the
-                # hit/refuse contract, incl. the exact-case HIT, is the
-                # method docstring — no restatement here)
-                raise ValueError(
-                    f"ensure_label: {name!r} collides with a System Label "
-                    "name in the mailbox — rename [labels] applied/high/med "
-                    "(System Labels are never write targets)"
-                )
+        hit = find_user_label(labels, name)  # pass 1: the exact-case get-or-create hit
+        if hit is not None:
+            return hit
+        # pass 2 (F2 review): the collision guard runs AFTER the user-hit
+        # pass — an EXISTING exact-case user label is always reused
+        # (deterministic regardless of the list order); the guard only
+        # prevents MINTING a look-alike. CASEFOLDED (F2): the Gmail REST
+        # reference documents the 409 duplicate-name refusal but not a
+        # case rule, and CI cannot ask the live API — belt-and-braces: the
+        # visual trap is the same whichever way Gmail's rule falls (the
+        # hit/refuse contract, incl. the exact-case HIT, is the method
+        # docstring — no restatement here)
+        if system_label_namesake(labels, name) is not None:
+            raise ValueError(
+                f"ensure_label: {name!r} collides with a System Label "
+                "name in the mailbox — rename [labels] applied/high/med "
+                "(System Labels are never write targets)"
+            )
         try:
             data = self._call(
                 self._svc().labels().create(userId="me", body={"name": name})
@@ -407,9 +441,9 @@ class GmailRestClient:
         except GmailPermanentError as e:
             if e.status != 409:
                 raise
-            for label in self.list_labels():  # the ONE re-list
-                if label.name == name and label.type == "user":
-                    return label.id
+            winner = find_user_label(self.list_labels(), name)  # the ONE re-list
+            if winner is not None:
+                return winner
             raise  # still absent after the race: the original refusal
         return _s(data, "id")
 

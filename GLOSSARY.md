@@ -42,8 +42,10 @@ med; a skip-present label earns no band tier, it is not applied). That
 composition (umbrella + one band tier) SHIPS at the library level
 (ticket #24): `applications.plan_message_write` composes it from the
 tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
-ships the name→id resolution; the daemon's startup calls it once per
-configured name (#25), `apply` will too (#26)). The Application is ALL-OR-NOTHING
+ships the name→id resolution; the daemon's and the `apply --apply`
+backfill's startups each call it once per configured name (#25, #26) —
+a dry `apply` preview resolves the names by lookup only and refuses to
+mint, since a preview writes nothing). The Application is ALL-OR-NOTHING
 per message: a data-path compose error means NO write for that message
 plus a counted warning naming the message id and the plan detail
 (label and score where the failure shape carries them; structurally
@@ -202,6 +204,22 @@ _Avoid_: checkpoint (the encoder's artifact owns that word)
 The pre-existing mailbox history, as opposed to newly-arriving mail. The
 default `shadow run` window (90 days) includes recent arrivals as well as the
 older history — it is "recent mailbox", not strictly "pre-existing".
+
+**Backfill**:
+Applying graduated labels to Backlog mail through a `--since`-defined
+window (`after:<epoch>`, unbounded upward — so it reaches recent mail and
+MAY overlap what the live daemon also processes; the overlap is allowed
+and idempotent via skip-present, but running both at once is not
+recommended — see README). The `apply --since [--apply]` command is the
+ONLY path that does it, and it is always an explicit human decision, never
+automatic (the daemon never invokes it).
+A Backfill reuses the daemon's exact decision core and records
+Applications identically to daemon-applied ones (only the `source` column
+differs); it carries NO history cursor (invariant #3 is the daemon's
+alone), so its idempotency rests on skip-present — a re-run over the same
+window writes nothing already present. `apply` without `--apply` is the
+Backfill's PREVIEW (zero Gmail writes), not a Backfill itself.
+_Avoid_: replay (the daemon's crash-replay is a different thing), catch-up
 
 **Corpus**:
 A user's labeled mail, assembled for training. Sourced either from a live

@@ -1,10 +1,10 @@
 """gmail-labeler command-line interface.
 
 Command surface is frozen by the Phase 0 design (AGENTS.md "Layout");
-later phases add apply/status (absent until wired, which surfaces as a
-usage error). Phase 0 subcommands, the Phase 1 ``train``/``eval``/
-``shadow`` commands, and the Phase 2 ``daemon`` (ticket #25) are wired
-as they are implemented. Exit 3 is reserved for wired-but-stubbed
+the Phase 1 ``train``/``eval``/``shadow`` commands, the Phase 2 ``daemon``
+(ticket #25), and the Phase 2 ``apply`` bulk path (ticket #26) are wired
+as they are implemented; ``status`` remains absent until wired (which
+surfaces as a usage error). Exit 3 is reserved for wired-but-stubbed
 commands and currently UNREACHABLE — no command is stubbed; scripts can
 branch on 0/2/4/5 today.
 """
@@ -40,6 +40,8 @@ AttributionPosture = Literal[
 
 if TYPE_CHECKING:
     from .config import Config, LabelsConfig
+    from .corpus_record import CorpusRecord
+    from .daemon import ServingContext
     from .gmail_client import GmailClient
     from .graduation import GraduationTable
     from .thresholds import BandsArtifact
@@ -3134,6 +3136,420 @@ def _restore_shutdown_handlers(previous: _PreviousHandlers) -> None:
         signal.signal(sig, handler)
 
 
+@dataclass(frozen=True, slots=True)
+class _ServeStartup:
+    """The gates-first startup bundle BOTH the daemon (#25) and the
+    ``apply`` command (#26) serve from — the ONE extraction of #25's
+    startup chain (the design's "startup = ONE extraction": a second
+    copy is the drift the shared helper exists to prevent). The config,
+    the effective state DB path, the authenticated client, the
+    sidecar-validated model, the ``ServingContext`` (bands / graduated /
+    System Labels / id-bridge + the two name→id maps the plan consumes),
+    and the corpus records (apply's AC5 provenance scan reads them; the
+    daemon ignores them — the fingerprint was already verified at load).
+
+    Every startup refusal raises ``typer.Exit`` with the PROJECT
+    exit-code contract (2 usage · 4 auth/config incl. the tier-name
+    collision · 5 artifact/store/wire failure); ``command`` names the
+    calling command in every refusal message (the daemon's sealed
+    "daemon failed:" strings ride ``command="daemon"``, byte-identical)."""
+
+    cfg: Config
+    db_path: Path
+    client: GmailClient
+    model: Model
+    ctx: ServingContext
+    # a TUPLE, not a list: a frozen dataclass carrying a mutable list
+    # would let a caller mutate the "immutable" bundle's records in place
+    # (the AC5 provenance scan reads them; the daemon ignores them)
+    records: tuple[CorpusRecord, ...]
+
+
+def _serve_startup(
+    *,
+    command: str,
+    config: str | None,
+    bands: str,
+    graduation: str,
+    db: str | None,
+    mint_labels: bool = True,
+) -> _ServeStartup:
+    """The daemon's gates-first startup, extracted VERBATIM (ticket #26):
+    identity gates run FIRST (the shadow-run shape: checkpoint, Graduation
+    Table, Bands Artifact), then the three configured Tier Label names
+    resolve ONCE via ensure_label (a System-Label name collision refuses
+    AT MINT at exit 4, naming the [labels] key). The client and model
+    factories are the module-level seams (``_daemon_client`` /
+    ``_daemon_model_factory``) so a test's monkeypatch reaches BOTH the
+    daemon and the apply path — the seams are shared, not forked. The
+    daemon command and the apply command are the only callers; the
+    daemon's poll loop and the apply batch both consume the returned
+    bundle unchanged.
+
+    ``mint_labels`` is the preview's read-only discipline (ticket #26
+    AC1): the daemon and the ``apply --apply`` backfill pass True (the
+    get-or-create ensure_label, the daemon's sealed behavior — a
+    System-Label name collision still refuses at exit 4). A dry PREVIEW
+    passes False: the Tier Label names resolve by LOOKUP ONLY (the
+    already-listed labels), and a name the mailbox does not carry hits
+    the MINT GUARD — refused NAMED (exit 5), never silently created (a
+    preview performs zero wire writes, so it cannot mint its own Tier
+    Labels; the operator runs ``apply --apply``/``daemon`` or creates
+    them first). The collision case is still a config error (exit 4, the
+    same rename diagnosis ensure_label gives)."""
+    from .auth import AuthError
+    from .corpus_record import corpus_fingerprint
+    from .corpus_store import CorpusError, CorpusStore
+    from .daemon import ServingContext
+    from .dataset_build import SplitManifest
+    from .gmail_client import find_user_label, system_label_namesake
+    from .gmail_errors import GmailAuthError, GmailError
+    from .model import (
+        MANIFEST_FILENAME,
+        THRESHOLDS_SOURCE_NONE,
+        CheckpointRefusedError,
+        ExpectedIdentity,
+        load_model,
+    )
+    from .tiers import TIER_APPLIED, TIER_HIGH, TIER_MED
+    from .tokens import TokenStoreError
+
+    # usage refusals up front (exit 2, before any work — the shadow
+    # precedent): an empty --bands/--graduation would degenerate to
+    # Path("") and fail awkwardly mid-run
+    for flag, target in (("--bands", bands), ("--graduation", graduation)):
+        if not target.strip():
+            typer.echo(f"{command} failed: {flag} PATH must be non-empty", err=True)
+            raise typer.Exit(code=2) from None
+
+    # PROJECT exit-code contract (cli epilog + every command suite):
+    # config load failure is 4 (auth/config unusable) — _load_config's
+    # own mapping; the serve startup does not fork the contract
+    cfg = _load_config(config)
+    db_path = _resolve_db_path(cfg, db, command)
+    db_origin = "--db PATH" if db is not None else "[store] db_path"
+    _check_store_db_path(db_path, cfg, command, db_origin)
+    # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
+    # pay the corpus-scale identity work below
+    try:
+        client = _daemon_client(cfg)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+
+    # S5: the state DB validated FAIL-FAST before any network work
+    _validate_store_db(db_path, command=command)
+
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        typer.echo(
+            f"{command} failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset export/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        records = list(store.iter_records())
+    except (CorpusError, OSError, UnicodeDecodeError):
+        typer.echo(f"{command} failed: records unreadable", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if not records:
+        typer.echo(
+            f"{command} failed: corpus is empty \u2014 run dataset "
+            "export/import-gyb first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the checkpoint (identity gate, the shadow shape): the materialized
+    # manifest is the split's authority (invariant #7)
+    checkpoint_dir = cfg.model.checkpoint_dir
+    manifest_path = checkpoint_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        typer.echo(
+            f"{command} failed: checkpoint {checkpoint_dir} has no "
+            f"{MANIFEST_FILENAME} \u2014 no verifiable split identity "
+            "(run train first)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        manifest = SplitManifest.from_json(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        typer.echo(
+            f"{command} failed: checkpoint manifest unreadable or tampered: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    expected = ExpectedIdentity(
+        vocabulary=manifest.vocabulary,
+        corpus_fingerprint=corpus_fingerprint(records, manifest.train_ids),
+        split_manifest_hash=manifest.content_hash,
+        thresholds_source=THRESHOLDS_SOURCE_NONE,
+        encoder_id=cfg.model.encoder,
+    )
+    try:
+        model = load_model(checkpoint_dir, expected, _daemon_model_factory)
+    except CheckpointRefusedError as e:
+        typer.echo(
+            f"{command} failed: checkpoint refused ({', '.join(e.fields)}) "
+            "\u2014 no silent fallback; rebuild the checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ImportError as e:
+        typer.echo(
+            f"{command} failed: the model recipe is unavailable ({e}) "
+            "\u2014 install the optional extra: `uv sync --extra train` "
+            "(if it is already installed, the recipe import itself is "
+            "broken \u2014 report it)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        typer.echo(f"{command} failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    if model.vocabulary != manifest.vocabulary:
+        typer.echo(
+            f"{command} failed: the model's vocabulary does not match the "
+            "manifest's \u2014 refusing to score against a lying column "
+            "order",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the Bands Artifact + the Graduation Table (identity gates, the
+    # shadow shape — cause naming per #22's doctrine)
+    from .graduation import GraduationRefusedError, GraduationTable, verify_graduation
+    from .thresholds import BandsArtifact, BandsRefusedError, verify_bands
+
+    bands_path = Path(bands)
+    if not bands_path.is_file():
+        typer.echo(
+            f"{command} failed: no bands artifact at {bands_path} \u2014 "
+            "run `eval --bands` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        bands_text = bands_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"{command} failed: bands artifact at {bands_path} is unreadable "
+            "(I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"{command} failed: bands artifact at {bands_path} is not valid "
+            "UTF-8 \u2014 it does not parse as a Bands Artifact",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        artifact = BandsArtifact.from_json(bands_text)
+    except ValueError as e:
+        typer.echo(
+            f"{command} failed: bands artifact at {bands_path} does not parse "
+            f"as a Bands Artifact: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_bands(
+            artifact,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+        )
+    except BandsRefusedError as e:
+        typer.echo(
+            f"{command} failed: bands artifact refused ({', '.join(e.fields)}) "
+            "\u2014 it disagrees with this checkpoint/eval; re-run "
+            "`eval --bands` against this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"{command} failed: bands verification failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    graduation_path = Path(graduation)
+    if not graduation_path.is_file():
+        typer.echo(
+            f"{command} failed: no graduation table at {graduation_path} "
+            "\u2014 run `eval --graduation --confirm-graduation` first",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        graduation_text = graduation_path.read_text(encoding="utf-8")
+    except OSError:
+        typer.echo(
+            f"{command} failed: graduation table at {graduation_path} is "
+            "unreadable (I/O failure)",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except UnicodeDecodeError:
+        typer.echo(
+            f"{command} failed: graduation table at {graduation_path} is not "
+            "valid UTF-8 \u2014 it does not parse as a Graduation Table",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        table = GraduationTable.from_json(graduation_text)
+    except ValueError as e:
+        typer.echo(
+            f"{command} failed: graduation table at {graduation_path} does not "
+            f"parse as a Graduation Table: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    try:
+        verify_graduation(
+            table,
+            vocabulary=manifest.vocabulary,
+            corpus_fingerprint=expected.corpus_fingerprint,
+            split_manifest_hash=manifest.content_hash,
+            encoder_id=cfg.model.encoder,
+            split_date=manifest.split_date,
+            test_examples=len(manifest.test_ids),
+            bands_content_hash=artifact.content_hash,
+        )
+    except GraduationRefusedError as e:
+        typer.echo(
+            f"{command} failed: graduation table refused ({', '.join(e.fields)}) "
+            "\u2014 it disagrees with this checkpoint/eval/bands; re-run "
+            "`eval --graduation` against this checkpoint",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except ValueError as e:
+        typer.echo(f"{command} failed: graduation verification failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+
+    # the label bridge (presence + System Labels — the read path)
+    try:
+        labels = client.list_labels()
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"{command} failed: label list failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    id_to_name = {li.id: li.name for li in labels}
+    system_names = frozenset(li.name for li in labels if li.type == "system")
+    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
+    bands_map = {entry.label: (entry.high, entry.med) for entry in artifact.labels}
+
+    # STARTUP tier resolution: the three configured [labels] names →
+    # Gmail label ids ONCE (ensure_label: get-or-create; the Q1 ruling
+    # keeps the signature and pays one list round-trip per name). The
+    # collision refusal is a BARE ValueError (the C0 Protocol contract —
+    # NOT the gmail_errors taxonomy): it maps to exit 4 (config error)
+    # and names the offending [labels] KEY (the #24 carryover — a bare
+    # ValueError would otherwise land as exit-1 'a bug').
+    tier_constants = {"applied": TIER_APPLIED, "high": TIER_HIGH, "med": TIER_MED}
+    tier_label_ids: dict[str, str] = {}
+    for key, name in (
+        ("applied", cfg.labels.applied),
+        ("high", cfg.labels.high),
+        ("med", cfg.labels.med),
+    ):
+        if not mint_labels:
+            # the preview's MINT GUARD (AC1): a dry run never creates a
+            # label, so the Tier Label names resolve by LOOKUP ONLY — via
+            # the SAME read-only resolvers ensure_label rides (gmail_client.
+            # find_user_label / system_label_namesake), NOT a forked copy
+            # of its two-pass logic (the drift this seam exists to stop).
+            # An exact-case USER label of the name is used as-is; a
+            # System-Label name-sake is the config error it always was
+            # (exit 4); an ABSENT exact-case name is refused NAMED (exit 5)
+            # — the preview cannot mint the label it needs to compose a
+            # faithful plan, so it says so instead of writing
+            hit = find_user_label(labels, name)
+            if hit is not None:
+                tier_label_ids[tier_constants[key]] = hit
+                continue
+            if system_label_namesake(labels, name) is not None:
+                typer.echo(
+                    f"{command} failed: [labels] {key} = {name!r} collides "
+                    "with a System Label name in the mailbox (System Labels "
+                    f"are never write targets) \u2014 rename [labels] {key} "
+                    "and restart",
+                    err=True,
+                )
+                raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+            # honest wording: an exact-case USER label is absent — a
+            # case-DIFFERING user label may well exist (the match is
+            # exact-case), so "is not present in the mailbox" would be a
+            # lie; say what is actually missing
+            typer.echo(
+                f"{command} failed: [labels] {key} = {name!r} has no "
+                "exact-case USER label in the mailbox \u2014 a preview does "
+                "not create Tier Labels; run `apply --apply` (or `daemon`) "
+                "to create it, or create it yourself",
+                err=True,
+            )
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+        try:
+            tier_label_ids[tier_constants[key]] = client.ensure_label(name)
+        except ValueError as e:
+            typer.echo(
+                f"{command} failed: [labels] {key} = {name!r} refused: {e} "
+                f"\u2014 rename [labels] {key} and restart",
+                err=True,
+            )
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailAuthError as e:
+            # ensure_label's own round-trips (list + create) are WIRE
+            # calls: they take the SAME arms as every other client call
+            # site (the review round's blocker — they escaped the
+            # ValueError-only arm to exit 1); auth is human-gated (4)
+            typer.echo(f"auth: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+        except GmailError as e:
+            # transient/permanent wire failure at startup resolution:
+            # operation failure (5), named, never a traceback
+            typer.echo(f"{command} failed: tier label resolution failed: {e}", err=True)
+            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    # the Managed Label name→id map for the would-apply names (the
+    # bridge, user labels only, exact-case first hit wins — the plan's
+    # _resolve_id fail-safes any name absent here)
+    managed_label_ids: dict[str, str] = {}
+    for li in labels:
+        if (
+            li.type == "user"
+            and li.name in graduated
+            and li.name not in managed_label_ids
+        ):
+            managed_label_ids[li.name] = li.id
+
+    ctx = ServingContext(
+        bands=bands_map,
+        graduated=graduated,
+        system_labels=system_names,
+        id_to_name=id_to_name,
+        managed_label_ids=managed_label_ids,
+        tier_label_ids=tier_label_ids,
+    )
+    return _ServeStartup(
+        cfg=cfg,
+        db_path=db_path,
+        client=client,
+        model=model,
+        ctx=ctx,
+        records=tuple(records),
+    )
+
+
 @app.command("daemon")
 def daemon(
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
@@ -3180,311 +3596,23 @@ def daemon(
     import sys
 
     from .appdb import AppDB, AppDBError
-    from .auth import AuthError
-    from .corpus_record import corpus_fingerprint
-    from .corpus_store import CorpusError, CorpusStore
-    from .daemon import ServingContext, daemon_loop
-    from .dataset_build import SplitManifest
-    from .gmail_errors import GmailAuthError, GmailError
-    from .model import (
-        MANIFEST_FILENAME,
-        THRESHOLDS_SOURCE_NONE,
-        CheckpointRefusedError,
-        ExpectedIdentity,
-        load_model,
+    from .daemon import daemon_loop
+    from .gmail_errors import GmailAuthError
+
+    # the gates-first startup, SHARED with apply (#26): the identity
+    # gates, the client/model seams, the ensure_label tier resolution,
+    # and the ServingContext all live in _serve_startup — the daemon's
+    # suite rides it VERBATIM (the extraction is behavior-preserving; a
+    # test edit would mean the extraction is wrong)
+    startup = _serve_startup(
+        command="daemon", config=config, bands=bands, graduation=graduation, db=db
     )
-    from .tiers import TIER_APPLIED, TIER_HIGH, TIER_MED
-    from .tokens import TokenStoreError
-
-    # usage refusals up front (exit 2, before any work — the shadow
-    # precedent): an empty --bands/--graduation would degenerate to
-    # Path("") and fail awkwardly mid-run
-    for flag, target in (("--bands", bands), ("--graduation", graduation)):
-        if not target.strip():
-            typer.echo(f"daemon failed: {flag} PATH must be non-empty", err=True)
-            raise typer.Exit(code=2) from None
-
-    # PROJECT exit-code contract (cli epilog + every command suite):
-    # config load failure is 4 (auth/config unusable) — _load_config's
-    # own mapping; the daemon does not fork the contract
-    cfg = _load_config(config)
-    db_path = _resolve_db_path(cfg, db, "daemon")
-    db_origin = "--db PATH" if db is not None else "[store] db_path"
-    _check_store_db_path(db_path, cfg, "daemon", db_origin)
-    # auth gate FIRST (exit 4 precedent): a not-signed-in run must not
-    # pay the corpus-scale identity work below
-    try:
-        client = _daemon_client(cfg)
-    except (AuthError, TokenStoreError) as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-
-    # S5: the state DB validated FAIL-FAST before any network work
-    _validate_store_db(db_path, command="daemon")
-
-    store = CorpusStore(cfg.corpus.dir)
-    if not store.root.is_dir():
-        typer.echo(
-            f"daemon failed: corpus dir {store.root} is missing or not a "
-            "directory \u2014 run dataset export/import-gyb first or fix "
-            "[corpus] dir",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        records = list(store.iter_records())
-    except (CorpusError, OSError, UnicodeDecodeError):
-        typer.echo("daemon failed: records unreadable", err=True)
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    if not records:
-        typer.echo(
-            "daemon failed: corpus is empty \u2014 run dataset export/import-gyb first",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-
-    # the checkpoint (identity gate, the shadow shape): the materialized
-    # manifest is the split's authority (invariant #7)
-    checkpoint_dir = cfg.model.checkpoint_dir
-    manifest_path = checkpoint_dir / MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        typer.echo(
-            f"daemon failed: checkpoint {checkpoint_dir} has no "
-            f"{MANIFEST_FILENAME} \u2014 no verifiable split identity "
-            "(run train first)",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        manifest = SplitManifest.from_json(manifest_path.read_text(encoding="utf-8"))
-    except (ValueError, OSError) as e:
-        typer.echo(
-            f"daemon failed: checkpoint manifest unreadable or tampered: {e}",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    expected = ExpectedIdentity(
-        vocabulary=manifest.vocabulary,
-        corpus_fingerprint=corpus_fingerprint(records, manifest.train_ids),
-        split_manifest_hash=manifest.content_hash,
-        thresholds_source=THRESHOLDS_SOURCE_NONE,
-        encoder_id=cfg.model.encoder,
-    )
-    try:
-        model = load_model(checkpoint_dir, expected, _daemon_model_factory)
-    except CheckpointRefusedError as e:
-        typer.echo(
-            f"daemon failed: checkpoint refused ({', '.join(e.fields)}) "
-            "\u2014 no silent fallback; rebuild the checkpoint",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except ImportError as e:
-        typer.echo(
-            f"daemon failed: the model recipe is unavailable ({e}) "
-            "\u2014 install the optional extra: `uv sync --extra train` "
-            "(if it is already installed, the recipe import itself is "
-            "broken \u2014 report it)",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except (ValueError, OSError, RuntimeError) as e:
-        typer.echo(f"daemon failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    if model.vocabulary != manifest.vocabulary:
-        typer.echo(
-            "daemon failed: the model's vocabulary does not match the "
-            "manifest's \u2014 refusing to score against a lying column "
-            "order",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-
-    # the Bands Artifact + the Graduation Table (identity gates, the
-    # shadow shape — cause naming per #22's doctrine)
-    from .graduation import GraduationRefusedError, GraduationTable, verify_graduation
-    from .thresholds import BandsArtifact, BandsRefusedError, verify_bands
-
-    bands_path = Path(bands)
-    if not bands_path.is_file():
-        typer.echo(
-            f"daemon failed: no bands artifact at {bands_path} \u2014 "
-            "run `eval --bands` first",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        bands_text = bands_path.read_text(encoding="utf-8")
-    except OSError:
-        typer.echo(
-            f"daemon failed: bands artifact at {bands_path} is unreadable "
-            "(I/O failure)",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except UnicodeDecodeError:
-        typer.echo(
-            f"daemon failed: bands artifact at {bands_path} is not valid "
-            "UTF-8 \u2014 it does not parse as a Bands Artifact",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        artifact = BandsArtifact.from_json(bands_text)
-    except ValueError as e:
-        typer.echo(
-            f"daemon failed: bands artifact at {bands_path} does not parse "
-            f"as a Bands Artifact: {e}",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        verify_bands(
-            artifact,
-            vocabulary=manifest.vocabulary,
-            corpus_fingerprint=expected.corpus_fingerprint,
-            split_manifest_hash=manifest.content_hash,
-            encoder_id=cfg.model.encoder,
-            split_date=manifest.split_date,
-            test_examples=len(manifest.test_ids),
-        )
-    except BandsRefusedError as e:
-        typer.echo(
-            f"daemon failed: bands artifact refused ({', '.join(e.fields)}) "
-            "\u2014 it disagrees with this checkpoint/eval; re-run "
-            "`eval --bands` against this checkpoint",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except ValueError as e:
-        typer.echo(f"daemon failed: bands verification failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-
-    graduation_path = Path(graduation)
-    if not graduation_path.is_file():
-        typer.echo(
-            f"daemon failed: no graduation table at {graduation_path} "
-            "\u2014 run `eval --graduation --confirm-graduation` first",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        graduation_text = graduation_path.read_text(encoding="utf-8")
-    except OSError:
-        typer.echo(
-            f"daemon failed: graduation table at {graduation_path} is "
-            "unreadable (I/O failure)",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except UnicodeDecodeError:
-        typer.echo(
-            f"daemon failed: graduation table at {graduation_path} is not "
-            "valid UTF-8 \u2014 it does not parse as a Graduation Table",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        table = GraduationTable.from_json(graduation_text)
-    except ValueError as e:
-        typer.echo(
-            f"daemon failed: graduation table at {graduation_path} does not "
-            f"parse as a Graduation Table: {e}",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    try:
-        verify_graduation(
-            table,
-            vocabulary=manifest.vocabulary,
-            corpus_fingerprint=expected.corpus_fingerprint,
-            split_manifest_hash=manifest.content_hash,
-            encoder_id=cfg.model.encoder,
-            split_date=manifest.split_date,
-            test_examples=len(manifest.test_ids),
-            bands_content_hash=artifact.content_hash,
-        )
-    except GraduationRefusedError as e:
-        typer.echo(
-            f"daemon failed: graduation table refused ({', '.join(e.fields)}) "
-            "\u2014 it disagrees with this checkpoint/eval/bands; re-run "
-            "`eval --graduation` against this checkpoint",
-            err=True,
-        )
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    except ValueError as e:
-        typer.echo(f"daemon failed: graduation verification failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-
-    # the label bridge (presence + System Labels — the read path)
-    try:
-        labels = client.list_labels()
-    except GmailAuthError as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailError as e:
-        typer.echo(f"daemon failed: label list failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    id_to_name = {li.id: li.name for li in labels}
-    system_names = frozenset(li.name for li in labels if li.type == "system")
-    graduated = frozenset(entry.label for entry in table.labels if entry.graduated)
-    bands_map = {entry.label: (entry.high, entry.med) for entry in artifact.labels}
-
-    # STARTUP tier resolution: the three configured [labels] names →
-    # Gmail label ids ONCE (ensure_label: get-or-create; the Q1 ruling
-    # keeps the signature and pays one list round-trip per name). The
-    # collision refusal is a BARE ValueError (the C0 Protocol contract —
-    # NOT the gmail_errors taxonomy): it maps to exit 4 (config error)
-    # and names the offending [labels] KEY (the #24 carryover — a bare
-    # ValueError would otherwise land as exit-1 'a bug').
-    tier_constants = {"applied": TIER_APPLIED, "high": TIER_HIGH, "med": TIER_MED}
-    tier_label_ids: dict[str, str] = {}
-    for key, name in (
-        ("applied", cfg.labels.applied),
-        ("high", cfg.labels.high),
-        ("med", cfg.labels.med),
-    ):
-        try:
-            tier_label_ids[tier_constants[key]] = client.ensure_label(name)
-        except ValueError as e:
-            typer.echo(
-                f"daemon failed: [labels] {key} = {name!r} refused: {e} "
-                f"\u2014 rename [labels] {key} and restart",
-                err=True,
-            )
-            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-        except GmailAuthError as e:
-            # ensure_label's own round-trips (list + create) are WIRE
-            # calls: they take the SAME arms as every other client call
-            # site (the review round's blocker — they escaped the
-            # ValueError-only arm to exit 1); auth is human-gated (4)
-            typer.echo(f"auth: {e}", err=True)
-            raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-        except GmailError as e:
-            # transient/permanent wire failure at startup resolution:
-            # operation failure (5), named, never a traceback
-            typer.echo(f"daemon failed: tier label resolution failed: {e}", err=True)
-            raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
-    # the Managed Label name→id map for the would-apply names (the
-    # bridge, user labels only, exact-case first hit wins — the plan's
-    # _resolve_id fail-safes any name absent here)
-    managed_label_ids: dict[str, str] = {}
-    for li in labels:
-        if (
-            li.type == "user"
-            and li.name in graduated
-            and li.name not in managed_label_ids
-        ):
-            managed_label_ids[li.name] = li.id
-
-    ctx = ServingContext(
-        bands=bands_map,
-        graduated=graduated,
-        system_labels=system_names,
-        id_to_name=id_to_name,
-        managed_label_ids=managed_label_ids,
-        tier_label_ids=tier_label_ids,
-    )
+    cfg = startup.cfg
+    client = startup.client
+    model = startup.model
+    ctx = startup.ctx
+    db_path = startup.db_path
+    graduated = ctx.graduated
     typer.echo(
         f"daemon: serving {len(graduated)} graduated label(s); poll "
         f"{cfg.gmail.history_poll_seconds}s; db {db_path}",
@@ -3542,6 +3670,206 @@ def daemon(
         daemon_log.setLevel(previous_log_level)
         _restore_shutdown_handlers(previous_handlers)
         store_db.close()
+
+
+@app.command("apply")
+def apply_cmd(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    bands: str = typer.Option(
+        ...,
+        "--bands",
+        help="Bands Artifact path (required — the calibrated Threshold Bands)",
+    ),
+    graduation: str = typer.Option(
+        ...,
+        "--graduation",
+        help="Graduation Table path (required — only GRADUATED labels apply)",
+    ),
+    since: str = typer.Option(
+        ...,
+        "--since",
+        help=(
+            "ISO date (YYYY-MM-DD): the Backfill boundary — process mail "
+            "from that day onward (the named day is INCLUDED — the cutoff "
+            "is UTC midnight of it). REQUIRED: the only bulk path never "
+            "guesses its own window"
+        ),
+    ),
+    apply_flag: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Perform the backfill (write graduated labels + record "
+            "Applications). WITHOUT it: a dry preview that scores the "
+            "window and writes NOTHING"
+        ),
+    ),
+    db: str | None = typer.Option(
+        None,
+        "--db",
+        help="State DB path (overrides [store] db_path; ~ expanded)",
+    ),
+) -> None:
+    """Preview or backfill graduated labels over HISTORICAL mail since
+    ``--since`` — the ONLY bulk path, always an explicit human decision
+    (ticket #26; GLOSSARY: Application, Backfill).
+
+    Without ``--apply`` this is a dry preview: it scores the window and
+    reports the would-apply lines (id + label names + band/tier + scores)
+    and performs ZERO Gmail writes (AC1). With ``--apply`` it backfills:
+    the SAME decision core the daemon runs (``applications.
+    plan_message_write`` — one core, no second implementation, AC2), the
+    write-first ordering identical to the daemon, and Applications
+    recorded identically to daemon-applied ones (AC3). skip-present makes
+    a re-run idempotent (AC4): a label that already landed reads present,
+    composes an empty plan, earns no second write and no duplicate row.
+
+    The wire query is ``after:<epoch-seconds>`` ONLY — deliberately
+    WITHOUT ``in:inbox`` (backfill targets historical mail, which is
+    mostly archived); the epoch form is the unambiguous one (a calendar
+    date in an API query is midnight PST, not the UTC boundary). The
+    cutoff reuses the shadow-run rule (``_backlog_cutoff``: UTC midnight
+    of the named day). apply NEVER reads or writes the daemon's history
+    cursor (invariant #3 is the daemon's alone); a mid-run SIGTERM
+    completes the current batch to its commit point (the shared shutdown
+    handler), and a transient write failure holds NOTHING — the message
+    stays un-labeled and a re-run picks it up.
+
+    Records in the window lacking a Date Provenance stamp (pre-#17
+    corpora) surface ONE counted warning at the boundary (AC5): the
+    date-based window is only as trustworthy as the dates. Bodies never
+    enter the DB or any log (invariant #5). Exit codes: 0 clean · 2
+    usage · 4 auth/config (incl. the tier-name collision) · 5 artifact/
+    store failure, a preview whose Tier Labels are absent, or a model /
+    wire failure."""
+    import logging
+    import sys
+
+    from .appdb import AppDB, AppDBError
+    from .apply import run_apply
+    from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES
+    from .gmail_errors import GmailAuthError, GmailError
+
+    # --since is REQUIRED (the only bulk path never guesses its window);
+    # typer rejects an absent option itself. Strict ISO (strptime, not
+    # the lenient 3.11+ fromisoformat — the shadow-run precedent): a
+    # non-ISO value is a usage error (exit 2)
+    try:
+        since_date = datetime.strptime(since, "%Y-%m-%d").date()
+    except ValueError:
+        typer.echo(
+            f"apply failed: --since {since!r} is not an ISO date (YYYY-MM-DD)",
+            err=True,
+        )
+        raise typer.Exit(code=2) from None
+    now = _now()
+    cutoff_dt = _backlog_cutoff(since_date, now)  # UTC midnight of the named day
+    # the backfill query: after:<epoch-seconds> ONLY — no in:inbox (the
+    # window is historical mail, mostly archived; the epoch form is the
+    # unambiguous one per #23's primary-source doctrine)
+    query = f"after:{int(cutoff_dt.timestamp())}"
+
+    # the gates-first startup, SHARED with the daemon (_serve_startup):
+    # a dry preview FORBIDS minting Tier Labels (mint_labels=False — the
+    # AC1 zero-write discipline: a preview that needs a label it lacks
+    # fails named, never silently creates); the backfill resolves them via
+    # ensure_label exactly as the daemon does
+    startup = _serve_startup(
+        command="apply",
+        config=config,
+        bands=bands,
+        graduation=graduation,
+        db=db,
+        mint_labels=apply_flag,
+    )
+    client = startup.client
+    model = startup.model
+    ctx = startup.ctx
+    db_path = startup.db_path
+
+    # AC5: the --since boundary is a DATE; a corpus record whose date has
+    # no server-authoritative provenance stamp (pre-#17 lines read as
+    # "unknown") cannot be trusted to sit on the right side of it. ONE
+    # counted warning at the boundary (never per-message spam)
+    unprovenanced = sum(
+        1
+        for rec in startup.records
+        if rec.date >= cutoff_dt
+        and rec.date_provenance not in SERVER_AUTHORITATIVE_PROVENANCES
+    )
+    if unprovenanced:
+        typer.echo(
+            f"apply: WARNING {unprovenanced} corpus record(s) dated at or "
+            f"after the --since boundary ({cutoff_dt.date()}) lack a "
+            "server-authoritative Date Provenance stamp — the date-based "
+            "window is only as trustworthy as those dates (GLOSSARY: Date "
+            "Provenance)",
+            err=True,
+        )
+
+    typer.echo(
+        f"apply: {'backfill' if apply_flag else 'preview'} query={query!r} "
+        f"serving {len(ctx.graduated)} graduated label(s); db {db_path}",
+        err=True,
+    )
+    stop_flag = threading.Event()
+    previous_handlers = _install_shutdown_handlers(stop_flag)
+    # the preview lines and per-batch counters are INFO on the apply
+    # logger; install a stderr handler so they reach the operator (the
+    # daemon's F2 MINOR 7 precedent), removed in the finally
+    store_db = AppDB(db_path)
+    apply_log = logging.getLogger("gmail_labeler.apply")
+    log_handler = logging.StreamHandler(sys.stderr)
+    log_handler.setLevel(logging.INFO)
+    previous_log_level = apply_log.level
+    apply_log.setLevel(logging.INFO)
+    apply_log.addHandler(log_handler)
+    try:
+        store_db.open()
+        outcome = run_apply(
+            client=client,
+            db=store_db,
+            model=model,
+            ctx=ctx,
+            query=query,
+            clock=_now,
+            should_stop=stop_flag.is_set,
+            dry_run=not apply_flag,
+        )
+    except GmailAuthError as e:
+        # the propagating human-gated arm (exit 4, never a traceback)
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        # a page-read failure: apply has no cursor to resume from, so the
+        # honest posture is a loud stop (a re-run re-pages, skip-present
+        # idempotent)
+        typer.echo(f"apply failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except AppDBError as e:
+        typer.echo(f"apply failed: state DB: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    except (ValueError, OSError, RuntimeError) as e:
+        # a model shape defect or a model-raised failure: the cause is
+        # named by CLASS only (a model error may quote the scored TEXT,
+        # which carries the body — invariant #5)
+        typer.echo(
+            f"apply failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
+    finally:
+        apply_log.removeHandler(log_handler)
+        apply_log.setLevel(previous_log_level)
+        _restore_shutdown_handlers(previous_handlers)
+        store_db.close()
+    typer.echo(
+        f"apply: {'backfill' if apply_flag else 'preview'} done "
+        f"batches={outcome.batches} messages={outcome.messages} "
+        f"written={outcome.written} skipped={outcome.skipped} "
+        f"warnings={outcome.warnings} rows={outcome.rows}",
+        err=True,
+    )
 
 
 if __name__ == "__main__":

@@ -351,7 +351,7 @@ def test_rows_carry_the_composition_and_round_trip_the_store(
     assert all(r.applied_at == TS and r.source == "daemon" for r in plan.rows)
     db = AppDB(tmp_path / "state.db")
     db.open()
-    assert db.record_applications(list(plan.rows)) == 2
+    assert db.commit_applications(list(plan.rows)) == 2
     rows = db.applications_for_message("aa")
     assert [(r.label, r.band, r.tier, r.source) for r in rows] == [
         ("Money/Bills", "med", "ai-high", "daemon"),

@@ -5,7 +5,8 @@ Strictly-local auto-labeling for Gmail: fine-tune a multi-label classifier on
 confident, reviewably when it isn't.
 
 > **Status: pre-alpha — Phase 0 (corpus acquisition), Phase 1 (train,
-> eval, and the Shadow Pass), and Phase 2's `daemon` have landed.** The
+> eval, and the Shadow Pass), and Phase 2's `daemon` and `apply` have
+> landed.** The
 > architecture decisions, domain language, and development standards are
 > committed; the CLI installs (`uv sync`, then `gmail-labeler --help`)
 > with a working OAuth flow,
@@ -14,11 +15,13 @@ confident, reviewably when it isn't.
 > precision/recall on the temporal test split), the Shadow Pass —
 > `shadow run` scores the recent Backlog and applies nothing, and
 > `shadow report` diffs the verdicts against your actual labels (the
-> Phase 1 exit review) — and the `daemon`: it polls the Gmail History
+> Phase 1 exit review) — the `daemon`: it polls the Gmail History
 > API (~30 s), scores arriving mail in-process, and applies only
-> GRADUATED labels with Tier Labels, additive-only. Phase 2's exit
+> GRADUATED labels with Tier Labels, additive-only — and `apply`: the
+> only bulk path, a human-gated `--since` preview/backfill over historical
+> mail that reuses the daemon's exact decision core. Phase 2's exit
 > posture: high-band labels apply silently; you work the `ai-med`
-> queue. `apply` / correction capture / `status` follow — see the phase
+> queue. Correction capture / `status` follow — see the phase
 > plan in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Why
@@ -36,7 +39,8 @@ you would.
 - **It only ever adds labels.** `gmail-labeler` will not remove anything,
   and every application carries an `ai-applied`
   umbrella plus one band Tier Label (`ai-high` / `ai-med`) so you can audit
-  every decision it ever made (the daemon's write path landed with #25).
+  every decision it ever made (the daemon's live write path landed with
+  #25, the `apply` bulk path with #26 — both through the one core).
 - **Nothing goes live unproven.** Each label is trained, scored on a recent
   held-out slice of *your* mail, and shadow-scored before it is ever applied
   silently. Labels that don't earn it stay in review.
@@ -121,6 +125,10 @@ gmail-labeler shadow run --bands bands.json --graduation graduation.json
 gmail-labeler shadow report           # diff the verdicts against your actual labels (Phase 1 exit)
 gmail-labeler daemon --bands bands.json --graduation graduation.json
                                       # poll the History API (~30s), apply GRADUATED labels as mail lands (Phase 2)
+gmail-labeler apply --since 2025-01-01 --bands bands.json --graduation graduation.json
+                                      # PREVIEW a backfill since that date: score it, write NOTHING (Phase 2)
+gmail-labeler apply --since 2025-01-01 --apply --bands bands.json --graduation graduation.json
+                                      # ^ the real backfill: apply GRADUATED labels to historical mail (an explicit human decision)
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -336,9 +344,12 @@ umbrella plus the best band tier to every write, and
 `gmail_client.ensure_label` ships the name→Gmail-label-id resolution
 (get-or-create: an existing USER label of exactly that name is used
 as-is; a casefolded System Label name-sake is refused named — the
-refusal guards minting a look-alike only; the daemon calls it once per
-configured name at startup, `apply` will too); the daemon's live write
-landed with #25, the `apply` bulk path lands with #26;
+refusal guards minting a look-alike only; the daemon and the `apply
+--apply` backfill each call it once per configured name at startup,
+while a dry `apply` preview resolves the names by lookup only and
+refuses to mint — a preview writes nothing, not even its own Tier
+Labels); the daemon's live write and the `apply` bulk path both landed
+(#25, #26);
 GLOSSARY: Application, Tier Label.
 
 ### Reviewing the shadow report (Phase 1 exit demo)
@@ -372,11 +383,11 @@ gmail-labeler shadow report
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`apply` and `status` are frozen command names that arrive in later
-phases (not wired yet) — until they are, they exit `2` as unknown
-commands; `3` is reserved for wired-but-stubbed commands and
-currently unreachable. Scripts can branch on 0/2/4/5 today; a `1`
-means an unhandled crash — that's a bug, please report it.
+`status` is a frozen command name that arrives in a later phase (not
+wired yet) — until it is, it exits `2` as an unknown command; `3` is
+reserved for wired-but-stubbed commands and currently unreachable.
+Scripts can branch on 0/2/4/5 today; a `1` means an unhandled crash —
+that's a bug, please report it.
 
 ### Running the daemon (Phase 2)
 
@@ -430,7 +441,7 @@ typically available for at least a week, and the retention can be
 significantly shorter), the cursor expires: the daemon re-establishes
 it from the newest message (the documented full-sync bootstrap), warns
 loudly, and the gap mail was NOT labeled — review it with
-`shadow run` (or `apply` when it lands).
+`shadow run` (or backfill it with `apply --since`).
 
 Shutdown is graceful: `SIGTERM` / `SIGINT` finish the current delta to
 its commit point (cursor written) and exit 0; a signal during the
@@ -454,6 +465,94 @@ Exit codes: 0 clean shutdown · 2 usage · 4 auth/config (including the
 tier-name collision above) · 5 artifact/store failure, startup
 tier-resolution wire failure, or a loop I/O failure. Exit 3 stays
 the reserved not-implemented arm.
+
+### Backfilling historical mail (`apply`, Phase 2)
+
+`apply --since <YYYY-MM-DD> [--apply]` is the **only bulk path**
+(ticket #26): it backfills graduated labels over the mail the `--since`
+window selects. It is **always an explicit human decision, never
+automatic**: the daemon never invokes it (there is a test that greps
+`daemon.py` for any reference to the apply machinery and fails if one
+appears).
+
+Without `--apply` it is a **dry preview**: it scores the window and
+prints, per message, the id, the would-be label names, the band/tier, and
+the scores — and performs **zero Gmail writes** (it does not even mint
+its own Tier Labels: a preview whose configured Tier Labels are absent in
+the mailbox refuses with exit 5 and tells you to run `--apply` or create
+them, rather than silently creating them). With `--apply` it performs the
+backfill.
+
+`--since` is **required** — the only bulk path never guesses its own
+window. It parses through the same UTC-midnight rule as `shadow run`
+(the named day is INCLUDED), and the Gmail query is `after:<epoch-seconds>`
+**without** `in:inbox`: backfill targets historical mail, which is mostly
+archived out of the inbox. The window is `after:<epoch>` and so **unbounded
+upward** — it reaches right up to the newest message and therefore
+**overlaps whatever the live daemon is also processing**; that overlap is
+allowed and safe (skip-present makes both paths idempotent on the same
+mail), but see the concurrency caution below.
+
+The backfill reaches the **exact same decision core** as the live daemon
+through the same composition seam — `apply` imports `daemon.compose_plan`
+(and `daemon.present_names`), and `compose_plan` calls the one
+`applications.plan_message_write` core (never re-implemented; a test runs
+one daemon tick and one apply batch over identical mail and asserts
+they land identical plans). So the tier/band/skip-present semantics are
+identical, and **backfilled Applications are recorded identically to
+daemon-applied ones** (only the `source` column differs: `apply` vs
+`daemon`).
+
+**Re-runs are idempotent** (invariant #2, skip-present): a label that
+already landed reads present, composes an empty plan, and earns no second
+write and no duplicate Application row. `apply` has **no history cursor**
+— it never reads or writes the daemon's `daemon_state` table, so a live
+daemon's cursor is untouched across a whole backfill. A mid-run `SIGTERM`
+completes the current page to its commit point (exit 0); a transient read
+**or** write failure **holds nothing** (there is no cursor to retry
+against) — the message stays un-labeled with a counted warning, and a
+re-run picks it up. Mail that 404s (deleted since your export — a backfill
+over years **will** hit this) is a counted skip, never fatal. A
+**quota-limited or partially-degraded mailbox produces warnings, not an
+abort, by design** (the v1 posture: no backoff — the window is walked one
+message at a time and every failure is counted), so the `warnings=N` tail
+line is the tell that a run under-served the window; re-running later picks
+up exactly the missed messages (skip-present, and unwritten labels leave no
+row — the same re-run shape pinned for a single transient failure).
+
+**Concurrency caution (read this before running both at once).** `apply`
+and the daemon share the state DB and the mailbox, and running them
+together is **not recommended** — the exposure is honest, not benign:
+
+- **Duplicate audit rows are possible.** The `applications` table has no
+  UNIQUE constraint on `(message_id, label)` (the v1 posture: a
+  re-earned label is legitimate history). If the daemon and a backfill
+  score the SAME message and BOTH decide to add the SAME absent label,
+  each lands its own Gmail write (idempotent on Gmail's side — adding a
+  present label is a no-op) **and** its own audit row, so you can see two
+  `applications` rows for one `(message, label)`. The Gmail truth stays
+  correct; the audit table is the noisier one.
+- **A lock can abort the backfill.** SQLite serializes the short
+  transactions, but past the default 5-second busy timeout a contended
+  write raises `database is locked` — which surfaces as exit 5 **mid-
+  backfill** (the pages already committed stand; a re-run picks up the
+  rest).
+
+Stop the daemon before a backfill — there is **no** `--since` value that
+excludes mail the daemon is processing: the window is `after:<epoch>`,
+upward-unbounded, so it always reaches the newest message.
+
+**Date-provenance warning (AC5).** The `--since` boundary is a date, and
+a corpus record whose date has no server-authoritative provenance stamp
+(a pre-#17 line read as `unknown`) cannot be trusted to sit on the right
+side of it. `apply` scans the window and, if any such records fall at or
+after the boundary, prints **one** counted warning — the date-based
+window is only as trustworthy as those dates.
+
+Exit codes: 0 clean (preview or backfill) · 2 usage (missing/invalid
+`--since`) · 4 auth/config (the tier-name collision, and a mid-run auth
+failure) · 5 artifact/store failure, a preview whose Tier Labels are
+absent, a lock contention past the busy timeout, or a model/wire failure.
 
 ## Docs
 

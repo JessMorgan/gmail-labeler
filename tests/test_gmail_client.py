@@ -10,6 +10,7 @@ from gmail_labeler.gmail_client import (
     GmailClient,
     GmailRestClient,
     HistoryPage,
+    LabelInfo,
     MessagePage,
     MessageStub,
     RawMessage,
@@ -82,7 +83,13 @@ def _rest(payload: Any = None, error: Exception | None = None) -> GmailRestClien
             def get(self, **_kw: object) -> _Req:
                 return _Req(payload, error)
 
+        # tree mirrors the REAL discovery doc (#59): labels live under
+        # users, never at top level — a fake shaped like the bug cannot
+        # catch the bug
         class _Mid(_Leaf):
+            def labels(self) -> _Mid:
+                return self
+
             def filters(self) -> _Mid:
                 return self
 
@@ -96,9 +103,6 @@ def _rest(payload: Any = None, error: Exception | None = None) -> GmailRestClien
                 return self
 
         class _Top:
-            def labels(self) -> _Mid:
-                return _Mid()
-
             def users(self) -> _Mid:
                 return _Mid()
 
@@ -730,6 +734,204 @@ def test_default_build_path_constructs_offline(monkeypatch) -> None:
     # request-object construction is pure (discovery-schema bound method):
     # an HttpRequest comes back without a single byte leaving the process
     assert isinstance(svc.users().messages().list(userId="me"), HttpRequest)
+
+
+# -- #59: EVERY surface path walks the REAL discovery tree, offline ----------
+
+# (call, canned payload, expected URI path, EXACT query-param set, expected
+# parsed result); the case label rides pytest.param's id.
+# Paths read from the bundled discovery doc (source of truth, offline):
+# rootUrl https://gmail.googleapis.com/ + gmail/v1/users/{userId}/... —
+# the v1 tree has ONLY `users` at top level; labels = users.labels. The
+# param set is EXACT (alt=json is attached by googleapiclient's JSON
+# model, not the doc): a superset check would bless a drift that ADDS a
+# param, and the no-token cases pin pageToken ABSENCE for free. Each case
+# also asserts the canned payload PARSES into the expected value object —
+# the table is self-contained, a wire-key drift fails HERE, not only in
+# the pre-existing parse tests.
+_SURFACE_CASES = [
+    pytest.param(
+        lambda c: c.list_labels(),
+        {"labels": [{"id": "L1", "name": "Shipping", "type": "user"}]},
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+        {"alt": "json"},
+        [LabelInfo(id="L1", name="Shipping", type="user")],
+        id="list_labels",
+    ),
+    pytest.param(
+        lambda c: c.list_filters(),
+        # non-empty values everywhere in this table: empty containers
+        # EQUAL the helpers' absent-key defaults, so a key-drift mutant
+        # (filter->filters, history->histories, labelIds->label_ids…)
+        # would sail through the parse assert un-challenged
+        {
+            "filter": [
+                {
+                    "id": "f1",
+                    "criteria": {"from": "a@b.c"},
+                    "action": {"addLabelIds": ["L1"]},
+                }
+            ]
+        },
+        "https://gmail.googleapis.com/gmail/v1/users/me/settings/filters",
+        {"alt": "json"},
+        [
+            FilterInfo(
+                id="f1", criteria={"from": "a@b.c"}, action={"addLabelIds": ["L1"]}
+            )
+        ],
+        id="list_filters",
+    ),
+    pytest.param(
+        lambda c: c.list_messages("in:inbox"),
+        {"messages": [{"id": "a1", "threadId": "t1"}], "nextPageToken": "n2"},
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        {"q": "in:inbox", "maxResults": "500", "alt": "json"},
+        MessagePage(
+            stubs=(MessageStub(id="a1", thread_id="t1"),), next_page_token="n2"
+        ),
+        id="list_messages",
+    ),
+    pytest.param(
+        # page_token forwarding is export-termination load-bearing
+        lambda c: c.list_messages("in:inbox", "p2"),
+        {"messages": [{"id": "a1", "threadId": "t1"}]},
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        {"q": "in:inbox", "maxResults": "500", "pageToken": "p2", "alt": "json"},
+        MessagePage(
+            stubs=(MessageStub(id="a1", thread_id="t1"),), next_page_token=None
+        ),
+        id="list_messages_page_token",
+    ),
+    pytest.param(
+        # distinct id: a path built from the WRONG argument is unforgeable
+        lambda c: c.get_message("m-17"),
+        {
+            "id": "m-17",
+            "threadId": "t1",
+            "labelIds": ["INBOX", "L1"],
+            "internalDate": "1790000000000",
+            "raw": "abc",
+        },
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m-17",
+        {"format": "raw", "alt": "json"},
+        RawMessage(
+            id="m-17",
+            thread_id="t1",
+            label_ids=("INBOX", "L1"),
+            internal_date_ms=1790000000000,
+            raw_b64url="abc",
+        ),
+        id="get_message",
+    ),
+    pytest.param(
+        lambda c: c.history(7),
+        {
+            "historyId": "42",
+            "history": [{"messagesAdded": []}],
+            "nextPageToken": "n2",
+        },
+        "https://gmail.googleapis.com/gmail/v1/users/me/history",
+        {"startHistoryId": "7", "alt": "json"},
+        HistoryPage(
+            history_id=42, next_page_token="n2", records=({"messagesAdded": []},)
+        ),
+        id="history",
+    ),
+    pytest.param(
+        lambda c: c.history(7, "hp"),
+        {"historyId": "42", "history": []},
+        "https://gmail.googleapis.com/gmail/v1/users/me/history",
+        {"startHistoryId": "7", "pageToken": "hp", "alt": "json"},
+        HistoryPage(history_id=42, next_page_token=None, records=()),
+        id="history_page_token",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("call", "payload", "expected_path", "expected_params", "expected"),
+    _SURFACE_CASES,
+)
+def test_surface_paths_walk_the_real_discovery_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    call: Any,
+    payload: dict[str, object],
+    expected_path: str,
+    expected_params: dict[str, str],
+    expected: object,
+) -> None:
+    """#59 RED pin: the FIRST live `dataset export` after #56 died with
+    AttributeError: 'Resource' object has no attribute 'labels' — the gmail
+    v1 tree has ONLY `users` at top level (labels = users.labels), the
+    build_service fakes mirrored the code's wrong assumption, and #57's
+    real-build test constructed only the users().messages().list path.
+    Request construction is pure against the static bundled discovery doc
+    (only .execute() is live), so capturing the HttpRequest each surface
+    method builds pins EVERY path+param drift offline — params are EXACT-
+    set equality (a superset check blesses drift that ADDS a param) — and
+    each case asserts the canned payload parses to the expected value, so
+    wire-key drift fails here too (invariant #9 stays honored — no byte
+    leaves the process)."""
+    import urllib.parse
+
+    import httplib2
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.http import HttpRequest
+
+    def _no_network(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("offline: no network in tests (invariant #9)")
+
+    monkeypatch.setattr(httplib2.Http, "request", _no_network)
+
+    creds = Credentials(
+        "fake",
+        client_id="cid",
+        client_secret="sec",  # fake, offline, never refreshed
+        token_uri="https://token.invalid",
+    )
+    client = GmailRestClient(creds)  # DEFAULT real-build path, no injection
+
+    captured: list[object] = []
+
+    def _record(request: object) -> dict[str, object]:
+        captured.append(request)
+        return payload
+
+    monkeypatch.setattr(GmailRestClient, "_call", staticmethod(_record))
+    result = call(client)
+
+    assert len(captured) == 1
+    request = captured[0]
+    assert isinstance(request, HttpRequest)
+    assert request.method == "GET"
+    # the uri carries query params — pin the PATH portion exactly against
+    # the doc's rootUrl + path pattern
+    path, _, query = request.uri.partition("?")
+    assert path == expected_path
+    assert dict(urllib.parse.parse_qsl(query, keep_blank_values=True)) == (
+        expected_params
+    )
+    # parse assert LAST: a wire-key failure then lands on top of the
+    # shape diagnostics instead of masking them
+    assert result == expected  # the parse path is part of the pin
+
+
+def test_surface_cases_cover_the_whole_protocol() -> None:
+    # the pin list going stale as the Protocol grows is the SAME drift
+    # class #59 came from — a sixth surface method must land here too
+    public = {n for n in dir(GmailClient) if not n.startswith("_")}
+    ids = set()
+    for case in _SURFACE_CASES:
+        assert isinstance(case.id, str)  # every param carries an id
+        ids.add(case.id)
+    # plain ids must equal the Protocol EXACTLY: a _page_token variant is
+    # an extra, never a stand-in for its base case (deleting the base
+    # would silently drop that case's pageToken-ABSENCE pin). The suffix
+    # is exemption-by-convention: a Protocol method actually named
+    # *_page_token would slip through — contrived today; rename it if it
+    # ever ships
+    assert {i for i in ids if not i.endswith("_page_token")} == public
 
 
 def test_build_service_precedence_over_http_seam() -> None:

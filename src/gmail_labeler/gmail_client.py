@@ -211,7 +211,11 @@ class GmailRestClient:
     # -- surface ----------------------------------------------------------
 
     def list_labels(self) -> list[LabelInfo]:
-        data = self._call(self._svc().labels().list(userId="me"))
+        # the v1 tree has ONLY `users` at top level — labels ride under it
+        # (users.labels.list); the bare .labels() guess died with a raw
+        # AttributeError on the first live export (#59, path pinned offline
+        # by test_surface_paths_walk_the_real_discovery_tree)
+        data = self._call(self._svc().users().labels().list(userId="me"))
         return [
             LabelInfo(id=_s(item, "id"), name=_s(item, "name"), type=_s(item, "type"))
             for item in _obj_list(data, "labels")

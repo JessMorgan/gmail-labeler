@@ -64,3 +64,9 @@ capability, not a promise this design leans on.
   tombstoned); tombstones are a future format change, not a fold change.
 - Compaction of superseded revisions is always safe but never load-bearing
   for correctness.
+- Event-sync is an optimization over ground truth: `--full-resync` compares
+  the Corpus against the mailbox directly (label-enumeration scan or
+  corpus-metadata walk, whichever the up-front cost estimate favors) and
+  needs no history at all — the remedy for an expired Sync Cursor and the
+  reconciliation path for GYB-sourced Corpora. See ADR-0007 for cursor
+  ownership.

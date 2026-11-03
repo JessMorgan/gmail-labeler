@@ -94,8 +94,9 @@ data. Label-state freshness reaches only as far as its last Label Sync.
 
 **Gmail Import**:
 Building a Corpus by pulling labeled mail through the Gmail API — the
-canonical sourcing path (GYB Import is the optional fast path). Resumable:
-the corpus id set is the cursor.
+canonical sourcing path (GYB Import is the optional fast path). Resumable
+via the corpus id set — a structural resume point, distinct from the Sync
+Cursor.
 _Avoid_: export (the command fills the Corpus, so it is named from the
 Corpus's side; "export" is reserved for a future Corpus-dump command),
 pull (implies fetch-and-merge; the store only appends)
@@ -113,6 +114,13 @@ newly-arrived mail stays owned by the assembly paths (Gmail Import, GYB
 Import).
 _Avoid_: corpus update, re-sync ("re-sync" is Gmail's name for the prescribed
 full re-pull; Label Sync re-assembles nothing)
+
+**Sync Cursor**:
+A Corpus's record of how far it has consumed the mailbox's event stream;
+owned by Label Sync — Gmail Import may birth it when absent, and only a
+sync advances it. Distinct from the Gmail Import resume point (the corpus
+id set).
+_Avoid_: watermark, checkpoint
 
 **Revision**:
 A record line appended later for a message id already in the Corpus's log,

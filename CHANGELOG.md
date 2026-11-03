@@ -154,7 +154,54 @@ does not ship releases yet.
   both constants ride in the Split Manifest (FORMAT_VERSION=3) so a
   21-year corpus is not dominated by its oldest mail and a manifest-input
   rebuild is reproducible from the artifact alone.
-
+- `eval` command (ticket #20): scores the temporal test split and
+  reports per-label precision/recall at candidate thresholds — the
+  measured table Threshold Bands and Graduation both read (GLOSSARY:
+  Eval Report). The checkpoint is sidecar-validated through
+  `load_model` (a mismatched checkpoint refuses with exit 5, naming
+  every disagreeing field — no silent fallback); the test-side
+  membership is rebuilt THROUGH the checkpoint's materialized Split
+  Manifest (invariant #7 — the split is pinned, never re-derived, so
+  there is no `--split-date`); predictions run through the Model seam
+  (offline tests drive `FakeModel` behind a monkeypatchable factory);
+  the text is `corpus_record.preprocess_text` (invariant #4, the same
+  function train used). The split-boundary trust filter is a
+  split-identity decision owned by the manifest — eval inherits it,
+  never re-applies it (the report states it). The pure core
+  (`eval.py`) scores in-memory examples with scores aligned by
+  EXAMPLE ID (a missing score, a lying vector, a misaligned row, a
+  non-canonical vocabulary, a label outside the vocabulary, or a bad
+  threshold grid refuses with `ValueError`); the candidate-threshold
+  grid is a fixed named constant (tenths, `DEFAULT_THRESHOLDS` — #21's
+  calibration supersedes it); a non-tenth grid refuses (the text
+  report labels columns to one decimal — `0.11` would render `0.1`);
+  a score exactly at the threshold is a positive; zero denominators
+  are 0.0, never a fabricated 1.0. The report is deterministic and
+  diff-friendly (per-label rows x threshold columns with P/R +
+  support; same inputs → byte-identical), opened by a split-
+  provenance header (split date + manifest hash short form — a saved
+  `.txt` is never indistinguishable from a stale one) and closed by a
+  convention footer naming the zero-denominator rendering, to stdout
+  by default, `--out PATH` for the same bytes in a file (0600 from
+  creation; replacing an existing file is announced on stderr — no
+  silent clobber), and `--json` for the machine-readable payload
+  (graduation workflows). Message bodies never enter the report, the
+  `--out` file, the `--json` payload, or any log path (invariant #5,
+  pinned by content + caplog tests). Exit-code contract 0/2/3/4/5
+  preserved (config error → 4; corpus/build/checkpoint refusal, empty
+  test split, unreadable shard, missing `train` extra, and factory
+  failure → 5).
+- `eval` metric-table core (`eval.py`): the pure-core half of ticket
+  #20 — `eval_metrics` (in-memory examples + hand-authored score
+  vectors → the deterministic metric table; refuses non-tenth
+  threshold grids and labels outside the vocabulary) and
+  `render_report` (byte-stable text with the split-provenance header
+  and the zero-denominator convention footer; validates its argument).
+  Golden metric-table tests with hand-authored score vectors (the
+  `test_analyze` pattern), incl. the `>=`-threshold boundary,
+  zero-support labels, input-order invariance, the alignment-by-id
+  pin, and every refusal. GLOSSARY gains the Eval Report term. Joins
+  the pyright strict list.
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (export + analysis).
 - `docs/ROADMAP.md` — the phase plan of record (Phase 0 remnants →
@@ -163,6 +210,20 @@ does not ship releases yet.
 
 ### Changed
 
+- `HfModel.predict` is batched (ticket #20, #19's deferral): eval is
+  the first bulk caller, and a single pass over a large test split
+  would pad every text to the longest one — token memory
+  O(corpus x max length), the exact hazard the lazy per-batch
+  collator exists to avoid for training. predict now tokenizes in
+  `_PREDICT_BATCH_SIZE` (32 — the token budget, ~32 x 512 tokens per
+  batch — named in one place) chunks, transfers each batch to the
+  host once (`cpu().tolist()`), and concatenates the sigmoid rows;
+  row i still corresponds to text i (pinned by smoke tests that force
+  a small batch size AND cross the real default 32 over 33 texts).
+- Identity/report artifacts are written 0600 FROM CREATION
+  (`cli._write_secret_tight`: `os.open(..., 0o600)` + `fchmod`), not
+  write-then-`chmod` — the microsecond 0644 window is closed. Covers
+  the train manifest/sidecar writes and the eval `--out` report.
 - `dataset export` scope excludes DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message

@@ -40,7 +40,9 @@ Landed so far: the temporal-split builder core with Filter-Authored
 exclusion and recency weighting (#18); the Model seam + `FakeModel`,
 checkpoint sidecar identity + loader refusal, the `train/` recipe
 (torch optional extra, smoke/gpu markers), and the `train` command
-(#19).
+(#19); the `eval` command — per-label precision/recall at candidate
+thresholds on the temporal test split, sidecar-validated checkpoint,
+test-side membership rebuilt through the Split Manifest (#20).
 
 Scope:
 

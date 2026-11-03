@@ -89,6 +89,46 @@ than pulling through the Gmail API. Optional fast path; the API export is the
 canonical source.
 _Avoid_: backup restore (this reads, never restores)
 
+**Training Example**:
+One corpus record turned for training: its id, date, label names, a
+recency weight, and the record's Date Provenance stamped for
+split-boundary filtering. The unit the model trains on; the corpus →
+examples transform is one shared pure function.
+_Avoid_: sample, data point
+
+**Split Manifest**:
+The versioned, hashable artifact materializing the temporal train/test
+split: format version (v2 adds the bridge pin; v3 adds the recency-
+weighting fields), split date, train/test id sets, the label vocabulary,
+the split-boundary trust filter, a canonical hash of the effective
+filters/labels bridge the build consumed (insensitive to filter order
+and unreferenced label entries), the recency-weighting parameters
+(window, old weight, and the frozen UTC cutoff), and a content hash over
+all of it. `train`/`eval` rebuild against it — same records + manifest →
+same examples, no re-split (invariant #7); a drifted bridge, a shrunken
+corpus, or a violated format invariant refuses the rebuild.
+_Avoid_: split config, train/test file
+
+**Recency Weight**:
+The per-Training-Example weight from the recency window: 1.0 at or after
+the cutoff (`months_ago(now, recent_months)`, analyze's shape),
+`old_weight` before it. The cutoff and both constants ride in the Split
+Manifest — no ad-hoc decay curve — so a 21-year corpus cannot be
+dominated by its oldest mail and a manifest-input rebuild weights from
+the frozen cutoff, not a fresh `now`. Scoped to fixed-offset/UTC-
+normalized inputs (callers should pass `now` in UTC for cross-host
+stability); whether an eval applies the weight is the consumer's choice.
+_Avoid_: decay factor, age weight
+
+**Filter-Authored exclusion (builder doctrine)**:
+The dataset builder excludes Filter-Authored evidence from training
+examples — per-message for a simulatable filter, the whole label for an
+unverifiable/malformed one (exclusion, not guessing, analyze's shared
+doctrine). A missing, incomplete, or malformed filters/labels snapshot
+aborts the build loudly (`BuildAbortedError`) rather than silently
+training on filter-covered signal (invariant #6).
+_Avoid_: filter filtering, auto-excluded
+
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`
 (`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB

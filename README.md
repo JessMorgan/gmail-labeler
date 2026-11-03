@@ -114,7 +114,7 @@ label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
 mailbox has no labeling filters). Both imports are resumable:
-the corpus id set is the cursor, so re-running after a failure skips what is
+the corpus id set is the resume point, so re-running after a failure skips what is
 already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself
 is fixed — resumable is not the same as completable. `dataset analyze`
@@ -144,7 +144,7 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 - [AGENTS.md](AGENTS.md) — architecture spine and phase plan
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
-- [docs/adr/](docs/adr/) — the seven shape-defining decisions
+- [docs/adr/](docs/adr/) — the eight shape-defining decisions
 
 ## License
 

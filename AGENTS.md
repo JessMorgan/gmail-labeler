@@ -39,7 +39,8 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {import-gmail,import-gyb,analyze}` are wired (the acquisition pair
   is pinned by ADR-0006; the old `export` name is a usage error, no alias);
-  `train`, `eval`, `shadow {run,report}`, `apply`, `daemon`, `status` are
+  `train`, `eval`, `shadow {run,report}`, `apply`, `daemon`, `status`, and
+  `dataset sync-labels` (spec #64) are
   frozen by the design conversation, not yet wired — change names with cause.
 
 ## Commands

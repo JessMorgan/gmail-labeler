@@ -144,7 +144,7 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 - [AGENTS.md](AGENTS.md) — architecture spine and phase plan
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
-- [docs/adr/](docs/adr/) — the six shape-defining decisions
+- [docs/adr/](docs/adr/) — the seven shape-defining decisions
 
 ## License
 

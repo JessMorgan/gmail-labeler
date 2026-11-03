@@ -22,7 +22,7 @@ from gmail_labeler.attribution import (
 )
 
 # one filter whose label id resolves through the bridge (the happy shape the
-# export writer produces)
+# Gmail import writer produces)
 FILTERS_L1 = '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["L1"]}}]'
 BRIDGE_L1 = '{"L1": "Shipping"}'
 
@@ -87,7 +87,7 @@ def test_snapshot_posture_carries_filters_and_bridge() -> None:
 
 
 def test_empty_snapshot_pair_is_a_snapshot() -> None:
-    # a mailbox genuinely without filters exports "[]" / "{}" — that is
+    # a mailbox genuinely without filters writes "[]" / "{}" — that is
     # EVIDENCE, not absence; the gate opens on the real snapshot
     posture, filters, id_to_name = parse_attribution(
         "[]", "{}", assume_no_filters=False

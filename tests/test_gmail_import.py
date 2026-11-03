@@ -1,3 +1,5 @@
+"""gmail_import import loop: resume gate, retry taxonomy, snapshot writers."""
+
 from __future__ import annotations
 
 from datetime import UTC, datetime
@@ -7,10 +9,10 @@ import pytest
 
 from gmail_labeler.corpus_record import CorpusRecord, body_hash
 from gmail_labeler.corpus_store import CorpusStore
-from gmail_labeler.export import export_corpus
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import classify_status
+from gmail_labeler.gmail_import import import_gmail
 
 
 def _eml(
@@ -30,7 +32,7 @@ def store_at(tmp_path: Path) -> CorpusStore:
     return CorpusStore(tmp_path / "corpus")
 
 
-def test_export_writes_records_with_normalized_fields(tmp_path: Path) -> None:
+def test_import_gmail_writes_records_with_normalized_fields(tmp_path: Path) -> None:
     fake = FakeGmailClient(
         messages=[
             FakeMessage(
@@ -45,7 +47,7 @@ def test_export_writes_records_with_normalized_fields(tmp_path: Path) -> None:
         labels=[LabelInfo("L1", "Shipping", "user")],
     )
     store = store_at(tmp_path)
-    stats = export_corpus(fake, store, id_to_name=NAMES)
+    stats = import_gmail(fake, store, id_to_name=NAMES)
     assert stats.written == 2 and not stats.failed
     records = {r.id: r for r in store.iter_records()}
     one = records["aaa"]
@@ -58,12 +60,12 @@ def test_export_writes_records_with_normalized_fields(tmp_path: Path) -> None:
     assert body == "body of One"  # stored body == hashed body
 
 
-def test_export_resume_skips_present(tmp_path: Path) -> None:
+def test_import_gmail_resume_skips_present(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     store = store_at(tmp_path)
-    export_corpus(fake, store, id_to_name=NAMES)
+    import_gmail(fake, store, id_to_name=NAMES)
     calls_before = len(fake.calls)
-    stats = export_corpus(fake, store, id_to_name=NAMES)
+    stats = import_gmail(fake, store, id_to_name=NAMES)
     assert stats.written == 0 and stats.skipped_present == 1
     # skip happened without even fetching the message (id-set cursor)
     fetches = [c for c in fake.calls[calls_before:] if c.startswith("get_message")]
@@ -74,7 +76,7 @@ def test_transient_retries_then_succeeds(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     fake.fail("get_message", classify_status(503))
     slept: list[float] = []
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=slept.append
     )
     assert stats.written == 1 and stats.retried == 1 and len(slept) == 1
@@ -84,7 +86,7 @@ def test_rate_limit_backoff_honors_retry_after(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     fake.fail("get_message", classify_status(429, retry_after_s=7.0))
     slept: list[float] = []
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=slept.append
     )
     assert stats.written == 1
@@ -99,7 +101,7 @@ def test_permanent_failure_records_and_continues(tmp_path: Path) -> None:
         ]
     )
     fake.fail("get_message", classify_status(404))
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
     )
     # permanent = do NOT retry: get_message:aaa issued exactly once, aaa
@@ -115,7 +117,7 @@ def test_unrecoverable_retries_exhaust(tmp_path: Path) -> None:
             raise classify_status(503)
 
     down = AlwaysDown(messages=[FakeMessage(id="aaa", eml=_eml())])
-    stats = export_corpus(
+    stats = import_gmail(
         down,
         store_at(tmp_path),
         id_to_name=NAMES,
@@ -145,7 +147,7 @@ def test_corrupt_raw_and_missing_dates_are_failed_not_fabricated(
             FakeMessage(id="not-hex!", eml=_eml("Z")),
         ]
     )
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
     )
     reasons = dict(stats.failed)
@@ -160,14 +162,14 @@ def test_pagination_walks_all_pages(tmp_path: Path) -> None:
         messages=[FakeMessage(id=f"5{i:02x}", eml=_eml(f"M{i}")) for i in range(5)],
         page_size=2,
     )
-    stats = export_corpus(fake, store_at(tmp_path), id_to_name=NAMES)
+    stats = import_gmail(fake, store_at(tmp_path), id_to_name=NAMES)
     assert stats.scanned == 5 and stats.written == 5
 
 
 def test_page_level_failure_stops_run_loudly(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     fake.fail("list_messages", classify_status(503))
-    stats = export_corpus(
+    stats = import_gmail(
         fake,
         store_at(tmp_path),
         id_to_name=NAMES,
@@ -187,14 +189,14 @@ def test_max_messages_cap_and_case_insensitive_ids(tmp_path: Path) -> None:
         ]
     )
     store = store_at(tmp_path)
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store, id_to_name=NAMES, max_messages=1, sleeper=lambda s: None
     )
     assert stats.scanned == 1
     ids = [r.id for r in store.iter_records()]
     assert ids == ["19f6abc"]  # ids normalized to lowercase
     # rerun: the UPPERCASE stub id still matches the stored lowercase id
-    stats2 = export_corpus(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    stats2 = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
     assert stats2.skipped_present >= 1
 
 
@@ -219,7 +221,7 @@ def test_max_messages_bound_holds_on_warm_resume(tmp_path: Path) -> None:
         )
     fake = FakeGmailClient(messages=[FakeMessage(id=mid, eml=_eml()) for mid in ids])
     fresh = CorpusStore(tmp_path / "corpus")
-    stats = export_corpus(
+    stats = import_gmail(
         fake, fresh, id_to_name=NAMES, sleeper=lambda s: None, max_messages=2
     )
     assert stats.scanned == 2 and stats.skipped_present == 2
@@ -237,20 +239,20 @@ def test_store_corruption_stops_the_run(tmp_path: Path) -> None:
         ]
     )
     store = store_at(tmp_path)
-    export_corpus(fake, store, id_to_name=NAMES)
+    import_gmail(fake, store, id_to_name=NAMES)
     # corrupt the index (middle line) so the strict resume gate refuses
     rp = tmp_path / "corpus" / "records.jsonl"
     lines = rp.read_text(encoding="utf-8").splitlines()
     lines[0] = "{broken"
     rp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     with pytest.raises(CorpusError, match="corrupt record"):
-        export_corpus(fake, store_at(tmp_path), id_to_name=NAMES)
+        import_gmail(fake, store_at(tmp_path), id_to_name=NAMES)
 
 
 def test_records_round_trip_through_the_store(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml("RT"))])
     store = store_at(tmp_path)
-    export_corpus(fake, store, id_to_name=NAMES)
+    import_gmail(fake, store, id_to_name=NAMES)
     reopened = CorpusStore(tmp_path / "corpus")
     rec = next(iter(reopened.iter_records()))
     assert isinstance(rec, CorpusRecord)
@@ -259,7 +261,7 @@ def test_records_round_trip_through_the_store(tmp_path: Path) -> None:
 
 def test_max_messages_zero_is_a_noop(tmp_path: Path) -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
-    stats = export_corpus(fake, store_at(tmp_path), id_to_name=NAMES, max_messages=0)
+    stats = import_gmail(fake, store_at(tmp_path), id_to_name=NAMES, max_messages=0)
     assert stats.scanned == stats.written == stats.skipped_present == 0
 
 
@@ -272,14 +274,12 @@ def test_auth_errors_propagate_typed_not_swallowed(tmp_path: Path) -> None:
 
     fake = Revoked(messages=[FakeMessage(id="aaa", eml=_eml())])
     with pytest.raises(GmailAuthError):
-        export_corpus(
-            fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
-        )
+        import_gmail(fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None)
 
 
 def test_settings_fetch_propagates_auth_too(tmp_path: Path) -> None:
-    from gmail_labeler.export import fetch_settings
     from gmail_labeler.gmail_errors import GmailAuthError
+    from gmail_labeler.gmail_import import fetch_settings
 
     class DeadAuth(FakeGmailClient):
         def list_labels(self):  # type: ignore[no-untyped-def]
@@ -293,7 +293,7 @@ def test_snapshot_death_leaves_secret_tight_root(tmp_path: Path) -> None:
     # deepseek MINOR: root created by the snapshot path must be 0700 even
     # when the run dies before the first put()
     from gmail_labeler.corpus_store import CorpusStore
-    from gmail_labeler.export import write_filters_snapshot
+    from gmail_labeler.gmail_import import write_filters_snapshot
 
     store = CorpusStore(tmp_path / "deep" / "corpus")
     write_filters_snapshot(store, [])
@@ -305,7 +305,7 @@ def test_snapshot_fsyncs_directory_after_replace(tmp_path: Path, monkeypatch) ->
     import os as _os
 
     from gmail_labeler.corpus_store import CorpusStore
-    from gmail_labeler.export import write_filters_snapshot
+    from gmail_labeler.gmail_import import write_filters_snapshot
 
     synced: list[str] = []
     real_fsync = _os.fsync
@@ -324,7 +324,7 @@ def test_snapshot_failure_leaves_no_tmp(tmp_path: Path, monkeypatch) -> None:
     import os as _os
 
     from gmail_labeler.corpus_store import CorpusError, CorpusStore
-    from gmail_labeler.export import write_filters_snapshot
+    from gmail_labeler.gmail_import import write_filters_snapshot
 
     store = CorpusStore(tmp_path / "c")
 
@@ -346,7 +346,7 @@ def test_snapshot_fchmod_failure_cleans_up(tmp_path: Path, monkeypatch) -> None:
     import pytest as _pt
 
     from gmail_labeler.corpus_store import CorpusError, CorpusStore
-    from gmail_labeler.export import write_filters_snapshot
+    from gmail_labeler.gmail_import import write_filters_snapshot
 
     store = CorpusStore(tmp_path / "c")
     monkeypatch.setattr(
@@ -375,7 +375,7 @@ def test_snapshot_replace_failure_leaves_healable_tmp(
 
     from gmail_labeler.attribution import SIDECAR_FILTERS
     from gmail_labeler.corpus_store import CorpusError, CorpusStore
-    from gmail_labeler.export import write_filters_snapshot
+    from gmail_labeler.gmail_import import write_filters_snapshot
 
     store = CorpusStore(tmp_path / "c")
     real_replace = _os.replace
@@ -420,7 +420,7 @@ def test_resume_gate_is_case_insensitive(tmp_path: Path) -> None:
         "whatever",
     )
     fresh = CorpusStore(tmp_path / "corpus")  # fresh resume cache
-    stats = export_corpus(fake, fresh, id_to_name=NAMES, sleeper=lambda s: None)
+    stats = import_gmail(fake, fresh, id_to_name=NAMES, sleeper=lambda s: None)
     assert stats.skipped_present == 1
     assert not [c for c in fake.calls if c.startswith("get_message")]
 
@@ -432,7 +432,7 @@ def test_retry_after_hint_ceiling_pinned(tmp_path: Path) -> None:
     slept: list[float] = []
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
     fake.fail("get_message", GmailRateLimitedError("slow down", retry_after_s=300.0))
-    export_corpus(
+    import_gmail(
         fake,
         store_at(tmp_path),
         id_to_name=NAMES,
@@ -444,7 +444,7 @@ def test_retry_after_hint_ceiling_pinned(tmp_path: Path) -> None:
 
 def test_max_attempts_below_one_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="max_attempts must be >= 1"):
-        export_corpus(
+        import_gmail(
             FakeGmailClient(),
             store_at(tmp_path),
             id_to_name=NAMES,
@@ -465,9 +465,7 @@ def test_logs_never_contain_body_text(
     )
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=eml)])
     with caplog.at_level(_logging.DEBUG):
-        export_corpus(
-            fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
-        )
+        import_gmail(fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None)
     assert marker not in caplog.text
 
 
@@ -477,7 +475,7 @@ def test_empty_body_is_a_deliberate_record(tmp_path: Path) -> None:
     # (the wire guard rejects empty RAW — a different thing). Pinned intent.
     eml = b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\n"
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=eml)])
-    stats = export_corpus(
+    stats = import_gmail(
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
     )
     assert stats.written == 1  # label signal survives a body-less mail

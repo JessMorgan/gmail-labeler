@@ -7,7 +7,7 @@ confident, reviewably when it isn't.
 > **Status: pre-alpha — Phase 0 (corpus acquisition) has landed.** The
 > architecture decisions, domain language, and development standards are
 > committed; the CLI installs (`uv sync`, then `gmail-labeler --help`) with a
-> working OAuth flow and `dataset export` / `import-gyb` / `analyze`.
+> working OAuth flow and `dataset import-gmail` / `import-gyb` / `analyze`.
 > Training, graduation, and the daemon arrive in later phases — follow the
 > phase plan in [AGENTS.md](AGENTS.md).
 
@@ -34,7 +34,7 @@ you would.
 
 ## How it works
 
-1. **Export** — pull your labeled mail via the Gmail API, or import an
+1. **Import** — pull your labeled mail via the Gmail API, or import an
    existing [Got Your Back](https://github.com/GAM-team/got-your-back) backup.
 2. **Analyze & train** — per-label report (counts, filter-authored labels,
    duplicates), then fine-tune a small encoder with one sigmoid head per
@@ -96,7 +96,7 @@ land without a keyring.
 ```sh
 gmail-labeler auth                    # credential status
 gmail-labeler auth login              # one-time desktop OAuth consent flow
-gmail-labeler dataset export          # pull labeled mail via the Gmail API
+gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 ```
@@ -104,7 +104,7 @@ gmail-labeler dataset analyze         # per-label report: counts, recency, dup r
 (These assume the project venv is active; from a fresh checkout, prefix any
 line with `uv run ` — e.g. `uv run gmail-labeler --help` always works.)
 
-Every command takes `--config PATH`. `dataset export` takes `--query`
+Every command takes `--config PATH`. `dataset import-gmail` takes `--query`
 (default `in:anywhere -in:spam -in:trash`) and `--max-messages` (smoke
 runs); it writes `filters.json` and `labels.json` sidecars next to the
 corpus — the offline snapshot `dataset analyze` uses for filter
@@ -113,7 +113,7 @@ attribution. `dataset import-gyb` takes `--path`, `--max-messages`, and
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). Both export and import are resumable:
+mailbox has no labeling filters). Both imports are resumable:
 the corpus id set is the cursor, so re-running after a failure skips what is
 already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself
@@ -144,7 +144,7 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 - [AGENTS.md](AGENTS.md) — architecture spine and phase plan
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
-- [docs/adr/](docs/adr/) — the five shape-defining decisions
+- [docs/adr/](docs/adr/) — the six shape-defining decisions
 
 ## License
 

@@ -23,13 +23,20 @@ def test_help_lists_commands() -> None:
 def test_dataset_help_lists_subcommands() -> None:
     result = runner.invoke(app, ["dataset", "--help"])
     assert result.exit_code == 0
-    for cmd in ("export", "import-gyb", "analyze"):
+    for cmd in ("import-gmail", "import-gyb", "analyze"):
         assert cmd in result.output
 
 
 def test_usage_error_stays_exit_2() -> None:
     """The 2/3 split is the contract: unknown commands keep exit 2."""
     result = runner.invoke(app, ["bogus-command"])
+    assert result.exit_code == 2
+
+
+def test_old_export_command_is_usage_error() -> None:
+    """Hard cut (ticket #68): `dataset export` is gone with no compat alias —
+    the old name stays a plain usage error (exit 2), never a hidden command."""
+    result = runner.invoke(app, ["dataset", "export"])
     assert result.exit_code == 2
 
 
@@ -68,7 +75,7 @@ def test_auth_login_failures_exit_4_no_traceback(tmp_path: Path) -> None:
     )
 
 
-def _export_cfg(tmp_path: Path) -> Path:
+def _import_gmail_cfg(tmp_path: Path) -> Path:
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         '[gmail]\ntoken_backend = "file"\n'
@@ -79,7 +86,7 @@ def _export_cfg(tmp_path: Path) -> Path:
     return cfg
 
 
-def test_dataset_export_writes_and_reports(
+def test_dataset_import_gmail_writes_and_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -99,11 +106,12 @@ def test_dataset_export_writes_and_reports(
         labels=[LabelInfo("L1", "Shipping", "user")],
         filters=[FilterInfo(id="f1", criteria={"from": "shipper@x.com"}, action={})],
     )
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 0
+    assert "import-gmail:" in result.stdout  # success-line prefix follows the name
     assert "written=1" in result.output
     assert (tmp_path / "corpus" / "records.jsonl").is_file()
     import json as _json
@@ -115,31 +123,31 @@ def test_dataset_export_writes_and_reports(
     assert sidecar[0]["criteria"] == {"from": "shipper@x.com"}
 
 
-def test_dataset_export_incomplete_exits_5(
+def test_dataset_import_gmail_incomplete_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from gmail_labeler import cli
     from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 
     fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=b"no-date-here")])
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 5
     assert "failed=1" in result.stdout
 
 
-def test_dataset_export_auth_failure_exits_4(tmp_path: Path) -> None:
+def test_dataset_import_gmail_auth_failure_exits_4(tmp_path: Path) -> None:
     # token_file has no token -> credentials() AuthError -> 4 (not 5, not 1)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 4
     assert "Traceback" not in result.output
 
 
-def test_export_sidecar_is_0600_and_query_flows(
+def test_import_gmail_sidecar_is_0600_and_query_flows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -156,14 +164,14 @@ def test_export_sidecar_is_0600_and_query_flows(
         labels=[LabelInfo("L1", "Shipping", "user")],
         filters=[FilterInfo(id="f1", criteria={"from": "a@b.c"}, action={})],
     )
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
         app,
         [
             "dataset",
-            "export",
+            "import-gmail",
             "--config",
-            str(_export_cfg(tmp_path)),
+            str(_import_gmail_cfg(tmp_path)),
             "--query",
             "has:attachment",
         ],
@@ -179,7 +187,7 @@ def test_export_sidecar_is_0600_and_query_flows(
     assert any("list_messages:has:attachment:" in c for c in fake.calls)
 
 
-def test_export_settings_blip_retries_then_succeeds(
+def test_import_gmail_settings_blip_retries_then_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -195,15 +203,15 @@ def test_export_settings_blip_retries_then_succeeds(
         ]
     )
     fake.fail("list_labels", classify_status(503))  # one transient on bootstrap
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 0  # settings are not a single-blip kill switch
     assert "written=1" in result.output
 
 
-def test_export_auth_failure_exits_4_not_5(
+def test_import_gmail_auth_failure_exits_4_not_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -212,15 +220,15 @@ def test_export_auth_failure_exits_4_not_5(
     def boom(cfg: object) -> object:
         raise AuthError("not signed in — run `gmail-labeler auth login`")
 
-    monkeypatch.setattr(cli, "_export_client", boom)
+    monkeypatch.setattr(cli, "_import_gmail_client", boom)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 4
     assert "auth" in (result.stdout + result.stderr)
 
 
-def test_export_bootstrap_auth_failure_exits_4(
+def test_import_gmail_bootstrap_auth_failure_exits_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # deepseek MINOR: the now-live `except GmailAuthError` clauses need
@@ -231,15 +239,15 @@ def test_export_bootstrap_auth_failure_exits_4(
 
     fake = FakeGmailClient()
     fake.fail("list_labels", classify_status(401))
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 4
     assert "auth:" in result.stderr
 
 
-def test_export_settings_exhaustion_exits_5(
+def test_import_gmail_settings_exhaustion_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -250,17 +258,18 @@ def test_export_settings_exhaustion_exits_5(
     for _ in range(8):  # exhaust every attempt (MAX_ATTEMPTS is smaller)
         fake.fail("list_labels", classify_status(503))
     monkeypatch.setattr(
-        "gmail_labeler.export.time.sleep", lambda _s: None
+        "gmail_labeler.gmail_import.time.sleep", lambda _s: None
     )  # 5x503 exhaustion would pay ~15 s real backoff
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 5
     assert "label map unavailable after retries" in result.stderr
+    assert "import failed:" in result.stderr  # reworded prefix (ticket #68)
 
 
-def test_export_retried_counts_settings_blips(
+def test_import_gmail_retried_counts_settings_blips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # deepseek NIT: the retried= merge (cli.py) must be asserted, not just
@@ -278,15 +287,15 @@ def test_export_retried_counts_settings_blips(
         ]
     )
     fake.fail("list_filters", classify_status(503))
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 0
     assert "retried=1" in result.stdout
 
 
-def test_export_midrun_auth_failure_exits_4(
+def test_import_gmail_midrun_auth_failure_exits_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # deepseek seal MINOR: the mid-run `except GmailAuthError` clause is the
@@ -305,15 +314,15 @@ def test_export_midrun_auth_failure_exits_4(
         ]
     )
     fake.fail("get_message", classify_status(401))
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 4
     assert "auth:" in result.stderr
 
 
-def test_export_filters_exhaustion_message(
+def test_import_gmail_filters_exhaustion_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # deepseek seal NIT: the list_filters exhaustion branch is its own
@@ -326,11 +335,11 @@ def test_export_filters_exhaustion_message(
     for _ in range(8):
         fake.fail("list_filters", classify_status(503))
     monkeypatch.setattr(
-        "gmail_labeler.export.time.sleep", lambda _s: None
+        "gmail_labeler.gmail_import.time.sleep", lambda _s: None
     )  # 5x503 exhaustion would pay ~15 s real backoff
-    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
     result = runner.invoke(
-        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
     )
     assert result.exit_code == 5
     assert "filter snapshot unavailable after retries" in result.stderr
@@ -560,6 +569,8 @@ def test_analyze_no_snapshot_withholds_candidates(tmp_path: Path) -> None:
     assert "no-filter-snapshot" in result.stdout
     assert "CANDIDATE" not in result.stdout
     assert "no filters.json snapshot" in result.stderr
+    # the NOTE must advise the renamed acquisition command (ticket #68)
+    assert "dataset import-gmail" in result.stderr
 
 
 def test_analyze_assume_no_filters_opens_gate(tmp_path: Path) -> None:
@@ -823,7 +834,7 @@ def test_analyze_json_keeps_engine_reasons_alongside_posture(tmp_path: Path) -> 
 
 def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
     # deepseek NIT: the empty-corpus advice is the friendly line, not
-    # 'run dataset export to capture filters'
+    # 'run dataset import-gmail to capture filters'
     (tmp_path / "corpus").mkdir()
     result = runner.invoke(
         app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]

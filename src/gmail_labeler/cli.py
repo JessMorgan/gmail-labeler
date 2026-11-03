@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import typer
 
 from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS, parse_attribution
-from .export import DEFAULT_QUERY
+from .gmail_import import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
@@ -101,10 +101,11 @@ def _load_config(config: str | None):
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
 
 
-_EXPORT_ERROR_EXIT = 5  # transport/corpus failure or incomplete run
+_OPERATION_ERROR_EXIT = 5  # operation failure (transport/corpus) or incomplete
+# run — shared by all dataset commands (import-gmail, import-gyb, analyze)
 
 
-def _export_client(config: Config) -> GmailClient:
+def _import_gmail_client(config: Config) -> GmailClient:
     """Client factory seam: tests inject FakeGmailClient here."""
     from .auth import credentials as build_credentials
     from .gmail_client import GmailRestClient
@@ -112,8 +113,8 @@ def _export_client(config: Config) -> GmailClient:
     return GmailRestClient(build_credentials(config))
 
 
-@dataset_app.command("export")
-def dataset_export(
+@dataset_app.command("import-gmail")
+def dataset_import_gmail(
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
     query: str = typer.Option(
         DEFAULT_QUERY, "--query", help="Gmail search query (single-sourced)"
@@ -125,23 +126,23 @@ def dataset_export(
         help="Stop after scanning N messages (smoke runs)",
     ),
 ) -> None:
-    """Export labeled mail from the Gmail API into the corpus."""
+    """Import labeled mail from the Gmail API into the corpus."""
     from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
-    from .export import (
-        export_corpus,
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import (
         fetch_settings,
+        import_gmail,
         write_filters_snapshot,
         write_labels_snapshot,
     )
-    from .gmail_errors import GmailAuthError, GmailError
     from .tokens import TokenStoreError
 
     cfg = _load_config(config)
     # Auth gate FIRST: a not-signed-in run must not create or re-mode a
     # corpus tree (a typo'd corpus.dir especially).
     try:
-        client = _export_client(cfg)
+        client = _import_gmail_client(cfg)
         id_to_name, filters, bootstrap = fetch_settings(client)
     except (AuthError, TokenStoreError) as e:
         typer.echo(f"auth: {e}", err=True)
@@ -150,8 +151,8 @@ def dataset_export(
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
     except GmailError as e:
-        typer.echo(f"export failed: {e}", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        typer.echo(f"import failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     store = CorpusStore(cfg.corpus.dir)
     store.enforce_modes()
     for offender in store.verify_modes():
@@ -159,7 +160,7 @@ def dataset_export(
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
-        stats = export_corpus(
+        stats = import_gmail(
             client,
             store,
             id_to_name=id_to_name,
@@ -170,11 +171,11 @@ def dataset_export(
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
     except (GmailError, CorpusError) as e:
-        typer.echo(f"export failed: {e}", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        typer.echo(f"import failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     stats.retried += bootstrap.retried  # settings blips count too
     typer.echo(
-        f"export: scanned={stats.scanned} written={stats.written} "
+        f"import-gmail: scanned={stats.scanned} written={stats.written} "
         f"skipped_present={stats.skipped_present} retried={stats.retried} "
         f"failed={len(stats.failed)}"
     )
@@ -183,7 +184,7 @@ def dataset_export(
             typer.echo(f"  failed {message_id}: {reason}", err=True)
         if len(stats.failed) > 20:
             typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
 
 
 @dataset_app.command("import-gyb")
@@ -214,7 +215,7 @@ def dataset_import_gyb(
     an in-flight GYB backup first, or its writes will block.
 
     Fully offline — msg-db.sqlite is opened read-only (your backup is
-    never mutated) and bodies go through the same MIME parser as export.
+    never mutated) and bodies go through the same MIME parser as import-gmail.
     """
     from .corpus_store import CorpusError, CorpusStore
     from .gyb_import import DB_FILENAME, GybImportError, import_gyb
@@ -222,17 +223,17 @@ def dataset_import_gyb(
     cfg = _load_config(config)
     if path is not None and not path.strip():
         typer.echo("import-gyb: --path is empty (not falling back silently)", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     root = Path(path).expanduser() if path else cfg.gyb.path
     if root is None:
         typer.echo(
             "import-gyb: no backup path — set [gyb] path in config or pass --path",
             err=True,
         )
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     if not (root / DB_FILENAME).is_file():
         typer.echo(f"import-gyb: {DB_FILENAME} not found under {root}", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     store = CorpusStore(cfg.corpus.dir)
     store.enforce_modes()
     for offender in store.verify_modes():
@@ -260,7 +261,7 @@ def dataset_import_gyb(
             else " — records durably imported so far are kept; re-running resumes"
         )
         typer.echo(f"import failed: {e}{state}", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     typer.echo(
         f"import-gyb: scanned={stats.scanned} written={stats.written} "
         f"skipped_present={stats.skipped_present} failed={len(stats.failed)}"
@@ -292,7 +293,7 @@ def dataset_import_gyb(
             typer.echo(f"  failed {message_id}: {reason}", err=True)
         if len(stats.failed) > 20:
             typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
 
 
 @dataset_app.command("analyze")
@@ -331,11 +332,11 @@ def dataset_analyze(
         # a config typo is an operation failure, NOT an "empty mailbox"
         typer.echo(
             f"analyze failed: corpus dir {store.root} is missing or not a "
-            "directory \u2014 run dataset export/import-gyb first or fix "
+            "directory \u2014 run dataset import-gmail/import-gyb first or fix "
             "[corpus] dir",
             err=True,
         )
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
@@ -343,7 +344,7 @@ def dataset_analyze(
     except (CorpusError, OSError, UnicodeDecodeError) as e:
         # unreadable/undecodable records are exit 5, never a traceback
         typer.echo(f"analyze failed: records unreadable ({type(e).__name__})", err=True)
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     try:
         filters_text = store.read_snapshot(SIDECAR_FILTERS)
         # Short-circuit preserved verbatim from the pre-extraction reader:
@@ -362,7 +363,7 @@ def dataset_analyze(
             f"analyze failed: snapshot unreadable ({type(e).__name__}: {e})",
             err=True,
         )
-        raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     if assume_no_filters and filters_text is not None:
         # an attestation contradicting on-disk evidence is ignored, loudly;
         # the None-vs-not read of the snapshot is the existence check
@@ -383,7 +384,7 @@ def dataset_analyze(
     )
     # The posture NOTEs below matter only when there is mail to report on.
     # For an empty corpus the human path already ends with the
-    # "corpus is empty — run dataset export/import-gyb first" line, and the
+    # "corpus is empty — run dataset import-gmail/import-gyb first" line, and the
     # --json path prints no human report on stdout — its payload carries the
     # posture in filters_posture; NOTEs here would just bury the advice.
     if summary.messages:
@@ -392,14 +393,14 @@ def dataset_analyze(
                 "NOTE: filters.json label ids are not all present in "
                 "labels.json (missing or stale bridge) \u2014 attribution "
                 "impossible, candidates withheld (invariant #6). Re-run "
-                "`dataset export` to refresh both.",
+                "`dataset import-gmail` to refresh both.",
                 err=True,
             )
         elif filters is None:
             typer.echo(
                 "NOTE: no filters.json snapshot \u2014 filter attribution "
                 "unknown, candidates withheld (invariant #6). Run `dataset "
-                "export` to capture it, or `--assume-no-filters` to attest "
+                "import-gmail` to capture it, or `--assume-no-filters` to attest "
                 "a filterless mailbox.",
                 err=True,
             )
@@ -425,7 +426,7 @@ def dataset_analyze(
 
     if summary.messages == 0:
         typer.echo(
-            "analyze: corpus is empty \u2014 run dataset export/import-gyb first"
+            "analyze: corpus is empty \u2014 run dataset import-gmail/import-gyb first"
         )
         return
     typer.echo(

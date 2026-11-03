@@ -1,5 +1,5 @@
 """FakeGmailClient — the test spine (invariant #9: the real API is never hit
-in CI). Lives in src/ deliberately: every sub-branch (export, gyb-import,
+in CI). Lives in src/ deliberately: every sub-branch (gmail-import, gyb-import,
 analyze, and later the daemon) programs it, so one fake keeps them honest
 against the same Protocol.
 
@@ -34,7 +34,7 @@ class FakeMessage:
     # Presence of internalDate on the raw path is not contractually
     # guaranteed upstream: serve exactly what is set. None => the field is
     # omitted (consumer tolerance branch); an int => served (authority
-    # branch). Export tests exercise BOTH.
+    # branch). Gmail-import tests exercise BOTH.
     internal_date_ms: int | None = None
 
 

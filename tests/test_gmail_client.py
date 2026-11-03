@@ -146,7 +146,7 @@ def test_status_classification(status: int, expected: type[GmailError]) -> None:
 )
 def test_403_rate_limit_reasons_backoff(reason: str) -> None:
     err = classify_status(403, reason=reason)
-    assert isinstance(err, GmailRateLimitedError), "export must back off, not abort"
+    assert isinstance(err, GmailRateLimitedError), "the import must back off, not abort"
 
 
 @pytest.mark.parametrize("reason", ["permissionDenied", "insufficientPermissions"])
@@ -708,7 +708,7 @@ def test_rest_client_transport_is_timeout_bounded(monkeypatch) -> None:
 
 def test_default_build_path_constructs_offline(monkeypatch) -> None:
     """#56 RED pin: build(http=…, credentials=…) is mutually exclusive in
-    google-api-python-client 2.x — the FIRST live `dataset export` died in
+    google-api-python-client 2.x — the FIRST live `dataset import-gmail` run died in
     _svc() with a raw ValueError, bypassing the typed taxonomy. This runs
     the real build with no spy and no injection: static discovery +
     cache_discovery=False keep construction offline, and the patched
@@ -793,7 +793,7 @@ _SURFACE_CASES = [
         id="list_messages",
     ),
     pytest.param(
-        # page_token forwarding is export-termination load-bearing
+        # page_token forwarding is import-termination load-bearing
         lambda c: c.list_messages("in:inbox", "p2"),
         {"messages": [{"id": "a1", "threadId": "t1"}]},
         "https://gmail.googleapis.com/gmail/v1/users/me/messages",
@@ -861,7 +861,7 @@ def test_surface_paths_walk_the_real_discovery_tree(
     expected_params: dict[str, str],
     expected: object,
 ) -> None:
-    """#59 RED pin: the FIRST live `dataset export` after #56 died with
+    """#59 RED pin: the FIRST live `dataset import-gmail` after #56 died with
     AttributeError: 'Resource' object has no attribute 'labels' — the gmail
     v1 tree has ONLY `users` at top level (labels = users.labels), the
     build_service fakes mirrored the code's wrong assumption, and #57's

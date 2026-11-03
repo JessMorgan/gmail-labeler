@@ -66,6 +66,13 @@ DEFAULT_QUERY = "in:anywhere -in:spam -in:trash -in:draft"
 # (ticket #73 generalization); the constant is imported here for the
 # default arguments below — the loop itself no longer lives in this module.
 
+# Per-stub outcome vocabulary (#61): the shared name for the loop's branches,
+# used by _import_one, the on_message callback, and the CLI renderer —
+# documentation + completion today (these modules are pyright `basic`, where
+# a typo'd comparison is NOT gated until the strict migration); a type error
+# then (#62's bar is the declared next consumer).
+ImportOutcome = Literal["written", "present", "failed", "policy_skip"]
+
 
 @dataclass
 class GmailImportStats:
@@ -79,6 +86,27 @@ class GmailImportStats:
     @property
     def failed_ids(self) -> list[str]:
         return [i for i, _ in self.failed]
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    """Immutable count view handed to the #61 progress callbacks.
+
+    Frozen, slots, ints-only: constructed fresh at every fire, so a callback
+    can neither mutate the run's accounting nor hold a live reference into it
+    (the snapshot is a value, not a window). Scope is the EXPORT LOOP only:
+    fetch_settings bootstrap retries live in the caller's own GmailImportStats
+    and are the adapter's to merge (deepseek r2: #62 must not read retried
+    as a run total). Counts ONLY — message ids ride on_message, never here
+    — and both are metadata, never content (invariant #5), so the engine
+    stays I/O-free (CODING-STANDARDS: pure core, bounded adapters print)."""
+
+    scanned: int
+    written: int
+    skipped_present: int
+    skipped_draft_chat: int
+    retried: int
+    failed_count: int
 
 
 def _ms_to_utc(ms: int | None) -> datetime | None:
@@ -100,12 +128,33 @@ def import_gmail(
     max_attempts: int = MAX_ATTEMPTS,
     sleeper: Callable[[float], None] | None = None,
     clock: Callable[[], datetime] | None = None,
+    on_page: Callable[[ProgressSnapshot], None] | None = None,
+    on_message: Callable[[str, ImportOutcome], None] | None = None,
 ) -> GmailImportStats:
     """Import the query's messages into the store. Returns counts + failures.
 
     Side effect beyond the record log (ADR-0008, additive): births the Sync
     Cursor when — and only when — the corpus has none. Advancement is Label
-    Sync's exclusive act; see _birth_cursor."""
+    Sync's exclusive act; see _birth_cursor.
+
+    Progress callbacks (#61, opt-in): ``on_page`` receives a fresh
+    ProgressSnapshot at each completed page and on every early-return path
+    (max_messages bound hit mid-page; the ``<page>`` sentinel fetch-failure
+    return) so operators see final counts before the summary — EXCEPT the
+    ``max_messages <= 0`` no-op, which fires nothing. ``on_message`` receives
+    (message id, outcome) per stub once the outcome is decided, from the
+    ImportOutcome vocabulary: 'written', 'present' (skip-present, either the
+    has()-pre-check or a concurrent put), 'policy_skip' (DRAFT/CHAT ingest
+    layer), 'failed'.
+
+    Callbacks MUST NOT RAISE — the engine deliberately does NOT catch their
+    exceptions (fail-loud posture, pinned by
+    test_raising_progress_callback_propagates): a broken progress renderer
+    is a defect to surface, not noise to swallow, and resume is structural
+    (the id-set cursor) so a stopped run is simply re-run. Satisfying that
+    contract is the CALLER's duty: the CLI adapter closes its stderr channel
+    permanently on the first BrokenPipeError so its renderers never raise
+    (#61 fix round, deepseek-measured EPIPE abort)."""
     sleeper = sleeper or time.sleep
     clock = clock or (lambda: datetime.now(UTC))
     if max_attempts < 1:
@@ -115,6 +164,21 @@ def import_gmail(
     stats = GmailImportStats()
     if max_messages is not None and max_messages <= 0:
         return stats  # explicit no-op, never "process one anyway"
+
+    def _fire_page() -> None:
+        # fresh value object per fire — no mutable-state leak to callbacks
+        if on_page is not None:
+            on_page(
+                ProgressSnapshot(
+                    scanned=stats.scanned,
+                    written=stats.written,
+                    skipped_present=stats.skipped_present,
+                    skipped_draft_chat=stats.skipped_draft_chat,
+                    retried=stats.retried,
+                    failed_count=len(stats.failed),
+                )
+            )
+
     page_token: str | None = None
     seeding_done = False
     while True:
@@ -130,6 +194,7 @@ def import_gmail(
             stats.failed.append(
                 ("<page>", "list_messages stopped (permanent or exhausted)")
             )
+            _fire_page()  # early return still reports final counts (#61)
             return stats
         if not seeding_done:
             # ADR-0008: EVERY seed — page or profile — is captured BEFORE any
@@ -152,6 +217,7 @@ def import_gmail(
             stats.scanned += 1
             if store.has(stub.id.lower()):  # ids are stored lowercased
                 stats.skipped_present += 1
+                outcome = "present"  # same class as a concurrent put=False
             else:
                 outcome = _import_one(
                     client,
@@ -168,10 +234,19 @@ def import_gmail(
                     stats.skipped_present += 1
                 elif outcome == "policy_skip":
                     stats.skipped_draft_chat += 1
+            # per-stub event AFTER the outcome is decided (#61); the id is
+            # normalized like the store key so a -vv line and the corpus
+            # index always agree (uppercase wire stubs would otherwise
+            # render two spellings of one message); metadata, never content
+            # (invariant #5)
+            if on_message is not None:
+                on_message(stub.id.lower(), outcome)
             # bound checked on EVERY path (deepseek engine pass: continue
             # used to bypass it, scanning past max_messages on resume runs)
             if max_messages is not None and stats.scanned >= max_messages:
+                _fire_page()  # bound return still reports final counts (#61)
                 return stats
+        _fire_page()  # completed page: one snapshot per page (#61)
         if page_token is None:
             return stats
 
@@ -237,7 +312,7 @@ def _import_one(
     max_attempts: int,
     stats: GmailImportStats,
     sleeper: Callable[[float], None],
-) -> Literal["written", "present", "failed", "policy_skip"]:
+) -> ImportOutcome:
     msg = _retrying(
         lambda: client.get_message(message_id),
         max_attempts=max_attempts,

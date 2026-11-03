@@ -8,6 +8,12 @@ does not ship releases yet.
 
 ### Added
 
+- `dataset export` progress: opt-in `-v` prints per-page summaries and
+  `-vv` per-message outcome lines to STDERR, fed by engine callbacks
+  (`on_page`/`on_message`) that hand the CLI frozen `ProgressSnapshot`s —
+  the engine stays I/O-free, a broken progress pipe closes only the stderr
+  channel (never the run), the default run is byte-identical, and #62's
+  progress bar is specified to consume the same seam (ticket #61).
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):
   export stamps server `internalDate` vs MIME `Date`-header fallback
   distinctly, GYB import stamps its own source; pre-existing lines lacking

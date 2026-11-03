@@ -489,6 +489,34 @@ def test_import_gyb_empty_path_flag_is_error(tmp_path: Path) -> None:
     assert "empty" in result.stderr
 
 
+def test_import_gyb_stats_echo_includes_skipped_draft_chat(tmp_path: Path) -> None:
+    # user-visible stats line (ticket #32): the rejection
+    # count must not regress silently — mirrors the export echo pin
+    gyb = _gyb_fixture(tmp_path)
+    import sqlite3
+
+    con = sqlite3.connect(gyb / "msg-db.sqlite")
+    con.execute(
+        "INSERT INTO messages VALUES (2, '2026/7/14/beef.eml', '2026-07-14 10:00:00')"
+    )
+    con.execute("INSERT INTO uids VALUES (2, 'beef')")
+    con.execute("INSERT INTO labels VALUES (2, 'DRAFT')")
+    con.commit()
+    con.close()
+    # NO beef.eml written: rejected rows are answered from the index alone
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[corpus]\ndir = "{tmp_path / "corpus"}"\n[gyb]\npath = "{gyb}"\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["dataset", "import-gyb", "--config", str(cfg)])
+    assert result.exit_code == 0
+    assert (
+        "scanned=2 written=1 skipped_present=0 skipped_draft_chat=1 failed=0"
+        in result.stdout
+    )
+
+
 def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     gyb = _gyb_fixture(tmp_path)
     import sqlite3
@@ -496,6 +524,13 @@ def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     con = sqlite3.connect(gyb / "msg-db.sqlite")
     con.execute("INSERT INTO messages VALUES (2, '2026/7/16/beef.eml', 'garbage-date')")
     con.execute("INSERT INTO uids VALUES (2, 'beef')")
+    # a rejected DRAFT row sorting BEFORE the abort: the aborted-run echo
+    # must account for it too (ticket #32 — never vanish from the totals)
+    con.execute(
+        "INSERT INTO messages VALUES (3, '2026/7/14/draft.eml', '2026-07-14 10:00:00')"
+    )
+    con.execute("INSERT INTO uids VALUES (3, 'dddd')")
+    con.execute("INSERT INTO labels VALUES (3, 'DRAFT')")
     con.commit()
     con.close()
     cfg = tmp_path / "config.toml"
@@ -507,6 +542,7 @@ def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     assert result.exit_code == 5
     # good row (sorts before 'garbage') was durably imported and IS reported
     assert "1 record(s) durably imported so far" in result.stderr
+    assert "skipped_draft_chat=1" in result.stderr  # rejection counted pre-abort
 
 
 def test_import_gyb_help_documents_comma_limit(tmp_path: Path) -> None:

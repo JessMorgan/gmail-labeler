@@ -114,8 +114,21 @@ ingest layer hard-skips any message whose raw wire labelIds carry the
 system label id DRAFT or CHAT (no documented chat query token exists,
 and this layer is load-bearing: an explicit `--query` replaces the
 default wholesale but cannot bypass it). Records already exported are
-unaffected (append-only corpus). GYB import follows whatever the backup
-holds (tracked by #32). It writes `filters.json` and `labels.json`
+unaffected (append-only corpus). GYB import applies the same DRAFT/CHAT
+exclusion at ingest (#32): a backup row whose raw label tokens carry
+the canonical token is never stored. The count is new-row-only: a row
+already in the corpus is answered skip-present first and reports
+`skipped_present` without aborting the run; only a not-yet-stored row
+counts `skipped_draft_chat`. Rejection is canonical-exact-token only —
+`--system-labels` (`system_labels_extra`) equivalents are stripped from
+label sets but do not trigger row rejection. A backup storing DRAFT/CHAT
+with case drift imports, and the drifted token survives label filtering
+as a content label (training signal). The containment guard outranks
+the policy for rows not already stored: a DRAFT/CHAT row whose
+backup-index path escapes the backup root aborts the whole run
+(exit 5) instead of being counted; a row already in the corpus
+never reaches the path check (skip-present wins — no abort).
+Export writes `filters.json` and `labels.json`
 sidecars next to the corpus — the offline snapshot `dataset analyze`
 uses for filter attribution. `dataset import-gyb` takes `--path`,
 `--max-messages`, and `--system-labels` (comma-separated extras — the

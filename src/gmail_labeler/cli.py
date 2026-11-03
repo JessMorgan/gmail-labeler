@@ -214,7 +214,10 @@ def dataset_import_gyb(
         help=(
             "Comma-separated extra label names to treat as System Labels "
             "(e.g. 'INKASSIE'); the delimiter is a comma, so label names "
-            "containing commas cannot be expressed via this flag"
+            "containing commas cannot be expressed via this flag. Extra "
+            "tokens are stripped from label sets only — they do NOT "
+            "trigger DRAFT/CHAT row rejection, which matches canonical "
+            "tokens alone"
         ),
     ),
 ) -> None:
@@ -225,6 +228,9 @@ def dataset_import_gyb(
 
     Fully offline — msg-db.sqlite is opened read-only (your backup is
     never mutated) and bodies go through the same MIME parser as export.
+    DRAFT/CHAT rows are rejected at ingest exactly like the API export's
+    policy layer (ticket #32's completion of #17: one corpus-wide policy,
+    two ingest layers).
     """
     from .corpus_store import CorpusError, CorpusStore
     from .gyb_import import DB_FILENAME, GybImportError, import_gyb
@@ -264,8 +270,12 @@ def dataset_import_gyb(
         # into an operator message.
         partial = getattr(e, "stats", None)
         state = (
+            # the rejection count rides the aborted-run echo too (ticket
+            # #32): rows rejected BEFORE the stop must not vanish from the
+            # operator's accounting
             f" — {partial.written} record(s) durably imported so far are "
-            "kept; re-running resumes"
+            f"kept (skipped_draft_chat={partial.skipped_draft_chat}); "
+            "re-running resumes"
             if partial is not None
             else " — records durably imported so far are kept; re-running resumes"
         )
@@ -273,7 +283,9 @@ def dataset_import_gyb(
         raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
     typer.echo(
         f"import-gyb: scanned={stats.scanned} written={stats.written} "
-        f"skipped_present={stats.skipped_present} failed={len(stats.failed)}"
+        f"skipped_present={stats.skipped_present} "
+        f"skipped_draft_chat={stats.skipped_draft_chat} "
+        f"failed={len(stats.failed)}"
     )
     if stats.date_conflict:
         typer.echo(

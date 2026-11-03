@@ -21,6 +21,18 @@ the backup DB). ``system_labels_extra`` exists for hand-edited or derived
 exports where localized tokens CAN appear; a token list you maintain is
 safer than this module guessing.
 
+Corpus-wide exclusion (ticket #32, mirrors export's ingest layer): rows
+whose RAW label tokens carry DRAFT or CHAT (labels.EXCLUDED_CORPUS_LABEL_IDS)
+are rejected at import, never stored. Localized equivalents declared via
+``system_labels_extra`` (e.g. INKASSIE) do NOT trigger row rejection —
+there is no way to know which localized token means DRAFT — the same
+"token list you maintain is safer than guessing" posture as the label-SET
+filter above, and the verified corpus stores the canonical tokens anyway.
+A user label literally named "DRAFT" in the NAME space is already treated
+as the system token by ``_keep_label`` (labels.py's over-inclusion
+trade-off), but the delta must be said plainly: ``_keep_label`` dropped
+only the TOKEN from an imported row; this policy drops the WHOLE MESSAGE.
+
 Backups are read as POSIX trees (Windows-made backslash filenames
 are out of scope; split('/') finds no date shape and read_bytes finds no file).
 A full-run read transaction (BEGIN) keeps counts and stream on ONE
@@ -44,7 +56,7 @@ from pathlib import Path
 
 from .corpus_record import CorpusRecord, body_hash
 from .corpus_store import CorpusError, CorpusStore
-from .labels import is_system_label_id
+from .labels import EXCLUDED_CORPUS_LABEL_IDS, is_system_label_id
 from .mime_extract import parse_mime
 
 log = logging.getLogger("gmail_labeler.gyb")
@@ -69,6 +81,8 @@ class GybRow:
     eml_relpath: str
     when: datetime  # tz-aware UTC (folder-date-corrected; see module docstring)
     labels: tuple[str, ...]  # content labels only (system/extra filtered)
+    excluded_draft_chat: bool  # RAW label tokens carry DRAFT/CHAT (ticket #32):
+    # row-level corpus rejection, computed before _keep_label (module docstring)
     date_corrected: bool  # stamp's date fixed to the folder (zone skew <= 1 day)
     folder_unparsed: bool  # filename lacks the year/month/day shape:
     # NO UTC anchor exists for this row; the machine-local day is kept
@@ -81,6 +95,8 @@ class GybImportStats:
     scanned: int = 0
     written: int = 0
     skipped_present: int = 0
+    skipped_draft_chat: int = 0  # ingest-layer policy rejections (ticket #32:
+    # mirrors ExportStats — a decision counted, never a defect)
     date_corrected: int = 0  # rows whose stamp was fixed to the folder (<= 1 day)
     folder_unparsed: int = 0  # rows imported with NO UTC anchor (odd filename)
     date_conflict: int = 0  # folder/stamp disagree > 1 day: provenance broken
@@ -234,6 +250,11 @@ def read_gyb_index(
             raw_labels = (
                 labels_raw.split(_LABEL_SEP) if isinstance(labels_raw, str) else []
             )
+            # corpus-wide exclusion (ticket #32, mirrors export's ingest
+            # layer): exact-case intersection on the RAW split tokens,
+            # BEFORE _keep_label — the row still yields; rejection happens
+            # in the import loop so scanned/skipped counts stay honest
+            excluded = bool(EXCLUDED_CORPUS_LABEL_IDS.intersection(raw_labels))
             # label SET semantics made explicit: sorted + deduped, so the
             # stored line is byte-stable despite SQLite's arbitrary
             # aggregate order and any duplicate rows (deepseek MINOR)
@@ -245,6 +266,7 @@ def read_gyb_index(
                 eml_relpath=fname,
                 when=when,
                 labels=labels,
+                excluded_draft_chat=excluded,
                 date_corrected=corrected,
                 folder_unparsed=unparsed,
                 date_conflict=conflict,
@@ -276,62 +298,86 @@ def import_gyb(
             stats.scanned += 1
             mid = row.id.lower()  # ids normalize to lowercase (export does too)
             if store.has(mid):
+                # skip-present FIRST (invariant #2's corpus twin): a resume
+                # run answers from the id-set before any policy or path
+                # question is asked — pinned by two precedence tests
                 stats.skipped_present += 1
-                if max_messages is not None and stats.scanned >= max_messages:
-                    # the bound holds on EVERY path (deepseek engine pass:
-                    # skipped rows used to bypass it, scanning unbounded)
-                    return stats
-                continue
-            eml = (gyb_root / row.eml_relpath).resolve()
-            if not eml.is_relative_to(root_resolved):
-                # FAIL-CLOSED whole-run (vs per-row failed for unreadable
-                # .eml): the DB's paths are untrusted input, the file
-                # contents are the user's own — deliberate asymmetry
-                # the DB is untrusted input: '../' or absolute filenames must
-                # not read arbitrary files into the corpus (precedent:
-                # CorpusStore._body_path containment)
-                raise GybImportError(
-                    f"message_filename escapes the backup root: {row.eml_relpath!r}"
-                )
-            try:
-                data = eml.read_bytes()
-            except OSError as e:
-                stats.failed.append((mid, f"eml unreadable ({type(e).__name__})"))
-                continue
-            parsed = parse_mime(data)  # never raises; same path as the API export
-            try:
-                record = CorpusRecord(
-                    id=mid,
-                    date=row.when,
-                    subject=parsed.subject,
-                    sender=parsed.sender,
-                    recipients=parsed.recipients,
-                    labels=row.labels,
-                    body_hash=body_hash(parsed.body_text),
-                    source="gyb",
-                    # the folder-corrected message_internaldate — GYB's own
-                    # source, distinct from the two API provenances
-                    date_provenance="gyb_internaldate",
-                    thread_id="",  # msg-db carries no thread map; never guessed
-                )
-            except ValueError as e:
-                stats.failed.append((mid, f"record shape: {e}"))
-                continue
-            # CorpusError (corrupt index etc.) PROPAGATES and stops the run.
-            added = store.put(record, parsed.body_text)
-            if added:
-                stats.written += 1
-                if row.folder_unparsed:
-                    stats.folder_unparsed += 1
-                if row.date_corrected:
-                    # count rows THIS run corrected into the corpus, not
-                    # scans of already-present mail (deepseek NIT)
-                    stats.date_corrected += 1
-                if row.date_conflict:
-                    stats.date_conflict += 1
             else:
-                stats.skipped_present += 1
+                # containment guard BEFORE the policy branch (ticket #32
+                # reviews): fail-closed for DB-sourced paths is
+                # unconditional for every row NOT already in the corpus
+                # (skip-present wins, invariant #2) — an escaping
+                # message_filename aborts the whole run even on a row the
+                # policy would reject (the corrupt index itself is the
+                # defect; pinned by
+                # test_escape_stops_run_even_for_rejected_rows)
+                eml = (gyb_root / row.eml_relpath).resolve()
+                if not eml.is_relative_to(root_resolved):
+                    # FAIL-CLOSED whole-run (vs per-row failed for unreadable
+                    # .eml): the DB's paths are untrusted input, the file
+                    # contents are the user's own — deliberate asymmetry
+                    # ('../' or absolute filenames must not read arbitrary
+                    # files into the corpus; precedent:
+                    # CorpusStore._body_path containment)
+                    raise GybImportError(
+                        f"message_filename escapes the backup root: {row.eml_relpath!r}"
+                    )
+                if row.excluded_draft_chat:
+                    # ingest-layer rejection (ticket #32, mirrors export's
+                    # policy_skip): labels came from the index, so the
+                    # .eml is NEVER read — counted, never stored, never a
+                    # failure (a decision, not a defect)
+                    stats.skipped_draft_chat += 1
+                else:
+                    try:
+                        data = eml.read_bytes()
+                    except OSError as e:
+                        stats.failed.append(
+                            (mid, f"eml unreadable ({type(e).__name__})")
+                        )
+                    else:
+                        parsed = parse_mime(data)  # never raises; one parser
+                        try:
+                            record = CorpusRecord(
+                                id=mid,
+                                date=row.when,
+                                subject=parsed.subject,
+                                sender=parsed.sender,
+                                recipients=parsed.recipients,
+                                labels=row.labels,
+                                body_hash=body_hash(parsed.body_text),
+                                source="gyb",
+                                # the folder-corrected message_internaldate —
+                                # GYB's own source, distinct from the two
+                                # API provenances
+                                date_provenance="gyb_internaldate",
+                                thread_id="",  # no thread map; never guessed
+                            )
+                        except ValueError as e:
+                            stats.failed.append((mid, f"record shape: {e}"))
+                        else:
+                            # CorpusError (corrupt index etc.) PROPAGATES
+                            # and stops the run.
+                            added = store.put(record, parsed.body_text)
+                            if added:
+                                stats.written += 1
+                                if row.folder_unparsed:
+                                    stats.folder_unparsed += 1
+                                if row.date_corrected:
+                                    # count rows THIS run corrected into
+                                    # the corpus, not scans of already-
+                                    # present mail (deepseek NIT)
+                                    stats.date_corrected += 1
+                                if row.date_conflict:
+                                    stats.date_conflict += 1
+                            else:
+                                stats.skipped_present += 1
             if max_messages is not None and stats.scanned >= max_messages:
+                # ONE bottom-of-loop bound covers EVERY path — present,
+                # rejected, failed, written (export.py's shape; the old
+                # per-path checks missed the two failure paths and let an
+                # all-failing prefix scan past the bound — deepseek engine
+                # pass lineage: skipped rows once bypassed it too)
                 return stats
     except CorpusError as e:
         # store-side abort: re-surface as the typed gyb exit-5 class with

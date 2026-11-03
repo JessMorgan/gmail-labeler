@@ -7,7 +7,11 @@ one language.
 
 Space contract: matching is EXACT-CASE (Gmail's system namespace is; a
 lowercase look-alike is user content, and case-normalizing here would
-manufacture false negatives). The API path uses label IDS; the GYB path was
+manufacture false negatives). The ONE stated exception (F2): the
+``ensure_label`` startup refusal is CASE-INSENSITIVE — it guards
+against MINTING a System-Label look-alike user label, a different
+question from content-label matching, which stays exact-case.
+The API path uses label IDS; the GYB path was
 verified over a real corpus to store system labels as exactly the uppercase
 tokens below — the backup DB's label column carries those canonical ids
 (GYB's reader-side `labelIdsToLabels` mapping; its labellang map is

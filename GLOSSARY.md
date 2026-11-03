@@ -19,10 +19,16 @@ contributed something"), `ai-high` (the high-confidence band), and `ai-med`
 (the review-me band). The configured `high` / `med` names drive the shadow
 report's tier names NOW (the report renders the band tier name for would-be
 rows); the `applied` umbrella is VALIDATED at config NOW (stripped, and
-distinct from `high` / `med`) and CONSUMED by the write phase later — the
-name→Gmail-label-id resolution and the umbrella application are a WRITE-time
-concern the daemon WILL implement in the Application phase (#24/#25) —
-unshipped here (the report attaches no labels).
+distinct from `high` / `med`) and CONSUMED by the Application write
+composition (ticket #24): `applications.plan_message_write` adds the
+umbrella plus the best band tier to every write, and
+`gmail_client.ensure_label` ships the name→Gmail-label-id resolution
+(get-or-create: an existing USER label of exactly that name is used
+as-is; a casefolded System Label name-sake is refused named — the
+refusal guards minting a look-alike only; the daemon / `apply` startup
+of #25/#26 calls it once per configured name). The live write itself
+lands with the daemon / `apply` CLI (#25/#26); the shadow report still
+attaches no labels.
 _Avoid_: confidence label, meta label
 
 **Application**:
@@ -33,11 +39,24 @@ audits are counted against. The REAL contract: every Application carries the
 umbrella Tier Label (`[labels] applied`) AND exactly one band Tier Label
 (`[labels] high` or `med` — the BEST band among the applied labels, high beats
 med; a skip-present label earns no band tier, it is not applied). That
-composition (umbrella + one band tier) is done at WRITE time by the
-daemon phase (#24/#25), which also resolves the configured names to
-Gmail label ids. The shadow report is a PREVIEW, not an Application: it renders
-the band tier NAME for would-be rows and attaches no labels (no umbrella, no
-band tier on the wire).
+composition (umbrella + one band tier) SHIPS at the library level
+(ticket #24): `applications.plan_message_write` composes it from the
+tiers core and the resolved Gmail label ids (`gmail_client.ensure_label
+ships the name→id resolution; the daemon / `apply` startup of #25/#26
+calls it once per configured name). The Application is ALL-OR-NOTHING
+per message: a data-path compose error means NO write for that message
+plus a counted id-only warning (caller bugs and internal guards raise
+— and still write nothing; invariant #1's fail-safe), and nothing new
+earned — skip-present included — means an empty plan and no API call at
+all (invariant #2). Band tiers ACCUMULATE across Applications (accepted
+v1 policy): "exactly one band Tier Label" is PER-APPLICATION — a later
+Application can add a DIFFERENT band tier to the same message (a
+med-band Application on a message already carrying `ai-high` adds
+`ai-med`); additive-only never corrects the old one, so the audit truth
+is the Applications table, not the tier labels. The live write itself
+lands with the daemon / `apply` CLI (#25/#26). The shadow report is a
+PREVIEW, not an Application: it renders the band tier NAME for would-be
+rows and attaches no labels (no umbrella, no band tier on the wire).
 _Avoid_: auto-label (the event, not the label)
 
 **Additive-only**:
@@ -124,12 +143,17 @@ _Avoid_: shadow summary, evaluation report
 
 **state DB**:
 The SQLite file at `[store] db_path` (default `<config dir>/gmail-labeler.db`;
-overridden per-command by the `--db` flag) holding the `shadow_results` table
-(run id, message id, label, probability,
-band, run timestamp) and, with the daemon phase, the `applications` table. It
-carries ids, probabilities, labels, and timestamps ONLY — never bodies
-(invariant #5) — so it is publicly attachable. One transaction per run (a crash
-mid-run leaves no half rows); a foreign schema_version is refused.
+overridden per-command by the `--db` flag) holding the `shadow_results`
+table (run id, message id, label, probability, band, run timestamp) and
+the `applications` table (ticket #24, schema v2: message id, label, label
+id, score, band, tier, applied-at, source — the join corrections and
+`status` read). It carries ids, probabilities, labels, and timestamps
+ONLY — never bodies (invariant #5) — so it is publicly attachable. One
+transaction per write (a crash leaves no half rows), and every schema
+transition is one transaction too — fresh create+stamp, the live v1
+DB's single-row v1→v2 restamp, self-heals — so a crash leaves the file
+fully prior-state or fully new-state, never the intermediate; a foreign
+schema_version is refused.
 _Avoid_: shadow DB, label DB
 
 **Backlog**:

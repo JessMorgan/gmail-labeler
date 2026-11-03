@@ -12,9 +12,11 @@ the richer shape is opt-in per message.
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .gmail_client import (
+    BARE_ADD_IDS_REFUSAL,
     FilterInfo,
     HistoryPage,
     LabelInfo,
@@ -54,7 +56,19 @@ class FakeGmailClient:
     - history serves an explicit page list honoring page_token, then a
       configurable current id (the real API echoes its CURRENT historyId, it
       does not repeat your start id);
-    - call log enables exact-behavior assertions (no silent extra fetches).
+    - call log enables exact-behavior assertions (no silent extra fetches);
+    - write calls (ticket #24: apply_labels, ensure_label) append to the
+      SAME call log — the shadow zero-write pin (calls ⊆ read surface)
+      catches a write from a read-only path by NAME — and successful
+      writes are recorded in ``writes`` with the FULL body snapshot, so
+      the wire-shape assertions (addLabelIds ONLY) pin the composition,
+      not just the call;
+    - documented divergence: apply_labels ACCEPTS label ids the mailbox
+      never listed (the real messages.modify answers 400 on an unknown
+      id). Enforcement here would force every write test to program the
+      label list; a stale resolution that the REST path would hard-fail
+      stays green in CI — the live opt-in seam is where that class of
+      bug dies (the query-not-evaluated precedent above).
     """
 
     def __init__(
@@ -69,7 +83,10 @@ class FakeGmailClient:
     ) -> None:
         self.messages = {m.id: m for m in messages or []}
         self.order = [m.id for m in messages or []]
-        self.labels_list = labels or []
+        # list() copy (F2 review NIT, pre-existing trap): ensure_label
+        # CREATES append here — an aliased caller list would mutate a
+        # shared #25 fixture behind its back
+        self.labels_list = list(labels or [])
         self.filters_list = filters or []
         self.page_size = page_size
         # pages follow the token chain: index by page_token ("p0","p1",...).
@@ -88,6 +105,10 @@ class FakeGmailClient:
         self._history_expected: str | None = None
         self._failures: dict[str, list[GmailError]] = {}
         self.calls: list[str] = []
+        # successful write calls with their full body snapshots (the
+        # wire-shape evidence for the application path, ticket #24)
+        self.writes: list[dict[str, object]] = []
+        self._created_label_count = 0
 
     # -- programming --------------------------------------------------------
 
@@ -98,6 +119,8 @@ class FakeGmailClient:
             "get_message",
             "list_filters",
             "history",
+            "apply_labels",
+            "ensure_label",
             "any",
         }
     )
@@ -125,12 +148,19 @@ class FakeGmailClient:
     def list_labels(self) -> list[LabelInfo]:
         self.calls.append("list_labels")
         self._maybe_fail("list_labels")
-        return self.labels_list
+        # a COPY (F3): the REST adapter builds fresh objects per call;
+        # handing out the live list let a caller corrupt the fake's
+        # mailbox behind its back (the ctor aliasing trap, other
+        # direction — #25's exact-call tests ride this fake)
+        return list(self.labels_list)
 
     def list_filters(self) -> list[FilterInfo]:
         self.calls.append("list_filters")
         self._maybe_fail("list_filters")
-        return self.filters_list
+        # a COPY too (F3 review): the read surfaces stay symmetric —
+        # the REST adapter builds fresh FilterInfo per call; #25/#26
+        # ride this fake
+        return list(self.filters_list)
 
     def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:
         self.calls.append(f"list_messages:{query}:{page_token or ''}")
@@ -217,6 +247,85 @@ class FakeGmailClient:
             )
         self._history_expected = None
         return HistoryPage(history_id=self.current_history_id, next_page_token=None)
+
+    # -- write surface (ticket #24 — mirrors the REST adapter's behavior) --
+
+    def apply_labels(self, message_id: str, add_label_ids: Sequence[str]) -> None:
+        """Add labels to a message (the ONLY label write, invariant #1).
+        The recorded body snapshot carries ``addLabelIds`` ONLY — the
+        same shape the REST adapter composes; a removal is not even a
+        representable argument here. An unknown message id is the typed
+        404 the real API answers (the attempt stays visible in the call
+        log; nothing lands, so no write is recorded). The bare-str guard
+        mirrors the REST adapter (a caller bug raises BEFORE even the
+        call-log entry — no wire call happened)."""
+        if isinstance(add_label_ids, (str, bytes)):
+            raise ValueError(f"{BARE_ADD_IDS_REFUSAL} (got {add_label_ids!r})")
+        self.calls.append(f"apply_labels:{message_id}")
+        self._maybe_fail("apply_labels")
+        try:
+            message = self.messages[message_id]
+        except KeyError as e:
+            raise GmailPermanentError(
+                f"message {message_id} not found", status=404
+            ) from e
+        adds = list(add_label_ids)
+        # the real API stores a label SET: re-adding a present id is a
+        # no-op, not a duplicate — ACROSS calls AND WITHIN one call (the
+        # fake must not lie about it). The body SNAPSHOT keeps the raw
+        # caller input: wire evidence (a composition bug that sends
+        # duplicates stays visible, like the modify body the wire saw)
+        present = set(message.label_ids)
+        deduped: list[str] = []
+        for label_id in adds:
+            if label_id not in present and label_id not in deduped:
+                deduped.append(label_id)
+        message.label_ids = message.label_ids + tuple(deduped)
+        self.writes.append(
+            {
+                "method": "apply_labels",
+                "message_id": message_id,
+                "body": {"addLabelIds": adds},
+            }
+        )
+
+    def ensure_label(self, name: str) -> str:
+        """Get-or-create a USER label by exact name (idempotent when
+        present — exact-case match, no create recorded). A System
+        Label name-sake (casefolded) is REFUSED, named (the REST
+        mirror, F1/F2) — unless a USER label of exactly that name
+        already exists: it is used as-is (the refusal guards minting
+        only). The fake performs the same WIRE calls as the adapter —
+        list_labels first (recorded in the call log; a READ, so the
+        shadow zero-write pin is unaffected), create only when the name
+        is absent — so #25's
+        exact-call tests read one sequence, not two. (The
+        ``ensure_label:<name>`` entry itself is this fake's own
+        convention — the adapter logs nothing; the fidelity claim is
+        about the wire calls.) The 409 concurrent-create self-heal is
+        REST-only: the fake's single-threaded list+create has no race
+        window (documented divergence)."""
+        self.calls.append(f"ensure_label:{name}")
+        self._maybe_fail("ensure_label")
+        labels = self.list_labels()  # the wire call the adapter makes
+        wanted = name.casefold()
+        for label in labels:  # pass 1: the exact-case get-or-create hit
+            if label.name == name and label.type == "user":
+                return label.id
+        for label in labels:  # pass 2: the casefolded collision guard
+            # AFTER the user-hit pass (deterministic precedence, F2
+            # review) — the guard only prevents MINTING a look-alike
+            if label.type == "system" and label.name.casefold() == wanted:
+                raise ValueError(
+                    f"ensure_label: {name!r} collides with a System Label "
+                    "name in the mailbox — rename [labels] applied/high/med "
+                    "(System Labels are never write targets)"
+                )
+        self._created_label_count += 1
+        new_id = f"Label_fake_{self._created_label_count}"
+        self.labels_list.append(LabelInfo(id=new_id, name=name, type="user"))
+        self.writes.append({"method": "ensure_label", "body": {"name": name}})
+        return new_id
 
 
 def _is_ascii_digit(token: str) -> bool:

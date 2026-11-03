@@ -29,7 +29,8 @@ from .gmail_errors import (
 )
 
 # Adapter bound (CODING-STANDARDS: bounded transports): google_auth_httplib2
-# ignores per-request timeouts, so the bound lives on the httplib2 transport.
+# ignores per-request timeouts, so the bound lives on the INNER httplib2
+# transport of the AuthorizedHttp we compose in _svc() (#56).
 _REQUEST_TIMEOUT_S = 30.0
 
 
@@ -116,8 +117,11 @@ class GmailClient(Protocol):
 
 class GmailRestClient:
     """googleapiclient-backed adapter. The transport is injected
-    (build_service) so every response-shape parse is testable offline; no
-    live calls in CI (invariant #9)."""
+    (build_service replaces the whole default build; http is the caller's
+    authorized transport, used verbatim) so every response-shape parse is
+    testable offline; with no injection the default path composes a
+    timeout-bounded AuthorizedHttp itself (#56). No live calls in CI
+    (invariant #9)."""
 
     def __init__(
         self,
@@ -130,6 +134,8 @@ class GmailRestClient:
         self._service: Any | None = None
         self._build_service = build_service
         self._http = http  # injection seam; default is timeout-bounded.
+        # An injected http is the caller's AUTHORIZED transport by contract:
+        # it rides to build() verbatim, never re-wrapped (#56).
         # Precedence: build_service (if given) replaces the whole default
         # build and therefore ignores http.
 
@@ -142,16 +148,28 @@ class GmailRestClient:
                 # ignores per-request timeouts, so the bound goes on the
                 # httplib2 transport itself — a half-open TLS read fails as
                 # a socket.timeout (transient) instead of wedging the poll.
+                # #56: build() rejects http+credentials as mutually
+                # exclusive, so we compose the AuthorizedHttp wrapper it
+                # would have applied internally (token refresh keeps working)
+                # and hand build() only the transport; the timeout bound
+                # rides the INNER httplib2 of that wrapper.
                 import httplib2
+                from google_auth_httplib2 import AuthorizedHttp
                 from googleapiclient.discovery import build
 
-                http = self._http or httplib2.Http(timeout=_REQUEST_TIMEOUT_S)
+                http = (
+                    self._http
+                    if self._http is not None
+                    else AuthorizedHttp(
+                        self._credentials,
+                        http=httplib2.Http(timeout=_REQUEST_TIMEOUT_S),
+                    )
+                )
                 self._service = build(
                     "gmail",
                     "v1",
-                    credentials=self._credentials,
-                    cache_discovery=False,
                     http=http,
+                    cache_discovery=False,
                 )
             else:
                 self._service = self._build_service(self._credentials)

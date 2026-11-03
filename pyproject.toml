@@ -17,6 +17,7 @@ classifiers = [
 
 dependencies = [
     "google-api-python-client>=2.201",
+    "google-auth-httplib2>=0.2",  # direct import in gmail_client._svc (#56)
     "google-auth-oauthlib>=1.5",
     "keyring>=25.7",
     "pydantic>=2.14",

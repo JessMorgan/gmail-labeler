@@ -105,8 +105,13 @@ gmail-labeler dataset analyze         # per-label report: counts, recency, dup r
 line with `uv run ` — e.g. `uv run gmail-labeler --help` always works.)
 
 Every command takes `--config PATH`. `dataset export` takes `--query`
-(default `in:anywhere -in:spam -in:trash -in:draft`) and
-`--max-messages` (smoke runs). DRAFT and CHAT are deliberately out of
+(default `in:anywhere -in:spam -in:trash -in:draft`),
+`--max-messages` (smoke runs), and `-v`/`-vv` (opt-in progress on
+STDERR: `-v` one page summary per completed page, `-vv` adds per-message
+outcome lines; a final line is also printed when the loop returns early —
+max-messages bound or page-fetch failure — while an exception abort prints
+nothing extra). stdout and exit codes are unchanged at every level.
+DRAFT and CHAT are deliberately out of
 the API export — with Additive-only + skip-present and the append-only
 corpus, including them would be a permanent one-way door. Exclusion is
 two-layer: the query carries the documented `-in:draft` token, and the

@@ -7,7 +7,11 @@ import pytest
 
 from gmail_labeler.corpus_record import CorpusRecord, body_hash
 from gmail_labeler.corpus_store import CorpusStore
-from gmail_labeler.export import DEFAULT_QUERY, export_corpus
+from gmail_labeler.export import (
+    DEFAULT_QUERY,
+    ProgressSnapshot,
+    export_corpus,
+)
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import classify_status
@@ -605,6 +609,233 @@ def test_logs_never_contain_body_text(
             fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
         )
     assert marker not in caplog.text
+
+
+# ---- #61 progress callbacks (seam: engine on_page/on_message) ----
+# The silence problem: a first-run export of a decade-scale mailbox runs
+# minutes-to-hours with zero output. The fix is opt-in callbacks, not engine
+# I/O (CODING-STANDARDS: pure counts out, adapters print). #62's rich bar
+# consumes the SAME seam.
+
+
+def test_on_page_fires_once_per_completed_page_with_correct_counts(
+    tmp_path: Path,
+) -> None:
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id=f"5{i:02x}", eml=_eml(f"M{i}")) for i in range(5)],
+        page_size=2,
+    )
+    snaps: list[ProgressSnapshot] = []
+    stats = export_corpus(
+        fake, store_at(tmp_path), id_to_name=NAMES, on_page=snaps.append
+    )
+    # three pages of 2+2+1: exactly one snapshot per completed page,
+    # counts monotonic and exact at each fire
+    scanned = [s.scanned for s in snaps]
+    assert scanned == [2, 4, 5]
+    assert [s.written for s in snaps] == [2, 4, 5]
+    final = snaps[-1]
+    assert (
+        final.scanned,
+        final.written,
+        final.skipped_present,
+        final.skipped_draft_chat,
+        final.retried,
+        final.failed_count,
+    ) == (
+        stats.scanned,
+        stats.written,
+        stats.skipped_present,
+        stats.skipped_draft_chat,
+        stats.retried,
+        len(stats.failed),
+    )
+
+
+def test_on_message_events_match_outcome_classes_exactly(
+    tmp_path: Path,
+) -> None:
+    # outcome vocabulary mirrors the loop's branches (#61): 'written',
+    # 'present' (skip-present), 'policy_skip' (DRAFT/CHAT ingest layer),
+    # 'failed'. One fixture row per class, asserted EXACTLY (ids + order):
+    # a silent class swap must not survive.
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+
+    store = store_at(tmp_path)
+    store.put(
+        CorpusRecord(
+            id="b0b",
+            date=datetime(2026, 7, 15, tzinfo=UTC),
+            subject="x",
+            sender="a@b.c",
+            recipients=("m@x.y",),
+            labels=("Shipping",),
+            body_hash=body_hash("seeded"),
+            source="api",
+            date_provenance="internal_date",
+        ),
+        "seeded",
+    )
+
+    class OneFailing(FakeGmailClient):
+        def get_message(self, message_id: str):  # type: ignore[no-untyped-def]
+            if message_id == "fee":
+                raise classify_status(404)  # permanent: record-and-continue
+            return super().get_message(message_id)
+
+    fake = OneFailing(
+        messages=[
+            FakeMessage(id="AAA", eml=_eml("A")),  # uppercase stub: the
+            # event must carry the normalized (store-key) id, #61 fix round
+            FakeMessage(id="b0b", eml=_eml("P")),  # already in the store
+            FakeMessage(id="dad", eml=_eml("D"), label_ids=("INBOX", "DRAFT")),
+            FakeMessage(id="fee", eml=_eml("F")),
+        ]
+    )
+    events: list[tuple[str, str]] = []
+    stats = export_corpus(
+        fake,
+        store,
+        id_to_name=NAMES,
+        sleeper=lambda s: None,
+        on_message=lambda mid, outcome: events.append((mid, outcome)),
+    )
+    assert events == [
+        ("aaa", "written"),
+        ("b0b", "present"),  # has()-pre-check skip
+        ("dad", "policy_skip"),
+        ("fee", "failed"),
+    ]
+    assert stats.scanned == 4 and stats.written == 1
+    assert stats.skipped_present == 1 and stats.skipped_draft_chat == 1
+    assert [fid for fid, _ in stats.failed] == ["fee"]
+
+
+def test_bound_hit_fires_exactly_one_final_page_snapshot(tmp_path: Path) -> None:
+    # the bound return is NOT a completed page, but the operator must still
+    # see final counts before the summary (#61): exactly one snapshot at the
+    # bound, none after — a second fire would double-count under #62's bar
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id=f"5{i:02x}", eml=_eml(f"M{i}")) for i in range(5)],
+        page_size=2,
+    )
+    snaps: list[ProgressSnapshot] = []
+    stats = export_corpus(
+        fake,
+        store_at(tmp_path),
+        id_to_name=NAMES,
+        max_messages=3,
+        on_page=snaps.append,
+    )
+    assert [s.scanned for s in snaps] == [2, 3]  # page 1 done, then bound
+    assert snaps[-1].written == stats.written == 3
+
+
+def test_page_fetch_failure_return_fires_final_snapshot(tmp_path: Path) -> None:
+    # the '<page>' sentinel return must carry the failed count to the
+    # operator too (#61): the run stopped early, the last line says so
+    fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
+    fake.fail("list_messages", classify_status(503))
+    snaps: list[ProgressSnapshot] = []
+    stats = export_corpus(
+        fake,
+        store_at(tmp_path),
+        id_to_name=NAMES,
+        max_attempts=1,
+        sleeper=lambda s: None,
+        on_page=snaps.append,
+    )
+    assert len(snaps) == 1
+    assert snaps[0].scanned == 0
+    assert snaps[0].failed_count == 1  # the <page> sentinel, counted
+    assert len(stats.failed) == 1
+
+
+def test_concurrent_present_fires_present_event_and_count(tmp_path: Path) -> None:
+    # 'present' has TWO sources (#61 vocabulary): the has()-pre-check and a
+    # record appearing between the check and put() (crash-retry race). The
+    # fake store reproduces the race: has() says no, put() reports present.
+    # Mutation pin: dropping the elif-present branch leaves the count at 0.
+    from gmail_labeler.corpus_store import CorpusStore
+
+    class RacyStore(CorpusStore):
+        def has(self, message_id: str) -> bool:
+            return False  # pre-check always misses
+
+        def put(self, record: object, body: str) -> bool:
+            return False  # ... but the row is there by write time
+
+    fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
+    events: list[tuple[str, str]] = []
+    stats = export_corpus(
+        fake,
+        RacyStore(tmp_path / "corpus"),
+        id_to_name=NAMES,
+        on_message=lambda mid, outcome: events.append((mid, outcome)),
+    )
+    assert events == [("aaa", "present")]
+    assert stats.skipped_present == 1 and stats.written == 0
+
+
+def test_noop_run_fires_nothing(tmp_path: Path) -> None:
+    # max_messages<=0 is an explicit no-op: no page was scanned, no failure
+    # happened — firing a zero snapshot would make #62's bar render a phantom
+    # completed page (#61 design: the ONE path that stays silent)
+    fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
+    fires: list[object] = []
+    stats = export_corpus(
+        fake,
+        store_at(tmp_path),
+        id_to_name=NAMES,
+        max_messages=0,
+        on_page=fires.append,
+        on_message=lambda mid, outcome: fires.append((mid, outcome)),
+    )
+    assert fires == []
+    assert stats.scanned == 0
+
+
+def test_progress_snapshot_is_frozen() -> None:
+    # callbacks cannot mutate the run's accounting (#61): the value object
+    # refuses assignment, so a renderer bug corrupts its own printout only
+    import dataclasses
+
+    snap = ProgressSnapshot(
+        scanned=1,
+        written=1,
+        skipped_present=0,
+        skipped_draft_chat=0,
+        retried=0,
+        failed_count=0,
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snap.scanned = 99  # type: ignore[misc]
+    # slots=True is part of the contract too (deepseek fix round: removing
+    # it is otherwise suite-green): no per-instance attribute dict
+    assert hasattr(ProgressSnapshot, "__slots__")
+    assert not hasattr(snap, "__dict__")
+
+
+def test_raising_progress_callback_propagates(tmp_path: Path) -> None:
+    # fail-loud posture, pinned (#61): the engine does NOT catch callback
+    # exceptions. A broken progress renderer is a defect to surface — and
+    # resume is structural, so the stopped run is simply re-run. Wrapping
+    # either call in try/except would silently swallow operator blindness.
+    fake = FakeGmailClient(messages=[FakeMessage(id="aaa", eml=_eml())])
+
+    def boom_page(snap: ProgressSnapshot) -> None:
+        raise RuntimeError("page renderer died")
+
+    with pytest.raises(RuntimeError, match="page renderer died"):
+        export_corpus(fake, store_at(tmp_path), id_to_name=NAMES, on_page=boom_page)
+
+    def boom_message(message_id: str, outcome: str) -> None:
+        raise RuntimeError("message renderer died")
+
+    with pytest.raises(RuntimeError, match="message renderer died"):
+        export_corpus(
+            fake, store_at(tmp_path / "c2"), id_to_name=NAMES, on_message=boom_message
+        )
 
 
 def test_empty_body_is_a_deliberate_record(tmp_path: Path) -> None:

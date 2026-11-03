@@ -13,7 +13,9 @@ to land.
 - `CODING-STANDARDS.md` is enforced by CI (ruff, pyright, pytest with the
   coverage gate). `GLOSSARY.md` terms are the code's terms — new domain
   concepts land in the glossary in the same PR.
-- Tests fake the Gmail API; do not add live-API tests to CI.
+- Tests fake the Gmail API's responses; structural offline request-shape
+  tests against the bundled static discovery doc are sanctioned (see
+  `CODING-STANDARDS.md`, §Tests); live-API tests stay out of CI.
 
 ## License
 

@@ -65,8 +65,12 @@ deterministic, never string-matched at call sites.
 Test-first at the seams (see the project-local `tdd` skill). The Gmail API is
 **always faked** — a `FakeGmailClient` behind the same `Protocol` powers unit
 and integration tests alike; live-API tests carry a `--live` opt-in marker and
-never run in CI. GYB layout parsing and the corpus transform are golden-tested
-on fixture trees. Coverage: 80% overall gate, ~90% held on the pure core.
+never run in CI. The one exception that lives in CI is structural: a test may
+construct the real discovery-derived request objects offline — the static
+bundled doc, never `.execute()` — to pin request paths and params; execution
+stays fake-only, so invariant #9 is untouched. GYB layout parsing and the
+corpus transform are golden-tested on fixture trees. Coverage: 80% overall
+gate, ~90% held on the pure core.
 Model-load tests run on a tiny stub checkpoint, never a real download.
 
 ## Git and docs

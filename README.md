@@ -61,14 +61,43 @@ you would.
 4. **Run** — the daemon polls the Gmail History API (~30 s), classifies
    new messages in-process, and applies graduated labels with Tier
    Labels — additive only, already-present labels never touched. Your
-   manual corrections are captured as training signal for the next
-   round (Phase 2, landing).
+   manual corrections are captured to the local state DB (#27); folding
+   them into the next training round is the human-gated step, not an
+   automatic one (ADR-0005).
 
 ## Setup
 
 Every user brings their own GCP project and desktop-app OAuth client
 (ADR-0004) — roughly 15 minutes in Google's console, nothing shared with
 us.
+
+**Run the guided wizard.** It walks you through the console steps, verifies
+what it *can* check on your machine (the client file exists, parses, and is a
+*desktop*-type client), wires `config.toml` and the token store, and finishes
+by signing you in:
+
+```sh
+gmail-labeler auth setup
+```
+
+Running plain `gmail-labeler auth` on a terminal with no credentials yet offers
+the same wizard. It is honest about its limits: it **cannot** check from your
+machine whether the Gmail API is enabled or the consent screen is set to *In
+production*. Signing in proves the OAuth client and your consent; the first
+Gmail call (e.g. `dataset export`) is what proves the API is enabled; and a
+token still working after 7 days proves *In production* mode — none of which it
+can verify up front. It never asks for your token; the refresh token goes to
+your OS keyring (or a 0600 file when no keyring backend exists) via the existing
+`auth login` flow.
+
+`auth setup` is also the ONE command where a lost output channel is a cancel:
+if its stdout/stderr is a dead pipe (`gmail-labeler auth setup | head`) or is
+closed (`>&-`), it exits `130` exactly like a Ctrl-C, with the diagnosis on
+whichever stream survives. Every other command lets typer's default path turn
+that same early-closed pipe into an exit `1`.
+
+<details>
+<summary>Manual setup — the same steps, if you'd rather drive them yourself</summary>
 
 1. Create a project in [Google Cloud Console](https://console.cloud.google.com/)
    and enable the **Gmail API** in it.
@@ -88,6 +117,8 @@ us.
    token lands in your OS keyring (set `token_backend = "file"` on headless
    boxes — see [example.toml](example.toml)).
 6. `gmail-labeler auth` should report `SIGNED IN`.
+
+</details>
 
 The token grants one scope (`gmail.modify`); token values never appear in
 logs, config, or the corpus.
@@ -113,7 +144,8 @@ land without a keyring.
 ## CLI
 
 ```sh
-gmail-labeler auth                    # credential status
+gmail-labeler auth                    # credential status (offers the wizard if unsigned)
+gmail-labeler auth setup              # guided ADR-0004 onboarding (GCP project + OAuth client)
 gmail-labeler auth login              # one-time desktop OAuth consent flow
 gmail-labeler dataset export          # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
@@ -384,13 +416,18 @@ gmail-labeler shadow report
 ```
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
-auth/config unusable · `5` operation failed or incomplete. `status` and
+auth/config unusable · `5` operation failed or incomplete · `130`
+cancelled with Ctrl-C. `130` is typer's app-wide Ctrl-C mapping and applies
+to every command EXCEPT `daemon`, which traps Ctrl-C (and SIGTERM) for a
+graceful exit 0. `status` and
 `corrections export` are wired (ticket #27) and read the local state DB
 only — no Gmail call, no auth gate, so they answer on a sick or offline
 mailbox (`status` uses 0/2/4/5; `3` stays reserved for wired-but-stubbed
 commands and is currently unreachable).
-Scripts can branch on 0/2/4/5 today; a `1` means an unhandled crash —
-that's a bug, please report it.
+Scripts can branch on 0/2/4/5 (and `130` on Ctrl-C) today; a `1` means an
+unhandled crash, or a non-`auth setup` command whose output was closed
+early (a broken pipe like `| head`) — typer's default path, which only
+`auth setup` overrides to `130` (see Setup).
 
 ### Running the daemon (Phase 2)
 
@@ -403,9 +440,10 @@ carries the umbrella Tier Label plus its best band tier, additive-only
 (`addLabelIds` is the only write the product ever performs), and an
 already-present label is never re-applied (skip-present). The Phase 2
 posture: **high-band labels apply silently; work the `ai-med` queue**
-— the med tier is the review-me band, and your manual corrections on
-applied mail become the next retrain's signal (correction capture is a
-later Phase 2 ticket).
+— the med tier is the review-me band, and the daemon captures your manual
+corrections on applied mail to the local state DB as the next retrain's
+candidate signal (capture landed in #27; folding them in and retraining is
+the deferred human-gated step — see *Watching it work* and ADR-0005).
 
 Startup runs the identity gates FIRST, exactly like `shadow run`: the
 state DB is validated fail-fast, then the checkpoint, the Bands

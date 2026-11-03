@@ -150,11 +150,25 @@ Scope:
   builder's fold seam ships as a pure function but is NOT wired into a
   retrain — folding the dump into the corpus and retraining is the deferred
   human step (no auto-retrain; the human gate holds);
-- the `auth` wizard (ADR-0004) — ships in Phase 0's spirit but is
-  scheduled in Phase 2 (it is onboarding polish, not a gate to training).
+- the `auth` wizard (ADR-0004) — LANDED (#28): `auth setup` walks the console
+  steps, verifies locally what it can (client file exists / parses / is
+  desktop-type), wires the config + token store, and COMPOSES the existing
+  `auth login` loopback flow to sign in; a bare `auth` with no credentials
+  offers it on a terminal (in a script it stays exit 4, naming it — the brief's
+  exit-5 detour was corrected to preserve the contract). Onboarding
+  polish, not a gate to training.
 
 **Exit:** high-band labels apply silently; the user works the `ai-med`
 queue.
+
+**Phase-1 stack — user-facing loop complete (#27 + #28, 2026-11):** with
+Correction capture + `status` (#27) and the auth-onboarding wizard (#28) landed,
+every user-facing command of the Phase-1/Phase-2 loop now exists end to end —
+onboard (`auth setup`) → acquire (`dataset export`/`import-gyb`/`analyze`) →
+train → eval (bands/graduation) → `shadow` → `apply` → the daemon capturing
+Corrections → `status`/`corrections export`. What remains is the deferred human
+retrain step (fold the Corrections dump back in; no auto-retrain, ADR-0005) and
+the explicitly-parked Phase 3.
 
 ## Phase 3 — deferred (explicitly parked)
 

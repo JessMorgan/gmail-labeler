@@ -19,9 +19,10 @@ its phase lands.
 - ADR-0003 Gmail History-API polling (default 30s) is the sync spine; Pub/Sub
   push is a deferred trigger, not a redesign.
 - ADR-0004 each user brings their own GCP project + desktop OAuth client
-  (production mode, not testing); the README Setup section
-  guides today's flow — the interactive `auth` wizard ADR-0004 sketches is not
-  built yet (see its status note).
+  (production mode, not testing); the wizard SHIPS as `auth setup` (ticket #28)
+  and the README Setup section is wizard-first with a manual fallback. The
+  "docs-only repo" framing and the planned-CLI list elsewhere in this file are
+  pre-existing staleness owned by issue #42 — deliberately left untouched here.
 - ADR-0005 additive-only writes; Shadow Pass until per-label Graduation;
   human-gated retrain/threshold changes.
 

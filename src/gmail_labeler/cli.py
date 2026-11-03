@@ -45,12 +45,14 @@ if TYPE_CHECKING:
     from .gmail_client import GmailClient
     from .graduation import GraduationTable
     from .thresholds import BandsArtifact
+    from .wizard import ClientFileState, Prompt
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
     epilog=(
         "Exit codes: 0 ok · 2 usage error · 3 not implemented · "
-        "4 auth/config unusable · 5 operation failed or incomplete"
+        "4 auth/config unusable · 5 operation failed or incomplete · "
+        "130 cancelled (Ctrl-C)"
     ),
     no_args_is_help=True,
 )
@@ -67,6 +69,13 @@ corrections_app = typer.Typer(
 app.add_typer(corrections_app, name="corrections")
 
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
+_INCOMPLETE_EXIT = 5  # operation failed or incomplete (write/declined/export)
+# Ctrl-C at a prompt exits 130 — the SAME code typer already uses for a raw
+# KeyboardInterrupt (`except KeyboardInterrupt: raise Exit(130)`), so the whole
+# CLI signals "cancelled by signal" identically. (typer's prompt/confirm would
+# otherwise downgrade a prompt-cancel to Abort→exit 1; the wizard maps it back
+# to 130 — see _typer_ask/_typer_confirm.)
+_CANCEL_EXIT = 130
 # (typer requires concrete annotations: str | None, not Any)
 
 
@@ -75,17 +84,86 @@ def auth_status(
     ctx: typer.Context,
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
-    """Report credential status; `auth login` runs the consent flow."""
+    """Report credential status; `auth login` runs the consent flow, `auth
+    setup` the guided ADR-0004 onboarding."""
     if ctx.invoked_subcommand is not None:
         return
     from .auth import status as _status
+    from .config import ConfigError, load_config
 
-    cfg = _load_config(config)
-    st = _status(cfg)
-    state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
-    typer.echo(f"auth: {state} ({st.backend}) — {st.detail}")
-    if not st.signed_in:
+    # A MISSING config (fresh profile) is "no credentials", not a hard error —
+    # the wizard is the answer. An EXPLICIT --config that is broken stays a
+    # config error (exit 4): the user pointed at a bad path, not a fresh box.
+    if config is not None:
+        try:
+            cfg = load_config(config)
+        except ConfigError as e:
+            typer.echo(f"config error: {e}", err=True)
+            raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
+    else:
+        # No explicit --config: distinguish "no config file anywhere" (a fresh
+        # profile → the wizard is the answer) from "a config exists but is
+        # invalid" (a real config error → exit 4, the message preserved). A
+        # bare `except ConfigError: cfg=None` would conflate the two (review
+        # MAJOR 3): a typo'd ./config.toml must NOT be reported as "no config".
+        from .config import find_config
+
+        try:
+            found = find_config()
+        except ConfigError:
+            cfg = None  # genuinely nothing found → fresh profile
+        else:
+            try:
+                cfg = load_config(str(found))
+            except ConfigError as e:
+                typer.echo(f"config error: {e}", err=True)
+                raise typer.Exit(code=_AUTH_ERROR_EXIT) from e
+    if cfg is None:
+        # B7: the informative hint (looked-in paths + copy-example.toml) that
+        # the C2-era rewrite silently dropped — restored; exit stays 4 (F1).
+        typer.echo(
+            "auth: NOT SIGNED IN — no config.toml found (looked in ./ and "
+            "~/.config/gmail-labeler/); copy example.toml and edit, or run "
+            "`gmail-labeler auth setup` to create one."
+        )
+    else:
+        st = _status(cfg)
+        state = "SIGNED IN" if st.signed_in else "NOT SIGNED IN"
+        typer.echo(f"auth: {state} ({st.backend}) — {st.detail}")
+        if st.signed_in:
+            return  # signed in: bare `auth` keeps its status meaning, exit 0
+    # No credentials → the wizard ENTRY-POINT decision. Interactive only on a
+    # real terminal; a script must never half-prompt.
+    if _stdin_is_tty():
+        typer.echo(
+            "Not signed in. Starting the guided setup (ADR-0004) — about 15 "
+            "minutes in the Google console, nothing shared with the maintainer."
+        )
+        _run_setup_wizard(config)
+    else:
+        # F1 (brief corrected at source): an unsigned non-TTY `auth` is an
+        # AUTH-STATE, not an operation failure — it stays exit 4 (auth/config
+        # unusable), the contract scripts have always branched on. The
+        # wizard-entry NAMING stays (it names `auth setup`); only the code is
+        # 4, not 5.
+        typer.echo(
+            "Not signed in and stdin is not a terminal — run "
+            "`gmail-labeler auth setup` interactively.",
+            err=True,
+        )
         raise typer.Exit(code=_AUTH_ERROR_EXIT)
+
+
+@auth_app.command("setup")
+def auth_setup(
+    config: str | None = typer.Option(
+        None, "--config", help="Where to WRITE config.toml (default: ./config.toml)"
+    ),
+) -> None:
+    """Guided ADR-0004 onboarding: create your own GCP project + desktop OAuth
+    client and wire the token store, then sign in. Interactive (a TTY); it
+    COMPOSES the existing `auth login` flow rather than forking it."""
+    _run_setup_wizard(config)
 
 
 @auth_app.command("login")
@@ -106,6 +184,293 @@ def auth_login(
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
     typer.echo("auth: signed in, refresh token stored")
+
+
+# --- auth-setup wizard wiring (the CLI side of the pure machine) -------------
+def _stdin_is_tty() -> bool:
+    """Whether bare `auth` may auto-launch the wizard. Kept as a tiny seam so
+    the tests can drive both the interactive and the script path without a
+    controlling terminal."""
+    import sys
+
+    return sys.stdin.isatty()
+
+
+def _project_id_shape_ok(pid: str) -> bool:
+    """GCP project-id SHAPE only (a paste-error guard): 6-30 chars, lowercase
+    letters/digits/hyphens, starting with a letter. The project's EXISTENCE and
+    API enablement are not locally checkable — the wizard says so, never fakes
+    a check."""
+    import re
+
+    return re.fullmatch(r"[a-z][a-z0-9-]{5,29}", pid) is not None
+
+
+class _RealEnvironmentProbe:
+    """The filesystem/keyring facts the wizard may check LOCALLY. Returns
+    verdicts only — never file contents — so secret material cannot reach the
+    pure machine (invariant #8)."""
+
+    def client_file_state(self, path: str) -> ClientFileState:
+        from .wizard import ClientFileState
+
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return ClientFileState.MISSING
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return ClientFileState.MALFORMED
+        if not isinstance(data, dict) or not isinstance(data.get("installed"), dict):
+            return ClientFileState.NOT_DESKTOP  # e.g. a "web" wrapper
+        inst = data["installed"]
+        if not inst.get("client_id") or not inst.get("client_secret"):
+            return ClientFileState.MALFORMED
+        return ClientFileState.DESKTOP_OK
+
+    def project_id_shape_ok(self, pid: str) -> bool:
+        return _project_id_shape_ok(pid)
+
+    def keyring_available(self) -> bool:
+        # reuse the existing keyring posture (tokens.py) — a working backend
+        # answers, a headless box raises TokenStoreError.
+        from .tokens import KeyringStore, TokenStoreError
+
+        try:
+            KeyringStore().probe()
+        except TokenStoreError:
+            return False
+        return True
+
+    def config_target_exists(self, path: Path) -> bool:
+        # resolve()-compare posture, stated: existence is a resolved-path
+        # compare; the samefile/fd caution family is issue #47's scope.
+        try:
+            return Path(path).expanduser().resolve().exists()
+        except OSError:
+            return False
+
+
+def _typer_ask(prompt: Prompt) -> str:
+    from typer.exceptions import Abort
+
+    from .wizard import WizardCancelled
+
+    try:
+        return typer.prompt(prompt.text)
+    except (Abort, KeyboardInterrupt, EOFError):
+        raise WizardCancelled from None
+
+
+def _typer_confirm(text: str) -> bool:
+    from typer.exceptions import Abort
+
+    from .wizard import WizardCancelled
+
+    try:
+        # default=False: an overwrite is never the accidental Enter key.
+        return typer.confirm(text, default=False)
+    except (Abort, KeyboardInterrupt, EOFError):
+        raise WizardCancelled from None
+
+
+def _write_config_toml(target: Path, cfg: Config) -> None:
+    """Write a minimal config.toml carrying ONLY the gmail wiring (paths). No
+    secret values, ever (invariant #8). Absolute paths so the record is
+    unambiguous regardless of the later cwd."""
+    cred = cfg.gmail.credentials_path
+    cred_s = str(cred.expanduser().resolve()) if cred is not None else ""
+    body = (
+        "# gmail-labeler configuration — written by `auth setup` (ADR-0004).\n"
+        "# Secrets are paths only — never tokens, never inline values.\n"
+        "[gmail]\n"
+        f"credentials_path = {json.dumps(cred_s)}\n"
+        f"token_backend = {json.dumps(cfg.gmail.token_backend)}\n"
+        f"token_file = {json.dumps(str(cfg.gmail.token_file.expanduser()))}\n"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # atomic write: temp in the same dir, fsync, then replace — a torn config
+    # would break every later command (the durability the comment promises,
+    # matching FileTokenStore.save). The config is paths-only (invariant #8), so
+    # it is mode 0644 like example.toml — NOT the 0600 a token file needs. An
+    # OSError here (parent is a file, read-only dir, …) propagates and the
+    # wizard's write_config catch turns it into a write-error outcome (exit 5) —
+    # never a raw traceback (exit 1).
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _setup_config_target(config: str | None) -> Path:
+    from .config import ConfigError, find_config
+
+    if config is not None:
+        return Path(config).expanduser()
+    try:
+        return find_config()
+    except ConfigError:
+        return Path.cwd() / "config.toml"
+
+
+def _echo_out(text: str) -> None:
+    """The wizard's output sink — a named seam so tests can simulate a closed
+    stdout (BrokenPipeError) without patching typer globally.
+
+    The explicit flush is belt-and-suspenders: click.echo already flushes, so a
+    `| head` break fires in-run here (a mutant removing this flush SURVIVED — the
+    load-bearing boundary fix is _silence_output, not the flush). The None guard
+    covers `>&-`, where sys.stdout is None and .flush() would raise AttributeError."""
+    import sys
+
+    typer.echo(text)
+    if sys.stdout is not None:  # `>&-` leaves sys.stdout as None
+        sys.stdout.flush()
+
+
+def _silence_output() -> None:
+    """Retarget the real stdout (fd 1) / stderr (fd 2) descriptors at /dev/null so
+    the interpreter's shutdown flush of either can neither fail (BrokenPipeError ->
+    exit 120) nor print, before a cancel/incomplete Exit — including the merged
+    `auth setup 2>&1 | head` case where stderr SHARES the dead pipe and a diagnosis
+    echo to fd 2 would otherwise EPIPE out of the handler (exit 1).
+
+    It is guarded on fileno(): the retarget is only correct for the REAL fd 1/2.
+    Under the in-process CliRunner sys.stdout is a BytesIO/StringIO whose fileno()
+    RAISES, so the except branch skips it — a deliberate NO-OP (the exit code is
+    captured directly and there is no interpreter shutdown to break; a hardcoded
+    dup2(…, 1/2) would clobber the test process's own stdout/stderr for the rest of
+    the run). In the real subprocess (a pipe/terminal on fd 1/2) both are retargeted.
+
+    The `fd != want` arm below is forward-defence for a harness that hands us a
+    stream wrapping a real pipe fd that is NOT 1/2; it is UNREACHABLE in the current
+    test matrix (verified: no node reaches it — CliRunner's stream raises on fileno,
+    the subprocess streams report exactly 1/2). A stream reporting an fd that is
+    itself already closed (a stale-fd dup, which could leave a shutdown-flush exit
+    120) is likewise not reachable from this entry point — Python binds
+    sys.stdout/stderr to None when fd 1/2 is closed at startup — so no extra guard."""
+    import sys
+
+    for stream, want in ((sys.stdout, 1), (sys.stderr, 2)):
+        try:
+            fd = stream.fileno()  # None -> AttributeError; BytesIO -> ValueError
+        except (AttributeError, OSError, ValueError):
+            continue
+        if fd != want:
+            # Forward-defence for a stream wrapping a real pipe fd that is not 1/2.
+            # UNREACHABLE in the current matrix (CliRunner raises on fileno; the
+            # subprocess streams report exactly 1/2) — kept so a future redirected-fd
+            # harness cannot trip a real-fd clobber.
+            continue
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, fd)
+            os.close(devnull)
+
+
+def _echo_err(text: str) -> None:
+    """Write a diagnosis to stderr, tolerating a closed/broken stderr. In the
+    merged `2>&1 | head` case fd 2 IS the dead pipe, so the write raises
+    BrokenPipeError; letting it escape would turn the intended exit code into 1.
+    If the channel is gone the user cannot see the line anyway."""
+    import sys
+
+    if sys.stderr is None:  # `2>&-`: no stderr channel at all
+        return
+    with contextlib.suppress(BrokenPipeError):
+        typer.echo(text, err=True)
+
+
+def _run_setup_wizard(config: str | None) -> None:
+    """Wire the real I/O + the real auth.login/status/config-writer into the
+    pure machine, then map its outcome onto the CLI exit contract."""
+    import sys
+
+    from .auth import login as _login
+    from .auth import status as _status
+    from .wizard import WizardCancelled, WizardIO, run_wizard
+
+    if sys.stdout is None:
+        # `auth setup >&-`: fd 1 was closed at startup, so sys.stdout is None and
+        # the wizard has no channel to display on. One-line stderr diagnosis, then
+        # the cancel-class 130 — the same "output channel gone" abort as a closed
+        # pipe (F3 MINOR: previously this crashed with a traceback -> exit 1).
+        _echo_err(
+            "setup: stdout is unavailable (closed); the interactive wizard cannot run."
+        )
+        _silence_output()
+        raise typer.Exit(code=_CANCEL_EXIT)
+
+    target = _setup_config_target(config)
+    io = WizardIO(ask=_typer_ask, confirm=_typer_confirm, out=_echo_out)
+    try:
+        result = run_wizard(
+            probe=_RealEnvironmentProbe(),
+            io=io,
+            login=_login,
+            status=_status,
+            write_config=_write_config_toml,
+            config_target=target,
+        )
+    except WizardCancelled:
+        # The diagnosis goes to STDERR, which in the merged `2>&1 | head` case is
+        # the SAME dead pipe — so the echo must be BrokenPipe-safe (_echo_err) and
+        # both fds silenced before the Exit, or the write(2, "setup cancelled.")
+        # EPIPEs out of this handler and the process exits 1 (F3 round-2 MAJOR:
+        # the closed set must hold at the boundary even when stderr shares the pipe).
+        _echo_err("setup cancelled.")
+        _silence_output()
+        raise typer.Exit(code=_CANCEL_EXIT) from None
+    except BrokenPipeError:
+        # stdout closed mid-run (`auth setup | head`): the pipe is gone. Redirect
+        # BOTH output fds to devnull so neither the shutdown flush nor a later
+        # stderr write can fail — otherwise the intended 130 becomes 120/1 (F3
+        # MAJOR: the code must be true at the PROCESS boundary, not just in-
+        # process). NOT a config-write failure (that is caught machine-side).
+        #
+        # The `>&-` case (fd 1 CLOSED, not a pipe) is handled earlier by the
+        # `sys.stdout is None` guard, which fires before any prompt; a `try/
+        # except RuntimeError` around the run would be unreachable there (proven:
+        # typer.echo does not raise on a None stdout, and typer.prompt's
+        # "lost sys.stdout" is pre-empted by that guard), so it is deliberately
+        # NOT added — no dead code, no fragile message matching.
+        _silence_output()
+        raise typer.Exit(code=_CANCEL_EXIT) from None
+    # Explicit elif chain with a loud else: a new Outcome literal must NOT
+    # silently fall through to exit 5 (F3-4c — fail loudly on unmapped outcomes).
+    # Every non-zero Exit routes through _silence_output so the closed set holds at
+    # the boundary uniformly (a no-op under CliRunner; a real retarget in the
+    # subprocess). The echo-free arms below write nothing, but silencing keeps the
+    # invariant "every non-zero Exit retargets both fds" true by construction.
+    if result.outcome == "completed" and result.signed_in:
+        return  # exit 0
+    elif result.outcome == "completed":
+        _silence_output()
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — finished but NOT signed in
+    elif result.outcome == "failed":
+        _silence_output()
+        raise typer.Exit(code=_AUTH_ERROR_EXIT)  # 4 — sign-in did not complete
+    elif result.outcome == "write-error":
+        _echo_err(f"setup: {result.detail}")
+        _silence_output()
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — could not write the config
+    elif result.outcome == "status-error":
+        _echo_err(f"setup: {result.detail}")
+        _silence_output()
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — the sign-in check crashed
+    elif result.outcome == "aborted":
+        _silence_output()
+        raise typer.Exit(code=_INCOMPLETE_EXIT)  # 5 — declined / capped
+    else:
+        raise AssertionError(f"unmapped wizard outcome: {result.outcome!r}")
 
 
 def _write_secret_tight(path: Path, text: str) -> None:

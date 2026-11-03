@@ -362,6 +362,352 @@ def test_export_filters_exhaustion_message(
     assert "filter snapshot unavailable after retries" in result.stderr
 
 
+# ---- #61 opt-in export progress (-v/-vv, stderr seam) ----
+
+
+def _progress_fake():  # FakeGmailClient imported locally below (file style)
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    return FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+            ),
+            FakeMessage(
+                id="bbb",
+                eml=b"Subject: y\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+            ),
+        ],
+        page_size=1,  # two pages: the page-summary cadence is observable
+    )
+
+
+_PROGRESS_SUMMARY = (
+    "export: scanned=2 written=2 skipped_present=0 skipped_draft_chat=0 "
+    "retried=0 failed=0\n"
+)
+
+
+def test_export_default_run_emits_no_progress_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the byte-identical pin (#61): level 0 wires NOTHING — stdout is the
+    # unchanged summary, stderr stays empty exactly as before the feature
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: _progress_fake())
+    result = runner.invoke(
+        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert result.stdout == _PROGRESS_SUMMARY
+    assert result.stderr == ""
+
+
+def test_export_verbose_emits_page_summaries_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # -v: one page line per completed page, in order, on STDERR; the stdout
+    # summary and exit code are UNCHANGED (scripts parse stdout)
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: _progress_fake())
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout == _PROGRESS_SUMMARY
+    assert result.stderr.splitlines() == [
+        "export: page scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=0",
+        "export: page scanned=2 written=2 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=0",
+    ]
+
+
+def test_export_verbose2_adds_per_message_outcome_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # -vv: message lines interleave BEFORE their page line (the per-stub
+    # event precedes the page completion) — exact order pinned
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: _progress_fake())
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-vv"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout == _PROGRESS_SUMMARY
+    assert result.stderr.splitlines() == [
+        "export: aaa written",
+        "export: page scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=0",
+        "export: bbb written",
+        "export: page scanned=2 written=2 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=0",
+    ]
+
+
+def test_export_verbose_page_line_counts_bootstrap_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # deepseek r1 MINOR: the summary merges fetch_settings retries; the
+    # LAST -v line must agree with it, not show a smaller retried=
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+    from gmail_labeler.gmail_errors import classify_status
+
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+            )
+        ],
+        page_size=1,
+    )
+    fake.fail("list_filters", classify_status(503))  # one bootstrap blip
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code == 0
+    assert result.stderr.splitlines() == [
+        "export: page scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=1 failed=0",
+    ]
+    assert (
+        result.stdout == "export: scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=1 failed=0\n"
+    )
+
+
+def test_export_verbose_survives_broken_progress_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # EPIPE on the progress channel must not kill the run (#61 fix round,
+    # deepseek-measured): `dataset export -v 2>&1 | head` used to die in
+    # typer.echo -> silent exit 1, no summary — breaking the "exit codes
+    # unchanged at every level" promise AND the callbacks-must-not-raise
+    # contract, whose satisfaction is the ADAPTER's duty. One failure closes
+    # the channel permanently: no repeated attempts, no spam, no traceback,
+    # the engine runs to its typed outcome. Seam: typer.echo swapped for a
+    # stderr-write stand-in that always raises BrokenPipeError.
+    from typing import Any
+
+    import typer as _typer
+
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: _progress_fake())
+    real_echo = _typer.echo
+    attempts: list[str] = []
+
+    def boom_echo(message: object = None, **kw: Any) -> None:
+        if kw.get("err"):
+            attempts.append(str(message))
+            raise BrokenPipeError(32, "EPIPE")
+        real_echo(message, **kw)
+
+    monkeypatch.setattr(_typer, "echo", boom_echo)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-vv"],
+    )
+    assert result.exit_code == 0
+    assert result.stdout == _PROGRESS_SUMMARY
+    # exactly ONE attempt: the first failure closes the channel, later
+    # pages/messages render nothing (no retrying a dead pipe)
+    assert len(attempts) == 1
+
+
+def test_export_verbose_page_line_retried_matches_summary_mixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #61 fix round: the offset math must hold for BOTH retry sources
+    # across pages — one bootstrap blip (fetch_settings) + one in-loop
+    # fetch retry, two pages: every -v line and the stdout summary agree
+    # on retried=2. Mutation pins: dropping the bootstrap offset or the
+    # engine's own retried count each leaves the lines at retried=1.
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+    from gmail_labeler.gmail_errors import classify_status
+
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+            ),
+            FakeMessage(
+                id="bbb",
+                eml=b"Subject: y\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+            ),
+        ],
+        page_size=1,
+    )
+    fake.fail("list_filters", classify_status(503))  # bootstrap source
+    fake.fail("get_message", classify_status(503))  # in-loop source (aaa)
+    monkeypatch.setattr(
+        "gmail_labeler.export.time.sleep", lambda _s: None
+    )  # no real backoff for the two blips
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code == 0
+    assert result.stderr.splitlines() == [
+        "export: page scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=2 failed=0",
+        "export: page scanned=2 written=2 skipped_present=0 "
+        "skipped_draft_chat=0 retried=2 failed=0",
+    ]
+    assert result.stdout == (
+        "export: scanned=2 written=2 skipped_present=0 "
+        "skipped_draft_chat=0 retried=2 failed=0\n"
+    )
+
+
+def test_export_dead_pipe_with_failures_keeps_typed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #61 fix round 2 (deepseek-measured MINOR): the post-run failure LIST
+    # echoed unguarded — dead pipe + one 404-class failure died in
+    # typer.echo with exit 1, falsifying the CHANGELOG's "never the run".
+    # The list rides the same _emit guard: a dead channel stops printing
+    # too, and the exit code stays the TYPED 5 with the stdout summary
+    # intact. Mutation pin: unguarding either echo returns exit 1.
+    from typing import Any
+
+    import typer as _typer
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    fake = FakeGmailClient(
+        # no Date header + no internalDate: 'no authoritative timestamp'
+        messages=[FakeMessage(id="aaa", eml=b"no-date-here")]
+    )
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    real_echo = _typer.echo
+    attempts: list[str] = []
+
+    def boom_echo(message: object = None, **kw: Any) -> None:
+        if kw.get("err"):
+            attempts.append(str(message))
+            raise BrokenPipeError(32, "EPIPE")
+        real_echo(message, **kw)
+
+    monkeypatch.setattr(_typer, "echo", boom_echo)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code == 5  # typed incomplete, NOT an EPIPE death
+    assert result.stdout == (
+        "export: scanned=1 written=0 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=1\n"
+    )
+    # ONE attempt total: the page line closed the channel; the failure
+    # list saw it closed and never touched the dead pipe
+    assert len(attempts) == 1
+
+
+def test_export_dead_pipe_with_overflow_list_keeps_typed_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #61 fix round 3 (deepseek M21): the '... and N more' overflow echo is
+    # part of the failure LIST — bare typer.echo there would die at 1 again
+    # once the channel is closed mid-list. 21 failures exercise the >20
+    # truncation branch AND the overflow line; dead pipe => exit stays 5.
+    # Mutation pin: reverting the overflow echo to bare typer.echo -> exit 1.
+    from typing import Any
+
+    import typer as _typer
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id=f"{i:03x}", eml=b"no-date-here") for i in range(1, 22)]
+    )
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    real_echo = _typer.echo
+    attempts: list[str] = []
+
+    def boom_echo(message: object = None, **kw: Any) -> None:
+        if kw.get("err"):
+            attempts.append(str(message))
+            raise BrokenPipeError(32, "EPIPE")
+        real_echo(message, **kw)
+
+    monkeypatch.setattr(_typer, "echo", boom_echo)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code == 5
+    assert "failed=21" in result.stdout
+    # one attempt (the page line) closes the channel: the 20 list lines
+    # AND the overflow echo never touch the dead pipe
+    assert len(attempts) == 1
+
+
+def test_export_progress_channel_narrowly_guarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # narrowness contract (#61 fix round 2): the guard catches
+    # BrokenPipeError ONLY — any other write error (ENOSPC-ish OSError on
+    # the fd) is a real defect and must propagate fail-loud, not be
+    # swallowed into a silent channel close. Kills the broad
+    # `except OSError` mutant.
+    from typing import Any
+
+    import typer as _typer
+
+    import gmail_labeler.cli as cli
+
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: _progress_fake())
+    real_echo = _typer.echo
+
+    def enospc_echo(message: object = None, **kw: Any) -> None:
+        if kw.get("err"):
+            raise OSError(28, "ENOSPC")
+        real_echo(message, **kw)
+
+    monkeypatch.setattr(_typer, "echo", enospc_echo)
+    result = runner.invoke(
+        app,
+        ["dataset", "export", "--config", str(_export_cfg(tmp_path)), "-v"],
+    )
+    assert result.exit_code != 0  # fail-loud: the run does NOT complete
+    assert isinstance(result.exception, OSError)
+    assert result.exception.errno == 28
+
+
+def test_export_failure_list_ids_are_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #61 fix round 2 NIT: all three surfaces — store keys, -vv events,
+    # the failure LIST — speak the lowercase id (one .lower() at the
+    # _emit site). Mutation pin: dropping it prints 'failed 19F6ABC'.
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    fake = FakeGmailClient(messages=[FakeMessage(id="19F6ABC", eml=b"no-date-here")])
+    monkeypatch.setattr(cli, "_export_client", lambda cfg: fake)
+    result = runner.invoke(
+        app, ["dataset", "export", "--config", str(_export_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "  failed 19f6abc: no authoritative timestamp" in result.stderr
+
+
 def _gyb_fixture(tmp_path: Path) -> Path:
     import sqlite3
 

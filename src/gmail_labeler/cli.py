@@ -25,6 +25,7 @@ AttributionPosture = Literal[
 
 if TYPE_CHECKING:
     from .config import Config
+    from .export import ExportOutcome, ProgressSnapshot  # annotations only
     from .gmail_client import GmailClient
 
 app = typer.Typer(
@@ -133,6 +134,21 @@ def dataset_export(
         min=1,
         help="Stop after scanning N messages (smoke runs)",
     ),
+    verbose: int = typer.Option(
+        0,
+        "--verbose",
+        "-v",
+        count=True,
+        metavar="",  # count option: the inferred <int> metavar would
+        # advertise a value the flag never takes (fix round NIT)
+        help=(
+            "Repeat for more progress on STDERR (no value): -v one page "
+            "summary per completed page, plus one final line when the loop "
+            "returns early (max-messages bound or page-fetch failure); -vv "
+            "adds per-message outcome lines; stdout and exit codes are "
+            "unchanged at every level (ticket #61)"
+        ),
+    ),
 ) -> None:
     """Export labeled mail from the Gmail API into the corpus."""
     from .auth import AuthError
@@ -165,6 +181,52 @@ def dataset_export(
     store.enforce_modes()
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+
+    # Opt-in progress (#61): the engine stays I/O-free and hands frozen
+    # ProgressSnapshots here; ALL printing lives in this adapter. STDERR on
+    # purpose — the stdout summary is a machine-parseable contract at every
+    # level. Level 0 wires nothing (byte-identical default run, pinned).
+    # That byte-identity is exact for a HEALTHY stderr: the deliberate
+    # dead-stderr divergence (typed exit 5 where the base run died at 1)
+    # lives in this channel by choice (#61 fix round 2), not pin scope.
+    #
+    # Callback safety is the ADAPTER's duty (engine contract: callbacks must
+    # not raise): ONE BrokenPipeError — e.g. `dataset export -v 2>&1 | head`
+    # — permanently closes the progress channel (#52's guard-precedence
+    # style: the first failure decides; no repeated attempts against a dead
+    # pipe, no spam, no traceback), the run continues to its typed outcome,
+    # and resume stays structural. Any OTHER callback error stays fail-loud.
+    # The post-run failure LIST shares this channel (fix round 2), so a
+    # dead pipe costs the listing, never the typed exit code.
+    progress_closed = False
+
+    def _emit(line: str) -> None:
+        nonlocal progress_closed
+        if progress_closed:
+            return
+        try:
+            typer.echo(line, err=True)
+        except BrokenPipeError:
+            progress_closed = True
+
+    def _page_line(snap: ProgressSnapshot) -> None:
+        _emit(
+            f"export: page scanned={snap.scanned} written={snap.written} "
+            f"skipped_present={snap.skipped_present} "
+            f"skipped_draft_chat={snap.skipped_draft_chat} "
+            # bootstrap blips happened BEFORE the loop, so the engine's
+            # retried= excludes them while the stdout summary merges them —
+            # offset here so every -v line and the summary share one scale
+            # (deepseek r1 MINOR; both sources pinned in test_cli)
+            f"retried={snap.retried + bootstrap.retried} "
+            f"failed={snap.failed_count}"
+        )
+
+    def _message_line(message_id: str, outcome: ExportOutcome) -> None:
+        _emit(f"export: {message_id} {outcome}")
+
+    on_page = _page_line if verbose >= 1 else None
+    on_message = _message_line if verbose >= 2 else None
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
@@ -174,6 +236,8 @@ def dataset_export(
             id_to_name=id_to_name,
             query=query,
             max_messages=max_messages,
+            on_page=on_page,
+            on_message=on_message,
         )
     except GmailAuthError as e:  # revoked token mid-run: the fix is human
         typer.echo(f"auth: {e}", err=True)
@@ -189,10 +253,14 @@ def dataset_export(
         f"retried={stats.retried} failed={len(stats.failed)}"
     )
     if stats.failed:
+        # the failure list shares the guarded stderr channel (#61 fix
+        # round 2): a dead pipe stops the LIST too, never the typed exit;
+        # ids normalized like the store key and the -vv events so all
+        # three surfaces agree (one .lower() at this site)
         for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
+            _emit(f"  failed {message_id.lower()}: {reason}")
         if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+            _emit(f"  ... and {len(stats.failed) - 20} more")
         raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
 
 

@@ -338,7 +338,7 @@ def test_write_snapshot_fchmod_failure_cleans_up(tmp_path: Path, monkeypatch) ->
         (c for c in ("/proc/self/fd", "/dev/fd") if _os.path.isdir(c)), None
     )  # linux + macos legs both mutation-pin the fd fold; the count is
     # process-global, so it assumes no other thread/plugin opens fds mid-call
-    # (single-process contract — same prior art as test_export.py)
+    # (single-process contract — same prior art as test_gmail_import.py)
     fd_before = len(_os.listdir(fd_cand)) if fd_cand else 0
     with pytest.raises(CorpusError):
         store.write_snapshot("filters.json", "[]")

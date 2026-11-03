@@ -1,10 +1,10 @@
-"""Resumable corpus export (GLOSSARY: Corpus; source mode ``api``).
+"""Resumable Gmail Import (GLOSSARY: Corpus, Gmail Import; source mode ``api``).
 
 Pulls messages through the GmailClient Protocol, parses via the single shared
 MIME path (invariant #4), and writes CorpusRecords through CorpusStore.
 Resume is *structural*: the store's id set is the cursor (skip-present is the
 same property that makes crash-retry harmless — invariant #2's corpus twin),
-so export can die at any moment and simply be re-run. Retry policy is driven
+so the import can die at any moment and simply be re-run. Retry policy is driven
 by the typed taxonomy only (transient→backoff-retry, rate_limited→honored
 backoff, permanent→record-and-continue: one unreadable message must never
 abort a 394k-message import). Messages whose timestamp cannot be
@@ -31,7 +31,7 @@ from .gmail_errors import BACKOFF, RETRY, GmailAuthError, GmailError
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 
-log = logging.getLogger("gmail_labeler.export")
+log = logging.getLogger("gmail_labeler.gmail_import")
 
 DEFAULT_QUERY = "in:anywhere -in:spam -in:trash"
 MAX_ATTEMPTS = 5
@@ -39,7 +39,7 @@ _BASE_BACKOFF_S = 1.0
 
 
 @dataclass
-class ExportStats:
+class GmailImportStats:
     scanned: int = 0
     written: int = 0
     skipped_present: int = 0
@@ -60,7 +60,7 @@ def _ms_to_utc(ms: int | None) -> datetime | None:
         return None
 
 
-def export_corpus(
+def import_gmail(
     client: GmailClient,
     store: CorpusStore,
     *,
@@ -69,14 +69,14 @@ def export_corpus(
     max_messages: int | None = None,
     max_attempts: int = MAX_ATTEMPTS,
     sleeper: Callable[[float], None] | None = None,
-) -> ExportStats:
-    """Export the query's messages into the store. Returns counts + failures."""
+) -> GmailImportStats:
+    """Import the query's messages into the store. Returns counts + failures."""
     sleeper = sleeper or time.sleep
     if max_attempts < 1:
-        # a zero-attempt loop would be a silent no-op export (deepseek:
+        # a zero-attempt loop would be a silent no-op import (deepseek:
         # the 'exhausted' return below was its only executed line)
         raise ValueError("max_attempts must be >= 1")
-    stats = ExportStats()
+    stats = GmailImportStats()
     if max_messages is not None and max_messages <= 0:
         return stats  # explicit no-op, never "process one anyway"
     page_token: str | None = None
@@ -100,7 +100,7 @@ def export_corpus(
             if store.has(stub.id.lower()):  # ids are stored lowercased
                 stats.skipped_present += 1
             else:
-                outcome = _export_one(
+                outcome = _import_one(
                     client,
                     store,
                     stub.id,
@@ -125,7 +125,7 @@ def _retrying[T](
     fn: Callable[[], T],
     *,
     max_attempts: int,
-    stats: ExportStats,
+    stats: GmailImportStats,
     sleeper: Callable[[float], None],
     what: str,
 ) -> T | None:
@@ -136,7 +136,7 @@ def _retrying[T](
             if e.kind in (RETRY, BACKOFF):
                 stats.retried += 1
                 if attempt == max_attempts - 1:
-                    log.warning("export: %s retries exhausted (%s)", what, e.kind)
+                    log.warning("import: %s retries exhausted (%s)", what, e.kind)
                     return None
                 delay = getattr(e, "retry_after_s", None)
                 if delay is None:  # an explicit server 0.0 stays 0.0
@@ -151,19 +151,19 @@ def _retrying[T](
                     # every later call would fail identically — the fix is
                     # human, so surface it typed (CLI exit 4), never swallow
                     raise
-                log.warning("export: %s permanent error: %s", what, e)
+                log.warning("import: %s permanent error: %s", what, e)
                 return None
     return None
 
 
-def _export_one(
+def _import_one(
     client: GmailClient,
     store: CorpusStore,
     message_id: str,
     id_to_name: Mapping[str, str],
     *,
     max_attempts: int,
-    stats: ExportStats,
+    stats: GmailImportStats,
     sleeper: Callable[[float], None],
 ) -> Literal["written", "present", "failed"]:
     msg = _retrying(
@@ -221,13 +221,13 @@ def fetch_settings(
     *,
     max_attempts: int = MAX_ATTEMPTS,
     sleeper: Callable[[float], None] | None = None,
-) -> tuple[dict[str, str], list[FilterInfo], ExportStats]:
+) -> tuple[dict[str, str], list[FilterInfo], GmailImportStats]:
     """Bootstrap reads (label map + filter snapshot) share the message
     loop's retry taxonomy: one transient blip on settings must not kill a
-    healthy export. Exhaustion RAISES — attribution (invariant #6) is never
+    healthy import. Exhaustion RAISES — attribution (invariant #6) is never
     silently skipped; the caller exits non-zero."""
     sleeper = sleeper or time.sleep
-    stats = ExportStats()  # ride along on the return: retried= stays honest
+    stats = GmailImportStats()  # ride along on the return: retried= stays honest
     labels = _retrying(
         client.list_labels,
         max_attempts=max_attempts,

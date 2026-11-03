@@ -308,7 +308,7 @@ def decode_gmail_raw(raw_b64url: str) -> bytes:
     Raises ValueError/UnicodeEncodeError on malformed base64url — unlike
     parse_mime, NOT under a never-raises contract: its input is Gmail's own
     API response, and a corrupted field should fail that one message loudly
-    in the export loop, not degrade silently.
+    in the import loop, not degrade silently.
     """
     padded = raw_b64url + "=" * (-len(raw_b64url) % 4)
     return base64.urlsafe_b64decode(padded.encode("ascii"))

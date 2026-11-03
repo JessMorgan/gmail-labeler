@@ -79,12 +79,20 @@ _Avoid_: dry run (reserved for the CLI flag)
 The pre-existing mailbox history, as opposed to newly-arriving mail.
 
 **Corpus**:
-A user's labeled mail, assembled for training. Sourced either from a live
-Gmail API export or an existing backup import; never shipped with or derived
-from another user's data.
+A user's labeled mail, assembled for training. Sourced either from a Gmail
+Import or a GYB Import; never shipped with or derived from another user's
+data.
+
+**Gmail Import**:
+Building a Corpus by pulling labeled mail through the Gmail API — the
+canonical sourcing path (GYB Import is the optional fast path). Resumable:
+the corpus id set is the cursor.
+_Avoid_: export (the command fills the Corpus, so it is named from the
+Corpus's side; "export" is reserved for a future Corpus-dump command),
+pull (implies fetch-and-merge; the store only appends)
 
 **GYB Import**:
 Building a Corpus from an existing Got Your Back (GYB) backup directory rather
-than pulling through the Gmail API. Optional fast path; the API export is the
-canonical source.
+than pulling through the Gmail API. Optional fast path; the Gmail Import is
+the canonical source.
 _Avoid_: backup restore (this reads, never restores)

@@ -22,21 +22,25 @@ what is wired vs. planned, and each gains detail as its phase lands.
   built yet (see its status note).
 - ADR-0005 additive-only writes; Shadow Pass until per-label Graduation;
   human-gated retrain/threshold changes.
+- ADR-0006 acquisition commands speak from the Corpus's perspective —
+  `import-gmail`/`import-gyb`; `export` is reserved for a future corpus-dump
+  command, never re-proposed for corpus population.
 
 ## Layout
 
 - `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
   `corpus_store`, `mime_extract`, `analyze`, `attribution`, `auth`, `tokens`,
-  `gmail_client`, `gmail_errors`, `fake_gmail`, `export`, `gyb_import`,
+  `gmail_client`, `gmail_errors`, `fake_gmail`, `gmail_import`, `gyb_import`,
   `cli`. Planned (later phases): model core (`dataset` build,
   `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
 - `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.
 - CLI surface: `auth` (status) + `auth login` and
-  `dataset {export,import-gyb,analyze}` are wired; `train`, `eval`,
-  `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
-  design conversation, not yet wired — change names with cause.
+  `dataset {import-gmail,import-gyb,analyze}` are wired (the acquisition pair
+  is pinned by ADR-0006; the old `export` name is a usage error, no alias);
+  `train`, `eval`, `shadow {run,report}`, `apply`, `daemon`, `status` are
+  frozen by the design conversation, not yet wired — change names with cause.
 
 ## Commands
 
@@ -177,6 +181,6 @@ contributor machines are configured independently.
   spans make `dataset analyze`'s recency gates load-bearing, and temporal
   splits alone would over-weight the oldest mail.
 - The importer must never depend on any user's backup existing, and backup
-  freshness vs the API export must be reconciled at import time.
+  freshness vs the Gmail Import must be reconciled at import time.
 - The maintainer's runtime box is a homelab host (CPU inference; a GPU host
   appears only for `train`); topology details live in `AGENTS.local.md`.

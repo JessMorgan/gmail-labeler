@@ -10,7 +10,7 @@ typer in through the CLI (spec #65).
 
 Owns the corpus-format contract pieces: the sidecar filenames and the
 ``AttributionPosture`` literal pinned for ``--json`` consumers. Serialization
-stays writer-side (export) because the filter-info type belongs to the Gmail
+stays writer-side (gmail_import) because the filter-info type belongs to the Gmail
 layer and the pure core must never import it (ADR-0002).
 """
 

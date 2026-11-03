@@ -77,7 +77,7 @@ class RawMessage:
     # the raw path (Google's format docs emphasize id/threadId/labelIds/raw;
     # whether internalDate rides along is not contractually pinned) — so
     # consumers MUST tolerate absence and fall back to the MIME Date header
-    # (export does); never trust presence.
+    # (the Gmail import does); never trust presence.
     internal_date_ms: int | None
     raw_b64url: str
 
@@ -213,7 +213,7 @@ class GmailRestClient:
     def list_labels(self) -> list[LabelInfo]:
         # the v1 tree has ONLY `users` at top level — labels ride under it
         # (users.labels.list); the bare .labels() guess died with a raw
-        # AttributeError on the first live export (#59, path pinned offline
+        # AttributeError on the first live import-gmail run (#59, path pinned offline
         # by test_surface_paths_walk_the_real_discovery_tree)
         data = self._call(self._svc().users().labels().list(userId="me"))
         return [
@@ -339,7 +339,7 @@ def _raw_nonempty(data: dict[str, object]) -> str:
 def _token(obj: dict[str, object]) -> str | None:
     """nextPageToken: absent or empty-string means 'no more' (Google's list
     APIs do emit empty tokens). A NON-STRING token is malformed wire — loud
-    permanent, never a silent end-of-list that truncates an export."""
+    permanent, never a silent end-of-list that truncates a Gmail import."""
     value = obj.get("nextPageToken")
     if value is None:
         return None

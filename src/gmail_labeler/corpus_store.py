@@ -12,7 +12,7 @@ Durability and integrity contract:
     Snapshot writes are atomic (tmp+fsync+rename, never a partial read).
     Opening a store NEVER mutates permissions (a read-only command pointed
     at a misconfigured corpus.dir must not clamp someone's $HOME): call
-    enforce_modes() from write-side commands (export/apply/daemon startup)
+    enforce_modes() from write-side commands (import-gmail/apply/daemon startup)
     to harden the tree; verify_modes() warns (content-free) on read paths;
   - body is written+fsynced BEFORE its record line is appended+fsynced;
     directory fsyncs are best-effort (NFS/FUSE tolerate) — a crash leaves at
@@ -308,7 +308,7 @@ class CorpusStore:
         """Harden the corpus tree: dirs 0700, every file 0600 (one bounded
         walk of ~256 shard dirs, plus the root-level snapshot sidecars and
         their stray ``*.tmp`` remnants). Call from WRITE-side commands at
-        startup (export/apply/daemon) — not from read-only tools."""
+        startup (import-gmail/apply/daemon) — not from read-only tools."""
         if not self.root.is_dir():
             return
         _chmod_if(self.root, _DIR_MODE)
@@ -375,7 +375,7 @@ _warned_dir_fsync = False
 
 def _fsync_dir(dirpath: Path, subject: Path | None = None) -> None:
     """Best-effort (some NFS/FUSE mounts refuse dir fsync); a missing
-    dirent is a durability downgrade, not a reason to kill an export."""
+    dirent is a durability downgrade, not a reason to kill a Gmail import."""
     global _warned_dir_fsync
     try:
         fd = os.open(dirpath, os.O_RDONLY)

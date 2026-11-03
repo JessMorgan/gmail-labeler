@@ -10,7 +10,7 @@ a naive 'YYYY-MM-DD HH:MM:SS' string in the backup machine's LOCAL time
 FOLDER DATE (year/month/day in message_filename) as authoritative and
 corrects the stamp's date to it — the day is what temporal splits
 (invariant #7) depend on; the H:M:S may be off by the backup machine's
-zone. Bodies go through the SAME shared MIME path as the API export
+zone. Bodies go through the SAME shared MIME path as the Gmail import
 (invariant #4: one parser, no per-source drift).
 
 Label names arrive in Gmail's NAME space; verified corpus shows system
@@ -29,7 +29,7 @@ after GYB has finished, or GYB's own writes will hit 'database is locked'
 (release comes when the read stream closes, not per row).
 
 Resume is structural (store id-set skip-present), crash-retry harmless,
-and a corrupt index STOPS the run — identical posture to export.
+and a corrupt index STOPS the run — identical posture to the Gmail import.
 """
 
 from __future__ import annotations
@@ -268,13 +268,13 @@ def import_gyb(
     """Import the backup into the corpus store. Returns counts + failures."""
     stats = GybImportStats()
     if max_messages is not None and max_messages <= 0:
-        return stats  # explicit no-op, same boundary as export
+        return stats  # explicit no-op, same boundary as the Gmail import
     db_path = gyb_root / DB_FILENAME
     root_resolved = gyb_root.resolve()
     try:
         for row in read_gyb_index(db_path, system_labels_extra=system_labels_extra):
             stats.scanned += 1
-            mid = row.id.lower()  # ids normalize to lowercase (export does too)
+            mid = row.id.lower()  # ids normalize to lowercase (import-gmail too)
             if store.has(mid):
                 stats.skipped_present += 1
                 if max_messages is not None and stats.scanned >= max_messages:
@@ -298,7 +298,7 @@ def import_gyb(
             except OSError as e:
                 stats.failed.append((mid, f"eml unreadable ({type(e).__name__})"))
                 continue
-            parsed = parse_mime(data)  # never raises; same path as the API export
+            parsed = parse_mime(data)  # never raises; same path as the Gmail import
             try:
                 record = CorpusRecord(
                     id=mid,
@@ -333,7 +333,7 @@ def import_gyb(
     except CorpusError as e:
         # store-side abort: re-surface as the typed gyb exit-5 class with
         # counts attached, so both abort paths print alike (deepseek NIT);
-        # CorpusError itself stays untouched — it's shared with export
+        # CorpusError itself stays untouched — it's shared with the Gmail import
         wrapped = GybImportError(f"corpus store aborted: {e}")
         wrapped.stats = stats
         raise wrapped from e

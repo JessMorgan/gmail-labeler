@@ -22,7 +22,7 @@ does not ship releases yet.
 - Shared MIME parsing (`mime_extract.py`) for both corpus sources.
 - Gmail REST client (`gmail_client.py`) + `FakeGmailClient` test spine and
   typed error taxonomy (`gmail_errors.py`).
-- `dataset export`: resumable API export, `--query`/`--max-messages`,
+- `dataset import-gmail`: resumable Gmail Import, `--query`/`--max-messages`,
   `filters.json` + `labels.json` sidecars.
 - `dataset import-gyb`: offline backup import (read-only `msg-db.sqlite`),
   folder-date correction, `--system-labels`.
@@ -30,14 +30,25 @@ does not ship releases yet.
   attribution, candidate shortlist, `--json`.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
-- Project scaffolded; implementation begins at Phase 0 (export + analysis).
+- Project scaffolded; implementation begins at Phase 0 (import + analysis).
+
+### Changed
+
+- Renamed `dataset export` to `dataset import-gmail` (ticket #68, ADR-0006):
+  the acquisition commands speak from the Corpus's side, symmetric with
+  `import-gyb`. Hard cut — no compat alias (pre-1.0); the old name exits 2
+  as a usage error. The module (`gmail_import.py`), its entry function,
+  stats class, CLI seam, test file, and the GLOSSARY **Gmail Import** term
+  follow; stored corpus data is untouched (record `source` values and the
+  on-disk layout are unchanged). `export` is reserved for a future
+  corpus-dump command.
 
 ### Fixed
 
-- `dataset export` no longer dies listing labels: the Gmail v1 discovery
+- `dataset import-gmail` no longer dies listing labels: the Gmail v1 discovery
   tree has only `users` at top level — `labels` live under it — and the
   REST client called `svc.labels()`, an `AttributeError` on the first live
-  export once #56 made construction survive. The `build_service` fake now
+  import-gmail run once #56 made construction survive. The `build_service` fake now
   mirrors the real tree, and a structural test captures each surface
   method's `HttpRequest` against the bundled offline discovery doc,
   pinning method + URI path + the exact query-param set (pageToken
@@ -45,7 +56,7 @@ does not ship releases yet.
   yield. The case table must also cover the whole client
   Protocol, so path and query-param drift on the read surfaces fails in
   CI instead of on the user's inbox (#59).
-- `dataset export` no longer dies on its first live call: the REST client's
+- `dataset import-gmail` no longer dies on its first live call: the REST client's
   default transport now composes `AuthorizedHttp` around a timeout-bounded
   httplib2 and hands `build()` only `http` — google-api-python-client 2.x
   rejects `http`+`credentials` as mutually exclusive, which surfaced as a

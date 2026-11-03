@@ -99,10 +99,18 @@ def _record(
     # the REAL Gmail wire shape (discovery rev 20261026): PLURAL
     # labelsAdded/labelsRemoved, each element nesting the Message under
     # 'message' (id at message.id). This is what the adapter delivers raw.
+    # A POSITIONAL id here is an ARRIVAL (S1): it rides BOTH the generic
+    # messages[] stubs AND messagesAdded[] — the field the daemon scores.
+    # Label-only events (added/removed) with NO positional id are old-mail
+    # changes: they carry no messagesAdded and are never scored.
     rec: dict[str, object] = {
         "id": hid,
         "messages": [{"id": m, "threadId": f"t{m}"} for m in message_ids],
     }
+    if message_ids:
+        rec["messagesAdded"] = [
+            {"message": {"id": m, "threadId": f"t{m}"}} for m in message_ids
+        ]
     if added:
         rec["labelsAdded"] = [
             {"message": {"id": m}, "labelIds": lids} for m, lids in added
@@ -234,6 +242,50 @@ def test_added_managed_label_records_correction(tmp_path: Path) -> None:
     # label -> the human added it (positive training signal). A MISSING
     # snapshot is the SEPARATE None case, pinned below as 'unverifiable'.
     assert corr[0].attribution == "human"
+    db.close()
+
+
+def test_crash_replay_own_lost_write_is_unverifiable_not_human(
+    tmp_path: Path,
+) -> None:
+    # S1 C2 (deepseek's MINOR, invariant #6): the daemon wrote Money/Bills to
+    # aa11 but its (aa11, Money/Bills) ROW was lost before the commit (a
+    # mid-delta crash). On replay the delta re-carries the daemon's OWN
+    # labelsAdded echo (aa11, L2). aa11 has a DIFFERENT committed row
+    # (Shipping) so it clears the join gate, but Money/Bills is NOT in
+    # `applied` (its row is gone). This tick scores Money/Bills high AND finds
+    # it PRESENT (L2 on aa11) -> a skip-present pair. An added-correction for a
+    # skip-presented pair is AMBIGUOUS (our own lost write vs a human who added
+    # exactly what we would have) -> WITHHELD 'unverifiable', never 'human' —
+    # crediting it would poison human_added AND the training fold.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")  # a prior committed row (clears join)
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    # Money/Bills high on aa11's text; L2 already present -> skip-present pair
+    model = FakeModel(VOCAB, scores={"one\nbody": (0.9, 0.1)})
+    assert _tick(tmp_path, fake, db, model=model) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "unverifiable")
+    ]
+    db.close()
+
+
+def test_genuine_human_add_not_skip_presented_stays_human(tmp_path: Path) -> None:
+    # The CONTRAST that keeps C2 from over-withholding: the SAME present label
+    # (L2 on aa11), but this tick does NOT band it (Money/Bills score below
+    # med) -> NOT a skip-present pair -> the labelsAdded is a genuine human add
+    # -> 'human' (positive signal). The over-withholding mutant (route EVERY
+    # ambiguous-looking add to unverifiable) dies here.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    model = FakeModel(VOCAB, scores={"one\nbody": (0.1, 0.1)})  # no band
+    assert _tick(tmp_path, fake, db, model=model) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "human")
+    ]
     db.close()
 
 
@@ -382,6 +434,31 @@ def test_added_correction_attributed_filter_covered(tmp_path: Path) -> None:
         filters=[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": ["L2"]}}]
     )
     assert _tick(tmp_path, fake, db, ctx=ctx) == 0
+    corr = db.corrections_for_message("aa11")
+    assert [(c.label, c.kind, c.attribution) for c in corr] == [
+        ("Money/Bills", "added", "filter_covered")
+    ]
+    db.close()
+
+
+def test_filter_covered_survives_the_crash_replay_ambiguity(tmp_path: Path) -> None:
+    # S1 C2 (deepseek MINOR-1): the crash-replay withhold applies ONLY to the
+    # HUMAN credit. An 'added' whose authorship is PROVEN filter_covered (a
+    # simulatable filter adds L2, the message matches) stays filter_covered even
+    # when the label is skip-present this tick (banded + present, no row) — a
+    # proof must not be downgraded to "unverifiable" (which claims an ignorance
+    # we do not have). RED pre-fix (the withhold overrode any skip-present add);
+    # the route-all-to-unverifiable mutant dies here too.
+    db = _db(tmp_path)
+    _applied(db, "aa11", "Shipping", "L1")  # clears the join; Money/Bills row absent
+    fake = _fake(_page(_record("aa11", added=[("aa11", ["L2"])])))
+    ctx = _ctx(
+        filters=[{"criteria": {"from": "a@x.com"}, "action": {"addLabelIds": ["L2"]}}]
+    )
+    # Money/Bills banded high + present (L2 on aa11) -> a skip_present pair; the
+    # filter PROVES authorship, so it stays filter_covered, not unverifiable.
+    model = FakeModel(VOCAB, scores={"one\nbody": (0.9, 0.1)})
+    assert _tick(tmp_path, fake, db, ctx=ctx, model=model) == 0
     corr = db.corrections_for_message("aa11")
     assert [(c.label, c.kind, c.attribution) for c in corr] == [
         ("Money/Bills", "added", "filter_covered")

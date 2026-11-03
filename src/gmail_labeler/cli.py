@@ -1985,14 +1985,18 @@ def eval(
             err=True,
         )
 
+    from .daemon import _PredictionShapeError
+
     try:
         rows = model.predict(texts)
         if len(rows) != len(test_examples):
             # a named operator message, not raw zip internals: a wrong
-            # row count is a checkpoint/recipe defect
-            raise ValueError(
+            # row count is a checkpoint/recipe defect (self-authored,
+            # counts-only — safe to log verbatim, unlike a model-raised
+            # error which may quote the scored TEXT)
+            raise _PredictionShapeError(
                 f"the model returned {len(rows)} score rows for "
-                f"{len(test_examples)} texts \u2014 checkpoint/recipe defect"
+                f"{len(test_examples)} texts — checkpoint/recipe defect"
             )
         # alignment by EXAMPLE ID (not position): the Protocol's row i
         # ↔ texts[i] is re-keyed onto the example ids before the core
@@ -2003,8 +2007,18 @@ def eval(
             example.id: row for example, row in zip(test_examples, rows, strict=True)
         }
         table = eval_metrics(test_examples, scores, vocabulary=manifest.vocabulary)
+    except _PredictionShapeError as e:
+        # self-authored, counts-only (ids/counts, never a body): named verbatim
+        typer.echo(f"eval failed: prediction/processing failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (ValueError, OSError, RuntimeError) as e:
-        typer.echo(f"eval failed: prediction failed: {e}", err=True)
+        # the model's OWN failure may quote the scored TEXT (which carries the
+        # body) — named by CLASS only (invariant #5; the daemon/apply doctrine
+        # this #20-era arm predated)
+        typer.echo(
+            f"eval failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     trust = (
@@ -2999,15 +3013,29 @@ def shadow_run(
 
     # the batched predict (the #20 batching seam: ONE call over all
     # texts — the model materializes the iterable once)
+    from .daemon import _PredictionShapeError
+
     try:
         rows = model.predict(texts)
         if len(rows) != len(fetched):
-            raise ValueError(
+            # self-authored, counts-only (safe to log verbatim, unlike a
+            # model-raised error which may quote the scored TEXT)
+            raise _PredictionShapeError(
                 f"the model returned {len(rows)} score rows for "
-                f"{len(fetched)} texts \u2014 checkpoint/recipe defect"
+                f"{len(fetched)} texts — checkpoint/recipe defect"
             )
+    except _PredictionShapeError as e:
+        # self-authored, counts-only (ids/counts, never a body): named verbatim
+        typer.echo(f"shadow run failed: prediction/processing failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
     except (ValueError, OSError, RuntimeError) as e:
-        typer.echo(f"shadow run failed: prediction failed: {e}", err=True)
+        # the model's OWN failure may quote the scored TEXT (which carries the
+        # body) — named by CLASS only (invariant #5; the daemon/apply doctrine
+        # this #23-era arm predated)
+        typer.echo(
+            f"shadow run failed: prediction/processing failed ({type(e).__name__})",
+            err=True,
+        )
         raise typer.Exit(code=_OPERATION_FAILED_EXIT) from None
 
     # the would-apply verdicts (the single decision core — tiers.py):
@@ -4344,18 +4372,20 @@ def corrections_export(
     fmt: str = typer.Option("json", "--format", help="Export format (json)"),
 ) -> None:
     """Export the recorded Corrections as future TRAINING SIGNAL: a JSON
-    list of ``{message_id, label, kind, attribution}`` (ticket #27;
-    GLOSSARY: Correction). This is a faithful RAW dump — every row is
+    list of ``{message_id, label, kind, detected_at, attribution}`` (ticket
+    #27; GLOSSARY: Correction). This is a faithful RAW dump — every row is
     written with its attribution so the artifact is auditable (you can see
     WHICH adds were withheld and why); the actual signal-filtering is the
     builder's correction-folding seam's single job (it drops every
     non-'human' 'added' before the corpus ever sees it). Reads the LOCAL
     state DB only — no Gmail call — and NEVER retrains: this writes an
-    artifact; folding it into the corpus is a composition point a human
-    opts into, and running a retrain is a SEPARATE human decision (the
-    AC's no-auto-retrain gate). NO
-    bodies (invariant #5): the export carries ids/labels/kinds/attributions
-    only. Exit contract 0/2/4/5."""
+    artifact. The fold seam ships as a PURE function, but it is not
+    operator-runnable end-to-end today — no shipped command invokes it and the
+    corpus store is append-only (`put()` no-ops on an existing id), so a folded
+    corpus cannot be produced through the CLI; the tooling for that is deferred
+    and the retrain itself is `train --force` (see ROADMAP). NO
+    bodies (invariant #5): the export carries ids/labels/kinds/detected-at/
+    attributions only. Exit contract 0/2/4/5."""
     from .appdb import AppDB, AppDBError
 
     if fmt != "json":
@@ -4397,6 +4427,7 @@ def corrections_export(
             "message_id": r.message_id,
             "label": r.label,
             "kind": r.kind,
+            "detected_at": r.detected_at.isoformat(),
             "attribution": r.attribution,
         }
         for r in rows

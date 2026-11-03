@@ -42,7 +42,12 @@ you would.
   and every application carries an `ai-applied`
   umbrella plus one band Tier Label (`ai-high` / `ai-med`) so you can audit
   every decision it ever made (the daemon's live write path landed with
-  #25, the `apply` bulk path with #26 — both through the one core).
+  #25, the `apply` bulk path with #26 — both through the one core). "One band
+  Tier Label" is per-Application: a message that earns a second Application
+  later carries that one's band tier too (additive-only forbids correcting
+  the first), so tier labels ACCUMULATE across a message's Applications — the
+  audit truth is the Applications table, not the tier labels (GLOSSARY:
+  Application).
 - **Nothing goes live unproven.** Each label is trained, scored on a recent
   held-out slice of *your* mail, and shadow-scored before it is ever applied
   silently. Labels that don't earn it stay in review.
@@ -209,6 +214,13 @@ weights from a LOCAL path (`[model] encoder_path` in the config;
 nothing is ever downloaded, and the `train` extra installs torch +
 transformers + accelerate — on a CPU box install the smaller
 CPU-only torch with `uv sync --extra train --torch-backend=cpu`).
+**Obtain the base weights yourself, out of band, before the first
+`train`:** the tool never fetches them, so point `encoder_path` at a
+pre-downloaded HF-style directory you already have — e.g.
+`hf download microsoft/deberta-v3-base --local-dir ~/models/deberta-v3-base`
+— then set `encoder_path` to that directory. (The train-env install/cost
+note above covers the torch side; the weights are a separate, one-time
+download you run outside this tool.)
 It mints the temporal Split Manifest, rebuilds the examples through
 it, trains only the train split (recency-weighted), and writes a
 checkpoint dir with a JSON sidecar pinning its identity
@@ -586,9 +598,9 @@ upward-unbounded, so it always reaches the newest message.
 **Date-provenance warning (AC5).** The `--since` boundary is a date, and
 a corpus record whose date has no server-authoritative provenance stamp
 (a pre-#17 line read as `unknown`) cannot be trusted to sit on the right
-side of it. `apply` scans the window and, if any such records fall at or
-after the boundary, prints **one** counted warning — the date-based
-window is only as trustworthy as those dates.
+side of it. `apply` scans the loaded corpus RECORDS and, if any dated at or
+after the boundary lack that stamp, prints **one** counted warning — the
+date-based window is only as trustworthy as those records' dates.
 
 Exit codes: 0 clean (preview or backfill) · 2 usage (missing/invalid
 `--since`) · 4 auth/config (the tier-name collision, and a mid-run auth
@@ -630,17 +642,29 @@ gmail-labeler corrections export --out corrections.json   # default: stdout
 ```
 
 `corrections export` writes a faithful RAW dump of the captured Corrections
-— `{message_id, label, kind, attribution}` rows, **no bodies**. "Raw" here
-means *not attribution-filtered* (every row, whatever its attribution), not
-*every stored column* — the artifact carries the correction identity, not
-the `detected_at` stamp. Every row carries its *attribution* (`human` /
+— `{message_id, label, kind, detected_at, attribution}` rows, **no bodies**
+(all five stored columns; never the message body). "Raw" here means *not
+attribution-filtered* — every row is written whatever its attribution. The
+`detected_at` stamp is carried so a consumer can rebuild a full CorrectionRow
+(the round-trip the export's pin asserts); the fold seam itself credits only a
+`human` add and does not read the stamp. Every row carries its *attribution*
+(`human` /
 `filter_covered` / `unverifiable`) so the artifact is auditable — you can
 see which adds were withheld and why.
 The builder's fold seam (`apply_corrections_to_records`) ships as a **pure
 function** (it credits only a `human` add), but the export does **not**
-call it, and **nothing wires the dump or the seam into a retrain** —
-folding them into the corpus and running a retrain is the **deferred human
-step** (ADR-0005's human-gated retrain). Only a `human` add is training
+call it, and **nothing wires the dump or the seam into a retrain**. It is
+also **not operator-runnable end-to-end today**: no shipped command invokes
+the fold (it is a library seam, not a CLI verb), and the corpus store is
+append-only — `put()` no-ops on an existing id, so a folded record cannot
+rewrite a message already in the corpus. (It is NOT the fingerprint or the
+checkpoint sidecar that blocks this: the fingerprint covers only the train
+split, and `train` does not verify a prior checkpoint's sidecar at all — its
+only gate is refusing an existing checkpoint dir without `--force`.) Producing
+a folded corpus therefore needs
+tooling that is **deferred**; once such a corpus exists the retrain itself is
+`train --force` (ADR-0005's human-gated retrain — never automatic). Only a
+`human` add is training
 signal: a `filter_covered` add (a Gmail filter verifiably would have
 applied it) and an `unverifiable` add — withheld, not guessed, when
 authorship cannot be determined: no usable filters snapshot (absent or
@@ -650,7 +674,11 @@ authorship is otherwise undecidable (its message fields were not fetched,
 or a filter's `addLabelIds` is unreadable — which is GLOBAL, not per-filter:
 we cannot read which labels that entry adds, so we cannot rule it out as any
 add's author, and every 'added' Correction, for every label, is withheld
-until the snapshot is clean) — are both excluded,
+until the snapshot is clean; or a crash-replay ambiguity — a `labelsAdded`
+for a label this tick skipped as already-present with no Application row,
+indistinguishable from the daemon's own landed write whose row was lost
+before the commit (this withhold applies to the would-be `human` credit only;
+a proven `filter_covered` add for the same event stands) — are both excluded,
 the *exclusion, not guessing* principle `dataset analyze` follows (#22).
 `status` discloses each withheld slice as its own count.
 

@@ -816,6 +816,51 @@ does not ship releases yet.
   Phase 1 → Phase 2 → explicitly-parked Phase 3); the README's
   phase-plan pointer now links there.
 
+### Fixed
+
+- Stack review S1 — the daemon scores ARRIVALS, not every changed message
+  (whole-stack pass; no ticket, PR refs #13): the scoring set read the
+  generic `messages[]` history field, which the Gmail reference describes as
+  "messages CHANGED in this record" and deprecates in favour of the
+  change-type fields. A label-only change to OLD mail — a user relabel, or
+  the daemon's OWN `apply_labels` echo — therefore re-enrolled that message
+  for scoring, and per-label skip-present does not block a DIFFERENT
+  graduated tier → retroactive labeling (violating README 'scores arriving
+  mail' and the ROADMAP Never-list). The scoring set is now `messagesAdded[]`;
+  the fake's history fixtures emit the documented shape (arrivals carry
+  generic stubs AND `messagesAdded`; a modify carries `labelsAdded` but no
+  `messagesAdded`) so the fixture can no longer mirror the code. A non-incoming
+  guard counts-skips SENT/DRAFT/CHAT arrivals that are NOT also in INBOX (the id
+  set is a SUPERSET of the corpus's DRAFT/CHAT exclusion — SENT is here for the
+  self-echo reason, not a corpus one; the INBOX exemption landed in S2).
+- Stack review S1 — the crash-replay window cannot fake a human's hand: a
+  `labelsAdded` for a label this tick skipped as already-present with no
+  Application row (the daemon's own landed write whose row was lost before
+  the commit) makes the would-be `human` credit AMBIGUOUS, so it is attributed
+  `unverifiable` (withheld) rather than `human` — crediting it would poison
+  `human_added` and the training fold (invariant #6). The withhold overrides
+  ONLY the human credit; a proven `filter_covered` add for the same event
+  stands. GLOSSARY / README / the daemon docstrings gain this fourth
+  unverifiable cause.
+- Stack review S2 — the non-incoming guard is COMPOUND: a SENT/DRAFT/CHAT
+  message is skipped only when it is NOT also in INBOX, so a message the human
+  dragged back into the inbox (the practical producer of SENT+INBOX
+  co-occurrence — native self-addressed mail arrives as a distinct copy Gmail
+  does not tag SENT, and a user label merely named 'sent' never matches the
+  id-guard; a Trash→Inbox restore is a second path, but the failure direction
+  is the safe score-not-skip one) is scored, not silently under-labelled.
+  Manager-sustained over a reviewer disagreement (deepseek: a wrong-skip is the
+  rank-one starvation class and the compound costs zero native coverage; qwen,
+  dissenting: own outgoing is not incoming-from-others mail) — both verified by
+  wire-reasoning (not CI) that the compound is a no-op on the native flows we
+  can name. The guard is daemon-scoped (ROADMAP permits `apply` to label
+  non-incoming mail); `_OUTGOING_LABEL_IDS` renamed `NON_INCOMING_LABEL_IDS`.
+  The per-label rationale split (DRAFT/CHAT never-legitimate-targets vs SENT
+  the operator's own send — NOT our apply_labels echo, which is a label-only
+  modify already excluded by `_message_ids`) replaces the earlier "outside the
+  training distribution" claim, which was false — export's `in:anywhere` query
+  puts sent mail IN the corpus.
+
 ### Changed
 
 - `HfModel.predict` is batched (ticket #20, #19's deferral): eval is

@@ -120,6 +120,59 @@ normalized inputs (callers should pass `now` in UTC for cross-host
 stability); whether an eval applies the weight is the consumer's choice.
 _Avoid_: decay factor, age weight
 
+**Checkpoint**:
+The fine-tuned model artifact: a plain HF-style directory (gitignored
+content) plus its JSON Checkpoint Sidecar. The Model loader refuses to
+serve any checkpoint whose sidecar disagrees with the Corpus/config it
+is asked to serve against — a stale or mismatched model can never be
+served silently.
+_Avoid_: model snapshot, weights bundle
+
+**Checkpoint Sidecar**:
+The checkpoint's JSON identity file: format version, label-vocabulary
+hash (kills vocabulary drift), thresholds source, Corpus fingerprint,
+train-split manifest hash (the Split Manifest's content hash — the
+split is pinned, not re-derived), and encoder identifier. Each field
+is verified INDEPENDENTLY by the loader; any disagreement refuses the
+load, naming every disagreeing field. The loader ALSO verifies the
+materialized `manifest.json` against the sidecar (a tampered manifest
+refuses with `split-manifest-mismatch`) and checks the format version
+first (an unknown version refuses with `sidecar-version`, not
+`sidecar-corrupt`).
+_Avoid_: model metadata, signature file
+
+**Corpus Fingerprint**:
+The Corpus's machine-checkable serving identity: the sha256 of the
+canonical record lines of the TRAIN-SPLIT slice only (the Split
+Manifest's train ids — each record's byte-stable JSON line, sorted,
+newline-joined) — input-order invariant, content-sensitive. Scoped to
+the train split ON PURPOSE: the corpus is append-only, so whole-corpus
+digesting would move the fingerprint on the first new email after
+training and the Phase 2 daemon would refuse its own checkpoint
+(#25's lifeline); append-only growth leaves it unchanged, a changed
+train slice moves it. Pinned in the Checkpoint Sidecar so a
+checkpoint trained on one train split can never be served against
+another.
+_Avoid_: corpus hash (unqualified), dataset checksum
+
+**Thresholds Source**:
+The Checkpoint Sidecar field naming where the serving thresholds come
+from. While no calibrated Threshold Bands exist it is `none` (train
+writes it, the loader expects it); the calibration artifact (#21)
+slots into this field (e.g. `calibrated:<hash>`) without a sidecar
+format change.
+_Avoid_: threshold config, band source
+
+**Model (seam)**:
+The `Model` Protocol — batch predict → per-label sigmoid scores over the
+checkpoint's Label-Path vocabulary (row i ↔ text i, column j ↔
+`vocabulary[j]`), plus vocabulary exposure. The ONE new test seam
+(spec #13): `FakeModel` (hand-authored score vectors) is the offline
+spine mirroring `FakeGmailClient`'s role; the real encoder (torch,
+ADR-0001) sits behind a lazy import in the `train/` recipe code only,
+so CI stays torch-free.
+_Avoid_: classifier interface, predictor API
+
 **Filter-Authored exclusion (builder doctrine)**:
 The dataset builder excludes Filter-Authored evidence from training
 examples — per-message for a simulatable filter, the whole label for an

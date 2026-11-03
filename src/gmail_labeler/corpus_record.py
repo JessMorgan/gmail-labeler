@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal, cast
@@ -178,6 +179,44 @@ def _need_str_list(payload: dict[str, object], key: str) -> tuple[str, ...]:
 
 def body_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def preprocess_text(subject: str, body: str) -> str:
+    """The ONE text a record becomes for the model (invariant #4:
+    preprocessing integrity — train and inference call this same
+    function from this same package; any format feature that exists on
+    one side and not the other is the worst class of bug here).
+
+    The contract, literally: ``subject + "\\n" + body``. Consequence:
+    an EMPTY body yields ``subject + "\\n"`` — the text ENDS WITH A
+    TRAILING NEWLINE. Inference must reproduce that byte for byte
+    (a missing body shard is trained and served as subject + trailing
+    newline, never bare subject)."""
+    return subject + "\n" + body
+
+
+def corpus_fingerprint(
+    records: Sequence[CorpusRecord], train_ids: Sequence[str]
+) -> str:
+    """The Corpus's machine-checkable identity (GLOSSARY: Corpus
+    Fingerprint): the sha256 of the canonical record lines of the
+    TRAIN-SPLIT slice only — the records whose id is in ``train_ids``
+    (the Split Manifest's train ids), each ``to_json_line()``
+    (byte-stable, sorted keys), sorted, joined with newlines.
+
+    Scoped to the train split ON PURPOSE: the corpus is append-only,
+    so whole-corpus digesting would move the fingerprint on the first
+    new email after training and the Phase 2 daemon would refuse its
+    own checkpoint (#25's lifeline). Append-only growth (new records,
+    test-side) leaves the train slice — and the fingerprint —
+    unchanged; a change to the train slice itself (a removed or
+    altered train record) moves it and is refused. Input-order
+    invariant (the store's append order is not an identity)."""
+    train = set(train_ids)
+    canonical = "\n".join(
+        sorted(record.to_json_line() for record in records if record.id in train)
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def with_body(record: CorpusRecord, text: str) -> CorpusRecord:

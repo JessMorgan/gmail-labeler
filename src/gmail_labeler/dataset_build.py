@@ -201,11 +201,11 @@ class SplitManifest:
             raise ValueError(
                 f"manifest old_weight must be in [0.0, 1.0], got {self.old_weight}"
             )
-        if not _sorted_unique(self.vocabulary):
+        if not sorted_unique(self.vocabulary):
             raise ValueError("manifest vocabulary must be sorted and unique")
-        if not _sorted_unique(self.train_ids):
+        if not sorted_unique(self.train_ids):
             raise ValueError("manifest train_ids must be sorted and unique")
-        if not _sorted_unique(self.test_ids):
+        if not sorted_unique(self.test_ids):
             raise ValueError("manifest test_ids must be sorted and unique")
         if set(self.train_ids) & set(self.test_ids):
             raise ValueError("manifest train_ids and test_ids must be disjoint")
@@ -583,7 +583,7 @@ def _need_bool(payload: dict[str, object], key: str) -> bool:
     return value
 
 
-def _sorted_unique(values: tuple[str, ...]) -> bool:
+def sorted_unique(values: tuple[str, ...]) -> bool:
     return all(a < b for a, b in pairwise(values))
 
 

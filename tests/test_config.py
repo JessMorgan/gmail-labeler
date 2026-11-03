@@ -21,12 +21,16 @@ def test_empty_config_is_all_defaults(
     _write(tmp_path, "")
     monkeypatch.chdir(tmp_path)
     loaded = load_config()
-    # Everything default EXCEPT corpus.dir, which load anchors to the config
-    # file's directory (never the invocation cwd).
+    # Everything default EXCEPT the relative default paths (corpus.dir,
+    # model.checkpoint_dir), which load anchors to the config file's
+    # directory (never the invocation cwd).
     assert loaded.corpus.dir == tmp_path / "corpus"
+    assert loaded.model.checkpoint_dir == tmp_path / "checkpoints/latest"
     bare = Config()
     assert loaded.model_dump() == bare.model_dump() | {
-        "corpus": bare.corpus.model_dump() | {"dir": loaded.corpus.dir}
+        "corpus": bare.corpus.model_dump() | {"dir": loaded.corpus.dir},
+        "model": bare.model.model_dump()
+        | {"checkpoint_dir": loaded.model.checkpoint_dir},
     }
 
 
@@ -110,6 +114,11 @@ def test_all_section_defaults_are_literal_pinned() -> None:
     # doesn't state; pin every section's actual default values.
     assert Config().corpus.dir == Path("./corpus")
     assert Config().gyb.path is None
+    assert Config().model.model_dump() == {
+        "encoder": "deberta-v3-base",
+        "encoder_path": None,
+        "checkpoint_dir": Path("./checkpoints/latest"),
+    }
     assert Config().labels.model_dump() == {
         "applied": "ai-applied",
         "high": "ai-high",

@@ -106,12 +106,32 @@ class GybConfig(BaseModel):
     path: Path | None = None
 
 
+class ModelConfig(BaseModel):
+    model_config = {"extra": "forbid", "frozen": True}
+
+    #: Encoder identifier (the Checkpoint Sidecar's ``encoder_id`` field).
+    encoder: str = "deberta-v3-base"
+    #: LOCAL path to the encoder weights — training downloads nothing
+    #: (AC#6); required for `train`, optional until it is used.
+    encoder_path: Path | None = None
+    #: Where `train` writes the checkpoint directory (gitignored).
+    checkpoint_dir: Path = Path("./checkpoints/latest")
+
+    @model_validator(mode="after")
+    def _encoder_identifier_nonempty(self) -> Self:
+        if not self.encoder.strip():
+            raise ValueError("model.encoder must be non-empty")
+        return self
+
+
 #: (section, field) pairs holding filesystem paths needing expansion.
 _PATH_FIELDS: tuple[tuple[str, str], ...] = (
     ("gmail", "credentials_path"),
     ("gmail", "token_file"),
     ("corpus", "dir"),
     ("gyb", "path"),
+    ("model", "encoder_path"),
+    ("model", "checkpoint_dir"),
 )
 
 
@@ -126,18 +146,24 @@ class Config(BaseModel):
     labels: LabelsConfig = Field(default_factory=LabelsConfig)
     corpus: CorpusConfig = Field(default_factory=CorpusConfig)
     gyb: GybConfig = Field(default_factory=GybConfig)
+    model: ModelConfig = Field(default_factory=ModelConfig)
 
 
 def _anchor_relative(cfg: Config, base_dir: Path) -> Config:
     """Resolve DEFAULT paths that are relative (file-supplied ones were
     already anchored by _prepare_raw). model_copy builds a new instance."""
-    if cfg.corpus.dir.is_absolute():
+    updates: dict[str, object] = {}
+    if not cfg.corpus.dir.is_absolute():
+        updates["corpus"] = cfg.corpus.model_copy(
+            update={"dir": base_dir / cfg.corpus.dir}
+        )
+    if not cfg.model.checkpoint_dir.is_absolute():
+        updates["model"] = cfg.model.model_copy(
+            update={"checkpoint_dir": base_dir / cfg.model.checkpoint_dir}
+        )
+    if not updates:
         return cfg
-    return cfg.model_copy(
-        update={
-            "corpus": cfg.corpus.model_copy(update={"dir": base_dir / cfg.corpus.dir})
-        }
-    )
+    return cfg.model_copy(update=updates)
 
 
 def _prepare_raw(raw: dict[str, object], base_dir: Path, problems: list[str]) -> None:

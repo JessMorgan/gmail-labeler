@@ -48,6 +48,106 @@ does not ship releases yet.
   order and unreferenced label entries) so a drifted snapshot refuses the
   rebuild. The filter-shape rule is shared with `dataset analyze`
   (`filter_label_ids` / `filter_label_ids_strict`).
+- Model seam (`model.py`): the `Model` Protocol — batch predict →
+  per-label sigmoid scores over the checkpoint's Label-Path vocabulary
+  (rows aligned to inputs, columns to the vocabulary; `texts` is an
+  Iterable that implementations materialize once) plus vocabulary
+  exposure — the ONE new test seam (spec #13). Conformance is
+  structural (a consumer annotated `Model` is the pin; no
+  `isinstance` anywhere). `FakeModel` is the offline spine
+  (hand-authored score vectors, call log, refuses misaligned/out-of-
+  range programming, RAISES on an unprogrammed text unless the caller
+  passed an explicit `default` — no silent 0.5) mirroring
+  `FakeGmailClient`'s role; `vocabulary_hash` is the ORDER-SENSITIVE
+  sha256 identity the checkpoint sidecar carries (a reordered
+  vocabulary must refuse). The sorted-unique helper now lives in
+  `dataset_build.sorted_unique` (one home, shared). No torch import
+  anywhere in the importable core — the real encoder stays behind the
+  `train/` recipe (pinned: importing `gmail_labeler.model` leaves
+  `torch` out of `sys.modules`).
+- `train` command (ticket #19): fine-tunes the encoder on the corpus,
+  fully local (AC#6). The run mints the Split Manifest, rebuilds the
+  examples THROUGH it (manifest mode — the manifest is authoritative,
+  invariant #7; the split boundary uses only server-authoritative
+  dates; the rebuild-via-manifest call is pinned by a `build_dataset`
+  spy), trains behind the Model seam (the recipe is reached through a
+  monkeypatchable factory — the offline tests drive `FakeModel`; the
+  factory's return is consumed: a trainer vocabulary that does not
+  match the manifest's refuses before any sidecar is written),
+  materializes the Split Manifest (`manifest.json`) with the
+  checkpoint, and writes the JSON Checkpoint Sidecar pinning the
+  run's identity (train-split scoped corpus fingerprint).
+  `--split-date` (required, strict ISO DATE — time components are a
+  usage error → 2) pins the temporal split; `--device cpu|cuda`
+  (default cpu) is plumbed to the recipe; `--assume-no-filters`
+  attests a filterless mailbox (the builder refuses a
+  missing/incomplete filters/labels bridge — invariant #6); the
+  existing-checkpoint refusal is hoisted BEFORE the two corpus-scale
+  build passes and REFUSES the run until `--force` is explicit
+  (retraining is human-gated, ADR-0005). `--force` replaces
+  staging-based: build in `<dir>.tmp` (0700 before training), verify
+  the sidecar by readback, rmtree the old dir, rename in — a crash
+  leaves the OLD checkpoint intact, an EMPTY dir, or the NEW one,
+  each refusal-safe, and no stale encoder file survives into the new
+  dir. The train text is `corpus_record.preprocess_text` (invariant
+  #4: train and inference share one preprocess function); missing
+  body shards warn with a count, an undecodable shard is exit 5. A
+  missing `train` extra (torch) is exit 5 with an install hint, not a
+  traceback (the recipe exception boundary is a documented decision:
+  ImportError/ValueError/OSError/RuntimeError → 5; anything else is a
+  code bug → traceback/exit 1). The dead `_stub`/`_NOT_IMPLEMENTED`
+  surface is removed (exit 3 stays documented as currently
+  unreachable); `store.verify_modes()` runs on the read path. Config
+  gains `[model]` (`encoder`, `encoder_path` — local weights only,
+  `checkpoint_dir`); exit-code contract 0/2/3/4/5 preserved (bad
+  `--split-date`/`--device` are usage errors → 2; build refusal,
+  unreadable corpus, recipe failure, and the checkpoint refusal are
+  5).
+- `train/` recipe (ticket #19): HF `Trainer` fine-tune over the
+  builder's Training Examples — one sigmoid head per Label Path
+  (multi-label BCE), the recency weight applied as a WEIGHTED MEAN of
+  per-example BCE losses from `outputs.logits` (`reduction='none'`,
+  `.mean(dim=-1)`, `(per*w).sum()/w.sum()` — the model's scalar
+  `outputs.loss` would make the weight mathematically inert),
+  LAZY tokenization (the dataset holds raw texts; the collator
+  tokenizes per batch — peak memory O(batch), not O(corpus)),
+  single-device contract (`use_cpu=True` on CPU; a multi-GPU host is
+  refused on the GPU path), `load_hf_model` refuses a checkpoint whose
+  `num_labels` does not match the served vocabulary, encoder weights
+  from a LOCAL path only (`local_files_only` everywhere — pinned by
+  spy, AC#6), checkpoint saved as a plain HF-style directory with the
+  `encoder_id` recorded on the HF config. The ONLY code that imports
+  torch/transformers, reached exclusively through lazy imports;
+  `torch` + `transformers` (v5 line) + `accelerate` (Trainer
+  hard-requires it) are the optional `train` extra. CPU-smoke tests
+  (incl. non-uniform-weight order-sensitivity, collator row
+  alignment, and the `local_files_only` pin) and one GPU test sit
+  behind the opt-in `smoke`/`gpu` markers, excluded from every
+  CI/local-ci run (AC#1/AC#2: the matrix stays torch-free and green);
+  the README carries the CPU-only torch install hint
+  (`uv sync --extra train --torch-backend=cpu`).
+- Checkpoint identity + loader refusal (`model.py`,
+  `corpus_record.py`): a checkpoint is a plain HF-style directory
+  (gitignored) plus a JSON Checkpoint Sidecar — label-vocabulary
+  hash, thresholds source (`none` until calibration exists; #21's
+  artifact slots in without a format change), Corpus fingerprint
+  (new `corpus_fingerprint`: sha256 of the canonical record lines of
+  the TRAIN-SPLIT slice only, order-invariant — append-only corpus
+  growth cannot invalidate a serving checkpoint, #25's lifeline),
+  train-split manifest hash, encoder identifier. Hash-shaped fields
+  are 64-hex validated at parse (empty strings refused).
+  `load_model` REFUSES any checkpoint whose sidecar disagrees with the
+  Corpus/config it is asked to serve against — each field refused
+  independently, all disagreements named in one
+  `CheckpointRefusedError` (a `ValueError`); the format version is
+  checked FIRST with its own `sidecar-version` code (not conflated
+  with `sidecar-corrupt`); the materialized `manifest.json` is
+  verified against the sidecar (`manifest-missing` /
+  `manifest-corrupt` / `split-manifest-mismatch` — a tampered
+  manifest refuses). `corpus_record.preprocess_text` states its
+  contract literally (`subject + "\n" + body`; an empty body ends
+  with a trailing newline). Pinned offline with `tmp_path` fixtures +
+  `FakeModel` (AC#3), incl. the append-only-growth serving test.
 - Dataset builder recency weighting: each Training Example carries a
   recency weight (1.0 at/after the cutoff, `old_weight` before) mirroring
   analyze's `months_ago` window shape; the cutoff (UTC-normalized) and

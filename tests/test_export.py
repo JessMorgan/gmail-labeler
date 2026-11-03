@@ -373,8 +373,9 @@ def test_snapshot_replace_failure_leaves_healable_tmp(
 
     import pytest as _pt
 
+    from gmail_labeler.attribution import SIDECAR_FILTERS
     from gmail_labeler.corpus_store import CorpusError, CorpusStore
-    from gmail_labeler.export import SIDECAR_FILTERS, write_filters_snapshot
+    from gmail_labeler.export import write_filters_snapshot
 
     store = CorpusStore(tmp_path / "c")
     real_replace = _os.replace

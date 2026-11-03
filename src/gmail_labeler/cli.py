@@ -12,16 +12,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeGuard
+from typing import TYPE_CHECKING
 
 import typer
 
-from .export import DEFAULT_QUERY, SIDECAR_FILTERS, SIDECAR_LABELS
-
-# summary.filters_posture values, pinned for --json consumers
-AttributionPosture = Literal[
-    "snapshot", "attested-none", "missing", "bridge-incomplete"
-]
+from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS, parse_attribution
+from .export import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
@@ -299,71 +295,6 @@ def dataset_import_gyb(
         raise typer.Exit(code=_EXPORT_ERROR_EXIT)  # never silently partial
 
 
-def _is_str_keyed_dict(obj: object) -> TypeGuard[dict[str, object]]:
-    return isinstance(obj, dict) and all(isinstance(k, str) for k in obj)
-
-
-def _load_attribution(
-    store_root: Path, *, assume_no_filters: bool
-) -> tuple[AttributionPosture, list[dict[str, object]] | None, dict[str, str]]:
-    """(posture, filters, id_to_name) for the analyze report.
-
-    Sidecars are untrusted on-disk state: parseable-but-wrong-shape raises
-    ValueError (the command maps it to exit 5) — never an AttributeError
-    escaping into a traceback. A filters.json whose label ids are NOT all
-    resolvable through labels.json cannot attribute anything, and the
-    filter-authored labels would surface as CANDIDATE — invariant #6's
-    unsafe direction, silent and wrong. Such a snapshot demotes to the
-    withheld posture 'bridge-incomplete' (deepseek CRITICAL).
-    """
-    sidecar = store_root / SIDECAR_FILTERS
-    if not sidecar.is_file():
-        if assume_no_filters:
-            return "attested-none", [], {}
-        return "missing", None, {}
-    raw_filters = json.loads(sidecar.read_text(encoding="utf-8"))
-    if not isinstance(raw_filters, list):
-        raise ValueError("filters snapshot is not a list")
-    filters: list[dict[str, object]] = []
-    for item in raw_filters:
-        if not _is_str_keyed_dict(item):
-            raise ValueError("filter entry is not a string-keyed object")
-        filters.append({str(k): v for k, v in item.items()})
-    id_to_name: dict[str, str] = {}
-    labels_path = store_root / SIDECAR_LABELS
-    if labels_path.is_file():
-        raw_labels = json.loads(labels_path.read_text(encoding="utf-8"))
-        if not _is_str_keyed_dict(raw_labels) or not all(
-            isinstance(v, str) for v in raw_labels.values()
-        ):
-            raise ValueError("labels snapshot is not an id->name object")
-        id_to_name = {str(k): str(v) for k, v in raw_labels.items()}
-    needed: set[str] = set()
-    for f in filters:
-        action = f.get("action")
-        if action is not None and not isinstance(action, dict):
-            # unreadable label bindings must not contribute zero `needed`
-            # ids and let the posture claim 'snapshot' — the same failure
-            # direction the non-str/non-list guards closed (deepseek r3)
-            raise ValueError("action must be an object")
-        ids = action.get("addLabelIds") if isinstance(action, dict) else None
-        if ids is not None and not isinstance(ids, list):
-            # present-but-wrong-shaped is as untrusted as a non-str entry:
-            # silently skipping would let a filter's labels surface
-            # CANDIDATE un-attributed (qwen MINOR)
-            raise ValueError("addLabelIds must be a list of strings")
-        if isinstance(ids, list):
-            if any(not isinstance(i, str) for i in ids):
-                # a type-corrupt id list would bypass the bridge check and
-                # silently un-attribute its label — the CRITICAL's failure
-                # mode, so it raises like every other wrong-shape field
-                raise ValueError("addLabelIds entries must be strings")
-            needed.update(ids)
-    if needed - set(id_to_name):
-        return "bridge-incomplete", None, {}
-    return "snapshot", filters, id_to_name
-
-
 @dataset_app.command("analyze")
 def dataset_analyze(
     config_file: str | None = typer.Option(
@@ -414,8 +345,16 @@ def dataset_analyze(
         typer.echo(f"analyze failed: records unreadable ({type(e).__name__})", err=True)
         raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
     try:
-        posture, filters, id_to_name = _load_attribution(
-            store.root, assume_no_filters=assume_no_filters
+        filters_text = store.read_snapshot(SIDECAR_FILTERS)
+        # Short-circuit preserved verbatim from the pre-extraction reader:
+        # with no filters snapshot, labels.json is never read, so a corrupt
+        # bridge file cannot turn the honest 'missing' posture into a failure
+        # (and parse_attribution decides before ever looking at it).
+        labels_text = (
+            store.read_snapshot(SIDECAR_LABELS) if filters_text is not None else None
+        )
+        posture, filters, id_to_name = parse_attribution(
+            filters_text, labels_text, assume_no_filters=assume_no_filters
         )
     except (ValueError, OSError, UnicodeDecodeError) as e:
         # JSONDecodeError is a ValueError; wrong-shape payloads raise here
@@ -424,8 +363,9 @@ def dataset_analyze(
             err=True,
         )
         raise typer.Exit(code=_EXPORT_ERROR_EXIT) from None
-    if assume_no_filters and (store.root / SIDECAR_FILTERS).is_file():
-        # an attestation contradicting on-disk evidence is ignored, loudly
+    if assume_no_filters and filters_text is not None:
+        # an attestation contradicting on-disk evidence is ignored, loudly;
+        # the None-vs-not read of the snapshot is the existence check
         typer.echo(
             "WARNING: --assume-no-filters ignored: a filters.json snapshot "
             "exists (evidence beats attestation)",

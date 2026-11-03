@@ -631,6 +631,24 @@ def test_analyze_corrupt_snapshot_exits_5(tmp_path: Path) -> None:
     assert "snapshot unreadable" in result.stderr
 
 
+def test_analyze_corrupt_labels_without_filters_stay_missing(tmp_path: Path) -> None:
+    # the short-circuit is load-bearing: with no filters.json the CLI must
+    # not read labels.json at all — a corrupt bridge file beside an absent
+    # snapshot is still an honest 'missing' posture (exit 0), not exit 5
+    root = _seed_corpus(tmp_path, n=2)
+    (root / "labels.json").write_bytes(b"\xff\xfe not utf-8")
+    import os
+
+    os.chmod(root / "labels.json", 0o600)  # representative healthy-corpus mode
+    result = runner.invoke(
+        app,
+        ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path)), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["filters_posture"] == "missing"
+
+
 def test_analyze_empty_corpus_is_friendly(tmp_path: Path) -> None:
     (tmp_path / "corpus").mkdir()  # present but empty = friendly guidance
     result = runner.invoke(
@@ -666,56 +684,6 @@ def test_analyze_records_undecodable_exits_5(tmp_path: Path) -> None:
     )
     assert result.exit_code == 5
     assert "Traceback" not in (result.stdout + result.stderr)
-
-
-def test_analyze_missing_bridge_withholds_candidates(tmp_path: Path) -> None:
-    # deepseek CRITICAL: filters.json without the labels.json bridge must
-    # NEVER surface filter-authored labels as CANDIDATE
-    root = _seed_corpus(tmp_path)
-    (root / "filters.json").write_text(
-        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["L1"]}}]',
-        encoding="utf-8",
-    )
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 0
-    assert "CANDIDATE" not in result.stdout
-    assert "bridge" in result.stderr
-
-
-def test_analyze_stale_bridge_withholds_too(tmp_path: Path) -> None:
-    root = _seed_corpus(tmp_path)
-    (root / "filters.json").write_text(
-        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": ["GONE"]}}]',
-        encoding="utf-8",
-    )
-    (root / "labels.json").write_text('{"L1": "Shipping"}', encoding="utf-8")
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 0
-    assert "CANDIDATE" not in result.stdout and "bridge" in result.stderr
-
-
-def test_analyze_wrong_shape_sidecars_exit_5(tmp_path: Path) -> None:
-    # deepseek MAJOR: parseable-but-wrong-shape is exit 5, not a traceback
-    for payload in ("[42]", '{"not": "a list"}'):
-        root = _seed_corpus(tmp_path, n=2)
-        (root / "filters.json").write_text(payload, encoding="utf-8")
-        result = runner.invoke(
-            app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-        )
-        assert result.exit_code == 5 and "snapshot unreadable" in result.stderr
-        (root / "filters.json").unlink(missing_ok=True)
-        (root / "labels.json").unlink(missing_ok=True)
-    root = _seed_corpus(tmp_path, n=2)
-    (root / "filters.json").write_text("[]", encoding="utf-8")
-    (root / "labels.json").write_text('["L1"]', encoding="utf-8")
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 5  # labels map wrong-shape raises too
 
 
 def test_analyze_contradictory_attestation_is_ignored_loudly(tmp_path: Path) -> None:
@@ -800,20 +768,6 @@ def test_analyze_corrupt_records_exit_5(tmp_path: Path) -> None:
     assert result.exit_code == 5
 
 
-def test_analyze_nonstring_label_ids_rejected(tmp_path: Path) -> None:
-    # deepseek MINOR: [42]-as-id must not bypass the bridge check
-    root = _seed_corpus(tmp_path, n=2)
-    (root / "filters.json").write_text(
-        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": [42]}}]',
-        encoding="utf-8",
-    )
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 5
-    assert "must be strings" in result.stderr
-
-
 def test_analyze_attested_posture_is_visible_in_text_mode(tmp_path: Path) -> None:
     # deepseek MINOR: --assume-no-filters rests the gate on the attestation,
     # and the human report must say so
@@ -867,21 +821,6 @@ def test_analyze_json_keeps_engine_reasons_alongside_posture(tmp_path: Path) -> 
     assert "stale bridge" in result.stderr  # the NOTE names the real cause
 
 
-def test_analyze_nonlist_addlabelids_rejected(tmp_path: Path) -> None:
-    # qwen MINOR2: a dict-instead-of-list ids field must not attribute nothing
-    root = _seed_corpus(tmp_path, n=2)
-    (root / "filters.json").write_text(
-        '[{"criteria": {"from": "shop@x.z"}, "action": {"addLabelIds": {"x": 1}}}]',
-        encoding="utf-8",
-    )
-    (root / "labels.json").write_text("{}", encoding="utf-8")
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 5
-    assert "addLabelIds must be a list" in result.stderr
-
-
 def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
     # deepseek NIT: the empty-corpus advice is the friendly line, not
     # 'run dataset export to capture filters'
@@ -904,18 +843,3 @@ def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
     assert "no filters.json snapshot" not in json_result.stderr
     payload = json.loads(json_result.stdout)
     assert payload["summary"]["filters_posture"] == "missing"
-
-
-def test_analyze_nonobject_action_rejected(tmp_path: Path) -> None:
-    # deepseek r4 MINOR: a filter whose action is unreadable must not
-    # contribute zero needed-ids and let the posture claim 'snapshot'
-    root = _seed_corpus(tmp_path, n=2)
-    (root / "filters.json").write_text(
-        '[{"criteria": {"from": "shop@x.z"}, "action": "nope"}]',
-        encoding="utf-8",
-    )
-    result = runner.invoke(
-        app, ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path))]
-    )
-    assert result.exit_code == 5
-    assert "action must be an object" in result.stderr

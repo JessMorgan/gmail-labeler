@@ -265,3 +265,172 @@ def test_iter_raises_on_non_dict_line(tmp_path: Path) -> None:
     p.write_text(p.read_text(encoding="utf-8") + "5\n", encoding="utf-8")
     with pytest.raises(CorpusError, match=":2: corrupt record"):
         list(store.iter_records())
+
+
+# ---- snapshot I/O (ticket #66: the store owns corpus-root snapshot files) ----
+
+
+def test_read_snapshot_absent_returns_none(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    assert store.read_snapshot("filters.json") is None
+
+
+def test_read_snapshot_present_returns_exact_text(tmp_path: Path) -> None:
+    # exact text, byte-for-byte: unicode and trailing whitespace included
+    payload = '{"a": "é"}  \n'
+    store = CorpusStore(tmp_path / "corpus")
+    store.write_snapshot("labels.json", payload)
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.read_snapshot("labels.json") == payload
+
+
+def test_write_snapshot_creates_root_0700_and_file_0600(tmp_path: Path) -> None:
+    # secret material from the FIRST byte: root 0700, snapshot 0600-at-fd
+    store = CorpusStore(tmp_path / "deep" / "corpus")
+    store.write_snapshot("filters.json", "[]")
+    assert (tmp_path / "deep" / "corpus").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "deep" / "corpus" / "filters.json").stat().st_mode & 0o777 == (
+        0o600
+    )
+
+
+def test_write_snapshot_fsyncs_file_and_dir(tmp_path: Path, monkeypatch) -> None:
+    # the rename-durability dir fsync must stay pinned at the store seam
+    import os as _os
+
+    synced: list[str] = []
+    real_fsync = _os.fsync
+
+    def spy(fno: int) -> None:
+        synced.append("fsync")
+        real_fsync(fno)
+
+    monkeypatch.setattr(_os, "fsync", spy)
+    CorpusStore(tmp_path / "c").write_snapshot("filters.json", "[]")
+    assert synced.count("fsync") >= 2  # file + directory (tokens.py parity)
+
+
+def test_write_snapshot_midwrite_failure_leaves_no_tmp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import os as _os
+
+    store = CorpusStore(tmp_path / "c")
+
+    def boom(*a: object, **k: object) -> None:
+        raise OSError("ENOSPC-ish")
+
+    monkeypatch.setattr(_os, "fdopen", boom)
+    with pytest.raises(CorpusError):
+        store.write_snapshot("filters.json", "[]")
+    assert not (store.root / "filters.json.tmp").exists()
+
+
+def test_write_snapshot_fchmod_failure_cleans_up(tmp_path: Path, monkeypatch) -> None:
+    # the fd-ownership finally: no leaked fd, no tmp litter
+    import os as _os
+
+    store = CorpusStore(tmp_path / "c")
+    monkeypatch.setattr(
+        _os, "fchmod", lambda *a, **k: (_ for _ in ()).throw(OSError("EPERM"))
+    )
+    fd_cand = next(
+        (c for c in ("/proc/self/fd", "/dev/fd") if _os.path.isdir(c)), None
+    )  # linux + macos legs both mutation-pin the fd fold; the count is
+    # process-global, so it assumes no other thread/plugin opens fds mid-call
+    # (single-process contract — same prior art as test_export.py)
+    fd_before = len(_os.listdir(fd_cand)) if fd_cand else 0
+    with pytest.raises(CorpusError):
+        store.write_snapshot("filters.json", "[]")
+    assert not (store.root / "filters.json.tmp").exists()
+    if not fd_cand:
+        pytest.skip("no fd table to count — fd-fold invisible on this host")
+    assert len(_os.listdir(fd_cand)) == fd_before
+
+
+def test_write_snapshot_replace_failure_tightens_tmp_and_is_resumable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # never-read-a-partial-state: the final path only ever appears via
+    # os.replace; a failed replace leaves the COMPLETE tmp, tightened to
+    # 0600 even when it pre-existed loose (the O_CREAT fchmod trap), and
+    # the next write re-writes-and-renames it away (resumable).
+    import os as _os
+
+    store = CorpusStore(tmp_path / "c")
+    store.write_snapshot("filters.json", '["v1"]')
+    tmp = store.root / "filters.json.tmp"
+    tmp.write_text("stale loose litter", encoding="utf-8")
+    tmp.chmod(0o666)
+    real_replace = _os.replace
+
+    def boom(a: object, b: object, **k: object) -> None:
+        raise OSError("EXDEV-ish")
+
+    monkeypatch.setattr(_os, "replace", boom)
+    with pytest.raises(CorpusError):
+        store.write_snapshot("filters.json", '["v2"]')
+    assert tmp.is_file()  # complete tmp kept, never deleted
+    assert tmp.stat().st_mode & 0o777 == 0o600  # pre-existing tmp tightened
+    assert (store.root / "filters.json").read_text(encoding="utf-8") == '["v1"]'
+    monkeypatch.setattr(_os, "replace", real_replace)
+    store.write_snapshot("filters.json", '["v2"]')  # the next run heals it
+    assert (store.root / "filters.json").read_text(encoding="utf-8") == '["v2"]'
+    assert not tmp.exists()
+
+
+def test_enforce_modes_hardens_sidecars_and_tmp_remnants(tmp_path: Path) -> None:
+    # SECURITY promise made literal (ticket #66): root-level sidecars and
+    # stray *.tmp remnants are chmod'd 0600 by the write-side walk.
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    sidecars = [corpus / "filters.json", corpus / "labels.json"]
+    remnants = [corpus / "filters.json.tmp", corpus / "labels.json.tmp"]
+    for p in sidecars + remnants:
+        p.write_text("{}", encoding="utf-8")
+        p.chmod(0o644)
+    store.enforce_modes()
+    for p in sidecars + remnants:
+        assert p.stat().st_mode & 0o077 == 0
+
+
+def test_verify_modes_lists_loose_sidecar_offender(tmp_path: Path) -> None:
+    # read paths warn symmetrically with the enforce walk
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    filters = corpus / "filters.json"
+    labels = corpus / "labels.json"
+    filters.write_text("[]", encoding="utf-8")
+    labels.write_text("{}", encoding="utf-8")
+    filters.chmod(0o600)
+    labels.chmod(0o600)
+    assert store.verify_modes() == []  # 0600 sidecars: clean
+    filters.chmod(0o644)
+    offenders = store.verify_modes()
+    assert str(filters) in offenders
+    assert str(labels) not in offenders
+
+
+def test_snapshot_names_are_bare_filenames(tmp_path: Path) -> None:
+    # containment, mirroring _body_path: a traversal name is a caller bug
+    # refused before any filesystem touch (ticket #66 review MINOR)
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside", encoding="utf-8")
+    store = CorpusStore(tmp_path / "corpus")
+    for bad in (
+        "../secret.txt",
+        "nested/x.json",
+        "/etc/passwd",
+        "",
+        ".",
+        "..",
+        "a\x00b",
+    ):
+        with pytest.raises(CorpusError, match="bare filename"):
+            store.read_snapshot(bad)
+        with pytest.raises(CorpusError, match="bare filename"):
+            store.write_snapshot(bad, "x")
+    assert secret.read_text(encoding="utf-8") == "outside"  # untouched
+    assert not (tmp_path / "corpus").exists()  # refused before mkdir

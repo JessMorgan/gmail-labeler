@@ -553,7 +553,7 @@ def test_eval_bands_readback_fault_exits_5(
     out = tmp_path / "bands.json"
     result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
     assert result.exit_code == 5
-    assert "cannot write --bands" in result.stderr
+    assert "--bands write failed AFTER the target was replaced" in result.stderr
     assert "readback fault" in result.stderr
     assert "test examples=6" in result.stdout  # the report is not lost
 
@@ -602,7 +602,7 @@ def test_eval_bands_readback_mismatch_exits_5(
     out = tmp_path / "bands.json"
     result, _factory = _run_eval(tmp_path, "--bands", str(out), monkeypatch=monkeypatch)
     assert result.exit_code == 5
-    assert "cannot write --bands" in result.stderr
+    assert "--bands write failed AFTER the target was replaced" in result.stderr
     assert "readback mismatch" in result.stderr
     # the message names the real semantics: it DID parse
     assert "content hash differs" in result.stderr

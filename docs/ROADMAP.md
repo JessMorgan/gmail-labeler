@@ -48,7 +48,15 @@ candidate threshold per band, explicit no-band state with named
 reasons, undefined-precision cells never meet a target), the versioned
 Bands Artifact bound to checkpoint + eval identity (refused on any
 disagreement), the config's `[bands]` per-label overrides, and
-`eval --bands` as the only writer (recompute posture, #21).
+`eval --bands` as the only writer (recompute posture, #21); per-label
+Graduation gates — the pure core (minimum examples + minimum
+precision at the calibrated high band, analyze's strict-gt operator
+precedent, named reasons, the med band never graduates), the versioned
+Graduation Table bound to checkpoint + eval identity + the Bands
+Artifact's content hash (refused on any disagreement), the config's
+`[graduation]` per-label overrides, and `eval --graduation` with the
+human-confirm diff + CLI-gated `--confirm-graduation` write (ADR-0005;
+recompute posture, #22).
 
 Scope:
 

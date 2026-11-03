@@ -126,6 +126,58 @@ contributor machines are configured independently.
   `~/.config/gh/hosts.yml` expose live tokens — never paste their
   output into logs, commits, review reports, or PR text.
 
+### Merge-style policy
+
+- The maintainer picks the merge style per PR (the maintainer may
+  override the agent's recommendation at merge time), recorded in the PR
+  body's "Recommended merge method" line. Agents write it themselves
+  when opening a PR (rubric below; this policy overrides the
+  git-management/dev-workflow skills' default in this repo); follow it
+  and never object to squash being the maintainer's choice — older PR
+  bodies may say "do not squash-merge"; this policy supersedes them.
+- Three styles (GitHub button names):
+  1. **Rebase and merge** — single-commit PRs, or PRs whose commits are
+     unrelated to each other (lands linearly; content identical).
+  2. **Create a merge commit** — independently meaningful stages of one
+     ticket: each would have existed without review rounds, is CI-green
+     on its own, a worthwhile bisect stop; history keeps them as a group.
+  3. **Squash and merge** — PRs delivering ONE unit where any of their
+     commits exist only as PR-feedback artifacts (review-round /
+     forward-fix / closeout); those carry no record value.
+- For a PR delivering one unit, the boundary is: "Would EVERY commit
+  have existed without the review rounds?" Yes → merge commit, provided
+  style 2's other conditions hold; otherwise → squash — any commit that
+  would not have existed without the review rounds is a review-round
+  artifact (the genuine stages fold into the squashed unit; the
+  full-message rule keeps their subjects visible). Multiple unrelated
+  commits are not one unit — style 1 applies.
+- Messages: a squash merge MUST keep GitHub's full concatenated commit
+  message (all subjects + bodies); title-only squash is FORBIDDEN — it
+  destroys the `Written by:`/`Reviewed by:` review ledger. (Rebase and
+  merge commit preserve per-commit messages by construction.)
+- Provenance: squash commits carry a `Merged-from: <pr-head-sha>`
+  footer — the PR head AT MERGE TIME (re-verify after any later
+  force-push) — so `main` history identifies the exact reviewed head,
+  which GitHub links to the PR's review thread.
+- Merge-box handoff: GitHub pre-fills the full concatenation under
+  `squash_merge_commit_message=COMMIT_MESSAGES` — verify the pre-fill,
+  then append the `Merged-from:` line; post the paste-ready footer as a
+  PR conversation comment (not an inline diff comment), refreshed
+  whenever the head sha changes; only if the pre-fill is wrong, supply
+  the whole message. If that setting ever changes, enforce the
+  concatenated-message requirement by hand.
+- Style changes no gate or attribution rule: the per-commit two-family
+  review gate (qwen + deepseek) applies to branch commits before its PR
+  is opened (hence before merging); attribution blocks are required in
+  every commit message, in all styles; the agent never merges — existing
+  rule, not a new one.
+- Stack mechanics: deleting a merged base branch only retargets
+  dependent PRs to the default branch — rebase dependents by hand onto
+  the default branch's new head, rerun gates, and record the rebase on the dependent PRs. Until
+  the hand rebase lands, the dependent PR's diff re-shows the base's
+  already-merged commits; its rebase force-push is permitted only while
+  the dependent PR is unmerged.
+
 ## Invariants (seed gotchas; expand the list as code lands)
 
 1. **Additive-only**: the only Gmail write is `addLabelIds`; no code path may

@@ -40,7 +40,7 @@ concept the glossary lacks, add it there in the same commit.
   skip-present makes the retry harmless. No application may depend on
   in-memory state.
 - **Cursor discipline**: the `historyId` cursor persists only after all events
-  in that page are durably handled; a replayed page must be harmless.
+  of the poll's delta are durably handled; a replayed delta must be harmless.
 
 ## Secrets, privacy, logging
 

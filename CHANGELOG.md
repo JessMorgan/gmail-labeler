@@ -84,6 +84,21 @@ does not ship releases yet.
   finalized to ADR-0008's wording printing the exact
   `dataset sync-labels --full-resync` command (#73's vaporware-absence pin
   flipped to a presence pin).
+- Composition flags (ticket #75, spec #64): `dataset sync-labels
+  --also-import-gmail` runs the full Gmail Import pass after the Label
+  Sync delta is durable (Sync Cursor advanced); `dataset import-gmail
+  --also-sync-labels` runs the Label Sync event walk after the import
+  completes durably. Opt-in by design — without the flags both commands
+  keep their standalone contracts byte-identically (pinned). One report
+  carries both passes' stats; each second pass delegates to the landed
+  core (no re-implementation — ingest stays single-sourced, and the
+  composite sync pass is the event walk only, never an implicit
+  `--full-resync`); a second-pass failure exits non-zero per the pinned
+  taxonomy (4 auth, 5 failed — the expired-cursor guidance contract
+  included) and never rolls back the first pass's durable records or
+  cursor; a failed first pass never starts the second. `--dry-run`
+  refuses `--also-import-gmail` as a usage error (`2`): dry-run writes
+  nothing, the import pass writes records.
 - Sync Cursor sidecar (`sync_cursor.py`, `corpus_store.py`, ADR-0008,
   ticket #72): `dataset import-gmail` births `sync-cursor.json`
   (`{version, history_id, last_sync}`, tz-aware UTC `last_sync`) inside the

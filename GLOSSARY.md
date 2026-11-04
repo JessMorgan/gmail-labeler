@@ -110,7 +110,8 @@ _Avoid_: backup restore (this reads, never restores)
 **Full Resync**:
 The ground-truth Label Reconciliation that needs no history: one
 `labels.list` plus local resolved-view counts price both strategies up
-front, and the cheaper runs — the Label Inventory Scan (enumerate every
+front, and the cheaper runs (ties and an unpriceable scan go to the walk)
+— the Label Inventory Scan (enumerate every
 mailbox user label's current members by label id and diff against the
 Corpus's sets, metadata-fetching only flagged ids; vanished labels'
 corpus members fetched directly) or the Corpus Metadata Walk (fetch every

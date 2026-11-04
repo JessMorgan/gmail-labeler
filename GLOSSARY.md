@@ -107,6 +107,19 @@ than pulling through the Gmail API. Optional fast path; the Gmail Import is
 the canonical source.
 _Avoid_: backup restore (this reads, never restores)
 
+**Full Resync**:
+The ground-truth Label Reconciliation that needs no history: one
+`labels.list` plus local resolved-view counts price both strategies up
+front, and the cheaper runs — the Label Inventory Scan (enumerate every
+mailbox user label's current members by label id and diff against the
+Corpus's sets, metadata-fetching only flagged ids; vanished labels'
+corpus members fetched directly) or the Corpus Metadata Walk (fetch every
+corpus id's current labels, diff, revise). The remedy for an expired Sync
+Cursor and the first reconciliation for GYB-sourced Corpora; it reseeds
+the Cursor from a profile value captured before the scan.
+_Avoid_: re-import (nothing is re-assembled), re-sync (Gmail's name for
+the prescribed full re-pull)
+
 **Label Sync**:
 Bringing a Corpus's label state up to the mailbox's current label state,
 without re-assembling the Corpus. An operation on freshness, not on ingest:

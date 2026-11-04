@@ -54,6 +54,36 @@ does not ship releases yet.
   generalized into `retry.py` (shared pacing, duck-typed `retried`) and
   now re-raises `GmailResyncError` instead of swallowing it to a warning —
   silent success over a blind window was the bug.
+- `dataset sync-labels --full-resync` (ticket #74, spec #64): ground-truth
+  label reconciliation needing no history — the expired-cursor remedy and
+  the first reconciliation path for GYB-sourced Corpora.
+  `label_sync.full_resync(client, store, id_to_name, sleeper, clock,
+  dry_run, progress)` (pure core, daemon-reusable) captures the profile
+  seed BEFORE the scan and persists it only after the reconciliation's
+  revisions are durable — an advance, or a birth-when-absent on a
+  cursorless corpus with the same ordering (ADR-0008). ONE `labels.list`
+  (per-label `messagesTotal`) plus local resolved-view counts yield the
+  cost estimate, printed with the strategy choice before any enumeration
+  spend; the estimator runs the cheaper of the label-inventory scan
+  (enumerate every mailbox user label's members by label id via the new
+  `list_messages(label_ids=...)` protocol extension — real adapter, fake,
+  and the surface-table tripwires; diff against the Corpus's sets;
+  metadata-fetch only flagged ids; vanished labels' corpus members fetched
+  directly — the `id:` convention kept where unresolvable, and an id that
+  resolved since import converging via one direct fetch; system-label-only
+  churn flags nothing) or the corpus-metadata walk (metadata-get every
+  corpus id, diff, revise only on drift); ties and an unpriceable scan
+  (`messagesTotal` absent) go to the walk, whose number is exact. On the
+  scan the report prints the flag-rate before the metadata pass and
+  quotes the worst-case cost vs a from-scratch reload when a corpus-wide
+  drift is flagged (the walk prices its full fetch up front instead);
+  call-log tests
+  keep both strategies body-free (invariant #5), failed runs hold the
+  ledger and replay harmlessly (invariant #3), and `--dry-run` prints the
+  estimate, choice, and plan with zero writes. The 404 guidance is
+  finalized to ADR-0008's wording printing the exact
+  `dataset sync-labels --full-resync` command (#73's vaporware-absence pin
+  flipped to a presence pin).
 - Sync Cursor sidecar (`sync_cursor.py`, `corpus_store.py`, ADR-0008,
   ticket #72): `dataset import-gmail` births `sync-cursor.json`
   (`{version, history_id, last_sync}`, tz-aware UTC `last_sync`) inside the

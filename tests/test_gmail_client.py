@@ -502,6 +502,101 @@ def test_fake_serves_real_mime_and_per_method_failures() -> None:
     assert fake.calls == ["list_messages:q:", "get_message:m"]
 
 
+def test_list_messages_label_ids_repeats_on_the_wire_and_refuses_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review minors (both families, commit-A round 1), pinned standalone
+    because the shared surface table compares dict(parse_qsl(...)) — which
+    collapses a repeated key to its LAST value and structurally cannot
+    carry the two-id form. The real adapter must emit labelIds REPEATED
+    (discovery: repeated:true), not comma-joined: a comma-joined drift
+    would read as one bogus label id upstream and silently return an
+    empty inventory."""
+    import urllib.parse
+
+    import httplib2
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.http import HttpRequest
+
+    monkeypatch.setattr(
+        httplib2.Http,
+        "request",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("offline: no network in tests (invariant #9)")
+        ),
+    )
+    creds = Credentials(
+        "fake",
+        client_id="cid",
+        client_secret="sec",  # fake, offline, never refreshed
+        token_uri="https://token.invalid",
+    )
+    client = GmailRestClient(creds)  # DEFAULT real-build path
+    captured: list[HttpRequest] = []
+    monkeypatch.setattr(
+        GmailRestClient,
+        "_call",
+        staticmethod(lambda request: captured.append(request) or {"messages": []}),
+    )
+    client.list_messages("", label_ids=["L1", "L2"])
+    assert len(captured) == 1
+    _, _, query = captured[0].uri.partition("?")
+    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    assert [v for k, v in pairs if k == "labelIds"] == ["L1", "L2"]
+    assert "q" not in dict(pairs)  # empty query rides absent
+
+    # an EMPTY label_ids list is a caller bug on both spines, never a
+    # silent whole-mailbox sweep (doctrine: loud, like _label_list)
+    with pytest.raises(ValueError, match="whole mailbox"):
+        client.list_messages("", label_ids=[])
+    fake = FakeGmailClient()
+    with pytest.raises(ValueError, match="whole mailbox"):
+        fake.list_messages("", label_ids=[])
+
+
+def test_fake_list_messages_label_ids_filters_and_logs() -> None:
+    """#74 protocol extension: the full-resync inventory scan enumerates a
+    label's current members by label ID (ids, not search names — dodges
+    slash-path quoting). The fake must filter like the wire (AND across
+    ids) and log the ids so call-sequence tests can tell an inventory call
+    from a plain list."""
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="m1", eml=b"x", label_ids=("L1", "L2")),
+            FakeMessage(id="m2", eml=b"x", label_ids=("L1",)),
+            FakeMessage(id="m3", eml=b"x", label_ids=("L2",)),
+        ]
+    )
+    one = fake.list_messages("", label_ids=["L1"])
+    assert [s.id for s in one.stubs] == ["m1", "m2"]
+    both = fake.list_messages("", label_ids=["L1", "L2"])
+    assert [s.id for s in both.stubs] == ["m1"]  # Gmail AND semantics
+    # no label_ids => the call log is byte-identical to the landed shape
+    # (import call-sequence pins survive the extension)
+    plain = fake.list_messages("q")
+    assert [s.id for s in plain.stubs] == ["m1", "m2", "m3"]
+    assert fake.calls == [
+        "list_messages:::L1",
+        "list_messages:::L1,L2",
+        "list_messages:q:",
+    ]
+
+
+def test_fake_list_messages_label_ids_pages_the_filtered_set() -> None:
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id=f"m{i}", eml=b"x", label_ids=("L1",) if i % 2 else ("L2",))
+            for i in range(6)
+        ],
+        page_size=2,
+    )
+    p1 = fake.list_messages("", label_ids=["L1"])
+    assert [s.id for s in p1.stubs] == ["m1", "m3"]
+    assert p1.next_page_token == "2"
+    p2 = fake.list_messages("", p1.next_page_token, label_ids=["L1"])
+    assert [s.id for s in p2.stubs] == ["m5"] and p2.next_page_token is None
+
+
 def test_fake_fail_once_then_succeeds() -> None:
     fake = FakeGmailClient(messages=[FakeMessage(id="m", eml=b"x")])
     fake.fail("get_message", classify_status(503))
@@ -1288,6 +1383,22 @@ _SURFACE_CASES = [
         id="list_messages_page_token",
     ),
     pytest.param(
+        # #74 inventory scan: members enumerated by label ID, not by search
+        # name (dodges slash-path quoting). The empty query must NOT ride
+        # the wire as an empty q= param — the EXACT param set pins its
+        # absence; labelIds is `repeated: true` in the discovery doc, so a
+        # single id keeps the pin readable (parse_qsl would collapse a
+        # repeated key to its last value)
+        lambda c: c.list_messages("", None, label_ids=["L9"]),
+        {"messages": [{"id": "a1", "threadId": "t1"}]},
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        {"labelIds": "L9", "maxResults": "500", "alt": "json"},
+        MessagePage(
+            stubs=(MessageStub(id="a1", thread_id="t1"),), next_page_token=None
+        ),
+        id="list_messages_label_ids",
+    ),
+    pytest.param(
         # distinct id: a path built from the WRONG argument is unforgeable
         lambda c: c.get_message("m-17"),
         {
@@ -1444,13 +1555,16 @@ def test_surface_cases_cover_the_whole_protocol() -> None:
     for case in _SURFACE_CASES:
         assert isinstance(case.id, str)  # every param carries an id
         ids.add(case.id)
-    # plain ids must equal the Protocol EXACTLY: a _page_token variant is
-    # an extra, never a stand-in for its base case (deleting the base
-    # would silently drop that case's pageToken-ABSENCE pin). The suffix
-    # is exemption-by-convention: a Protocol method actually named
-    # *_page_token would slip through — contrived today; rename it if it
-    # ever ships
-    assert {i for i in ids if not i.endswith("_page_token")} == public
+    # plain ids must equal the Protocol EXACTLY: a variant case is an
+    # extra, never a stand-in for its base case (deleting the base would
+    # silently drop that case's pageToken-ABSENCE or labelIds-ABSENCE pin).
+    # The suffixes are exemption-by-convention: a Protocol method actually
+    # named *_page_token / *_label_ids would slip through — contrived
+    # today; rename it if it ever ships
+    variant_suffixes = ("_page_token", "_label_ids")
+    assert {
+        i for i in ids if not any(i.endswith(suffix) for suffix in variant_suffixes)
+    } == public
 
 
 def test_build_service_precedence_over_http_seam() -> None:

@@ -108,7 +108,12 @@ Every command takes `--config PATH`. `dataset import-gmail` takes `--query`
 (default `in:anywhere -in:spam -in:trash`) and `--max-messages` (smoke
 runs); it writes `filters.json` and `labels.json` sidecars next to the
 corpus — the offline snapshot `dataset analyze` uses for filter
-attribution. `dataset import-gyb` takes `--path`, `--max-messages`, and
+attribution — and births the `sync-cursor.json` Sync Cursor (ADR-0008)
+when the corpus has none, seeded from the first list page before any
+message is ingested (or warns and leaves the corpus birth-eligible when no
+seed is available); import never advances an existing cursor, and
+`dataset import-gyb` never writes one. `dataset import-gyb` takes
+`--path`, `--max-messages`, and
 `--system-labels` (comma-separated extras — the delimiter is a comma, so
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds

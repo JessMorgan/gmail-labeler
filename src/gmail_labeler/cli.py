@@ -105,22 +105,22 @@ _OPERATION_ERROR_EXIT = 5  # operation failure (transport/corpus) or incomplete
 # run — shared by all dataset commands (import-gmail, import-gyb,
 # sync-labels, analyze)
 
-# Interim recovery guidance for Label Sync (ticket #73). HONESTY CONTRACT:
-# the flag that would fix an expired cursor (--full-resync) lands in
-# ticket #74 — these strings must not name it as existing, and the CLI
-# test pins that absence. #74 finalizes ADR-0008's wording by swapping
-# these two constants and their pinned test, nothing else.
+# ADR-0008's FINAL recovery wording — the swap site ticket #73 documented
+# and ticket #74 consumed: --full-resync is real, so the 404 guidance
+# prints the exact recovery command and the birth NOTE recommends it. The
+# CLI test pins PRESENCE of `dataset sync-labels --full-resync` (the #73
+# vaporware-absence pin flipped alongside these constants).
 _RESYNC_GUIDANCE = (
     "guidance: the Sync Cursor is outside Gmail's retained history \u2014 "
-    "recovery is never automatic (ADR-0008). A full label-resync command is "
-    "not built yet; until it lands, refresh label state by rebuilding the "
-    "corpus: remove the corpus directory and re-run dataset import-gmail "
-    "(or dataset import-gyb)."
+    "recovery is never automatic (ADR-0008). Run "
+    "`dataset sync-labels --full-resync`: it reconciles the corpus's label "
+    "state against the mailbox directly (no history needed), prints a cost "
+    "estimate before any enumeration spend, and reseeds the cursor only "
+    "after the reconciliation's revisions are durable."
 )
 _RESYNC_GUIDANCE_NOTE = (
-    "A full label-resync command is not built yet; until it lands, reconcile "
-    "older label drift by rebuilding the corpus (dataset import-gmail or "
-    "import-gyb into a fresh corpus directory)."
+    "Run `dataset sync-labels --full-resync` to reconcile label drift older "
+    "than the retained history (cost-estimated up front)."
 )
 
 
@@ -323,19 +323,39 @@ def dataset_sync_labels(
         "--dry-run",
         help="Show the change plan: identical report, no records or cursor written",
     ),
+    full_resync: bool = typer.Option(
+        False,
+        "--full-resync",
+        help=(
+            "Ground-truth reconciliation for an expired Sync Cursor or a "
+            "cursorless (GYB-shaped) corpus: estimates both strategies from "
+            "one labels.list, prints the choice, runs the cheaper one (ties "
+            "and unpriceable scans go to the exact-cost walk) — no history "
+            "needed"
+        ),
+    ),
 ) -> None:
     """Refresh the corpus's label state from mailbox changes (Label Sync).
 
-    Walks the Gmail history from the corpus's Sync Cursor and appends a
-    label Revision for every touched message — metadata only, bodies never
-    (invariant #5). New mail is counted and reported, never ingested here;
-    deleted mail keeps its record.
+    Default path: walks the Gmail history from the corpus's Sync Cursor and
+    appends a label Revision for every touched message — metadata only,
+    bodies never (invariant #5). New mail is counted and reported, never
+    ingested here; deleted mail keeps its record.
+
+    --full-resync (recovery path, ticket #74): reconciles the corpus's
+    label state against the mailbox directly when the history window is
+    gone or was never consumed — cost-estimated up front from one
+    labels.list plus local resolved-view counts, cheaper of the
+    label-inventory scan and the corpus-metadata walk picked with a printed
+    rationale, the cursor reseeded (from the seed captured BEFORE the scan)
+    only after the reconciliation's revisions are durable (ADR-0008).
     """
     from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
     from .gmail_import import fetch_settings
-    from .label_sync import sync_labels
+    from .label_sync import FullResyncStats, SyncStats, sync_labels
+    from .label_sync import full_resync as run_full_resync
     from .tokens import TokenStoreError
 
     cfg = _load_config(config)
@@ -373,7 +393,20 @@ def dataset_sync_labels(
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
-        stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
+        if full_resync:
+            # progress lines (estimate + strategy BEFORE any enumeration
+            # spend; the scan's flag-rate BEFORE the metadata pass) print
+            # as they happen — the flood guard is only a guard if it
+            # lands early
+            stats: SyncStats | FullResyncStats = run_full_resync(
+                client,
+                store,
+                id_to_name=id_to_name,
+                dry_run=dry_run,
+                progress=typer.echo,
+            )
+        else:
+            stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
     except GmailResyncError as e:
         # the ledger is untouched (advancement is sync's act and this run
         # never reached it); recovery is never automatic (ADR-0008)
@@ -389,35 +422,60 @@ def dataset_sync_labels(
         typer.echo(f"sync-labels failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     stats.retried += bootstrap.retried  # settings blips count too
-    prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
-    typer.echo(
-        f"{prefix} events={stats.events} stale={stats.stale} "
-        f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
-        f"new_match={stats.new_match} retried={stats.retried} "
-        f"failed={len(stats.failed)}"
-    )
-    if stats.birthed:
-        # ADR-0008 consequence 1: the provenance disclosure — a fresh
-        # cursor over a corpus whose label state may be months old
-        typer.echo(
-            "NOTE: this corpus had no Sync Cursor \u2014 it was birthed from "
-            "the mailbox profile and applies NOTHING (no consumed "
-            "baseline to diff against yet; the corpus's label state may "
-            "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+    if full_resync:
+        assert isinstance(stats, FullResyncStats)  # branch-shaped narrowing
+        prefix = (
+            "sync-labels --full-resync (dry-run):"
+            if dry_run
+            else "sync-labels --full-resync:"
         )
-    if stats.gains or stats.losses:
-        labels = sorted(set(stats.gains) | set(stats.losses))
-        width = min(max((len(name) for name in labels), default=5) + 1, 64)
-        typer.echo(f"\n{'label':<{width}} {'gains':>6} {'losses':>6}")
-        for name in labels:
-            # NO truncation: slash-nested label paths must stay readable
+        # the flag-rate is the scan's drift signal; on the walk every id
+        # is fetched by construction, so quoting a 100% "flag-rate" there
+        # would read as drift that never happened (deepseek review)
+        rate = f" (flag-rate {stats.flag_rate:.0%})" if stats.strategy == "scan" else ""
+        typer.echo(
+            f"{prefix} strategy={stats.strategy} "
+            f"corpus={stats.corpus_messages} "
+            f"flagged={stats.flagged}{rate} "
+            f"revised={stats.revised} unchanged={stats.unchanged} "
+            f"deleted_kept={stats.deleted_kept} new_match={stats.new_match} "
+            f"retried={stats.retried} failed={len(stats.failed)}"
+        )
+        if stats.birthed:
+            # honesty under dry_run: the plan says WOULD birth — nothing was
+            # written (the core sets birthed from the read, not the write)
             typer.echo(
-                f"{name:<{width}} {stats.gains.get(name, 0):>6} "
-                f"{stats.losses.get(name, 0):>6}"
+                "NOTE: this corpus had no Sync Cursor \u2014 full-resync "
+                + (
+                    "WOULD birth it from the profile seed captured BEFORE the scan"
+                    if dry_run
+                    else "birthed it from the profile seed captured BEFORE the scan"
+                )
+                + " (ADR-0008: changes made during the scan carry higher "
+                "ids and land in the next sync's window)"
             )
+    else:
+        assert isinstance(stats, SyncStats)  # branch-shaped narrowing
+        prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
+        typer.echo(
+            f"{prefix} events={stats.events} stale={stats.stale} "
+            f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
+            f"new_match={stats.new_match} retried={stats.retried} "
+            f"failed={len(stats.failed)}"
+        )
+        if stats.birthed:
+            # ADR-0008 consequence 1: the provenance disclosure — a fresh
+            # cursor over a corpus whose label state may be months old
+            typer.echo(
+                "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
+                "from the mailbox profile and applies NOTHING (no consumed "
+                "baseline to diff against yet; the corpus's label state may "
+                "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+            )
+    _render_gains_losses(stats.gains, stats.losses)
     if stats.new_match:
         typer.echo(
-            f"NOTE: {stats.new_match} event id(s) are not in the corpus \u2014 "
+            f"NOTE: {stats.new_match} mailbox id(s) are not in the corpus \u2014 "
             "new mail is ingested by dataset import-gmail, never by sync "
             "(spec #64: ingest stays the acquisition paths' alone)",
             err=True,
@@ -435,6 +493,19 @@ def dataset_sync_labels(
         if len(stats.failed) > 20:
             typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:
+    """Per-label gain/loss table, shared by the event-walk and full-resync
+    reports (the sync report closes with these counts, spec #64)."""
+    if not (gains or losses):
+        return
+    labels = sorted(set(gains) | set(losses))
+    width = min(max((len(name) for name in labels), default=5) + 1, 64)
+    typer.echo(f"\n{'label':<{width}} {'gains':>6} {'losses':>6}")
+    for name in labels:
+        # NO truncation: slash-nested label paths must stay readable
+        typer.echo(f"{name:<{width}} {gains.get(name, 0):>6} {losses.get(name, 0):>6}")
 
 
 @dataset_app.command("analyze")

@@ -93,7 +93,7 @@ Import or a GYB Import; never shipped with or derived from another user's
 data. Label-state freshness reaches only as far as its last Label Sync.
 
 **Gmail Import**:
-Building a Corpus by pulling labeled mail through the Gmail API — the
+Building a Corpus by fetching labeled mail through the Gmail API — the
 canonical sourcing path (GYB Import is the optional fast path). Resumable
 via the corpus id set — a structural resume point, distinct from the Sync
 Cursor.
@@ -103,7 +103,7 @@ pull (implies fetch-and-merge; at ingest the store only appends)
 
 **GYB Import**:
 Building a Corpus from an existing Got Your Back (GYB) backup directory rather
-than pulling through the Gmail API. Optional fast path; the Gmail Import is
+than fetching through the Gmail API. Optional fast path; the Gmail Import is
 the canonical source.
 _Avoid_: backup restore (this reads, never restores)
 

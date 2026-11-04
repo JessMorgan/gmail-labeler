@@ -130,10 +130,22 @@ _RESYNC_GUIDANCE_NOTE = (
 
 # The closing pointer and the new-match NOTE are shared between the
 # standalone sync report and the composite second pass (ticket #75): one
-# rendering, pinned once.
-_ANALYZE_POINTER = (
-    "\nNext: run `dataset analyze` for the updated candidate gates "
-    "(ADR-0005 keeps retraining and applying human-gated)"
+# tail, pinned once. Ticket #77 (fix-round deferral): the pointer
+# claimed "the updated candidate gates" after a --dry-run plan-only run —
+# the same honesty class as the WOULD-birth split (9a6da1c), mirrored the
+# same way: a dry-run twin sharing one tail constant with the real pointer
+# so the modes cannot drift, selected at the command's own echo site
+# (--dry-run refuses composition, so the composite pointer at the
+# import-gmail pass is always a real-behavior close).
+_ANALYZE_POINTER_TAIL = (
+    " for the updated candidate gates (ADR-0005 keeps retraining and "
+    "applying human-gated)"
+)
+_ANALYZE_POINTER = "\nNext: run `dataset analyze`" + _ANALYZE_POINTER_TAIL
+_ANALYZE_POINTER_DRY = (
+    "\nNext: this dry run wrote nothing \u2014 re-run the same command "
+    "without --dry-run to apply the plan, then `dataset analyze`"
+    + _ANALYZE_POINTER_TAIL
 )
 _NEW_MATCH_NOTE = (
     "NOTE: {n} mailbox id(s) are not in the corpus \u2014 new mail is "
@@ -566,8 +578,11 @@ def dataset_sync_labels(
     if also_import_gmail:
         _import_gmail_pass(client, store, id_to_name=id_to_name, filters=filters)
     # reaching this line means every pass that ran was complete — an
-    # incomplete run does not recommend analyzing a half-synced corpus
-    typer.echo(_ANALYZE_POINTER)
+    # incomplete run does not recommend analyzing a half-synced corpus.
+    # Under --dry-run the gates did NOT move (ticket #77): the plan-only
+    # twin closes instead; composition is refused under the flag, so no
+    # real second pass can hide behind the dry wording here.
+    typer.echo(_ANALYZE_POINTER_DRY if dry_run else _ANALYZE_POINTER)
 
 
 def _import_gmail_pass(

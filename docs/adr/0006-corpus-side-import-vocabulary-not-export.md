@@ -1,7 +1,7 @@
 # Corpus-side acquisition commands: import-gmail, not export
 
 Both corpus-acquisition commands fill the Corpus, so both are named from the
-Corpus's side: `dataset import-gmail` (pull labeled mail through the Gmail
+Corpus's side: `dataset import-gmail` (fetch labeled mail through the Gmail
 API) sits symmetrically next to the established `dataset import-gyb` (load an
 existing GYB backup). The old name, `dataset export`, spoke from the Gmail
 source side and read to a mailbox owner as the exact opposite operation —

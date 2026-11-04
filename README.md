@@ -35,7 +35,7 @@ you would.
 
 ## How it works
 
-1. **Import** — pull your labeled mail via the Gmail API, or import an
+1. **Import** — fetch your labeled mail via the Gmail API, or import an
    existing [Got Your Back](https://github.com/GAM-team/got-your-back)
    backup. Keep it fresh as you relabel or Backfill by hand:
    `dataset sync-labels` brings the label changes in with no
@@ -102,7 +102,7 @@ land without a keyring.
 ```sh
 gmail-labeler auth                    # credential status
 gmail-labeler auth login              # one-time desktop OAuth consent flow
-gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
+gmail-labeler dataset import-gmail    # fetch labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (--full-resync: no history needed)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution

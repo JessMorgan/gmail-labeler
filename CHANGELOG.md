@@ -136,6 +136,15 @@ does not ship releases yet.
 
 ### Fixed
 
+- `dataset sync-labels --dry-run` on a cursorless corpus no longer prints
+  "it was birthed from the mailbox profile" — dry-run writes nothing, so the
+  event-walk report now says WOULD birth, mirroring the
+  `--full-resync` branch's existing WOULD/actual split; both render modes
+  are pinned by CLI tests (#64 fix round).
+- `RawMessage` no longer carries the base64 message body in its `repr()`:
+  repr-into-a-log is a log channel, and invariant #5 keeps bodies out of
+  logs — the field stays on the value (the import parses it), only the
+  rendering drops it (#71 deferral, closed in the #64 fix round).
 - `dataset import-gmail` no longer dies listing labels: the Gmail v1 discovery
   tree has only `users` at top level — `labels` live under it — and the
   REST client called `svc.labels()`, an `AttributeError` on the first live

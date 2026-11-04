@@ -1182,9 +1182,37 @@ def test_sync_labels_births_cursorless_corpus_and_reports_provenance(
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 0, result.output
     assert "no Sync Cursor" in result.stdout  # provenance disclosed
+    assert "it was birthed" in result.stdout  # NOT "WOULD" (deepseek review)
+    assert "WOULD birth" not in result.stdout
     assert "applies nothing" in result.stdout.lower()
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 777
+
+
+def test_sync_labels_dry_run_cursorless_says_would_birth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Honesty under --dry-run on the EVENT WALK (fix-round review, both
+    axes): the full-resync branch already splits WOULD/actual birth, but the
+    event-walk report printed "it was birthed" although dry-run writes
+    nothing. The NOTE must say WOULD birth, the cursor file must stay
+    absent, and the records bytes must not move."""
+    import gmail_labeler.cli as cli
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor: birth-eligible
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    fake = _sync_fake(current_history_id=777)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--dry-run", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "(dry-run)" in result.stdout
+    assert "WOULD birth" in result.stdout
+    assert "was birthed" not in result.stdout
+    assert not (store.root / "sync-cursor.json").exists()
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
 
 
 def test_sync_labels_counts_new_match_and_deleted_without_writing(

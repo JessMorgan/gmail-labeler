@@ -147,5 +147,13 @@ stored label state)
 **Resolved view**:
 The Corpus's logical state after the store folds its record log by message
 id, last occurrence wins. It is the read interface for label state; the log
-itself stays append-only.
+itself stays append-only at ingest.
 _Avoid_: current state, live view
+
+**Compaction**:
+Rewriting the Corpus's record log so each message id keeps only its newest
+line (a Revision where superseded) — safe when atomic and exclusive, never
+load-bearing for correctness (ADR-0007): the last-wins fold is the truth,
+so compaction changes only the fold's cost, never the resolved state.
+_Avoid_: garbage collection, log rotation (both imply the history itself is
+what's managed; the fold already resolves it)

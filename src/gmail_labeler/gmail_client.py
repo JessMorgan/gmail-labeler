@@ -1,9 +1,11 @@
 """Gmail API surface for corpus acquisition — Protocol + REST adapter.
 
-Only the Phase 0 read surface (labels, filters, message list/get, history);
-the ONLY write the product ever performs (addLabelIds) arrives with the
-daemon phase and will live behind the same Protocol (FakeGmailClient is the
-test spine — invariant #9). Errors surface via gmail_errors taxonomy only.
+The read surface: labels (with per-label message totals), filters, message
+list/get, metadata-only message get (the Label Sync path — no raw payload
+ever), the mailbox profile (current historyId), and history. The ONLY write
+the product ever performs (addLabelIds) arrives with the daemon phase and
+will live behind the same Protocol (FakeGmailClient is the test spine —
+invariant #9). Errors surface via gmail_errors taxonomy only.
 
 Wire-shape rule (verified against the Gmail v1 discovery schema): int64 /
 uint64 fields (internalDate, historyId) arrive as STRINGS — googleapiclient
@@ -40,6 +42,10 @@ class LabelInfo:
     name: str
     type: str  # "system" | "user" (labels.list; System Label filtering is
     # labels.py's job — this carries the raw facts)
+    # Label.messagesTotal (int32 — a JSON NUMBER, not an int64 string): the
+    # cost estimator's basis (spec #64). Absent-tolerant: None when the wire
+    # omits it, never strict-required.
+    messages_total: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +72,13 @@ class FilterInfo:
 class MessageStub:
     id: str
     thread_id: str
+    # Message.historyId (uint64-as-string): the mailbox history record that
+    # last modified THIS message. ListMessagesResponse has NO page-level
+    # historyId — the cursor rides per-message, and the sync guide reads the
+    # FIRST stub's value as the mailbox lower bound (ADR-0008 birth).
+    # Absent-tolerant (None): a schema-legal absent must never become a loud
+    # error on an import; the get_profile fallback covers it.
+    history_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +93,32 @@ class RawMessage:
     # (the Gmail import does); never trust presence.
     internal_date_ms: int | None
     raw_b64url: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageMetadata:
+    """format=metadata response — the sync path's ONLY message view.
+
+    Structurally body-free (invariant #5): there is no raw/payload/snippet
+    field to populate, so a metadata get CANNOT return message content even
+    if the wire carried it. internalDate is commonly reported alongside
+    id/labelIds on the metadata format, but presence is not contractually
+    pinned upstream (the bundled discovery enum text names id/labels/
+    headers only) — tolerate absence like the raw path does, never trust
+    presence."""
+
+    id: str
+    label_ids: tuple[str, ...]
+    internal_date_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileInfo:
+    """users.getProfile — only the mailbox's current history id is surfaced
+    (the ADR-0008 birth fallback). emailAddress/messagesTotal stay on the
+    wire: the sync path has no consumer, and the surface stays minimal."""
+
+    history_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +148,10 @@ class GmailClient(Protocol):
     ) -> MessagePage: ...
 
     def get_message(self, message_id: str) -> RawMessage: ...
+
+    def get_message_metadata(self, message_id: str) -> MessageMetadata: ...
+
+    def get_profile(self) -> ProfileInfo: ...
 
     def history(
         self, start_history_id: int, page_token: str | None = None
@@ -217,7 +260,12 @@ class GmailRestClient:
         # by test_surface_paths_walk_the_real_discovery_tree)
         data = self._call(self._svc().users().labels().list(userId="me"))
         return [
-            LabelInfo(id=_s(item, "id"), name=_s(item, "name"), type=_s(item, "type"))
+            LabelInfo(
+                id=_s(item, "id"),
+                name=_s(item, "name"),
+                type=_s(item, "type"),
+                messages_total=_opt_int64(item, "messagesTotal"),
+            )
             for item in _obj_list(data, "labels")
         ]
 
@@ -243,7 +291,12 @@ class GmailRestClient:
         )
         data = self._call(req)
         stubs = tuple(
-            MessageStub(id=_s(m, "id"), thread_id=_s(m, "threadId"))
+            MessageStub(
+                id=_s(m, "id"),
+                thread_id=_s(m, "threadId"),
+                # per-message cursor (ADR-0008 birth source) — optional
+                history_id=_opt_int64(m, "historyId"),
+            )
             for m in _obj_list(data, "messages")
         )
         return MessagePage(stubs=stubs, next_page_token=_token(data))
@@ -259,6 +312,30 @@ class GmailRestClient:
             internal_date_ms=_opt_int64(data, "internalDate"),
             raw_b64url=_raw_nonempty(data),  # absent OR empty: loud
         )
+
+    def get_message_metadata(self, message_id: str) -> MessageMetadata:
+        # format=metadata: id/labelIds/internalDate only. Deliberately NOT
+        # _raw_nonempty — a metadata response has no raw field, and this
+        # path must stay structurally body-free (invariant #5: the sync
+        # direction is incapable of pulling a message body).
+        data = self._call(
+            self._svc()
+            .users()
+            .messages()
+            .get(userId="me", id=message_id, format="metadata")
+        )
+        return MessageMetadata(
+            id=_s(data, "id"),
+            label_ids=_str_list(data, "labelIds"),
+            internal_date_ms=_opt_int64(data, "internalDate"),
+        )
+
+    def get_profile(self) -> ProfileInfo:
+        # users.getProfile — a users-level METHOD (path
+        # gmail/v1/users/{userId}/profile), pinned offline by the surface
+        # table (#59 discipline)
+        data = self._call(self._svc().users().getProfile(userId="me"))
+        return ProfileInfo(history_id=_opt_int64(data, "historyId"))
 
     def history(
         self, start_history_id: int, page_token: str | None = None
@@ -355,7 +432,12 @@ def _opt_int64(obj: dict[str, object], key: str) -> int | None:
     """int64/uint64 wire fields arrive as strings (discovery schema:
     {"type":"string","format":"int64"}; googleapiclient does a bare
     json.loads). ABSENT => None (format-dependent presence is legitimate);
-    PRESENT-and-malformed => loud permanent error."""
+    PRESENT-and-malformed => loud permanent error.
+
+    Also serves int32 count fields (Label.messagesTotal — a JSON number):
+    counts are non-negative by nature, so a negative value is corrupt wire
+    and the unsigned rejection is the intended loud answer, not an
+    over-strictness."""
     value = obj.get(key)
     if value is None:
         return None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -713,6 +714,152 @@ def test_history_records_feed_the_fakes_history_pages() -> None:
     assert page.records[0]["labelsAdded"] == [
         {"message": {"id": "m1"}, "labelIds": ["L2"]}
     ]
+
+
+# -- #71 AC3/AC4: call-log & taxonomy proofs (invariant #5 executable) -------
+
+
+def test_message_metadata_type_has_no_body_bearing_field() -> None:
+    # structural proof, not behavioral: the sync direction's message view
+    # has NO raw/payload/snippet field to populate — a metadata get is
+    # incapable of returning a body even if the wire carried one
+    assert {f.name for f in dataclasses.fields(MessageMetadata)} == {
+        "id",
+        "label_ids",
+        "internal_date_ms",
+    }
+
+
+def test_rest_get_message_metadata_never_surfaces_raw_even_if_wire_carries_it() -> None:
+    # adversarial canned wire: raw/snippet present (a metadata-format server
+    # response never has them — if one ever did, the parse must not carry
+    # them out; the not-REQUIRE-ing-them half is pinned by
+    # test_rest_get_message_metadata_needs_no_raw)
+    client = _rest(
+        {
+            "id": "m",
+            "labelIds": ["L1"],
+            "internalDate": "5",
+            "raw": "SECRET-RAW",
+            "snippet": "SECRET-SNIPPET",
+        }
+    )
+    got = client.get_message_metadata("m")
+    assert not isinstance(got, RawMessage)
+    assert "SECRET" not in repr(got)
+
+
+def test_message_get_404_is_plain_permanent_not_resync() -> None:
+    # the resync reading belongs to history.list ONLY: a 404 on a message
+    # get means the message is gone, and must stay a natural permanent
+    client = _rest(error=_HttpError(404))
+    with pytest.raises(GmailPermanentError) as exc:
+        client.get_message_metadata("m")
+    assert not isinstance(exc.value, GmailResyncError)
+
+
+def test_resync_404_is_one_type_on_both_spines() -> None:
+    # AC #4 cross-spine pin: sync code detects the expired cursor through
+    # ONE type whether it runs against the fake (function-seam tests) or
+    # the real adapter (production)
+    client = _rest(error=_HttpError(404))
+    with pytest.raises(GmailResyncError) as real:
+        client.history(5)
+    fake = FakeGmailClient(current_history_id=10)
+    with pytest.raises(GmailResyncError) as scripted:
+        fake.history(11)
+    assert type(real.value) is type(scripted.value)
+    assert real.value.status == scripted.value.status == 404
+
+
+@pytest.mark.parametrize("method", ["get_message_metadata", "get_profile"])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, GmailTransientError),
+        (429, GmailRateLimitedError),
+        (403, GmailAuthError),
+        (400, GmailPermanentError),
+    ],
+)
+def test_taxonomy_holds_on_every_new_real_call_path(
+    method: str, status: int, expected: type
+) -> None:
+    # _call is the single chokepoint — the taxonomy rides the new methods
+    # by construction; this is the pin that keeps that construction honest.
+    # Dict dispatch (not an if/else catch-all): a method added to the
+    # parametrize list without a lambda here fails LOUD on KeyError
+    client = _rest(error=_HttpError(status))
+    calls = {
+        "get_message_metadata": lambda: client.get_message_metadata("m"),
+        "get_profile": lambda: client.get_profile(),
+    }
+    with pytest.raises(expected):
+        calls[method]()
+
+
+@pytest.mark.parametrize("method", ["get_message_metadata", "get_profile"])
+def test_taxonomy_holds_on_every_new_fake_call_path(method: str) -> None:
+    fake = FakeGmailClient(messages=[FakeMessage(id="m", eml=b"x")])
+    fake.fail(method, classify_status(503))
+    calls = {
+        "get_message_metadata": lambda: fake.get_message_metadata("m"),
+        "get_profile": lambda: fake.get_profile(),
+    }
+    with pytest.raises(GmailTransientError):
+        calls[method]()
+
+
+def test_sync_relevant_sequence_never_requires_raw_get() -> None:
+    # AC3: the whole freshness path — birth cursor from a list stub, event
+    # walk, refresh-on-any-touch metadata fetch, a profile read (the
+    # ADR-0008 fallback's branch input; the branch itself is #72's), label
+    # totals for the estimator — runs on the fake with NO raw get in the
+    # call log and no body anywhere near it (invariant #5, executable)
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="m1",
+                eml=b"Subject: x\r\n\r\nBODY-SECRET",
+                label_ids=("L1",),
+                thread_id="t1",
+            )
+        ],
+        labels=[LabelInfo("L1", "Shipping", "user", messages_total=42)],
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=history_records([LabelsAdded("m1", ("L2",))]),
+            )
+        ],
+        current_history_id=100,
+    )
+    page = fake.list_messages("in:anywhere")
+    assert page.stubs[0].history_id == 100  # ADR-0008 birth value
+    delta = fake.history(page.stubs[0].history_id)
+    assert "m1" in str(delta.records[0])  # the event names the corpus id
+    current = fake.get_message_metadata("m1")
+    # label state as programmed: the fake's history() SERVES records and
+    # never mutates self.messages, so the post-event truth is what the test
+    # set on the FakeMessage (see the history() docstring)
+    assert current.label_ids == ("L1",)  # body-free
+    # get_profile reachable on the sync path; the ADR-0008 FALLBACK branch
+    # itself is #72's, programmed via stub_history_id=False
+    assert fake.get_profile().history_id == 100
+    totals = {la.id: la.messages_total for la in fake.list_labels()}
+    assert totals == {"L1": 42}  # estimator basis, no extra call needed
+    # the log distinguishes the metadata path from a raw get — and shows
+    # the raw path was never taken
+    assert fake.calls == [
+        "list_messages:in:anywhere:",
+        "history:100:",
+        "get_message_metadata:m1",
+        "get_profile",
+        "list_labels",
+    ]
+    assert [c for c in fake.calls if c.startswith("get_message:")] == []
+    assert "BODY-SECRET" not in repr(fake.calls)
 
 
 # -- wire-truth pins for the reviewer-found production classes ---------------

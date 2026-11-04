@@ -24,7 +24,7 @@ import base64
 import logging
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email import message_from_bytes
 from email.message import EmailMessage, Message, MIMEPart
@@ -41,11 +41,19 @@ _MULTI_NL = re.compile(r"\n{3,}")
 
 @dataclass(frozen=True, slots=True)
 class ParsedMail:
-    subject: str
+    # repr=False on the body-bearing fields (ticket #78, invariant #5
+    # posture — repr() into a log IS a log channel, the RawMessage
+    # precedent): subject and body_text are message content and must
+    # never ride a traceback/log repr. The field census on this dataclass:
+    # subject (repr=False), sender/recipients/date (envelope identity
+    # metadata, stay inspectable like RawMessage's id), body_text
+    # (repr=False). Equality and construction are unaffected — the
+    # importers read these fields by name.
+    subject: str = field(repr=False)
     sender: str
     recipients: tuple[str, ...]  # deduped, order-preserving
     date: datetime | None  # message Date header, tz-aware UTC; None if absent
-    body_text: str  # canonicalized: THIS is what gets stored and hashed
+    body_text: str = field(repr=False)  # canonicalized: THIS is stored and hashed
 
     def is_parseable_body(self) -> bool:
         return bool(self.body_text)

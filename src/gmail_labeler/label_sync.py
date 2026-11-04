@@ -63,7 +63,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Final
+from typing import Final, Literal
 
 from .corpus_record import CorpusRecord
 from .corpus_store import CorpusStore
@@ -97,25 +97,47 @@ class _Gone:
 
 _GONE: Final = _Gone()
 
+#: The two reconciliation strategies the estimator picks between (#74) —
+#: typed to match the module's posture; None on the stats means the run
+#: bailed before the estimate landed and named no choice.
+_SyncStrategy = Literal["scan", "walk"]
 
-@dataclass
-class SyncStats:
-    events: int = 0  # history records walked
-    stale: int = 0  # corpus-resident ids the walk marked for refresh
+
+@dataclass(kw_only=True)
+class _SyncStatsBase:
+    """Counters shared by both Label Sync spines — the event walk and the
+    full resync (Standards review fold): one definition of the identical
+    fields; the report renderers read them by name. ``retried`` keeps the
+    duck-typed RetryStats protocol shape (retry.py) — the base is between
+    the two sync dataclasses only, never reaching GmailImportStats.
+    kw-only construction: the fold reordered the fields, so a positional
+    caller would bind silently to the wrong counter — the census stays
+    structural, not incidental. ``failed`` entries are (id, reason); the
+    "<...>" keys are SENTINELS, not message ids — report renderers must
+    not treat them as ids (each spine names its own sentinels in its
+    docstring)."""
+
     revised: int = 0  # revisions appended (planned, under dry_run)
-    deleted_kept: int = 0  # resident ids confirmed gone; records kept
-    new_match: int = 0  # event ids not resident in the corpus (report only)
+    deleted_kept: int = 0  # gone-touched ids; records kept — walk:
+    # delete-touched union metadata-404s, resync: metadata-404s only
+    new_match: int = 0  # event/inventory ids not resident (report only)
     retried: int = 0  # shared RetryStats protocol counter
     birthed: bool = False  # ADR-0008 consequence 1: cursorless corpus
     gains: dict[str, int] = field(default_factory=dict)  # label -> count
     losses: dict[str, int] = field(default_factory=dict)
-    # (id, reason); "<page>"/"<cursor>" are SENTINELS, not message ids —
-    # report renderers must not treat them as ids (gmail_import parity)
     failed: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def failed_ids(self) -> list[str]:
         return [i for i, _ in self.failed]
+
+
+@dataclass(kw_only=True)
+class SyncStats(_SyncStatsBase):
+    """Event-walk counters. ``failed`` sentinels: "<page>", "<cursor>"."""
+
+    events: int = 0  # history records walked
+    stale: int = 0  # corpus-resident ids the walk marked for refresh
 
 
 def sync_labels(
@@ -198,12 +220,8 @@ def sync_labels(
         # fold (ADR-0007 accepts the fold cost; it need not be paid empty).
         resolved = {rec.id: rec for rec in store.iter_resolved()}
         for message_id in stale:
-            meta = retrying(
-                lambda mid=message_id: _metadata_or_gone(client, mid),
-                max_attempts=max_attempts,
-                stats=stats,
-                sleeper=sleeper,
-                what=f"get_message_metadata:{message_id}",
+            meta = _fetch_metadata(
+                client, message_id, stats, max_attempts=max_attempts, sleeper=sleeper
             )
             if isinstance(meta, _Gone):  # narrows the union for the get below
                 gone_confirmed.add(message_id)
@@ -273,6 +291,32 @@ def _birth_without_applying(
     label state may be months behind. A seed failure is a recorded failure
     (exit non-zero) — unlike Gmail Import, where birth is a mere side
     effect of the real job."""
+    # Shared read/gate with the resync's up-front capture (_profile_seed,
+    # lockstep); persisted HERE, immediately — the resync defers to step 6.
+    seed = _profile_seed(client, stats, max_attempts=max_attempts, sleeper=sleeper)
+    if seed is None:
+        return stats
+    stats.birthed = True
+    if not dry_run:
+        store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
+    return stats
+
+
+def _profile_seed(
+    client: GmailClient,
+    stats: _SyncStatsBase,
+    *,
+    max_attempts: int,
+    sleeper: Callable[[float], None],
+) -> int | None:
+    """ONE validated historyId seed from get_profile — the two birth spines
+    read and gate the seed in deliberate lockstep (the append path's
+    shared-machinery precedent): the event walk's birth-without-applying
+    and the full resync's up-front capture (ADR-0008 note 9) share this
+    read, the same usable-seed gate, and the same "<cursor>" failure
+    sentinel; only WHEN they persist it differs (immediately for the
+    birth, after the durable revisions for the resync). None means no
+    usable seed: the failure is already recorded — callers return stats."""
     profile = retrying(
         client.get_profile,
         max_attempts=max_attempts,
@@ -283,11 +327,8 @@ def _birth_without_applying(
     seed = profile.history_id if profile is not None else None
     if seed is None or seed <= 0:
         stats.failed.append(("<cursor>", "no usable historyId seed (profile call)"))
-        return stats
-    stats.birthed = True
-    if not dry_run:
-        store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
-    return stats
+        return None
+    return seed
 
 
 def _history(
@@ -326,11 +367,34 @@ def _metadata_or_gone(client: GmailClient, message_id: str) -> MessageMetadata |
         raise
 
 
+def _fetch_metadata(
+    client: GmailClient,
+    message_id: str,
+    stats: _SyncStatsBase,
+    *,
+    max_attempts: int,
+    sleeper: Callable[[float], None],
+) -> MessageMetadata | _Gone | None:
+    """The retrying metadata get — byte-identical at both sync spines
+    (Standards review fold), so only the FETCH is shared: what a result
+    MEANS stays each spine's own gate (the walk self-heals on any touch,
+    the resync diffs before appending — the declined loop fold stays
+    declined). None means permanent/retries-exhausted; the caller records
+    the per-spine failure text."""
+    return retrying(
+        lambda: _metadata_or_gone(client, message_id),
+        max_attempts=max_attempts,
+        stats=stats,
+        sleeper=sleeper,
+        what=f"get_message_metadata:{message_id}",
+    )
+
+
 def _revise(
     resident: CorpusRecord,
     meta: MessageMetadata,
     id_to_name: Mapping[str, str],
-    stats: SyncStats | FullResyncStats,
+    stats: _SyncStatsBase,
     *,
     store: CorpusStore | None,
 ) -> None:
@@ -371,33 +435,20 @@ _METADATA_GET_UNITS: Final = 20
 _RELOAD_UNITS_PER_MSG: Final = 60
 
 
-@dataclass
-class FullResyncStats:
+@dataclass(kw_only=True)
+class FullResyncStats(_SyncStatsBase):
     """Report counts for one reconciliation. ``strategy`` names the choice
-    the estimator printed; the unit fields are the numbers behind it."""
+    the estimator printed; the unit fields are the numbers behind it.
+    ``failed`` sentinels: "<cursor>", "<labels>", "<label:ID>"."""
 
-    strategy: str = ""  # "scan" | "walk" ("" until the estimate lands)
+    strategy: _SyncStrategy | None = None  # None until the estimate lands
     corpus_messages: int = 0
     enumerated_labels: int = 0  # mailbox user labels the scan would page
     scan_list_units: int = 0  # enumeration floor; flagged metadata is on top
     walk_units: int = 0
     flagged: int = 0
-    revised: int = 0  # revisions appended (planned, under dry_run)
     unchanged: int = 0  # flagged/fetched but the diff came back empty
-    deleted_kept: int = 0  # metadata get 404'd; record kept
-    new_match: int = 0  # inventory ids not resident (report only)
-    retried: int = 0  # shared RetryStats protocol counter
-    birthed: bool = False  # cursorless corpus: this run births (ADR-0008)
     seed_history_id: int | None = None  # the up-front profile value written
-    gains: dict[str, int] = field(default_factory=dict)  # label -> count
-    losses: dict[str, int] = field(default_factory=dict)
-    # (id, reason); "<cursor>"/"<labels>"/"<label:ID>" are SENTINELS, not
-    # message ids — report renderers must not treat them as ids
-    failed: list[tuple[str, str]] = field(default_factory=list)
-
-    @property
-    def failed_ids(self) -> list[str]:
-        return [i for i, _ in self.failed]
 
     @property
     def flag_rate(self) -> float:
@@ -449,16 +500,11 @@ def full_resync(
     # 1. SEED UP FRONT (note 9, binding): ONE profile call before any
     #    enumeration. Events after capture carry higher ids, so persisting
     #    THIS value keeps mid-scan changes inside the next sync's window.
-    profile = retrying(
-        client.get_profile,
-        max_attempts=max_attempts,
-        stats=stats,
-        sleeper=sleeper,
-        what="get_profile",
-    )
-    seed = profile.history_id if profile is not None else None
-    if seed is None or seed <= 0:
-        stats.failed.append(("<cursor>", "no usable historyId seed (profile call)"))
+    #    The read/gate is the event walk's birth seed, shared in lockstep
+    #    (_profile_seed); only the persistence point differs — here, after
+    #    the reconciliation's revisions are durable (step 6).
+    seed = _profile_seed(client, stats, max_attempts=max_attempts, sleeper=sleeper)
+    if seed is None:
         return stats
     stats.seed_history_id = seed
 
@@ -498,7 +544,7 @@ def full_resync(
     # tie goes to the WALK (deepseek review nit): the scan number is only
     # an enumeration FLOOR that flagged metadata can exceed, while the
     # walk number is exact — at parity the exact cost wins
-    strategy = (
+    strategy: _SyncStrategy = (
         "walk" if (unpriceable or stats.walk_units <= stats.scan_list_units) else "scan"
     )
     stats.strategy = strategy
@@ -570,12 +616,8 @@ def full_resync(
     # 5. metadata-fetch ONLY flagged ids; diff; revise drifted ones
     gone_confirmed: set[str] = set()
     for message_id in flagged:
-        meta = retrying(
-            lambda mid=message_id: _metadata_or_gone(client, mid),
-            max_attempts=max_attempts,
-            stats=stats,
-            sleeper=sleeper,
-            what=f"get_message_metadata:{message_id}",
+        meta = _fetch_metadata(
+            client, message_id, stats, max_attempts=max_attempts, sleeper=sleeper
         )
         if isinstance(meta, _Gone):  # narrows the union for the get below
             gone_confirmed.add(message_id)

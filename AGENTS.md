@@ -29,15 +29,15 @@ what is wired vs. planned, and each gains detail as its phase lands.
   same id; readers resolve last-occurrence-wins; no marker field, no
   compaction requirement, no body fetching on the sync path. The fold,
   `append_revision`, and the body-free event walk are wired (tickets
-  #70/#73); `--full-resync` arrives with #74.
+  #70/#73), as is `--full-resync` (#74).
 - ADR-0008 the Sync Cursor is sync's ledger — `import-gmail` may birth it
   when absent (never advance); `import-gyb` never births; only the Label
   Sync operation advances it, after durable revisions — `dataset
   sync-labels` (the event walk, ticket #73) is wired; the daemon advances
-  it when ADR-0003 lands. Expired cursors fail loudly; the
-  `--full-resync` remedy lands in ticket #74, so today's guidance string
-  points at rebuilding the corpus instead of naming the unbuilt flag.
-  Sidecar storage + Gmail Import birth wired (ticket #72).
+  it when ADR-0003 lands. Expired cursors fail loudly, printing the exact
+  `dataset sync-labels --full-resync` recovery command (wired by #74;
+  ADR-0008's final wording, never automatic). Sidecar storage + Gmail
+  Import birth wired (ticket #72).
 
 ## Layout
 
@@ -53,8 +53,8 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {import-gmail,import-gyb,sync-labels,analyze}` are wired (the
   acquisition pair is pinned by ADR-0006; the old `export` name is a usage
-  error, no alias; `sync-labels` is the spec #64 event walk — its
-  `--full-resync` arrives with ticket #74, `--also-*` composites with #75);
+  error, no alias; `sync-labels` is the spec #64 event walk plus its
+  `--full-resync` recovery path, #73/#74; `--also-*` composites with #75);
   `train`, `eval`,
   `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
   design conversation, not yet wired — change names with cause.

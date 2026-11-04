@@ -111,6 +111,11 @@ class MessageMetadata:
 
     id: str
     label_ids: tuple[str, ...]
+    # Kept although no landed code reads it yet (Standards review flagged
+    # it unconsumed): spec #71's AC pins the metadata-get return as
+    # id/labelIds/internalDate, and the daemon freshness path (ADR-0003) is
+    # the named future consumer — the AC owns this field, not the current
+    # call graph.
     internal_date_ms: int | None = None
 
 

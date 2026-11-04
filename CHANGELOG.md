@@ -137,6 +137,13 @@ does not ship releases yet.
 
 ### Fixed
 
+- `dataset sync-labels --dry-run` (event walk and `--full-resync`) no
+  longer closes with "run `dataset analyze` for the updated candidate
+  gates" — a plan-only run moves no gates, so dry-run now closes with a
+  plan-only twin ("this dry run wrote nothing — re-run the same command
+  without --dry-run to apply the plan, then `dataset analyze` …"),
+  mirroring the WOULD-birth split; both modes are pinned by CLI tests
+  (#77, #64 fix-round deferral).
 - `dataset sync-labels --dry-run` on a cursorless corpus no longer prints
   "it was birthed from the mailbox profile" — dry-run writes nothing, so the
   event-walk report now says WOULD birth, mirroring the

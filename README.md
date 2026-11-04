@@ -36,7 +36,12 @@ you would.
 ## How it works
 
 1. **Import** — pull your labeled mail via the Gmail API, or import an
-   existing [Got Your Back](https://github.com/GAM-team/got-your-back) backup.
+   existing [Got Your Back](https://github.com/GAM-team/got-your-back)
+   backup. Keep it fresh as you relabel or Backfill by hand:
+   `dataset sync-labels` brings the label changes in without a
+   re-import. A corpus with no Sync Cursor yet — every GYB-sourced one —
+   starts with `--full-resync`; the Backfill→sync→analyze loop, see
+   [CLI](#cli).
 2. **Analyze & train** — per-label report (counts, filter-authored labels,
    duplicates), then fine-tune a small encoder with one sigmoid head per
    label. CPU works; a GPU is faster.
@@ -101,6 +106,12 @@ gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
 gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (--full-resync: no history needed)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
+
+# The Backfill loop: label Backlog mail by hand in Gmail, then —
+gmail-labeler dataset sync-labels && gmail-labeler dataset analyze
+# Either side refreshes the other in one sitting:
+gmail-labeler dataset sync-labels --also-import-gmail  # sync labels, then the full Gmail Import (import-gmail's default query)
+gmail-labeler dataset import-gmail --also-sync-labels  # import, then the Label Sync delta
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -147,7 +158,19 @@ fetch up front instead — every id is read by construction there, so drift
 is measured by the diff, not a flag-rate. The profile seed is captured before the scan
 and written only after the reconciliation's revisions are durable, so a
 relabel made mid-run lands in the next sync's window; `--dry-run` prints
-the estimate, the choice, and the plan, writing nothing. Both imports are resumable:
+the estimate, the choice, and the plan, writing nothing. The Gmail Import
+and Label Sync commands compose, opt-in by design:
+`sync-labels --also-import-gmail` runs the full Gmail Import pass after
+the label delta is durable (Sync Cursor advanced), and
+`import-gmail --also-sync-labels` runs the Label Sync walk after the
+import completes durably — one report carries both passes' stats, a
+second-pass failure exits non-zero without ever rolling back the first
+pass's durable records or cursor, and a failed first pass never starts
+the second. Default-off keeps `import-gmail`'s crisp "append new
+messages, never touch existing records" meaning unambiguous (the daemon
+is the eventual freshness owner, ADR-0003/0008); `--dry-run` refuses
+`--also-import-gmail` as a usage error (`2`) — dry-run writes nothing,
+the import pass writes records. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips
 what is already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself

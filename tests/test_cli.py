@@ -188,6 +188,67 @@ def test_import_gmail_sidecar_is_0600_and_query_flows(
     assert any("list_messages:has:attachment:" in c for c in fake.calls)
 
 
+def test_import_gmail_births_cursor_0600_and_second_run_preserves_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the ticket's end-to-end demonstration against the fake: import, import
+    # again, and the first lower bound survives untouched — at the CLI seam,
+    # with the secret-handling mode asserted right after the run
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb",
+                history_id=900,
+            )
+        ],
+        current_history_id=900,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = str(_import_gmail_cfg(tmp_path))
+    result = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert result.exit_code == 0
+    cursor = tmp_path / "corpus" / "sync-cursor.json"
+    assert cursor.is_file()
+    assert cursor.stat().st_mode & 0o077 == 0  # protected state from byte one
+    born = cursor.read_bytes()
+    assert b'"history_id": 900' in born
+
+    fake.current_history_id = 950  # the mailbox moves on between imports
+    result = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert result.exit_code == 0
+    assert cursor.read_bytes() == born  # birth-once, byte-for-byte (AC3)
+
+
+def test_import_gmail_invalid_cursor_exits_5_not_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the typed failure surface at the CLI seam: a corrupt ledger is an
+    # operation failure (exit 5, "import failed"), never a raw traceback
+    # (exit 1), and the garbage stays on disk untouched for a human
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=b"Subject: x\r\n\r\nb", history_id=900)]
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    garbage = "{ not json"
+    (corpus / "sync-cursor.json").write_text(garbage, encoding="utf-8")
+    result = runner.invoke(
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
+    )
+    assert result.exit_code == 5
+    assert "import failed" in result.output
+    assert "Traceback" not in result.output
+    assert (corpus / "sync-cursor.json").read_text(encoding="utf-8") == garbage
+
+
 def test_import_gmail_settings_blip_retries_then_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

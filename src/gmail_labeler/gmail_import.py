@@ -26,10 +26,11 @@ from typing import Literal
 from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord, body_hash, utc_datetime
 from .corpus_store import CorpusStore
-from .gmail_client import FilterInfo, GmailClient
+from .gmail_client import FilterInfo, GmailClient, MessagePage
 from .gmail_errors import BACKOFF, RETRY, GmailAuthError, GmailError
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
+from .sync_cursor import SyncCursor
 
 log = logging.getLogger("gmail_labeler.gmail_import")
 
@@ -69,9 +70,15 @@ def import_gmail(
     max_messages: int | None = None,
     max_attempts: int = MAX_ATTEMPTS,
     sleeper: Callable[[float], None] | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> GmailImportStats:
-    """Import the query's messages into the store. Returns counts + failures."""
+    """Import the query's messages into the store. Returns counts + failures.
+
+    Side effect beyond the record log (ADR-0008, additive): births the Sync
+    Cursor when — and only when — the corpus has none. Advancement is Label
+    Sync's exclusive act; see _birth_cursor."""
     sleeper = sleeper or time.sleep
+    clock = clock or (lambda: datetime.now(UTC))
     if max_attempts < 1:
         # a zero-attempt loop would be a silent no-op import (deepseek:
         # the 'exhausted' return below was its only executed line)
@@ -80,6 +87,7 @@ def import_gmail(
     if max_messages is not None and max_messages <= 0:
         return stats  # explicit no-op, never "process one anyway"
     page_token: str | None = None
+    seeding_done = False
     while True:
         page = _retrying(
             lambda tok=page_token: client.list_messages(query, tok),
@@ -94,6 +102,22 @@ def import_gmail(
                 ("<page>", "list_messages stopped (permanent or exhausted)")
             )
             return stats
+        if not seeding_done:
+            # ADR-0008: EVERY seed — page or profile — is captured BEFORE any
+            # message is ingested, on the first page only. Events after
+            # capture carry higher ids, so the seed is a lower bound and
+            # relabels made during the import land in the next sync's window
+            # instead of being silently skipped.
+            seeding_done = True
+            _birth_cursor(
+                client,
+                store,
+                page,
+                max_attempts=max_attempts,
+                stats=stats,
+                sleeper=sleeper,
+                clock=clock,
+            )
         page_token = page.next_page_token
         for stub in page.stubs:
             stats.scanned += 1
@@ -119,6 +143,58 @@ def import_gmail(
                 return stats
         if page_token is None:
             return stats
+
+
+def _birth_cursor(
+    client: GmailClient,
+    store: CorpusStore,
+    page: MessagePage,
+    *,
+    max_attempts: int,
+    stats: GmailImportStats,
+    sleeper: Callable[[float], None],
+    clock: Callable[[], datetime],
+) -> None:
+    """Birth the Sync Cursor when — and only when — the corpus has none
+    (ADR-0008: birth-when-absent; advancement is Label Sync's exclusive act,
+    so an existing ledger is left byte-identical without a quota call).
+
+    Seed order (the sync guide): the FIRST (newest) stub's historyId where
+    the wire carries it — Gmail's documented stub promises only id/threadId,
+    so absence is schema-legal, never an error — falling back to ONE
+    get_profile call (1 quota unit, the reliable path). Both are captured
+    before any message is ingested, keeping the seed a lower bound. A
+    negative seed is a wire lie the ledger refuses. When no usable seed
+    exists the import degrades LOUDLY but not fatally: the cursor is
+    additive, the corpus stays birth-eligible, and failing a healthy
+    394k-message import over one bootstrap read would regress the
+    acquisition contract. A write failure (CorpusError) propagates like any
+    structural store fault — typed exit 5."""
+    if store.read_cursor() is not None:
+        return  # birth-when-absent: an existing ledger is sync's to advance
+    seed = page.stubs[0].history_id if page.stubs else None
+    if seed is not None and seed <= 0:
+        # a non-positive page seed is a wire lie (history ids count from 1):
+        # treat it as absent so the guide-ordered profile fallback gets its
+        # turn, instead of birthing a ledger the first sync must 400 over
+        seed = None
+    if seed is None:
+        profile = _retrying(
+            client.get_profile,
+            max_attempts=max_attempts,
+            stats=stats,
+            sleeper=sleeper,
+            what="get_profile",
+        )
+        if profile is not None:
+            seed = profile.history_id
+    if seed is None or seed <= 0:
+        log.warning(
+            "import: no usable historyId seed (first page and profile) — "
+            "sync cursor NOT birthed; the first Label Sync will birth it"
+        )
+        return
+    store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
 
 
 def _retrying[T](

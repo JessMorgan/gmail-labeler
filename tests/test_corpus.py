@@ -14,6 +14,7 @@ from gmail_labeler.corpus_record import (
     with_body,
 )
 from gmail_labeler.corpus_store import CorpusError, CorpusStore
+from gmail_labeler.sync_cursor import SyncCursor
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 DUMMY_HASH = body_hash("placeholder")
@@ -701,3 +702,155 @@ def test_analyze_attribution_ratio_not_deflated_by_revisions(tmp_path: Path) -> 
     assert (ship_raw.total, ship_raw.filter_attributed) == (4, 2)
     assert ship_raw.attribution_ratio == 0.5  # deflated...
     assert "filter-covered" not in ship_raw.reasons  # ...past the strict gate
+
+
+# ---- Sync Cursor sidecar I/O (ADR-0008, ticket #72) -------------------------
+
+
+def _cursor() -> SyncCursor:
+    return SyncCursor(
+        history_id=4242, last_sync=datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    )
+
+
+def test_write_cursor_creates_root_0700_and_file_0600(tmp_path: Path) -> None:
+    # secret material from the FIRST byte: the cursor rides the snapshot
+    # discipline exactly — root 0700, file 0600-at-fd (AC #1)
+    store = CorpusStore(tmp_path / "deep" / "corpus")
+    store.write_cursor(_cursor())
+    assert (tmp_path / "deep" / "corpus").stat().st_mode & 0o777 == 0o700
+    cursor_path = tmp_path / "deep" / "corpus" / "sync-cursor.json"
+    assert cursor_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_cursor_fsyncs_file_and_dir(tmp_path: Path, monkeypatch) -> None:
+    # the rename-durability dir fsync must stay pinned at the cursor seam too
+    import os as _os
+
+    synced: list[str] = []
+    real_fsync = _os.fsync
+
+    def spy(fno: int) -> None:
+        synced.append("fsync")
+        real_fsync(fno)
+
+    monkeypatch.setattr(_os, "fsync", spy)
+    CorpusStore(tmp_path / "c").write_cursor(_cursor())
+    assert synced.count("fsync") >= 2  # file + directory (snapshot parity)
+
+
+def test_read_cursor_absent_returns_none(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    assert store.read_cursor() is None
+
+
+def test_read_cursor_roundtrips_the_written_cursor(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    store.write_cursor(_cursor())
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.read_cursor() == _cursor()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all",
+        '{"history_id": 1, "last_sync": "2026-11-04T12:00:00+00:00", "version": 99}',
+        '{"version": 1, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": null, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": -5, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": "42", "last_sync": "2026-11-04T12:00:00+00:00"}',
+    ],
+)
+def test_read_cursor_invalid_state_fails_loud_never_reads_as_absent(
+    tmp_path: Path, payload: str
+) -> None:
+    # the ADR's never-silent-re-birth rule at the store seam: an existing
+    # cursor that does not parse OR validate raises CorpusError — it must
+    # NEVER return None (None means absent, and absent is the birth gate)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sync-cursor.json").write_text(payload, encoding="utf-8")
+    store = CorpusStore(corpus)
+    with pytest.raises(CorpusError, match="sync cursor"):
+        store.read_cursor()
+
+
+def test_read_cursor_undecodable_bytes_is_typed_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    # deepseek segment-1 major: the READ sits inside the guard too — a
+    # non-UTF-8 cursor is CorpusError (CLI exit 5), never a raw
+    # UnicodeDecodeError escaping to exit 1
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sync-cursor.json").write_bytes(b'{"version": 1\xff\xfe\x00garbage')
+    store = CorpusStore(corpus)
+    with pytest.raises(CorpusError, match="sync cursor"):
+        store.read_cursor()
+
+
+def test_read_cursor_unreadable_file_is_typed_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    import os as _os
+
+    if hasattr(_os, "geteuid") and _os.geteuid() == 0:
+        pytest.skip("running as root: mode-000 does not deny the read")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    cursor = corpus / "sync-cursor.json"
+    cursor.write_text('{"version": 1}', encoding="utf-8")
+    cursor.chmod(0o000)
+    try:
+        with pytest.raises(CorpusError, match="sync cursor") as excinfo:
+            CorpusStore(corpus).read_cursor()
+        # pin the WRAP, not just the type: the cause must be the permission
+        # error, never a validation ValueError riding the same except arm
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+    finally:
+        cursor.chmod(0o600)
+
+
+def test_enforce_modes_hardens_the_cursor_and_its_tmp(tmp_path: Path) -> None:
+    # the cursor FILE is what the protected-file-set split brings into the
+    # hardening walk (the .tmp remnant rides the pre-existing *.tmp glob);
+    # both must land at 0600
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    cursor = corpus / "sync-cursor.json"
+    remnant = corpus / "sync-cursor.json.tmp"
+    for p in (cursor, remnant):
+        p.write_text("{}", encoding="utf-8")
+        p.chmod(0o644)
+    store.enforce_modes()
+    for p in (cursor, remnant):
+        assert p.stat().st_mode & 0o077 == 0
+
+
+def test_verify_modes_lists_loose_cursor_offender(tmp_path: Path) -> None:
+    # read paths warn symmetrically: a group/world-readable cursor is an
+    # offender (the ticket's explicit pin — mode coverage is NOT automatic
+    # from _SIDECAR_NAMES, it comes from the protected-file set)
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    cursor = corpus / "sync-cursor.json"
+    cursor.write_text("{}", encoding="utf-8")
+    cursor.chmod(0o600)
+    assert store.verify_modes() == []  # 0600 cursor: clean
+    cursor.chmod(0o644)
+    assert str(cursor) in store.verify_modes()
+
+
+def test_cursor_is_protected_state_not_an_attribution_sidecar() -> None:
+    # the split is the contract (ADR-0008 / wire fact #6): the cursor joins
+    # the protected-file set, NOT the attribution-named tuple — conflating
+    # them would mislabel sync's ledger as attribution data
+    from gmail_labeler import corpus_store as cs
+    from gmail_labeler.sync_cursor import SIDECAR_CURSOR
+
+    assert SIDECAR_CURSOR not in cs._SIDECAR_NAMES
+    assert SIDECAR_CURSOR in cs._PROTECTED_FILE_NAMES
+    assert set(cs._SIDECAR_NAMES) < set(cs._PROTECTED_FILE_NAMES)

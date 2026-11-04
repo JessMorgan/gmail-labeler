@@ -32,6 +32,19 @@ does not ship releases yet.
   typed error taxonomy (`gmail_errors.py`).
 - `dataset import-gmail`: resumable Gmail Import, `--query`/`--max-messages`,
   `filters.json` + `labels.json` sidecars.
+- Sync Cursor sidecar (`sync_cursor.py`, `corpus_store.py`, ADR-0008,
+  ticket #72): `dataset import-gmail` births `sync-cursor.json`
+  (`{version, history_id, last_sync}`, tz-aware UTC `last_sync`) inside the
+  corpus root when the corpus has none — seeded before any message is
+  ingested from the first page's newest stub, with one profile call as the
+  fallback (a permanently unusable seed warns and leaves the corpus
+  birth-eligible rather than failing the import). Birth-once: a live cursor
+  is never advanced or overwritten by import (byte-identical across a
+  second import), GYB Import never births, and an unparseable or invalid
+  cursor fails loud (`CorpusError`) rather than silently re-birthing. Mode
+  coverage rides a named protected-file set (attribution snapshots +
+  cursor, deliberately split from the attribution-named tuple) driving
+  both `enforce_modes` and `verify_modes`.
 - `dataset import-gyb`: offline backup import (read-only `msg-db.sqlite`),
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter

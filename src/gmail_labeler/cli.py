@@ -340,7 +340,10 @@ def dataset_analyze(
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
-        records = list(store.iter_records())
+        # The resolved view, not the raw log (ADR-0007): a revised message
+        # counts once, under its newest label set — duplicate-id inflation
+        # is eliminated by the fold, not guarded against here.
+        records = list(store.iter_resolved())
     except (CorpusError, OSError, UnicodeDecodeError) as e:
         # unreadable/undecodable records are exit 5, never a traceback
         typer.echo(f"analyze failed: records unreadable ({type(e).__name__})", err=True)

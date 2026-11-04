@@ -53,7 +53,7 @@ what is wired vs. planned, and each gains detail as its phase lands.
   `dataset {import-gmail,import-gyb,sync-labels,analyze}` are wired (the
   acquisition pair is pinned by ADR-0006; the old `export` name is a usage
   error, no alias; `sync-labels` is the spec #64 event walk plus its
-  `--full-resync` recovery path, #73/#74; `--also-*` composites with #75);
+  `--full-resync` recovery path and its `--also-*` composites, #73/#74/#75);
   `train`, `eval`,
   `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
   design conversation, not yet wired — change names with cause.

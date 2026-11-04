@@ -130,7 +130,7 @@ class MessagePage:
 @dataclass(frozen=True, slots=True)
 class HistoryPage:
     """history_id is the MAILBOX'S CURRENT id on EVERY page of a delta
-    (wire-verified via the discovery doc), NOT a per-page watermark:
+    (wire-verified via the discovery doc), NOT a per-page progress id:
     persist it only after the last page of the delta (invariant #3)."""
 
     history_id: int | None

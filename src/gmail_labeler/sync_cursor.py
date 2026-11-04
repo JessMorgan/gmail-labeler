@@ -37,7 +37,7 @@ def _strict_int(value: object) -> TypeGuard[int]:
 
 @dataclass(frozen=True, slots=True)
 class SyncCursor:
-    history_id: int  # the mailbox history watermark this Corpus has consumed
+    history_id: int  # the mailbox history id this Corpus has consumed up to
     last_sync: datetime  # always timezone-aware UTC (constructor enforces)
 
     def __post_init__(self) -> None:

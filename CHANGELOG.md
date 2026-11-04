@@ -31,6 +31,9 @@ does not ship releases yet.
 
 - Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (import + analysis).
+- Design: ADR-0007 (the Corpus is a revision log) and ADR-0008 (the Sync
+  Cursor is sync's ledger) for spec #64 (Label Sync), with glossary terms
+  Backfill, Label Sync, Sync Cursor, Revision, and Resolved view.
 
 ### Changed
 

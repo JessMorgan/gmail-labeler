@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -854,3 +855,25 @@ def test_analyze_empty_corpus_gets_no_filter_note(tmp_path: Path) -> None:
     assert "no filters.json snapshot" not in json_result.stderr
     payload = json.loads(json_result.stdout)
     assert payload["summary"]["filters_posture"] == "missing"
+
+
+def test_analyze_cli_consumes_resolved_view(tmp_path: Path) -> None:
+    # Producer switch (ticket #70): dataset analyze reads the store's
+    # resolved view, not the raw log — a revised message counts once,
+    # under its newest labels only.
+    from gmail_labeler.corpus_store import CorpusStore
+
+    root = _seed_corpus(tmp_path, n=60, label="Shipping")
+    store = CorpusStore(root)
+    for r in list(store.iter_records())[:10]:
+        store.append_revision(replace(r, labels=("Money",)))
+    result = runner.invoke(
+        app,
+        ["dataset", "analyze", "--config", str(_analyze_cfg(tmp_path)), "--json"],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["messages"] == 60  # raw log would say 70
+    by_label = {m["label"]: m for m in payload["labels"]}
+    assert by_label["Shipping"]["total"] == 50  # raw log would say 60
+    assert by_label["Money"]["total"] == 10

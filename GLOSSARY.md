@@ -24,7 +24,10 @@ _Avoid_: auto-label (the event, not the label)
 
 **Additive-only**:
 The write policy under which the system only ever adds labels; Corrections are
-captured as training signal but never acted on retroactively.
+captured as training signal but never acted on retroactively. Governs writes
+to Gmail only — it does not constrain the Corpus's label freshness (see
+Label Sync).
+_Avoid_: add-only corpus (conflates the Gmail write policy with Corpus storage)
 
 **Graduation**:
 A Managed Label's promotion from Shadow Pass to live application, earned by
@@ -78,21 +81,57 @@ _Avoid_: dry run (reserved for the CLI flag)
 **Backlog**:
 The pre-existing mailbox history, as opposed to newly-arriving mail.
 
+**Backfill**:
+The owner manually labeling Backlog mail to bring a label over the analysis
+candidate gates. Distinct from Correction: Backfill edits mail the system
+never applied to.
+_Avoid_: relabeling campaign, data repair
+
 **Corpus**:
 A user's labeled mail, assembled for training. Sourced either from a Gmail
 Import or a GYB Import; never shipped with or derived from another user's
-data.
+data. Label-state freshness reaches only as far as its last Label Sync.
 
 **Gmail Import**:
 Building a Corpus by pulling labeled mail through the Gmail API — the
-canonical sourcing path (GYB Import is the optional fast path). Resumable:
-the corpus id set is the cursor.
+canonical sourcing path (GYB Import is the optional fast path). Resumable
+via the corpus id set — a structural resume point, distinct from the Sync
+Cursor.
 _Avoid_: export (the command fills the Corpus, so it is named from the
 Corpus's side; "export" is reserved for a future Corpus-dump command),
-pull (implies fetch-and-merge; the store only appends)
+pull (implies fetch-and-merge; at ingest the store only appends)
 
 **GYB Import**:
 Building a Corpus from an existing Got Your Back (GYB) backup directory rather
 than pulling through the Gmail API. Optional fast path; the Gmail Import is
 the canonical source.
 _Avoid_: backup restore (this reads, never restores)
+
+**Label Sync**:
+Bringing a Corpus's label state up to the mailbox's current label state,
+without re-assembling the Corpus. An operation on freshness, not on ingest:
+newly-arrived mail stays owned by the assembly paths (Gmail Import, GYB
+Import).
+_Avoid_: corpus update, re-sync ("re-sync" is Gmail's name for the prescribed
+full re-pull; Label Sync re-assembles nothing)
+
+**Sync Cursor**:
+A Corpus's record of how far it has consumed the mailbox's event stream;
+owned by Label Sync — Gmail Import may birth it when absent, and only a
+sync advances it. Distinct from the Gmail Import resume point (the corpus
+id set).
+_Avoid_: watermark, checkpoint
+
+**Revision**:
+A record line appended later for a message id already in the Corpus's log,
+superseding the earlier line's label set. A Revision carries the record's
+`body_hash`, date, source, and envelope fields unchanged — only labels
+differ, and no body is written.
+_Avoid_: update, correction (a Correction is realized-precision signal, not
+stored label state)
+
+**Resolved view**:
+The Corpus's logical state after the store folds its record log by message
+id, last occurrence wins. It is the read interface for label state; the log
+itself stays append-only.
+_Avoid_: current state, live view

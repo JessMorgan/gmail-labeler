@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -434,3 +435,193 @@ def test_snapshot_names_are_bare_filenames(tmp_path: Path) -> None:
             store.write_snapshot(bad, "x")
     assert secret.read_text(encoding="utf-8") == "outside"  # untouched
     assert not (tmp_path / "corpus").exists()  # refused before mkdir
+
+
+# ---- revision log: resolved view + append_revision (ADR-0007, ticket #70) --
+
+
+def test_resolved_view_is_identity_on_duplicate_free_log(tmp_path: Path) -> None:
+    # Zero-migration promise (ADR-0007): a log written only through put()
+    # folds to itself — old corpora read identically through the new seam.
+    store = CorpusStore(tmp_path / "corpus")
+    for i in ("aaaa", "bbbb", "cccc"):
+        store.put(with_body(rec(i), f"body {i}"), f"body {i}")
+    assert list(store.iter_resolved()) == list(store.iter_records())
+
+
+def test_resolved_view_folds_last_occurrence_wins(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r1 = with_body(rec("aaaa"), "a")
+    store.put(r1, "a")
+    r2 = replace(r1, labels=("Shipping", "Bills"))
+    assert store.append_revision(r2) is True
+    assert list(store.iter_resolved()) == [r2]  # the newer label set wins
+    assert len(list(store.iter_records())) == 2  # the raw log keeps both
+
+
+def test_resolved_view_order_is_first_appearance(tmp_path: Path) -> None:
+    # Log position is the version, but the fold's sequence contract is
+    # first-appearance order carrying each id's LAST line (pinned so a
+    # refactor cannot silently flip it).
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    b = with_body(rec("bbbb"), "b")
+    store.put(a, "a")
+    store.put(b, "b")
+    store.append_revision(replace(a, labels=("Z",)))
+    assert [r.id for r in store.iter_resolved()] == ["aaaa", "bbbb"]
+
+
+def test_resolved_view_keeps_the_strict_reader(tmp_path: Path) -> None:
+    # The fold inherits iter_records' posture: corrupt middle line raises
+    # with :lineno:, never a silent guess.
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(with_body(rec("aaaa"), "a"), "a")
+    store.put(with_body(rec("bbbb"), "b"), "b")
+    p = tmp_path / "corpus" / "records.jsonl"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    lines[0] = "{not json}"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(CorpusError, match=":1: corrupt record"):
+        list(CorpusStore(tmp_path / "corpus").iter_resolved())
+
+
+def test_resolved_view_skips_torn_tail(tmp_path: Path) -> None:
+    # A crash tail is skipped by the resolved view exactly as iter_records
+    # skips it — the fold never resurrects or refuses it differently.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    with (tmp_path / "corpus" / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"id": "partial", "date": ')  # torn, no newline
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert list(reopened.iter_resolved()) == [a]
+
+
+def test_resolved_view_survives_reload(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    rev = replace(r, labels=("New",))
+    store.append_revision(rev)
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert list(reopened.iter_resolved()) == [rev]
+
+
+def test_append_revision_refuses_absent_id(tmp_path: Path) -> None:
+    # A revision for an id with no resident record would append a line
+    # pointing at a body that does not exist — the durability contract
+    # forbids it, and sync only ever revises corpus-resident ids.
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(with_body(rec("aaaa"), "a"), "a")
+    with pytest.raises(CorpusError, match="cannot revise absent id"):
+        store.append_revision(with_body(rec("ffff"), "ghost"))
+    assert len(list(store.iter_records())) == 1  # nothing was appended
+
+
+def test_append_revision_writes_present_id_without_touching_body(
+    tmp_path: Path,
+) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "original body")
+    store.put(r, "original body")
+    body = tmp_path / "corpus" / "bodies" / "aa" / "aaaa.txt"
+    before = body.read_bytes()
+    rev = replace(r, labels=("New",))
+    assert store.append_revision(rev) is True
+    assert body.read_bytes() == before  # the store neither rewrote nor read it
+    assert store.get_body("aaaa") == "original body"
+    assert list(store.iter_resolved()) == [rev]
+
+
+def test_append_revision_never_reads_the_body(tmp_path: Path) -> None:
+    # ADR-0007: the revision path does no body I/O — sync never has the
+    # body at hand, and the hash-vs-body tripwire stays on the body-READ
+    # path. Proven structurally: with the body file removed from disk the
+    # revision still appends (any read or hash-vs-body check would fail
+    # or diverge). Deliberately does NOT pin the absence of a future
+    # in-memory field-parity check (round-1 review finding).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    body = tmp_path / "corpus" / "bodies" / "aa" / "aaaa.txt"
+    body.unlink()
+    assert store.append_revision(replace(r, labels=("New",))) is True
+    assert not body.exists()  # no read, no resurrection
+
+
+def test_append_revision_line_is_newline_terminated(tmp_path: Path) -> None:
+    # The terminator is part of the durability contract: without it the
+    # next append glues two records into one unparseable line (mutant-
+    # verified: dropping the newline terminator here was invisible to
+    # every other test).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    store.append_revision(replace(r, labels=("New",)))
+    raw = (tmp_path / "corpus" / "records.jsonl").read_text(encoding="utf-8")
+    assert raw.endswith("\n")
+    assert len(raw.splitlines()) == 2
+
+
+def test_append_revision_replay_is_harmless(tmp_path: Path) -> None:
+    # Crash-retry of a Label Sync re-appends the identical line; the
+    # last-wins fold absorbs replays (ADR-0007).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    rev = replace(r, labels=("New",))
+    assert store.append_revision(rev) is True
+    assert store.append_revision(rev) is True
+    assert len(list(store.iter_records())) == 3  # the log is honest
+    assert list(store.iter_resolved()) == [rev]  # the view is stable
+
+
+def test_append_revision_repairs_torn_tail_like_put(tmp_path: Path) -> None:
+    # AC4: the crash-tail contract is put's, verbatim — an unparseable
+    # fragment is truncated, then the revision appends cleanly.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    with (tmp_path / "corpus" / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"id": "partial", "date": ')
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.append_revision(replace(a, labels=("New",))) is True
+    assert len(list(reopened.iter_records())) == 2  # torn line gone, both real
+
+
+def test_append_revision_seals_parseable_tail(tmp_path: Path) -> None:
+    # A COMPLETE line that merely lost its newline is sealed and kept,
+    # mirroring test_parseable_unterminated_tail_is_sealed_not_dropped.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    rp = tmp_path / "corpus" / "records.jsonl"
+    rp.write_text(rp.read_text(encoding="utf-8").removesuffix("\n"), encoding="utf-8")
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.append_revision(replace(a, labels=("New",))) is True
+    assert len(list(reopened.iter_records())) == 2
+
+
+def test_append_revision_tightens_loose_records_file(tmp_path: Path) -> None:
+    # AC4: permission behavior identical — 0600 at the fd plus fchmod
+    # tightening of a pre-existing loose file (put's _open_append_checked).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("deadbeef"), "x")
+    store.put(r, "x")
+    records = tmp_path / "corpus" / "records.jsonl"
+    records.chmod(0o644)
+    store.append_revision(replace(r, labels=("New",)))
+    assert records.stat().st_mode & 0o077 == 0
+
+
+def test_put_still_refuses_present_ids_after_revisions(tmp_path: Path) -> None:
+    # AC2: put()'s never-duplicate contract survives the revision log —
+    # the acquisition commands stay structurally incapable of revising.
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    store.append_revision(replace(r, labels=("New",)))
+    assert store.put(with_body(rec("aaaa"), "other"), "other") is False
+    assert store.get_body("aaaa") == "a"  # body untouched by the refusal
+    assert len(list(store.iter_records())) == 2  # only the revision line

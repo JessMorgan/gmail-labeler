@@ -38,8 +38,8 @@ you would.
 1. **Import** — pull your labeled mail via the Gmail API, or import an
    existing [Got Your Back](https://github.com/GAM-team/got-your-back)
    backup. Keep it fresh as you relabel or Backfill by hand:
-   `dataset sync-labels` brings the label changes in without a
-   re-import. A corpus with no Sync Cursor yet — every GYB-sourced one —
+   `dataset sync-labels` brings the label changes in with no
+   re-assembly. A corpus with no Sync Cursor yet — every GYB-sourced one —
    starts with `--full-resync`; the Backfill→sync→analyze loop, see
    [CLI](#cli).
 2. **Analyze & train** — per-label report (counts, filter-authored labels,
@@ -131,16 +131,18 @@ seed is available); import never advances an existing cursor, and
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). `dataset sync-labels` walks the Gmail history from the corpus's
-Sync Cursor (ADR-0008) and appends a label Revision for every corpus
-message an event touched — metadata only, bodies never (invariant #5) —
-so relabels and Backfills reach the corpus without a re-import. The
-cursor advances only after the delta's revisions are durable, a killed
-run is safe to re-run, `--dry-run` prints the identical plan writing no
-records and leaving the cursor byte-identical, event ids not in the
-corpus (typically new mail) are counted and reported but never ingested
-here, and upstream-deleted mail keeps its record (counted). An expired cursor (history 404) exits `5` printing the
-exact recovery command — recovery is never automatic (ADR-0008).
+mailbox has no labeling filters). `dataset sync-labels` walks the Gmail
+history from the corpus's Sync Cursor (ADR-0008) and appends a label
+Revision for every corpus message an event touched — metadata only,
+bodies never (invariant #5) — so relabels and Backfills reach the
+corpus with no re-assembly. The cursor advances only after the delta's
+revisions are durable, a killed run is safe to re-run, `--dry-run`
+prints the identical plan writing no records and leaving the cursor
+byte-identical, event ids not in the corpus (typically new mail) are
+counted and reported but never ingested here, and upstream-deleted
+mail keeps its record (counted). An expired cursor (history 404) exits
+`5` printing the exact recovery command — recovery is never automatic
+(ADR-0008).
 `dataset sync-labels --full-resync` is that recovery: a ground-truth
 reconciliation that needs no history at all — the remedy for a cursor aged
 past Gmail's retention and the first reconciliation path for GYB-sourced
@@ -155,9 +157,10 @@ corpus id's current labels, diff, revise). On the scan the report prints
 the flag-rate before the metadata pass, so a corpus-wide drift is visible
 early with the honest worst-case cost story; the walk prices its full
 fetch up front instead — every id is read by construction there, so drift
-is measured by the diff, not a flag-rate. The profile seed is captured before the scan
-and written only after the reconciliation's revisions are durable, so a
-relabel made mid-run lands in the next sync's window; `--dry-run` prints
+is measured by the diff, not a flag-rate. The profile seed is captured
+before the scan and written only after the reconciliation's revisions
+are durable, so a relabel made mid-run lands in the next sync's window;
+`--dry-run` prints
 the estimate, the choice, and the plan, writing nothing. The Gmail Import
 and Label Sync commands compose, opt-in by design:
 `sync-labels --also-import-gmail` runs the full Gmail Import pass after
@@ -171,10 +174,11 @@ messages, never touch existing records" meaning unambiguous (the daemon
 is the eventual freshness owner, ADR-0003/0008); `--dry-run` refuses
 `--also-import-gmail` as a usage error (`2`) — dry-run writes nothing,
 the import pass writes records. Both imports are resumable:
-the corpus id set is the resume point, so re-running after a failure skips
-what is already present. Transient failures resume cleanly; a deterministic abort
-(a corrupt backup row, an escaping filename) repeats until the backup itself
-is fixed — resumable is not the same as completable. `dataset analyze`
+the corpus id set is the resume point, so re-running after a failure
+skips what is already present. Transient failures resume cleanly; a
+deterministic abort (a corrupt backup row, an escaping filename) repeats
+until the backup itself is fixed — resumable is not the same as
+completable. `dataset analyze`
 gates candidates on volume
 (`--min-total`, `--min-recent`), recency window (`--recent-months`,
 default 24), duplicate-body rate, and filter coverage; attribution needs

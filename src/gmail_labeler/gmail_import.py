@@ -1,9 +1,10 @@
 """Resumable Gmail Import (GLOSSARY: Corpus, Gmail Import; source mode ``api``).
 
-Pulls messages through the GmailClient Protocol, parses via the single shared
+Fetches messages through the GmailClient Protocol, parses via the single shared
 MIME path (invariant #4), and writes CorpusRecords through CorpusStore.
-Resume is *structural*: the store's id set is the resume point (skip-present is the
-same property that makes crash-retry harmless — invariant #2's corpus twin),
+Resume is *structural*: the store's id set is the resume point
+(skip-present is the same property that makes crash-retry harmless —
+invariant #2's corpus twin),
 so the import can die at any moment and simply be re-run. Retry policy is driven
 by the typed taxonomy only (transient→backoff-retry, rate_limited→honored
 backoff, permanent→record-and-continue: one unreadable message must never

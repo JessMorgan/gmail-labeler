@@ -131,19 +131,19 @@ seed is available); import never advances an existing cursor, and
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). `dataset sync-labels` walks the Gmail history from the corpus's
-Sync Cursor (ADR-0008) and appends a label Revision for every corpus
-message an event touched — metadata only, bodies never (invariant #5) —
-so relabels and Backfills reach the corpus without a re-import. The
-cursor advances only after the delta's revisions are durable, a killed
-run is safe to re-run, `--dry-run` prints the identical plan writing no
-records and leaving the cursor byte-identical, ids the mailbox names that
-the corpus has never held are counted as Unseen Ids and reported but never
-ingested here (history events and label inventories cannot establish that
-they are new mail or that they match the import query), and
-upstream-deleted mail keeps its record (counted). An expired cursor
-(history 404) exits `5` printing the
-exact recovery command — recovery is never automatic (ADR-0008).
+mailbox has no labeling filters). `dataset sync-labels` walks the Gmail
+history from the corpus's Sync Cursor (ADR-0008) and appends a label
+Revision for every corpus message an event touched — metadata only, bodies
+never (invariant #5) — so relabels and Backfills reach the corpus with no
+re-assembly. The cursor advances only after the delta's revisions are
+durable, a killed run is safe to re-run, `--dry-run` prints the identical
+plan writing no records and leaving the cursor byte-identical, ids the
+mailbox names that the corpus has never held are counted as Unseen Ids and
+reported but never ingested here (history events and label inventories
+cannot establish that they are new mail or that they match the import
+query), and upstream-deleted mail keeps its record (counted). An expired
+cursor (history 404) exits `5` printing the exact recovery command —
+recovery is never automatic (ADR-0008).
 `dataset sync-labels --full-resync` is that recovery: a ground-truth
 reconciliation that needs no history at all — the remedy for a cursor aged
 past Gmail's retention and the first reconciliation path for GYB-sourced
@@ -177,10 +177,11 @@ messages, never touch existing records" meaning unambiguous (the daemon
 is the eventual freshness owner, ADR-0003/0008); `--dry-run` refuses
 `--also-import-gmail` as a usage error (`2`) — dry-run writes nothing,
 the import pass writes records. Both imports are resumable:
-the corpus id set is the resume point, so re-running after a failure skips
-what is already present. Transient failures resume cleanly; a deterministic abort
-(a corrupt backup row, an escaping filename) repeats until the backup itself
-is fixed — resumable is not the same as completable. `dataset analyze`
+the corpus id set is the resume point, so re-running after a failure
+skips what is already present. Transient failures resume cleanly; a
+deterministic abort (a corrupt backup row, an escaping filename) repeats
+until the backup itself is fixed — resumable is not the same as
+completable. `dataset analyze`
 gates candidates on volume
 (`--min-total`, `--min-recent`), recency window (`--recent-months`,
 default 24), duplicate-body rate, and filter coverage; attribution needs

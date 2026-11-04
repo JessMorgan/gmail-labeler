@@ -4,7 +4,15 @@ from typing import Any
 
 import pytest
 
-from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+from gmail_labeler.fake_gmail import (
+    FakeGmailClient,
+    FakeMessage,
+    LabelsAdded,
+    LabelsRemoved,
+    MessageAdded,
+    MessageDeleted,
+    history_records,
+)
 from gmail_labeler.gmail_client import (
     FilterInfo,
     GmailClient,
@@ -22,6 +30,7 @@ from gmail_labeler.gmail_errors import (
     GmailError,
     GmailPermanentError,
     GmailRateLimitedError,
+    GmailResyncError,
     GmailTransientError,
     classify_status,
 )
@@ -581,6 +590,131 @@ def test_fake_new_methods_are_failure_injectable() -> None:
     ]
 
 
+# -- #71: fake history-spine parity + deterministic history events -----------
+
+
+def test_fake_list_messages_stubs_carry_current_history_id() -> None:
+    # wire truth: list stubs carry historyId per message; the fake's
+    # default reproduces the real shape — PRESENT, at the mailbox's
+    # current id (ADR-0008 birth reads the FIRST stub)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="m1", eml=b"x", thread_id="t1")],
+        current_history_id=4242,
+    )
+    assert fake.list_messages("q").stubs[0].history_id == 4242
+
+
+def test_fake_stub_history_id_per_message_override() -> None:
+    # per-message override lets downstream birth tests prove they read the
+    # FIRST stub's id, not the last — uniform values would bless that bug
+    # (the newest message carries the current id; older mail carries less)
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="m1", eml=b"x", thread_id="t1"),  # newest: current
+            FakeMessage(id="m2", eml=b"x", thread_id="t2", history_id=60),
+        ],
+        current_history_id=100,
+    )
+    assert [s.history_id for s in fake.list_messages("q").stubs] == [100, 60]
+
+
+def test_fake_stub_history_id_absence_is_opt_in() -> None:
+    # the absent-tolerant quadrant ticket #72's profile-fallback branch
+    # must be able to program (the real wire may omit the field)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="m1", eml=b"x")],
+        stub_history_id=False,
+        current_history_id=7,
+    )
+    assert fake.list_messages("q").stubs[0].history_id is None
+
+
+def test_fake_expired_cursor_raises_resync_like_the_adapter() -> None:
+    # taxonomy alignment (AC #4): the fake's out-of-window cursor raises
+    # the SAME type the real adapter converts a history 404 into —
+    # GmailResyncError — so sync code detects resync through ONE type on
+    # both spines, and it stays a GmailPermanentError(status=404) for
+    # natural handlers
+    fake = FakeGmailClient(current_history_id=10)
+    with pytest.raises(GmailResyncError) as exc:
+        fake.history(11)
+    assert isinstance(exc.value, GmailPermanentError)
+    assert exc.value.status == 404
+    assert "outside the retained" in str(exc.value)
+
+
+def test_history_records_emit_wire_faithful_events() -> None:
+    # shapes verified against the discovery schemas: HistoryMessageAdded/
+    # Deleted carry only `message`; HistoryLabelAdded/Removed carry
+    # `message` + `labelIds` (list on the wire); the flat `messages[]`
+    # field duplicates the typed entries — Google recommends the typed
+    # fields, so the generator emits typed only
+    records = history_records(
+        [
+            MessageAdded(message_id="m1", thread_id="t1"),
+            LabelsAdded(message_id="m1", label_ids=("L2",)),
+            LabelsRemoved(message_id="m1", label_ids=("INBOX",)),
+            MessageDeleted(message_id="m2"),
+        ]
+    )
+    assert records == (
+        {"id": "1", "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]},
+        {"id": "2", "labelsAdded": [{"message": {"id": "m1"}, "labelIds": ["L2"]}]},
+        {
+            "id": "3",
+            "labelsRemoved": [{"message": {"id": "m1"}, "labelIds": ["INBOX"]}],
+        },
+        {"id": "4", "messagesDeleted": [{"message": {"id": "m2"}}]},
+    )
+
+
+def test_history_records_are_deterministic_with_seeded_ids() -> None:
+    # literal expected render (independent of the generator), not a
+    # self-equality — determinism means THIS shape, every time
+    events = [MessageAdded(message_id="m1", thread_id="t1"), LabelsAdded("m1", ("L1",))]
+    assert history_records(events) == (
+        {"id": "1", "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]},
+        {"id": "2", "labelsAdded": [{"message": {"id": "m1"}, "labelIds": ["L1"]}]},
+    )
+    ids = [r["id"] for r in history_records(events, start_id=50)]
+    assert ids == ["50", "51"]
+
+
+def test_history_records_reject_loud_inputs() -> None:
+    # the generator's doctrine is loud-on-nonsense: a start_id that is not
+    # an integer >= 1 is not a wire-valid id (the fake's own history()
+    # rejects such cursors), an event outside the union must never render a
+    # silent id-only record, and an Any-typed caller's str label_ids must
+    # not character-split into a wire lie
+    with pytest.raises(ValueError, match="start_id"):
+        history_records([], start_id=0)
+    with pytest.raises(ValueError, match="start_id"):
+        history_records([], start_id=1.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="unsupported history event"):
+        history_records([{"message_id": "m"}])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="sequence of strings"):
+        history_records([LabelsAdded("m1", "INBOX")])  # type: ignore[arg-type]
+
+
+def test_history_records_feed_the_fakes_history_pages() -> None:
+    # the generator's output is exactly what HistoryPage.records carries,
+    # so downstream sync tests program deltas declaratively
+    fake = FakeGmailClient(
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=history_records([LabelsAdded("m1", ("L2",))]),
+            )
+        ],
+        current_history_id=9,
+    )
+    page = fake.history(1)
+    assert page.records[0]["labelsAdded"] == [
+        {"message": {"id": "m1"}, "labelIds": ["L2"]}
+    ]
+
+
 # -- wire-truth pins for the reviewer-found production classes ---------------
 
 
@@ -841,7 +975,10 @@ def test_fake_history_cursor_guards() -> None:
     fake = FakeGmailClient(current_history_id=10)
     with pytest.raises(GmailPermanentError, match="not a valid cursor"):
         fake.history(-999)
-    with pytest.raises(GmailPermanentError, match="outside the retained") as exc:
+    # #71 taxonomy alignment: the out-of-window 404 is the SAME typed
+    # resync the real adapter raises (see
+    # test_fake_expired_cursor_raises_resync_like_the_adapter)
+    with pytest.raises(GmailResyncError, match="outside the retained") as exc:
         fake.history(11)
     assert exc.value.status == 404  # the resync-shaped status
 

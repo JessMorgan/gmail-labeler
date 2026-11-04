@@ -68,5 +68,5 @@ capability, not a promise this design leans on.
   the Corpus against the mailbox directly (label-enumeration scan or
   corpus-metadata walk, whichever the up-front cost estimate favors) and
   needs no history at all — the remedy for an expired Sync Cursor and the
-  reconciliation path for GYB-sourced Corpora. See ADR-0007 for cursor
+  reconciliation path for GYB-sourced Corpora. See ADR-0008 for cursor
   ownership.

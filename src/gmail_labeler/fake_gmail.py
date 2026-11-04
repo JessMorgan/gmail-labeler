@@ -18,8 +18,10 @@ from .gmail_client import (
     FilterInfo,
     HistoryPage,
     LabelInfo,
+    MessageMetadata,
     MessagePage,
     MessageStub,
+    ProfileInfo,
     RawMessage,
 )
 from .gmail_errors import GmailError, GmailPermanentError
@@ -96,6 +98,8 @@ class FakeGmailClient:
             "list_labels",
             "list_messages",
             "get_message",
+            "get_message_metadata",
+            "get_profile",
             "list_filters",
             "history",
             "any",
@@ -153,12 +157,7 @@ class FakeGmailClient:
     def get_message(self, message_id: str) -> RawMessage:
         self.calls.append(f"get_message:{message_id}")
         self._maybe_fail("get_message")
-        try:
-            m = self.messages[message_id]
-        except KeyError as e:
-            raise GmailPermanentError(
-                f"message {message_id} not found", status=404
-            ) from e
+        m = self._require_message(message_id)
         return RawMessage(
             id=m.id,
             thread_id=m.thread_id,
@@ -166,6 +165,39 @@ class FakeGmailClient:
             internal_date_ms=m.internal_date_ms,  # None = wire-faithful raw shape
             raw_b64url=base64.urlsafe_b64encode(m.eml).decode("ascii").rstrip("="),
         )
+
+    def _require_message(self, message_id: str) -> FakeMessage:
+        # one 404 shape shared by the raw and metadata gets, so the two
+        # cannot drift apart
+        try:
+            return self.messages[message_id]
+        except KeyError as e:
+            raise GmailPermanentError(
+                f"message {message_id} not found", status=404
+            ) from e
+
+    def get_message_metadata(self, message_id: str) -> MessageMetadata:
+        # metadata format: id/labelIds/internalDate — the eml is NEVER read
+        # (invariant #5: the sync direction is structurally body-free).
+        # internalDate is commonly reported on the metadata format, but
+        # presence is not contractually pinned upstream — the fake serves
+        # exactly what the FakeMessage sets (None => omitted), the same
+        # honest rule as the raw path.
+        self.calls.append(f"get_message_metadata:{message_id}")
+        self._maybe_fail("get_message_metadata")
+        m = self._require_message(message_id)
+        return MessageMetadata(
+            id=m.id,
+            label_ids=m.label_ids,
+            internal_date_ms=m.internal_date_ms,
+        )
+
+    def get_profile(self) -> ProfileInfo:
+        self.calls.append("get_profile")
+        self._maybe_fail("get_profile")
+        # the mailbox's CURRENT history id — same state the history() echo
+        # uses, so the ADR-0008 birth fallback needs no new fake state
+        return ProfileInfo(history_id=self.current_history_id)
 
     def history(
         self, start_history_id: int, page_token: str | None = None

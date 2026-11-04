@@ -254,6 +254,23 @@ def test_rest_get_message_int_shape_too() -> None:
     assert m == RawMessage("a1", "t", ("INBOX", "L1"), 1790000000000, "abc")
 
 
+def test_raw_message_repr_hides_the_body() -> None:
+    """Invariant #5 posture: repr() into a log IS a log channel, so the raw
+    b64 body must never ride it (spec #71 deferral, #64 fix round). The
+    field stays on the value — the import parses it — it is only the
+    rendering that must not carry it."""
+    msg = RawMessage(
+        id="a1",
+        thread_id="t",
+        label_ids=("L1",),
+        internal_date_ms=5,
+        raw_b64url="U0VDUkVULUJPRFk=",
+    )
+    assert "U0VDUkVULUJPRFk" not in repr(msg)
+    assert "raw_b64url" not in repr(msg)  # repr=False omits name AND value
+    assert "a1" in repr(msg)  # identity fields stay inspectable
+
+
 def test_rest_history_page_history_id_is_string_on_wire() -> None:
     client = _rest({"historyId": "42", "history": [{"messagesAdded": []}]})
     h = client.history(7)

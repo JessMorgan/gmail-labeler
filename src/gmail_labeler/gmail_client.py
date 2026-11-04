@@ -92,7 +92,9 @@ class RawMessage:
     # consumers MUST tolerate absence and fall back to the MIME Date header
     # (the Gmail import does); never trust presence.
     internal_date_ms: int | None
-    raw_b64url: str
+    # repr=False: repr() into a log is a log channel (invariant #5) — the
+    # body rides the value for the import to parse, never its rendering.
+    raw_b64url: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)

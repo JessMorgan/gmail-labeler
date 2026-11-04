@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gmail_labeler.analyze import analyze_corpus
 from gmail_labeler.corpus_record import (
     CorpusRecord,
     body_hash,
@@ -625,3 +626,78 @@ def test_put_still_refuses_present_ids_after_revisions(tmp_path: Path) -> None:
     assert store.put(with_body(rec("aaaa"), "other"), "other") is False
     assert store.get_body("aaaa") == "a"  # body untouched by the refusal
     assert len(list(store.iter_records())) == 2  # only the revision line
+
+
+# ---- AC3 demo: analyze reads the resolved view through the store seam ----
+
+
+def test_analyze_demo_resolved_view_reads_latest_labels(tmp_path: Path) -> None:
+    # Ticket #70 AC3: same id, two label sets — analyze's input (the
+    # store's resolved view) carries the newest label set only. The
+    # contrast assertions show exactly what the fold removes: pre-fold,
+    # revisions count as extra mail and double-count every body.
+    store = CorpusStore(tmp_path / "corpus")
+    originals = []
+    for i in (1, 2, 3):
+        r = with_body(rec(f"aa0{i}", labels=("Old",)), f"body {i}")
+        store.put(r, f"body {i}")
+        originals.append(r)
+    for r in originals:
+        assert store.append_revision(replace(r, labels=("New",))) is True
+
+    summary, metrics = analyze_corpus(
+        list(store.iter_resolved()), filters=None, id_to_name={}, now=NOW
+    )
+    assert summary.messages == 3  # not 6: revisions are not new mail
+    assert {m.label for m in metrics} == {"New"}  # the newer label set wins
+    new = next(m for m in metrics if m.label == "New")
+    assert (new.total, new.recent, new.dup_rate) == (3, 3, 0.0)
+
+    # The regression the fold exists for, demonstrated at the same seam:
+    summary_raw, metrics_raw = analyze_corpus(
+        list(store.iter_records()), filters=None, id_to_name={}, now=NOW
+    )
+    assert summary_raw.messages == 6
+    by_label = {m.label: m for m in metrics_raw}
+    assert by_label["Old"].total == 3 and by_label["New"].total == 3
+    assert by_label["New"].dup_rate == 1.0  # every body double-counted
+
+
+def test_analyze_attribution_ratio_not_deflated_by_revisions(tmp_path: Path) -> None:
+    # The invariant-#6-unsafe trap: attributed is a SET of ids while
+    # total counts LINES — pre-fold, revisions DEFLATE attribution_ratio
+    # and a fully filter-covered label slips the strict-greater
+    # filter-covered gate. The resolved view eliminates the asymmetry:
+    # the ratio stays 1.0 and the gate fires. (Ratio asserted, not just
+    # counts — manager note 10.5.)
+    store = CorpusStore(tmp_path / "corpus")
+    for i in ("bb01", "bb02"):
+        store.put(
+            with_body(rec(i, labels=("Shipping",), sender="shop@x.z"), f"body {i}"),
+            f"body {i}",
+        )
+    for r in list(store.iter_records()):
+        store.append_revision(replace(r, labels=("Shipping", "Bills")))
+    filters = [{"action": {"addLabelIds": ["L1"]}, "criteria": {"from": "shop@x.z"}}]
+
+    _, metrics = analyze_corpus(
+        list(store.iter_resolved()),
+        filters=filters,
+        id_to_name={"L1": "Shipping"},
+        now=NOW,
+    )
+    ship = next(m for m in metrics if m.label == "Shipping")
+    assert (ship.total, ship.filter_attributed) == (2, 2)
+    assert ship.attribution_ratio == 1.0
+    assert "filter-covered" in ship.reasons  # the gate fires, as it must
+
+    _, metrics_raw = analyze_corpus(
+        list(store.iter_records()),
+        filters=filters,
+        id_to_name={"L1": "Shipping"},
+        now=NOW,
+    )
+    ship_raw = next(m for m in metrics_raw if m.label == "Shipping")
+    assert (ship_raw.total, ship_raw.filter_attributed) == (4, 2)
+    assert ship_raw.attribution_ratio == 0.5  # deflated...
+    assert "filter-covered" not in ship_raw.reasons  # ...past the strict gate

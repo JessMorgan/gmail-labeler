@@ -17,6 +17,14 @@ does not ship releases yet.
   id→name normalization.
 - Corpus store (`corpus_store.py`): append-only records + sharded bodies,
   enforced 0600/0700 modes, crash-tail handling.
+- Corpus revision log (`corpus_store.py`, ADR-0007, ticket #70):
+  `append_revision()` appends a full revised record for a resident id
+  (deliberately separate from the never-duplicate `put()`),
+  `iter_resolved()` is the resolved view (last-wins fold per id, a no-op
+  on duplicate-free logs); `dataset analyze` consumes the resolved view,
+  eliminating duplicate-id inflation of the volume, recency, and
+  duplicate metrics — and the attribution-ratio deflation that could
+  slip the filter-covered gate (invariant #6).
 - OAuth (`auth.py`, `tokens.py`): desktop-app consent flow, keyring/file
   token stores, `auth` / `auth login` commands.
 - Shared MIME parsing (`mime_extract.py`) for both corpus sources.

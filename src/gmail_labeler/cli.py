@@ -21,7 +21,9 @@ from .gmail_import import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
-    from .gmail_client import GmailClient
+    from .corpus_store import CorpusStore
+    from .gmail_client import FilterInfo, GmailClient
+    from .label_sync import SyncStats
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -50,6 +52,9 @@ app.add_typer(auth_app, name="auth")
 
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
 # (typer requires concrete annotations: str | None, not Any)
+_USAGE_ERROR_EXIT = 2  # typer's own usage-error code, reused for a
+# contradictory flag combination refused before any config read or quota
+# spend (ticket #75: --dry-run + --also-import-gmail)
 
 
 @auth_app.callback(invoke_without_command=True)
@@ -123,6 +128,35 @@ _RESYNC_GUIDANCE_NOTE = (
     "than the retained history (cost-estimated up front)."
 )
 
+# The closing pointer and the new-match NOTE are shared between the
+# standalone sync report and the composite second pass (ticket #75): one
+# rendering, pinned once.
+_ANALYZE_POINTER = (
+    "\nNext: run `dataset analyze` for the updated candidate gates "
+    "(ADR-0005 keeps retraining and applying human-gated)"
+)
+_NEW_MATCH_NOTE = (
+    "NOTE: {n} mailbox id(s) are not in the corpus \u2014 new mail is "
+    "ingested by dataset import-gmail, never by sync (spec #64: ingest "
+    "stays the acquisition paths' alone)"
+)
+# ADR-0008 consequence 1 provenance disclosure, shared by the standalone
+# event walk and the composite sync pass (ticket #75): one rendering.
+_BIRTH_NOTE = (
+    "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
+    "from the mailbox profile and applies NOTHING (no consumed "
+    "baseline to diff against yet; the corpus's label state may "
+    "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+)
+
+
+def _render_failures(failed: list[tuple[str, str]]) -> None:
+    """Failure detail shared by every dataset report (20-line cap, stderr)."""
+    for message_id, reason in failed[:20]:
+        typer.echo(f"  failed {message_id}: {reason}", err=True)
+    if len(failed) > 20:
+        typer.echo(f"  ... and {len(failed) - 20} more", err=True)
+
 
 def _import_gmail_client(config: Config) -> GmailClient:
     """Client factory seam: tests inject FakeGmailClient here."""
@@ -144,8 +178,28 @@ def dataset_import_gmail(
         min=1,
         help="Stop after scanning N messages (smoke runs)",
     ),
+    also_sync_labels: bool = typer.Option(
+        False,
+        "--also-sync-labels",
+        help=(
+            "After the import completes durably, run the Label Sync "
+            "delta from the Sync Cursor — one report carries both "
+            "passes' stats; a sync-pass failure exits non-zero but "
+            "never invalidates the import (spec #64). Opt-in by "
+            "design: without it import-gmail keeps its crisp "
+            "append-new-messages contract"
+        ),
+    ),
 ) -> None:
-    """Import labeled mail from the Gmail API into the corpus."""
+    """Import labeled mail from the Gmail API into the corpus.
+
+    --also-sync-labels (ticket #75, opt-in by design): once the import has
+    completed durably, run the Label Sync delta too — one report, both
+    passes. A --max-messages-bounded run completes durably too, so the
+    sync pass still walks from the ledger's seed (birthed or pre-existing).
+    Without the flag the command keeps its crisp "append new messages,
+    never touch existing records" meaning (spec #64).
+    """
     from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError
@@ -199,11 +253,14 @@ def dataset_import_gmail(
         f"failed={len(stats.failed)}"
     )
     if stats.failed:
-        for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
-        if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        _render_failures(stats.failed)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+    if also_sync_labels:
+        _sync_labels_pass(client, store, id_to_name=id_to_name)
+        # the pointer closes the WHOLE report and has ONE owner — the
+        # command, after its pass chain — in both composite directions
+        # (review round 1: pointer-inside-the-pass was a double-print trap)
+        typer.echo(_ANALYZE_POINTER)
 
 
 @dataset_app.command("import-gyb")
@@ -308,10 +365,7 @@ def dataset_import_gyb(
             err=True,
         )
     if stats.failed:
-        for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
-        if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        _render_failures(stats.failed)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
 
 
@@ -334,6 +388,16 @@ def dataset_sync_labels(
             "needed"
         ),
     ),
+    also_import_gmail: bool = typer.Option(
+        False,
+        "--also-import-gmail",
+        help=(
+            "After the sync delta is durable (Sync Cursor advanced), run "
+            "the full Gmail Import pass (default query) — one report "
+            "carries both passes' stats; an import-pass failure exits "
+            "non-zero but never invalidates the sync (spec #64)"
+        ),
+    ),
 ) -> None:
     """Refresh the corpus's label state from mailbox changes (Label Sync).
 
@@ -349,7 +413,22 @@ def dataset_sync_labels(
     label-inventory scan and the corpus-metadata walk picked with a printed
     rationale, the cursor reseeded (from the seed captured BEFORE the scan)
     only after the reconciliation's revisions are durable (ADR-0008).
+
+    --also-import-gmail (ticket #75): once this command's own delta is
+    durable, run the full Gmail Import pass too — content and label
+    freshness refreshed in one sitting, each pass's durability its own.
     """
+    if dry_run and also_import_gmail:
+        # --dry-run promises ZERO writes; the import pass writes records —
+        # the combination is contradictory, not silently degraded (exit 2
+        # before any config read or quota spend)
+        typer.echo(
+            "sync-labels: --dry-run writes nothing, so the "
+            "--also-import-gmail pass has no durability point to follow "
+            "— refusing the combination",
+            err=True,
+        )
+        raise typer.Exit(code=_USAGE_ERROR_EXIT)
     from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
@@ -364,11 +443,13 @@ def dataset_sync_labels(
     try:
         client = _import_gmail_client(cfg)
         # Deliberate reuse of the landed bootstrap (spec #64 seam 3): the
-        # filters fetch is unused here — a filters-only outage therefore
-        # blocks sync too (loudly, exit 5). Accepted: one cheap shared call
-        # keeps every dataset command on the SAME auth/retry spine; a
-        # labels-only bootstrap is a refactor for the daemon phase.
-        id_to_name, _filters, bootstrap = fetch_settings(client)
+        # filters fetch is unused on the standalone path — a filters-only
+        # outage therefore blocks sync too (loudly, exit 5). Accepted: one
+        # cheap shared call keeps every dataset command on the SAME
+        # auth/retry spine; a labels-only bootstrap is a refactor for the
+        # daemon phase. --also-import-gmail puts the filters to their real
+        # use: the import pass's attribution snapshot (ticket #75).
+        id_to_name, filters, bootstrap = fetch_settings(client)
     except (AuthError, TokenStoreError) as e:
         typer.echo(f"auth: {e}", err=True)
         raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
@@ -454,44 +535,121 @@ def dataset_sync_labels(
                 + " (ADR-0008: changes made during the scan carry higher "
                 "ids and land in the next sync's window)"
             )
+        _render_gains_losses(stats.gains, stats.losses)
+        if stats.new_match:
+            typer.echo(_NEW_MATCH_NOTE.format(n=stats.new_match), err=True)
     else:
         assert isinstance(stats, SyncStats)  # branch-shaped narrowing
-        prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
-        typer.echo(
-            f"{prefix} events={stats.events} stale={stats.stale} "
-            f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
-            f"new_match={stats.new_match} retried={stats.retried} "
-            f"failed={len(stats.failed)}"
-        )
-        if stats.birthed:
-            # ADR-0008 consequence 1: the provenance disclosure — a fresh
-            # cursor over a corpus whose label state may be months old
-            typer.echo(
-                "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
-                "from the mailbox profile and applies NOTHING (no consumed "
-                "baseline to diff against yet; the corpus's label state may "
-                "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
-            )
-    _render_gains_losses(stats.gains, stats.losses)
-    if stats.new_match:
-        typer.echo(
-            f"NOTE: {stats.new_match} mailbox id(s) are not in the corpus \u2014 "
-            "new mail is ingested by dataset import-gmail, never by sync "
-            "(spec #64: ingest stays the acquisition paths' alone)",
-            err=True,
-        )
-    if not stats.failed:
-        # an incomplete run does not recommend analyzing a half-synced
-        # corpus — it exits 5 and says re-run instead
-        typer.echo(
-            "\nNext: run `dataset analyze` for the updated candidate gates "
-            "(ADR-0005 keeps retraining and applying human-gated)"
+        _render_sync_report(
+            stats, "sync-labels (dry-run):" if dry_run else "sync-labels:"
         )
     if stats.failed:
-        for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
-        if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        # an incomplete run gets NO second pass: the composite's precondition
+        # is the first pass's final durability point (cursor advanced), which
+        # a failed sync never reached (ticket #75)
+        _render_failures(stats.failed)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+    if also_import_gmail:
+        _import_gmail_pass(client, store, id_to_name=id_to_name, filters=filters)
+    # reaching this line means every pass that ran was complete — an
+    # incomplete run does not recommend analyzing a half-synced corpus
+    typer.echo(_ANALYZE_POINTER)
+
+
+def _import_gmail_pass(
+    client: GmailClient,
+    store: CorpusStore,
+    *,
+    id_to_name: dict[str, str],
+    filters: list[FilterInfo],
+) -> None:
+    """The second pass of ``dataset sync-labels --also-import-gmail``
+    (ticket #75): the FULL Gmail Import — the same snapshot writes +
+    ``import_gmail`` call the standalone command makes, delegated, never
+    re-implemented (spec #64: ingest stays single-sourced in the import
+    path). Reached only after the sync pass cleared its own durability gate,
+    so the Sync Cursor is already advanced and import's birth-when-absent
+    leaves it byte-identical (ADR-0008). ``bootstrap.retried`` is NOT added
+    again here — the sync report already carries it, and one composite
+    report must not double-count the shared settings blips. One bootstrap
+    serves both passes: the snapshots this pass writes reflect the settings
+    read BEFORE the sync walk, not a refetch at import start — label or
+    filter churn during the sync window surfaces in the next standalone
+    import or sync, a deliberate one-call quota trade (spec #64 keeps the
+    dataset commands on one shared bootstrap spine)."""
+    from .corpus_store import CorpusError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import (
+        import_gmail,
+        write_filters_snapshot,
+        write_labels_snapshot,
+    )
+
+    try:
+        write_filters_snapshot(store, filters)
+        write_labels_snapshot(store, id_to_name)
+        stats = import_gmail(client, store, id_to_name=id_to_name, query=DEFAULT_QUERY)
+    except GmailAuthError as e:  # revoked token mid-pass: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError) as e:
+        # the standalone import's mapping, unchanged — snapshot writes
+        # convert their OSError to CorpusError; the record-append block's
+        # write/fsync is the residual pre-existing gap, identical here and
+        # standalone. The sync pass's durable work is never rolled back by
+        # a second-pass fault
+        typer.echo(f"import failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    typer.echo(
+        f"import-gmail (also): scanned={stats.scanned} written={stats.written} "
+        f"skipped_present={stats.skipped_present} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    _render_failures(stats.failed)
+    if stats.failed:
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+def _sync_labels_pass(
+    client: GmailClient,
+    store: CorpusStore,
+    *,
+    id_to_name: dict[str, str],
+) -> None:
+    """The second pass of ``dataset import-gmail --also-sync-labels``
+    (ticket #75): the Label Sync event walk — the same ``sync_labels`` call
+    the standalone command makes, delegated, never re-implemented. Reached
+    only after the import completed durably, so the walk starts from the
+    ledger the import birthed (or found) — seeded BEFORE its paging
+    (ADR-0008): relabels made during the import land in this window, and
+    freshly imported ids touched by events are re-verified (self-healing
+    appends the fold absorbs). ``bootstrap.retried`` already rode the
+    import report — not added again here. The event WALK only:
+    ``--full-resync`` is an explicit recovery decision, never an implicit
+    second pass."""
+    from .corpus_store import CorpusError
+    from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
+    from .label_sync import sync_labels
+
+    try:
+        stats = sync_labels(client, store, id_to_name=id_to_name)
+    except GmailResyncError as e:
+        # the standalone sync's 404 contract, kept whole under composition:
+        # exact recovery command printed, ledger untouched, never automatic
+        typer.echo(f"sync-labels: {e}", err=True)
+        typer.echo(_RESYNC_GUIDANCE, err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    except GmailAuthError as e:  # revoked token mid-pass: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError, OSError, UnicodeDecodeError) as e:
+        # the import pass's durable work is never rolled back by a
+        # second-pass fault (spec #64)
+        typer.echo(f"sync-labels failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    _render_sync_report(stats, "sync-labels (also):")
+    _render_failures(stats.failed)
+    if stats.failed:
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
 
 
@@ -506,6 +664,27 @@ def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:
     for name in labels:
         # NO truncation: slash-nested label paths must stay readable
         typer.echo(f"{name:<{width}} {gains.get(name, 0):>6} {losses.get(name, 0):>6}")
+
+
+def _render_sync_report(stats: SyncStats, prefix: str) -> None:
+    """The event-walk sync report body (summary, birth provenance NOTE,
+    per-label counts, new-match NOTE) — shared by the standalone
+    ``sync-labels`` command and the ``import-gmail --also-sync-labels``
+    composite pass (ticket #75): one rendering, pinned once. The analyze
+    pointer is the COMMAND's — it closes the whole report after any
+    second pass; the failure detail is printed by each command's own
+    gate."""
+    typer.echo(
+        f"{prefix} events={stats.events} stale={stats.stale} "
+        f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
+        f"new_match={stats.new_match} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        typer.echo(_BIRTH_NOTE)
+    _render_gains_losses(stats.gains, stats.losses)
+    if stats.new_match:
+        typer.echo(_NEW_MATCH_NOTE.format(n=stats.new_match), err=True)
 
 
 @dataset_app.command("analyze")

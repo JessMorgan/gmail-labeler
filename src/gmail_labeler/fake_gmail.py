@@ -158,7 +158,9 @@ class FakeGmailClient:
       first-vs-last — the uniform default hides a last-stub read;
     - query is NOT evaluated — tests size the message set itself (documented
       divergence: query-construction bugs are caught at the live opt-in
-      seam, never in CI);
+      seam, never in CI); labelIds IS evaluated (AND across ids, like the
+      wire) because the full-resync inventory scan (#74) enumerates label
+      members through it — paging indexes the filtered set;
     - failures are programmed PER METHOD (method name, or "any"); an armed
       "any" fails WHICHEVER method is called next (documented opportunism),
       method queues cannot be stolen by other methods; each error is
@@ -258,16 +260,44 @@ class FakeGmailClient:
         self._maybe_fail("list_filters")
         return self.filters_list
 
-    def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:
-        self.calls.append(f"list_messages:{query}:{page_token or ''}")
+    def list_messages(
+        self,
+        query: str,
+        page_token: str | None = None,
+        *,
+        label_ids: Sequence[str] | None = None,
+    ) -> MessagePage:
+        # labelIds filter (#74): AND across the listed ids, like the wire.
+        # The filter applies BEFORE paging — the token indexes the filtered
+        # window, so a paged inventory scan sees exactly the label's
+        # members (the fake's token is an offset into that window; the real
+        # token is opaque and bound to its originating query — a divergence
+        # the fake cannot model and the core never exploits: it always
+        # chains its own tokens). The call log carries the ids (comma-
+        # joined) only when given, keeping the landed no-labels shape
+        # byte-identical for the import-path call-sequence pins. An EMPTY
+        # list is refused loud, matching the adapter.
+        if label_ids is not None and not label_ids:
+            raise ValueError(
+                "label_ids=[] would enumerate the whole mailbox — "
+                "pass None for no label filter"
+            )
+        log = f"list_messages:{query}:{page_token or ''}"
+        if label_ids:
+            log += f":{','.join(label_ids)}"
+        self.calls.append(log)
         self._maybe_fail("list_messages")
+        order = self.order
+        if label_ids:
+            wanted = set(label_ids)
+            order = [i for i in order if wanted <= set(self.messages[i].label_ids)]
         if page_token is None:
             start = 0
         elif _is_ascii_digit(page_token):
             start = int(page_token)
         else:  # the real API answers 400 on a corrupt token; so do we
             raise GmailPermanentError(f"invalid page token {page_token!r}", status=400)
-        window = self.order[start : start + self.page_size]
+        window = order[start : start + self.page_size]
         nxt = start + self.page_size
         return MessagePage(
             stubs=tuple(
@@ -278,7 +308,7 @@ class FakeGmailClient:
                 )
                 for i in window
             ),
-            next_page_token=str(nxt) if nxt < len(self.order) else None,
+            next_page_token=str(nxt) if nxt < len(order) else None,
         )
 
     def _stub_history_id(self, m: FakeMessage) -> int | None:

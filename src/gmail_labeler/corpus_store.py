@@ -5,6 +5,10 @@ Layout under a corpus directory:
   bodies/<id[:2]>/<id>.txt   body text sharded by id prefix
   filters.json / labels.json   attribution snapshot sidecars; the store
                 owns their durable I/O surface (read_snapshot/write_snapshot)
+  sync-cursor.json   the Sync Cursor (ADR-0008): versioned JSON ledger,
+                protected state on the same durable discipline (read_cursor/
+                write_cursor), covered by enforce/verify through the
+                protected-file set
 
 Durability and integrity contract:
   - files are created 0600 (and fchmod'd on rewrite, closing the
@@ -53,6 +57,7 @@ from pathlib import Path
 from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord
 from .corpus_record import body_hash as _body_hash
+from .sync_cursor import SIDECAR_CURSOR, SyncCursor, parse_cursor, render_cursor
 
 log = logging.getLogger("gmail_labeler.corpus")
 
@@ -69,6 +74,13 @@ _MAX_TAIL_SCAN = 1 << 20
 # Corpus-root attribution snapshots (invariant #6 sidecars): the names come
 # from the pure attribution module — one source of truth for the corpus format.
 _SIDECAR_NAMES = (SIDECAR_FILTERS, SIDECAR_LABELS)
+
+# Protected corpus-root state (ADR-0008): the attribution snapshots PLUS the
+# Sync Cursor. Deliberately split from the attribution-named tuple above —
+# the cursor is sync's ledger, never attribution data, but it rides the same
+# 0700/0600 secret handling, so BOTH enforce_modes and verify_modes walk
+# this set (mode coverage is not automatic from _SIDECAR_NAMES).
+_PROTECTED_FILE_NAMES = (*_SIDECAR_NAMES, SIDECAR_CURSOR)
 
 
 class CorpusStore:
@@ -336,6 +348,31 @@ class CorpusStore:
         path = self._snapshot_path(name)
         return path.read_text(encoding="utf-8") if path.is_file() else None
 
+    def read_cursor(self) -> SyncCursor | None:
+        """The Sync Cursor (ADR-0008), or None when absent. An existing
+        cursor that does not parse OR validate raises CorpusError — never
+        None: None is the birth gate, and reading invalid state as absent
+        would be the silent re-birth this ledger exists to prevent. The read
+        itself is guarded too: undecodable bytes or an unreadable file are
+        typed CorpusError (the CLI's exit-5 surface), never a raw traceback —
+        deepseek review, segment 1."""
+        try:
+            text = self.read_snapshot(SIDECAR_CURSOR)
+            if text is None:
+                return None
+            return parse_cursor(text)
+        except (ValueError, OSError) as e:
+            # UnicodeDecodeError is a ValueError subclass; OSError covers
+            # EACCES/ENOENT at the read (write_snapshot's same wrap)
+            raise CorpusError(f"corpus sync cursor invalid or unreadable: {e}") from e
+
+    def write_cursor(self, cursor: SyncCursor) -> None:
+        """Write the Sync Cursor on the snapshot discipline: 0600-at-fd,
+        fsynced, atomic replace (the durable surface is write_snapshot's,
+        verbatim). Birth callers must gate on read_cursor() is None first —
+        this method itself is a plain write, ownership lives in the caller."""
+        self.write_snapshot(SIDECAR_CURSOR, render_cursor(cursor))
+
     def write_snapshot(self, name: str, payload: str) -> None:
         """Created 0600 at the fd (never 0644-then-chmod), fsynced, atomically
         replaced; any OS failure is a CorpusError (CLI's typed exit-5 surface)."""
@@ -378,16 +415,17 @@ class CorpusStore:
 
     def enforce_modes(self) -> None:
         """Harden the corpus tree: dirs 0700, every file 0600 (one bounded
-        walk of ~256 shard dirs, plus the root-level snapshot sidecars and
-        their stray ``*.tmp`` remnants). Call from WRITE-side commands at
-        startup (import-gmail/apply/daemon) — not from read-only tools."""
+        walk of ~256 shard dirs, plus the protected root-level files — the
+        attribution snapshots and the Sync Cursor — and their stray ``*.tmp``
+        remnants). Call from WRITE-side commands at startup
+        (import-gmail/apply/daemon) — not from read-only tools."""
         if not self.root.is_dir():
             return
         _chmod_if(self.root, _DIR_MODE)
         records = self._records_path
         if records.is_file():
             _chmod_if(records, _FILE_MODE)
-        for name in _SIDECAR_NAMES:
+        for name in _PROTECTED_FILE_NAMES:
             sidecar = self.root / name
             if sidecar.is_file():
                 _chmod_if(sidecar, _FILE_MODE)
@@ -406,12 +444,12 @@ class CorpusStore:
 
     def verify_modes(self) -> list[str]:
         """Non-destructive check for group/world-readable STRUCTURAL paths
-        (root, bodies/, records index, snapshot sidecars) — not a full-tree
-        scan; call enforce_modes() from write-side commands for the whole
-        tree."""
+        (root, bodies/, records index, protected root-level files: the
+        attribution snapshots and the Sync Cursor) — not a full-tree scan;
+        call enforce_modes() from write-side commands for the whole tree."""
         offenders: list[str] = []
         paths = [self.root, self._bodies_dir, self._records_path]
-        paths += [self.root / name for name in _SIDECAR_NAMES]
+        paths += [self.root / name for name in _PROTECTED_FILE_NAMES]
         for p in paths:
             try:
                 if p.exists() and p.stat().st_mode & 0o077:

@@ -137,6 +137,12 @@ does not ship releases yet.
 
 ### Fixed
 
+- `ParsedMail` no longer carries the subject or the canonicalized body in
+  its `repr()`: repr-into-a-log is a log channel, and both fields are
+  message content — the fields stay on the value (the importers read them
+  by name; equality and construction are unaffected), only the rendering
+  drops them, mirroring the `RawMessage` pin (#78, latent invariant-#5
+  channel).
 - `dataset sync-labels --dry-run` (event walk and `--full-resync`) no
   longer closes with "run `dataset analyze` for the updated candidate
   gates" — a plan-only run moves no gates, so dry-run now closes with a

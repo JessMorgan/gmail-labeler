@@ -32,6 +32,28 @@ does not ship releases yet.
   typed error taxonomy (`gmail_errors.py`).
 - `dataset import-gmail`: resumable Gmail Import, `--query`/`--max-messages`,
   `filters.json` + `labels.json` sidecars.
+- `dataset sync-labels` (ticket #73, spec #64): the Label Sync event walk.
+  `label_sync.sync_labels(client, store, id_to_name, sleeper, clock,
+  dry_run)` — a pure-core module the daemon will reuse — pages Gmail
+  history from the Sync Cursor, marks every event-named corpus-resident
+  id stale (refresh-on-any-touch), metadata-fetches each one (never raw —
+  a call-log test proves the sync path is body-free, invariant #5) and
+  appends an ADR-0007 Revision via `dataclasses.replace()` on the resolved
+  record (field parity caller-owned, `id:` convention for now-unresolvable
+  labels). The cursor advances only after the delta's revisions are durable
+  and only when nothing failed (invariant #3 — crash-retry tests prove the
+  last-wins fold absorbs replays). `messagesDeleted`-touched ids keep their
+  record and are counted; non-resident event ids are counted as new-match,
+  never ingested; a cursorless corpus births from one profile call and
+  applies nothing (ADR-0008 consequence 1). The report prints per-label
+  gains/losses and closes with the `dataset analyze` pointer; `--dry-run`
+  prints the identical plan writing no records and leaving the cursor
+  byte-identical; an expired cursor (history
+  404) exits `5` with interim recovery guidance that names no unbuilt
+  flag (finalized by ticket #74). The gmail_import-private retry loop is
+  generalized into `retry.py` (shared pacing, duck-typed `retried`) and
+  now re-raises `GmailResyncError` instead of swallowing it to a warning —
+  silent success over a blind window was the bug.
 - Sync Cursor sidecar (`sync_cursor.py`, `corpus_store.py`, ADR-0008,
   ticket #72): `dataset import-gmail` births `sync-cursor.json`
   (`{version, history_id, last_sync}`, tz-aware UTC `last_sync`) inside the

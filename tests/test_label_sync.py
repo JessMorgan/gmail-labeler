@@ -308,6 +308,7 @@ def test_failed_refresh_keeps_cursor_behind_the_delta(tmp_path: Path) -> None:
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
     assert stats.failed == [("a1", "metadata fetch failed (permanent/retries)")]
+    assert stats.failed_ids == ["a1"]  # sentinel-safe accessor (gmail_import parity)
     assert stats.revised == 1  # b2's revision is durable, a1's is not
     assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)
 
@@ -530,3 +531,69 @@ def test_metadata_retry_exhaustion_fails_and_holds_cursor(tmp_path: Path) -> Non
     assert stats.failed == [("a1", "metadata fetch failed (permanent/retries)")]
     assert stats.revised == 0
     assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)
+
+
+def test_final_page_without_history_id_holds_the_cursor(tmp_path: Path) -> None:
+    """A delta whose final page carries no usable historyId cannot honestly
+    claim the window is consumed: the old cursor stays, the gap is a loud
+    failure (a replay is harmless; a guess is the silent-gap class)."""
+
+    class NoEcho(FakeGmailClient):
+        def history(self, start_history_id: int, page_token: str | None = None):  # type: ignore[no-untyped-def]
+            page = super().history(start_history_id, page_token)
+            # the wire-faithful field is present; this spine drops it
+            return HistoryPage(
+                history_id=None,
+                next_page_token=page.next_page_token,
+                records=page.records,
+            )
+
+    store = store_at(tmp_path)
+    _seed(store, _record("a1", ("Shipping",)))
+    store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
+    fake = NoEcho(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[_page(LabelsAdded("a1", ("L9",)))],
+    )
+    stats = sync_labels(
+        fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    assert stats.revised == 1  # the delta IS durable…
+    assert stats.failed == [
+        ("<cursor>", "no usable historyId on the final history page")
+    ]
+    assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)  # …unmarked
+
+
+def test_malformed_history_entries_name_no_messages(tmp_path: Path) -> None:
+    """The tolerant parser's defensive arms: garbage entries in typed fields
+    contribute no touches (and no crash) — the walk never guesses at
+    malformed wire shapes."""
+    store = store_at(tmp_path)
+    _seed(store, _record("a1", ("Shipping",)))
+    store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
+    fake = FakeGmailClient(
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=(
+                    {
+                        "id": "1",
+                        "labelsAdded": [
+                            "not-an-object",  # entry garbage
+                            {"message": "also-not-an-object"},  # nested garbage
+                            {"message": {"noId": True}},  # no id
+                        ],
+                    },
+                ),
+            )
+        ],
+    )
+    stats = sync_labels(
+        fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    assert stats.events == 1 and stats.stale == 0 and stats.new_match == 0
+    assert fake.calls == ["history:100:"]  # nothing was refreshed
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # empty delta consumed

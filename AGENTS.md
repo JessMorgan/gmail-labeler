@@ -32,9 +32,9 @@ what is wired vs. planned, and each gains detail as its phase lands.
   #70/#73), as is `--full-resync` (#74).
 - ADR-0008 the Sync Cursor is sync's ledger — `import-gmail` may birth it
   when absent (never advance); `import-gyb` never births; only the Label
-  Sync operation advances it, after durable revisions — `dataset
-  sync-labels` (the event walk, ticket #73) is wired; the daemon advances
-  it when ADR-0003 lands. Expired cursors fail loudly, printing the exact
+  Sync operation advances it, after durable revisions — `dataset sync-labels`
+  (the event walk, ticket #73) is wired; the daemon advances it when
+  ADR-0003 lands. Expired cursors fail loudly, printing the exact
   `dataset sync-labels --full-resync` recovery command (wired by #74;
   ADR-0008's final wording, never automatic).
 
@@ -43,9 +43,9 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
   `corpus_store`, `mime_extract`, `analyze`, `attribution`, `sync_cursor`,
   `auth`, `tokens`, `gmail_client`, `gmail_errors`, `fake_gmail`,
-  `gmail_import`, `gyb_import`, `retry`, `label_sync`, `cli`. Planned (later phases): model core
-  (`dataset` build, `thresholds`, `graduation`, `eval`) + `model` and
-  `daemon` adapters.
+  `gmail_import`, `gyb_import`, `retry`, `label_sync`, `cli`. Planned
+  (later phases): model core (`dataset` build, `thresholds`, `graduation`,
+  `eval`) + `model` and `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
 - `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.

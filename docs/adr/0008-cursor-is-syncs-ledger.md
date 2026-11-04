@@ -2,9 +2,9 @@
 
 The Corpus must remember how far the mailbox's event stream has been
 consumed, and more than one command touches that memory. We decided the
-Sync Cursor is owned by the Label Sync *operation* — `dataset
-sync-labels` is its first door, and the daemon (ADR-0003), when it
-lands, advances the same ledger through the shared sync code. Gmail Import
+Sync Cursor is owned by the Label Sync *operation* — `dataset sync-labels`
+is its first door, and the daemon (ADR-0003), when it lands, advances the
+same ledger through the shared sync code. Gmail Import
 (`dataset import-gmail`) may *birth* a cursor but never *advance* or
 overwrite an existing one, and GYB Import (`dataset import-gyb`) never
 births at all: a backup snapshots messages, not the event stream, and
@@ -27,8 +27,8 @@ already outside the retention window, where a profile seed can never be
 born expired. Birth keeps the guide-ordered page seed with a profile
 fallback to save the call whenever the wire carries the stub field; the
 failure mode it accepts is a first sync that fails loudly as an expired
-cursor — the same never-automatic recovery the last consequence
-prescribes.
+cursor — the same never-automatic recovery the retention consequence
+below prescribes.
 
 The cursor is a versioned JSON sidecar in the corpus root
 (`sync-cursor.json`: `{version, history_id, last_sync}`, `last_sync`

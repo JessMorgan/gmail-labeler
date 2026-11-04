@@ -6,15 +6,18 @@ can only be corrected by hand-deleting records or re-importing everything.
 We decided label updates are recorded by appending a full revised record for
 the same message id, with readers resolving last-occurrence-wins. Physical
 writes stay append-only — no durable record line is ever rewritten in place
-(crash recovery may seal or truncate an unterminated tail, never rewrite
-committed bytes) — and existing corpora need no migration because a log
-with no duplicate ids folds to itself.
+(crash recovery may seal an unterminated tail, truncate its damaged
+remainder, or refuse to guess when the damage outruns the store's scan
+bound — never rewrite committed bytes) — and existing corpora need no
+migration because a log with no duplicate ids folds to itself.
 
 Revisions travel through a dedicated append path, deliberately separate
 from `put`, which keeps its never-duplicate contract (re-putting a present
 id stays a no-op): the acquisition commands stay structurally incapable of
 writing revisions. That path shares the store's durability machinery —
-tail repair, append-only fd, flush/fsync ordering — and writes no body at
+tail repair, append-only fd, flush/fsync ordering (today documented as
+`put()`'s machinery; the implementing ticket makes the sharing explicit
+and corrects those docstrings) — and writes no body at
 all, so the body-before-record ordering simply does not apply to it. There
 is no new per-line marker field — a record's log position is its version —
 so the record line format is unchanged for writers and readers alike, and
@@ -23,9 +26,12 @@ the fold is a no-op on duplicate-free logs.
 Label revisions carry the record's `body_hash`, `date`, `source`, and
 envelope fields (`subject`, `sender`, `recipients`, `thread_id`)
 unchanged; only the label set differs. Sync therefore never fetches
-message bodies: per Gmail's sync guidance a cached message's content is
-immutable — only its `labelIds` can change — so the retained body stays
-authoritative. Integrity checking is unmoved by this decision too: the
+message bodies: per Gmail's sync guidance only a cached message's
+`labelIds` might change, so the retained body stays authoritative. The
+known exception is draft mail: the Gmail Import query does not exclude
+drafts, and a draft keeps its id while its body is edited — neither this
+log nor Label Sync claims body-freshness for drafts. Integrity checking is
+unmoved by this decision too: the
 landed tripwire is `put()`'s write-time hash-vs-record check, and because
 a revision writes no body, the sync path cannot create body/hash drift;
 deeper read-path verification (`--verify-bodies`) is a named future
@@ -62,8 +68,11 @@ capability, not a promise this design leans on.
   alongside the cursor-durability rule.
 - Messages deleted upstream keep their records (v1: reported, not
   tombstoned); tombstones are a future format change, not a fold change.
-- Compaction of superseded revisions is always safe but never load-bearing
-  for correctness.
+- Compaction of superseded revisions is safe when done atomically
+  (whole-file temp+fsync+rename, the store's established discipline) but
+  never load-bearing for correctness. It is also the answer to fold cost:
+  every consumer reads and folds the whole log, so a revision-heavy
+  corpus compacts when reports go slow.
 - Event-sync is an optimization over ground truth: `--full-resync` compares
   the Corpus against the mailbox directly (label-enumeration scan or
   corpus-metadata walk, whichever the up-front cost estimate favors) and

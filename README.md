@@ -114,8 +114,8 @@ label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
 mailbox has no labeling filters). Both imports are resumable:
-the corpus id set is the resume point, so re-running after a failure skips what is
-already present. Transient failures resume cleanly; a deterministic abort
+the corpus id set is the resume point, so re-running after a failure skips
+what is already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself
 is fixed — resumable is not the same as completable. `dataset analyze`
 gates candidates on volume
@@ -133,8 +133,9 @@ human-gated).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`train`, `eval`, `shadow`, `apply`, `daemon`, and `status` are frozen
-command names that arrive in later phases (not wired yet) — until they are,
+`train`, `eval`, `dataset sync-labels`, `shadow`, `apply`, `daemon`,
+and `status` are frozen command names that arrive in later phases (not
+wired yet) — until they are,
 they exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
 commands and currently unreachable. Scripts can branch on 0/2/4/5
 today; a `1` means an unhandled crash — that's a bug, please report it.

@@ -99,7 +99,7 @@ via the corpus id set — a structural resume point, distinct from the Sync
 Cursor.
 _Avoid_: export (the command fills the Corpus, so it is named from the
 Corpus's side; "export" is reserved for a future Corpus-dump command),
-pull (implies fetch-and-merge; the store only appends)
+pull (implies fetch-and-merge; at ingest the store only appends)
 
 **GYB Import**:
 Building a Corpus from an existing Got Your Back (GYB) backup directory rather

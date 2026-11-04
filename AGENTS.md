@@ -30,9 +30,10 @@ what is wired vs. planned, and each gains detail as its phase lands.
   compaction requirement, no body fetching on the sync path. Planned with
   spec #64's tickets; not yet wired.
 - ADR-0008 the Sync Cursor is sync's ledger — `import-gmail` may birth it
-  when absent (never advance); only the Label Sync operation advances it,
-  after durable revisions — `sync-labels` today, the daemon when ADR-0003
-  lands; expired cursors fail loudly toward `--full-resync`.
+  when absent (never advance); `import-gyb` never births; only the Label
+  Sync operation advances it, after durable revisions — `sync-labels` when
+  wired, the daemon when ADR-0003 lands; expired cursors fail loudly
+  toward `--full-resync`. Planned with spec #64's tickets; not yet wired.
 
 ## Layout
 
@@ -47,9 +48,9 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {import-gmail,import-gyb,analyze}` are wired (the acquisition pair
   is pinned by ADR-0006; the old `export` name is a usage error, no alias);
-  `train`, `eval`, `dataset sync-labels` (spec #64), `shadow {run,report}`,
-  `apply`, `daemon`, `status` are
-  frozen by the design conversation, not yet wired — change names with cause.
+  `train`, `eval`, `dataset sync-labels` (spec #64),
+  `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
+  design conversation, not yet wired — change names with cause.
 
 ## Commands
 

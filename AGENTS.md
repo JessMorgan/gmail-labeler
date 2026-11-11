@@ -25,6 +25,15 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - ADR-0006 acquisition commands speak from the Corpus's perspective —
   `import-gmail`/`import-gyb`; `export` is reserved for a future corpus-dump
   command, never re-proposed for corpus population.
+- ADR-0007 the Corpus is a revision log — label revisions append with the
+  same id; readers resolve last-occurrence-wins; no marker field, no
+  compaction requirement, no body fetching on the sync path. Planned with
+  spec #64's tickets; not yet wired.
+- ADR-0008 the Sync Cursor is sync's ledger — `import-gmail` may birth it
+  when absent (never advance); `import-gyb` never births; only the Label
+  Sync operation advances it, after durable revisions — `sync-labels` when
+  wired, the daemon when ADR-0003 lands; expired cursors fail loudly
+  toward `--full-resync`. Planned with spec #64's tickets; not yet wired.
 
 ## Layout
 
@@ -39,8 +48,9 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {import-gmail,import-gyb,analyze}` are wired (the acquisition pair
   is pinned by ADR-0006; the old `export` name is a usage error, no alias);
-  `train`, `eval`, `shadow {run,report}`, `apply`, `daemon`, `status` are
-  frozen by the design conversation, not yet wired — change names with cause.
+  `train`, `eval`, `dataset sync-labels` (spec #64),
+  `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
+  design conversation, not yet wired — change names with cause.
 
 ## Commands
 

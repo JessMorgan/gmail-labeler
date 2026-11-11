@@ -11,6 +11,7 @@ token.json
 *.sqlite3
 *.db
 state/
+.codegraph/
 
 # Python
 .venv/

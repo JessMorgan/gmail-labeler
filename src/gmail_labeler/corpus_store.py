@@ -32,7 +32,10 @@ Durability and integrity contract:
     field (a record's log position is its version); the revision path
     does no body I/O at all — the store's hash-vs-body check belongs to
     put()'s write path, and ADR-0007 assigns tamper/corruption detection
-    to the body paths, never to the revision append;
+    to the body paths, never to the revision append. Both writers share
+    one index-append sequence (_append_index_line()), so the crash-tail and
+    permission parity between the two paths is structural, not copied
+    discipline;
   - readers of label state use the resolved view, iter_resolved(): the
     log folded by id, last occurrence wins. A duplicate-free log folds to
     itself, so existing corpora need no migration. iter_records() stays
@@ -167,16 +170,7 @@ class CorpusStore:
                 f"corpus: body write failed ({type(e).__name__})"
             ) from None
         _fsync_dir(body_path.parent, body_path)  # ...then its dirent
-        self._repair_tail()
-        # ...then the index line, created 0600 (fchmod'd if pre-existing).
-        existed = self._records_path.exists()
-        fd = self._open_append_checked()
-        with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as fh:
-            fh.write(record.to_json_line() + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        if not existed:
-            _fsync_dir(self.root, self._records_path)
+        self._append_index_line(record)  # ...then the index line
         self._ids().add(record.id)
         return True
 
@@ -201,23 +195,36 @@ class CorpusStore:
         Revision) is the caller's contract: revisions are built with
         dataclasses.replace(); store-side enforcement is deferred to the
         sync ticket. Crash-tail repair and the flush/fsync + 0600 append
-        ordering are put's, verbatim. True on success.
+        ordering are the shared _append_index_line() sequence — one copy
+        with put(), so the AC4 parity is structural, not copied discipline.
+        True on success.
         """
         if record.id not in self._ids():
             raise CorpusError(
                 f"corpus: cannot revise absent id {record.id}: a Revision "
                 "supersedes a resident record, it does not create one"
             )
-        # The append sequence below is kept byte-for-byte in step with
-        # put()'s — the verbatim reuse is the crash/permission contract.
-        # (The `not existed` dir-fsync branch is reachable only on put()'s
-        # first write: the residency precondition above implies the index
-        # exists, and the single-writer contract (module docstring, citing
-        # ADR-0002) admits no deleter. It rides the copy deliberately —
-        # trimming the sequence to its live-at-here lines would break the
-        # byte-for-byte lockstep above, which is what guarantees AC4.)
+        self._append_index_line(record)
+        self._ids().add(record.id)
+        return True
+
+    def _append_index_line(self, record: CorpusRecord) -> None:
+        """The one index-append sequence, shared by put() and append_revision().
+
+        Crash-tail repair, then the record line appended to the index —
+        created 0600 at the fd (fchmod'd if pre-existing) — flushed and
+        fsynced; the root's dirent is fsynced only when the index file was
+        absent: live on put()'s first write; dead thereafter —
+        append_revision()'s residency precondition implies the index
+        exists, and for put() the file is present from its second write on
+        because the single-writer contract (module docstring, citing
+        ADR-0002) admits no deleter. Cache maintenance (_ids().add) stays
+        with the callers deliberately: put() returns False without ever
+        reaching this helper. One copy for both paths: the AC4
+        crash/permission parity the duplicated sequence used to police by
+        comment now holds structurally.
+        """
         self._repair_tail()
-        # ...then the index line, created 0600 (fchmod'd if pre-existing).
         existed = self._records_path.exists()
         fd = self._open_append_checked()
         with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as fh:
@@ -226,8 +233,6 @@ class CorpusStore:
             os.fsync(fh.fileno())
         if not existed:
             _fsync_dir(self.root, self._records_path)
-        self._ids().add(record.id)
-        return True
 
     def _ensure_written_dirs(self, shard: Path) -> None:
         """Create the chain root -> bodies/ -> shard (parents allowed — a

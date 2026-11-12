@@ -27,16 +27,19 @@ from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord, body_hash, utc_datetime
 from .corpus_store import CorpusStore
 from .gmail_client import FilterInfo, GmailClient, MessagePage
-from .gmail_errors import BACKOFF, RETRY, GmailAuthError, GmailError
+from .gmail_errors import GmailError
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
+from .retry import MAX_ATTEMPTS
+from .retry import retrying as _retrying
 from .sync_cursor import SyncCursor
 
 log = logging.getLogger("gmail_labeler.gmail_import")
 
 DEFAULT_QUERY = "in:anywhere -in:spam -in:trash"
-MAX_ATTEMPTS = 5
-_BASE_BACKOFF_S = 1.0
+# MAX_ATTEMPTS and the pacing loop are shared with Label Sync via retry.py
+# (ticket #73 generalization); the constant is imported here for the
+# default arguments below — the loop itself no longer lives in this module.
 
 
 @dataclass
@@ -195,41 +198,6 @@ def _birth_cursor(
         )
         return
     store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
-
-
-def _retrying[T](
-    fn: Callable[[], T],
-    *,
-    max_attempts: int,
-    stats: GmailImportStats,
-    sleeper: Callable[[float], None],
-    what: str,
-) -> T | None:
-    for attempt in range(max_attempts):
-        try:
-            return fn()
-        except GmailError as e:
-            if e.kind in (RETRY, BACKOFF):
-                stats.retried += 1
-                if attempt == max_attempts - 1:
-                    log.warning("import: %s retries exhausted (%s)", what, e.kind)
-                    return None
-                delay = getattr(e, "retry_after_s", None)
-                if delay is None:  # an explicit server 0.0 stays 0.0
-                    delay = _BASE_BACKOFF_S * (2**attempt)
-                # 60 s CEILING on server hints: a dailyLimitExceeded-scale
-                # hint is honest-but-bounded here per message; a global
-                # stop-vs-backoff policy is a daemon-phase decision (the
-                # ceiling keeps a poisoned hint from sleeping an hour)
-                sleeper(min(delay, 60.0))
-            else:
-                if isinstance(e, GmailAuthError):
-                    # every later call would fail identically — the fix is
-                    # human, so surface it typed (CLI exit 4), never swallow
-                    raise
-                log.warning("import: %s permanent error: %s", what, e)
-                return None
-    return None
 
 
 def _import_one(

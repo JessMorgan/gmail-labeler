@@ -7,7 +7,8 @@ confident, reviewably when it isn't.
 > **Status: pre-alpha — Phase 0 (corpus acquisition) has landed.** The
 > architecture decisions, domain language, and development standards are
 > committed; the CLI installs (`uv sync`, then `gmail-labeler --help`) with a
-> working OAuth flow and `dataset import-gmail` / `import-gyb` / `analyze`.
+> working OAuth flow and `dataset import-gmail` / `import-gyb` /
+> `sync-labels` / `analyze`.
 > Training, graduation, and the daemon arrive in later phases — follow the
 > phase plan in [AGENTS.md](AGENTS.md).
 
@@ -98,6 +99,7 @@ gmail-labeler auth                    # credential status
 gmail-labeler auth login              # one-time desktop OAuth consent flow
 gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
+gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (no re-import)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 ```
 
@@ -118,7 +120,17 @@ seed is available); import never advances an existing cursor, and
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). Both imports are resumable:
+mailbox has no labeling filters). `dataset sync-labels` walks the Gmail history from the corpus's
+Sync Cursor (ADR-0008) and appends a label Revision for every corpus
+message an event touched — metadata only, bodies never (invariant #5) —
+so relabels and Backfills reach the corpus without a re-import. The
+cursor advances only after the delta's revisions are durable, a killed
+run is safe to re-run, `--dry-run` prints the identical plan writing no
+records and leaving the cursor byte-identical, event ids not in the
+corpus (typically new mail) are counted and reported but never ingested
+here, and upstream-deleted mail keeps its record (counted). An expired cursor (history 404) exits `5` with recovery
+guidance — a full label-resync command is not built yet, so until it
+lands the guidance points at rebuilding the corpus. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips
 what is already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself
@@ -138,9 +150,8 @@ human-gated).
 
 Exit codes: `0` ok · `2` usage error · `3` not implemented · `4`
 auth/config unusable · `5` operation failed or incomplete.
-`train`, `eval`, `dataset sync-labels`, `shadow`, `apply`, `daemon`,
-and `status` are frozen command names that arrive in later phases (not
-wired yet) — until they are,
+`train`, `eval`, `shadow`, `apply`, `daemon`, and `status` are frozen
+command names that arrive in later phases (not wired yet) — until they are,
 they exit `2` as unknown commands; `3` is reserved for wired-but-stubbed
 commands and currently unreachable. Scripts can branch on 0/2/4/5
 today; a `1` means an unhandled crash — that's a bug, please report it.

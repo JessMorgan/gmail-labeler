@@ -21,7 +21,9 @@ from .gmail_import import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
-    from .gmail_client import GmailClient
+    from .corpus_store import CorpusStore
+    from .gmail_client import FilterInfo, GmailClient
+    from .gmail_import import GmailImportStats
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -132,6 +134,54 @@ def _import_gmail_client(config: Config) -> GmailClient:
     return GmailRestClient(build_credentials(config))
 
 
+def _dataset_auth_bootstrap(
+    cfg: Config, *, failure_prefix: str
+) -> tuple[GmailClient, dict[str, str], list[FilterInfo], GmailImportStats]:
+    """Shared dataset auth gate: build the client and run the settings
+    bootstrap behind the pinned exit-code contract — auth failures print
+    ``auth: …`` and exit 4; a transport failure prints
+    ``{failure_prefix}: …`` and exits 5. The gate runs FIRST: a
+    not-signed-in run must not touch the corpus tree (the dataset commands
+    must not create or re-mode it — a typo'd corpus.dir especially).
+    Raises typer.Exit; on success returns
+    (client, id_to_name, filters, bootstrap-stats)."""
+    from .auth import AuthError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import fetch_settings
+    from .tokens import TokenStoreError
+
+    try:
+        client = _import_gmail_client(cfg)
+        id_to_name, filters, bootstrap = fetch_settings(client)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"{failure_prefix}: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    return client, id_to_name, filters, bootstrap
+
+
+def _dataset_store_modes(store: CorpusStore, *, enforce: bool = True) -> None:
+    """Shared store mode handling for the dataset import and sync
+    commands: tighten the tree, then WARNING-loop over anything still
+    group/world-readable.
+    Pass ``enforce=False`` for read-only runs (``--dry-run``): per
+    corpus_store.enforce_modes' own contract ("Call from WRITE-side
+    commands… not from read-only tools", corpus_store.py ~431), a run
+    that writes nothing must not re-mode anything either. The
+    non-destructive verify_modes WARNING runs either way — it names the
+    structural paths the later write run would tighten (verify_modes is
+    a structural scan; the full-tree tightening is enforce_modes' job)."""
+    if enforce:
+        store.enforce_modes()
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+
+
 @dataset_app.command("import-gmail")
 def dataset_import_gmail(
     config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
@@ -146,36 +196,21 @@ def dataset_import_gmail(
     ),
 ) -> None:
     """Import labeled mail from the Gmail API into the corpus."""
-    from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError
     from .gmail_import import (
-        fetch_settings,
         import_gmail,
         write_filters_snapshot,
         write_labels_snapshot,
     )
-    from .tokens import TokenStoreError
 
     cfg = _load_config(config)
-    # Auth gate FIRST: a not-signed-in run must not create or re-mode a
-    # corpus tree (a typo'd corpus.dir especially).
-    try:
-        client = _import_gmail_client(cfg)
-        id_to_name, filters, bootstrap = fetch_settings(client)
-    except (AuthError, TokenStoreError) as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailAuthError as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailError as e:
-        typer.echo(f"import failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    # Auth gate FIRST via the shared bootstrap (_dataset_auth_bootstrap)
+    client, id_to_name, filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="import failed"
+    )
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
@@ -254,9 +289,7 @@ def dataset_import_gyb(
         typer.echo(f"import-gyb: {DB_FILENAME} not found under {root}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         stats = import_gyb(
             root,
@@ -332,33 +365,20 @@ def dataset_sync_labels(
     Unseen Ids and reported, never ingested here; deleted mail keeps its
     record.
     """
-    from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
-    from .gmail_import import fetch_settings
     from .label_sync import sync_labels
-    from .tokens import TokenStoreError
 
     cfg = _load_config(config)
-    # Auth gate FIRST (import-gmail parity): a not-signed-in run must not
-    # touch the corpus tree.
-    try:
-        client = _import_gmail_client(cfg)
-        # Deliberate reuse of the landed bootstrap (spec #64 seam 3): the
-        # filters fetch is unused here — a filters-only outage therefore
-        # blocks sync too (loudly, exit 5). Accepted: one cheap shared call
-        # keeps every dataset command on the SAME auth/retry spine; a
-        # labels-only bootstrap is a refactor for the daemon phase.
-        id_to_name, _filters, bootstrap = fetch_settings(client)
-    except (AuthError, TokenStoreError) as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailAuthError as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailError as e:
-        typer.echo(f"sync-labels failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    # Auth gate FIRST via the shared bootstrap (import-gmail on the same
+    # spine). Deliberate reuse of the landed bootstrap (spec #64 seam 3):
+    # the filters fetch is unused here — a filters-only outage therefore
+    # blocks sync too (loudly, exit 5). Accepted: one cheap shared call
+    # keeps every dataset command on the SAME auth/retry spine; a
+    # labels-only bootstrap is a refactor for the daemon phase.
+    client, id_to_name, _filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="sync-labels failed"
+    )
     store = CorpusStore(cfg.corpus.dir)
     if not store.root.is_dir():
         # analyze's gate, same reasoning: a config typo is an operation
@@ -370,18 +390,7 @@ def dataset_sync_labels(
             err=True,
         )
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
-    if not dry_run:
-        # WRITE-side only, per corpus_store.enforce_modes' own contract
-        # ("Call from WRITE-side commands… not from read-only tools",
-        # corpus_store.py ~431): a --dry-run sync writes nothing, so it
-        # must not re-mode anything either
-        store.enforce_modes()
-    for offender in store.verify_modes():
-        # non-destructive, so it runs under --dry-run too: the WARNING
-        # names the structural paths the later write run would tighten
-        # (verify_modes is a structural scan; the full-tree tightening is
-        # enforce_modes' job on the write run)
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store, enforce=not dry_run)
     try:
         stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
     except GmailResyncError as e:

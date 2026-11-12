@@ -130,6 +130,47 @@ def test_dataset_import_gmail_writes_and_reports(
     assert sidecar[0]["criteria"] == {"from": "shipper@x.com"}
 
 
+def test_dataset_import_gmail_enforces_modes_on_every_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Import-gmail enforces modes UNCONDITIONALLY (write-side, unlike
+    sync-labels' dry-run gate): a loosened structural path is tightened
+    even when the run itself writes no records — every message is
+    skip-present, so no append path re-fchmods records.jsonl and
+    enforce_modes is the only path that can bring the mode back (mirrors
+    the sync-labels real-run pin; kills an enforce=False mutant at the
+    import call site)."""
+    import os
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+    from gmail_labeler.gmail_client import FilterInfo, LabelInfo
+
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: Hi\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nbody",
+                label_ids=("INBOX", "L1"),
+                thread_id="t",
+                internal_date_ms=1761818400000,
+            )
+        ],
+        labels=[LabelInfo("L1", "Shipping", "user")],
+        filters=[FilterInfo(id="f1", criteria={"from": "shipper@x.com"}, action={})],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = str(_import_gmail_cfg(tmp_path))
+    first = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert first.exit_code == 0, first.output
+    records = tmp_path / "corpus" / "records.jsonl"
+    os.chmod(records, 0o644)  # loosen one structural path
+    second = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert second.exit_code == 0, second.output
+    assert "skipped_present=1" in second.stdout  # the run wrote no record itself
+    assert records.stat().st_mode & 0o077 == 0  # only enforce_modes could tighten
+
+
 def test_dataset_import_gmail_incomplete_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1152,6 +1193,29 @@ def test_sync_labels_auth_failure_exits_4(
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 4
     assert "auth:" in result.stderr
+
+
+def test_sync_labels_bootstrap_transport_failure_keeps_own_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared bootstrap's ``failure_prefix`` is the one divergent
+    carrier between import-gmail and sync-labels: pin that a bootstrap
+    transport failure prints THIS command's prefix, not import-gmail's
+    (kills the prefix-swap mutant — exit code and auth paths alone
+    survive it)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.gmail_errors import GmailError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake()
+    fake.fail("list_labels", GmailError("boom"))  # STOP kind: raises at once
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5
+    assert "sync-labels failed:" in result.stderr
+    assert "import failed:" not in result.stderr
 
 
 def test_sync_labels_midrun_auth_exits_4(

@@ -99,6 +99,10 @@ def history_records(
     wire-valid id, and an event outside the union (a raw dict, or a future
     HistoryEvent member forgotten here) raises instead of silently
     rendering an id-only record that names no change."""
+    # bool is a subclass of int, so the negated int check never fires for
+    # a bool: isinstance(True, int) is True, and without this arm
+    # start_id=True would pass every clause and silently render ids from
+    # "1"
     if not isinstance(start_id, int) or isinstance(start_id, bool) or start_id < 1:
         raise ValueError(f"history start_id must be an integer >= 1, got {start_id!r}")
     records: list[dict[str, object]] = []
@@ -130,7 +134,10 @@ def history_records(
 def _label_list(labels: object) -> list[str]:
     # the same loud doctrine at the field level: an Any-typed caller's
     # plain str would list() into character-split labelIds — a wire lie
-    # that survives every downstream presence check
+    # that survives every downstream presence check. The positive str test
+    # is load-bearing: str IS a Sequence, so the negative Sequence check
+    # below would let it pass, and all() can't catch it either (every
+    # character of a string is itself a str)
     if (
         isinstance(labels, str)
         or not isinstance(labels, Sequence)

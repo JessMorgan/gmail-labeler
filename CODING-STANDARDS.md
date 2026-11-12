@@ -65,7 +65,8 @@ deterministic, never string-matched at call sites.
 
 ## Tests
 
-Test-first at the seams (see the `tdd` skill). The Gmail API is
+Test-first at the seams (see the `tdd` skill; contributor trail:
+`CONTRIBUTING.md`). The Gmail API is
 **always faked** — a `FakeGmailClient` behind the same `Protocol` powers unit
 and integration tests alike; live-API tests carry a `--live` opt-in marker and
 never run in CI. The one exception that lives in CI is structural: a test may

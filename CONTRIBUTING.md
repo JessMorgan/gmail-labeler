@@ -17,6 +17,18 @@ to land.
   tests against the bundled static discovery doc are sanctioned (see
   `CODING-STANDARDS.md`, §Tests); live-API tests stay out of CI.
 
+## Agent skills
+
+Development is agent-assisted and leans heavily on Matt Pocock's skills
+set ([hub](https://www.aihero.dev/skills),
+[source](https://github.com/mattpocock/skills);
+install: `npx skills@latest add mattpocock/skills`). Docs in this repo
+may reference some of its skills by name — `tdd` and `domain-modeling`
+are used in `CODING-STANDARDS.md` and `AGENTS.md` — but the set is not
+vendored here; the installer gets you the same workflows. (Other doc
+pointers — e.g. the `git-worktree` and `git-management` skills — name
+maintainer-local skills that are not part of this published set.)
+
 ## License
 
 This project is AGPL-3.0-or-later. Submitting a contribution constitutes

@@ -98,9 +98,10 @@ is the merge gate; `--live` Gmail tests never run there (invariant #9).
 - Single context: root `GLOSSARY.md` + `docs/adr/`. The `domain-modeling`
   skill discipline is active in design sessions — challenge terms that drift
   from the glossary.
-- Skills come from the maintainer box's global skill set
-  (`~/.config/opencode/skills/`); the project carries no local skill tree —
-  do not re-create `.agents/`.
+- Skills resolve from each agent's own global installation; the project
+  carries no local skill tree — do not re-create `.agents/`. The published
+  set development leans on is described in `CONTRIBUTING.md` §Agent
+  skills; a few doc pointers name maintainer-local skills outside it.
 
 ## Known external facts
 

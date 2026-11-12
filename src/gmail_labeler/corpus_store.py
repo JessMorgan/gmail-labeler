@@ -19,14 +19,27 @@ Durability and integrity contract:
     worst an orphaned body (rewritten idempotently), never a record
     pointing at nothing;
   - crash tails: an unparseable final fragment is truncated by the next
-    put(); a COMPLETE line that merely lost its newline is sealed, never
-    dropped; an unterminated tail beyond the scan bound is refused loudly
-    (CorpusError) rather than guessed — whole-file destruction is never an
-    acceptable "repair";
+    put()/append_revision(); a COMPLETE line that merely lost its newline
+    is sealed, never dropped; an unterminated tail beyond the scan bound
+    is refused loudly (CorpusError) rather than guessed — whole-file
+    destruction is never an acceptable "repair";
   - put() verifies the record's body_hash against the body actually stored
     (preprocessing-integrity tripwire);
-  - re-putting an existing id is a no-op (append-only; corrections happen
-    at dataset build, not by mutation).
+  - re-putting an existing id is a no-op: put() stays never-duplicate, so
+    the acquisition commands stay structurally incapable of writing
+    revisions (ADR-0007). Label revisions travel through append_revision()
+    — a full revised line for a resident id, no body rewrite, no marker
+    field (a record's log position is its version); the revision path
+    does no body I/O at all — the store's hash-vs-body check belongs to
+    put()'s write path, and ADR-0007 assigns tamper/corruption detection
+    to the body paths, never to the revision append. Both writers share
+    one index-append sequence (_append_index_line()), so the crash-tail and
+    permission parity between the two paths is structural, not copied
+    discipline;
+  - readers of label state use the resolved view, iter_resolved(): the
+    log folded by id, last occurrence wins. A duplicate-free log folds to
+    itself, so existing corpora need no migration. iter_records() stays
+    the raw log.
 
 Single-process contract (ADR-0002): one writer per corpus directory at a
 time; no cross-process locking. Do not iterate and write concurrently.
@@ -109,6 +122,25 @@ class CorpusStore:
                     f"{self._records_path}:{lineno}: corrupt record: {e}"
                 ) from e
 
+    def iter_resolved(self) -> Iterator[CorpusRecord]:
+        """The resolved view (ADR-0007): the record log folded by id, last
+        occurrence wins. A duplicate-free log folds to itself — zero
+        migration. Sequence contract: ids in first-appearance order, each
+        carrying its LAST line (log position is the version; the winner is
+        the last-seen record, never the first).
+
+        Strictness is inherited from iter_records: a corrupt middle line
+        raises CorpusError with :lineno:, a torn crash tail is skipped.
+        Memory profile: the whole id->record map is materialized before
+        the first yield — heavier than _ids()' id-only set (full records
+        are retained), and in line with what the bulk consumers already
+        pay: dataset analyze materializes its record list today.
+        """
+        resolved: dict[str, CorpusRecord] = {}
+        for rec in self.iter_records():
+            resolved[rec.id] = rec
+        yield from resolved.values()
+
     def has(self, message_id: str) -> bool:
         return message_id in self._ids()
 
@@ -138,8 +170,61 @@ class CorpusStore:
                 f"corpus: body write failed ({type(e).__name__})"
             ) from None
         _fsync_dir(body_path.parent, body_path)  # ...then its dirent
+        self._append_index_line(record)  # ...then the index line
+        self._ids().add(record.id)
+        return True
+
+    def append_revision(self, record: CorpusRecord) -> bool:
+        """Append a full revised record for an id already in the log
+        (ADR-0007: log position is the version; readers see the resolved
+        view). Deliberately separate from put() — the acquisition paths
+        stay structurally incapable of writing revisions.
+
+        The id MUST already have a record: appending a line whose body was
+        never stored would violate the durability contract (never a record
+        pointing at nothing). Callers gate on has() first — a non-resident
+        id is routine (mailbox events name mail outside the corpus), so
+        this raise marks a caller bug, not a corpus fault.
+        No body is written or re-read: Gmail content immutability means a
+        revision differs only in labels, and the store's hash-vs-body
+        check stays with put()'s write path (ADR-0007 assigns detection to
+        the body paths, never to the revision append). Replays append
+        harmlessly — the last-wins fold absorbs them, which is what makes
+        crash-retry of a Label Sync safe. Field parity with the resident
+        record (body_hash, date, source, envelope unchanged — the glossary
+        Revision) is the caller's contract: revisions are built with
+        dataclasses.replace(); store-side enforcement is deferred to the
+        sync ticket. Crash-tail repair and the flush/fsync + 0600 append
+        ordering are the shared _append_index_line() sequence — one copy
+        with put(), so the AC4 parity is structural, not copied discipline.
+        True on success.
+        """
+        if record.id not in self._ids():
+            raise CorpusError(
+                f"corpus: cannot revise absent id {record.id}: a Revision "
+                "supersedes a resident record, it does not create one"
+            )
+        self._append_index_line(record)
+        self._ids().add(record.id)
+        return True
+
+    def _append_index_line(self, record: CorpusRecord) -> None:
+        """The one index-append sequence, shared by put() and append_revision().
+
+        Crash-tail repair, then the record line appended to the index —
+        created 0600 at the fd (fchmod'd if pre-existing) — flushed and
+        fsynced; the root's dirent is fsynced only when the index file was
+        absent: live on put()'s first write; dead thereafter —
+        append_revision()'s residency precondition implies the index
+        exists, and for put() the file is present from its second write on
+        because the single-writer contract (module docstring, citing
+        ADR-0002) admits no deleter. Cache maintenance (_ids().add) stays
+        with the callers deliberately: put() returns False without ever
+        reaching this helper. One copy for both paths: the AC4
+        crash/permission parity the duplicated sequence used to police by
+        comment now holds structurally.
+        """
         self._repair_tail()
-        # ...then the index line, created 0600 (fchmod'd if pre-existing).
         existed = self._records_path.exists()
         fd = self._open_append_checked()
         with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as fh:
@@ -148,8 +233,6 @@ class CorpusStore:
             os.fsync(fh.fileno())
         if not existed:
             _fsync_dir(self.root, self._records_path)
-        self._ids().add(record.id)
-        return True
 
     def _ensure_written_dirs(self, shard: Path) -> None:
         """Create the chain root -> bodies/ -> shard (parents allowed — a
@@ -186,7 +269,7 @@ class CorpusStore:
             ) from e
 
     def _repair_tail(self) -> None:
-        """Make the file append-ready (put only) without re-reading it.
+        """Make the file append-ready (put/append_revision) without re-reading it.
 
         A tail after the last newline is either a COMPLETE record line that
         lost its terminator (sealed, kept — it parses) or torn bytes that can

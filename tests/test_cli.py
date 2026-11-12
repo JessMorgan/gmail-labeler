@@ -1520,3 +1520,961 @@ def test_sync_labels_help_documents_full_resync() -> None:
 
     param = inspect.signature(cli.dataset_sync_labels).parameters["full_resync"]
     assert "no history" in param.default.help.lower()
+
+
+# ---- composition flags (ticket #75) ----------------------------------------
+
+# shared fixture bodies for the composition tests (kept as constants: the
+# inline byte literals exceed the line budget at this nesting depth)
+_COMPOSITE_NEW_EML = (
+    b"Subject: New\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nbody b2"
+)
+_COMPOSITE_OLD_EML = (
+    b"Subject: Hi\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nbody a1"
+)
+
+
+def test_sync_labels_also_import_gmail_reports_both_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #1 (sync→import): after the sync delta is durable (cursor
+    advanced), the FULL Gmail Import pass runs and ONE report carries both
+    passes' stats. The new-match interaction is the honest story: sync
+    counts b2 as new_match and writes nothing for it; the import pass then
+    ingests it — the resume gate (skip-present) absorbs only the already
+    resident a1, never fighting sync (spec #64 user story 14)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import (
+        FakeMessage,
+        LabelsAdded,
+        MessageAdded,
+        history_records,
+    )
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)  # history_id=100
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9")),
+            FakeMessage(
+                id="b2",
+                eml=_COMPOSITE_NEW_EML,
+                label_ids=("L1",),
+                internal_date_ms=1761818400000,
+            ),
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records(
+                    [LabelsAdded("a1", ("L9",)), MessageAdded("b2", "tb2")]
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 0, result.output
+    # first pass: the standalone sync summary, unchanged shape
+    assert (
+        "sync-labels: events=2 stale=1 revised=1 deleted_kept=0 "
+        "new_match=1 retried=0 failed=0" in result.stdout
+    )
+    # second pass: the import summary carries its own stats, clearly marked
+    assert (
+        "import-gmail (also): scanned=2 written=1 skipped_present=1 "
+        "retried=0 failed=0" in result.stdout
+    )
+    # ONE report: a single analyze pointer, closing AFTER both passes
+    assert result.stdout.count("dataset analyze") == 1
+    assert result.stdout.index("import-gmail (also):") < result.stdout.index(
+        "Next: run `dataset analyze`"
+    )
+    # post-state through the resolved view: sync's revision AND the
+    # imported record are both durable
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")
+    assert resolved["b2"].labels == ("Shipping",)
+    # the import pass never moved the ledger sync advanced (ADR-0008)
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_sync_labels_also_import_gmail_second_pass_failure_keeps_sync_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #2 (sync→import): the second pass's failure is reported non-zero
+    per the pinned taxonomy, and the first pass's durable records AND the
+    advanced cursor stay byte-intact — no rollback (spec #64: the second
+    pass's failure does not invalidate the first)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import (
+        FakeMessage,
+        LabelsAdded,
+        MessageAdded,
+        history_records,
+    )
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9")),
+            FakeMessage(
+                id="b2",
+                eml=_COMPOSITE_NEW_EML,
+                label_ids=("L1",),
+                internal_date_ms=1761818400000,
+            ),
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records(
+                    [LabelsAdded("a1", ("L9",)), MessageAdded("b2", "tb2")]
+                ),
+            )
+        ],
+    )
+    # the import pass's first wire call fails permanently — sync never
+    # touches list_messages, so only the second pass can consume this
+    from typing import Any
+
+    fake.fail("list_messages", GmailPermanentError("quota blown", status=400))
+    captured: dict[str, bytes] = {}
+    orig = fake.list_messages
+
+    def spy(query: str, page_token: str | None = None, **kw: Any) -> Any:
+        captured.setdefault("cursor", (store.root / "sync-cursor.json").read_bytes())
+        captured.setdefault("records", (store.root / "records.jsonl").read_bytes())
+        return orig(query, page_token, **kw)
+
+    monkeypatch.setattr(fake, "list_messages", spy)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 5
+    assert "import-gmail (also):" in result.stdout
+    assert "failed=1" in result.stdout
+    assert "failed <page>" in result.stderr  # the sentinel, reported
+    assert "Next: run `dataset analyze`" not in result.stdout  # incomplete
+    # the failed second pass rolled nothing back: the cursor bytes the sync
+    # pass wrote are still the bytes on disk, and sync's revision resolves
+    assert (store.root / "sync-cursor.json").read_bytes() == captured["cursor"]
+    assert (store.root / "records.jsonl").read_bytes() == captured["records"]
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")
+    assert "b2" not in resolved  # the import died before ingesting it
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_sync_labels_also_import_gmail_second_pass_auth_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #2 taxonomy: a revoked token mid-import-pass is exit 4 (the fix is
+    human), never a raw traceback — and the sync pass's durable work stands
+    untouched."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    fake.fail("list_messages", GmailAuthError("revoked mid-run"))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+    assert "sync-labels: events=1" in result.stdout  # first pass reported
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # stands
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_import_gmail_also_sync_labels_reports_both_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #1 (import→sync): after the import completes durably, the Label
+    Sync delta runs and ONE report carries both passes' stats. The cursor
+    story is ADR-0008's designed loop: import births the ledger from the
+    FIRST stub's historyId captured before paging (100), the sync walk
+    starts there and advances to the mailbox current id (500). The walk
+    re-touches the freshly imported a1 (refresh-on-any-touch): the metadata
+    matches what import wrote, so the Revision is a self-healing append —
+    revised=1 with an empty gains/losses table is the honest stats story."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1", "L9"),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,  # the birth seed the import must read first
+            )
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        "import-gmail: scanned=1 written=1 skipped_present=0 "
+        "retried=0 failed=0" in result.stdout
+    )
+    assert (
+        "sync-labels (also): events=1 stale=1 revised=1 deleted_kept=0 "
+        "new_match=0 retried=0 failed=0" in result.stdout
+    )
+    # ONE report: the analyze pointer closes after both passes, once
+    assert result.stdout.count("dataset analyze") == 1
+    assert result.stdout.index("sync-labels (also):") < result.stdout.index(
+        "Next: run `dataset analyze`"
+    )
+    store = CorpusStore(cfg.parent / "corpus")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # sync advanced
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_import_gmail_also_sync_labels_second_pass_failure_keeps_import_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #2 (import→sync): the sync pass's failure is reported non-zero;
+    the import's durable records and its birthed cursor stay byte-intact —
+    no rollback, no analyze pointer over a half-finished composite."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1",),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,
+            )
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([]),
+            )
+        ],
+    )
+    # the sync pass's first wire call fails permanently — import never
+    # touches history(), so only the second pass can consume this
+    fake.fail("history", GmailPermanentError("service blown", status=400))
+    captured: dict[str, bytes] = {}
+    orig = fake.history
+
+    def spy(start_history_id: int, page_token: str | None = None) -> object:
+        captured.setdefault(
+            "cursor", (tmp_path / "corpus" / "sync-cursor.json").read_bytes()
+        )
+        captured.setdefault(
+            "records", (tmp_path / "corpus" / "records.jsonl").read_bytes()
+        )
+        return orig(start_history_id, page_token)
+
+    monkeypatch.setattr(fake, "history", spy)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 5
+    assert "sync-labels (also):" in result.stdout
+    assert "failed=1" in result.stdout
+    assert "failed <page>" in result.stderr
+    assert "Next: run `dataset analyze`" not in result.stdout
+    # the failed second pass left the import's durable state byte-identical
+    assert (tmp_path / "corpus" / "sync-cursor.json").read_bytes() == (
+        captured["cursor"]
+    )
+    assert (tmp_path / "corpus" / "records.jsonl").read_bytes() == captured["records"]
+    store = CorpusStore(tmp_path / "corpus")
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping",)  # import's record stands
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # the birth, held
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def _also_sync_raise_fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error):
+    """Shared fixture for the import→sync raise-path tests: import runs
+    clean, the sync pass's first wire call raises `error` (consumed once —
+    these types are never retried, so one arm is the whole story)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1",),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,
+            )
+        ],
+    )
+    fake.fail("history", error)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    return fake
+
+
+def test_import_gmail_also_sync_labels_second_pass_auth_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #2 taxonomy: a revoked token mid-sync-pass is exit 4 (the fix is
+    human), the import's durable work standing."""
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    _also_sync_raise_fake(tmp_path, monkeypatch, GmailAuthError("revoked"))
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+    assert "import-gmail: scanned=1 written=1" in result.stdout  # first pass
+    from gmail_labeler.corpus_store import CorpusStore
+
+    store = CorpusStore(tmp_path / "corpus")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # the birth, held
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_import_gmail_also_sync_labels_expired_cursor_prints_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sync pass keeps the 404 recovery contract (ADR-0008): the exact
+    `dataset sync-labels --full-resync` command prints, exit 5, the import's
+    birthed ledger untouched — recovery stays a human decision even when
+    sync arrives as a composite's second pass."""
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    _also_sync_raise_fake(
+        tmp_path, monkeypatch, GmailPermanentError("history gone", status=404)
+    )
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 5
+    assert "retained history" in result.stderr
+    assert "dataset sync-labels --full-resync" in (result.stdout + result.stderr)
+    store = CorpusStore(tmp_path / "corpus")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # untouched
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_sync_labels_also_import_gmail_import_starts_after_cursor_durability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering pin (sync→import): the import pass's first wire call lands
+    strictly AFTER the Sync Cursor write — the sync pass's final durability
+    point — and the exact call log shows no silent extra fetches between
+    the passes."""
+    import gmail_labeler.cli as cli
+    import gmail_labeler.corpus_store as corpus_store
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_import import DEFAULT_QUERY
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9")),
+            FakeMessage(
+                id="b2",
+                eml=_COMPOSITE_NEW_EML,
+                label_ids=("L1",),
+                internal_date_ms=1761818400000,
+            ),
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    from gmail_labeler.sync_cursor import SyncCursor
+
+    cursor_writes: list[list[str]] = []
+    orig_write = corpus_store.CorpusStore.write_cursor
+
+    def spy_write(self: corpus_store.CorpusStore, cursor: SyncCursor) -> None:
+        cursor_writes.append(list(fake.calls))  # the call log AT the write
+        orig_write(self, cursor)
+
+    monkeypatch.setattr(corpus_store.CorpusStore, "write_cursor", spy_write)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 0, result.output
+    # import never re-writes a live cursor (birth-when-absent): the single
+    # write is the sync pass's own advancement
+    assert len(cursor_writes) == 1
+    # at the durability point, NO import wire call has happened yet — the
+    # second pass starts strictly after the first pass's final write
+    assert not any(c.startswith("list_messages") for c in cursor_writes[0])
+    assert fake.calls == [
+        "list_labels",
+        "list_filters",
+        "history:100:",
+        "get_message_metadata:a1",
+        f"list_messages:{DEFAULT_QUERY}:",
+        "get_message:b2",
+    ]
+
+
+def test_import_gmail_also_sync_labels_sync_starts_after_import_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering pin (import→sync): the sync walk's first wire call lands
+    after the import's last one, and the walk marking the freshly imported
+    id stale (stale=1) is the functional proof the import's writes were
+    durable and readable before the walk began — the resume gate and the
+    event walk never race over the same message."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_import import DEFAULT_QUERY
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1", "L9"),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,
+            )
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "stale=1" in result.stdout  # the walk SAW the imported record
+    assert fake.calls == [
+        "list_labels",
+        "list_filters",
+        f"list_messages:{DEFAULT_QUERY}:",
+        "get_message:a1",
+        "history:100:",  # from the birth seed — captured before paging
+        "get_message_metadata:a1",
+    ]
+
+
+def _composition_sync_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_name: str
+) -> tuple[Path, FakeGmailClient]:
+    """One mailbox/corpus fixture built twice (sync side of the
+    byte-identical pin): returns the config path for a fresh run."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import (
+        FakeMessage,
+        LabelsAdded,
+        MessageAdded,
+        history_records,
+    )
+    from gmail_labeler.gmail_client import HistoryPage
+
+    root = tmp_path / root_name
+    root.mkdir(parents=True)
+    store = _sync_seed_corpus(root)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9")),
+            FakeMessage(
+                id="b2",
+                eml=_COMPOSITE_NEW_EML,
+                label_ids=("L1",),
+                internal_date_ms=1761818400000,
+            ),
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records(
+                    [LabelsAdded("a1", ("L9",)), MessageAdded("b2", "tb2")]
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    return _import_gmail_cfg(root), fake
+
+
+def test_sync_labels_composite_body_is_byte_identical_to_standalone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #3: without the flag the report is exactly the standalone
+    contract; with it the sync pass's report body is BYTE-IDENTICAL — the
+    composition only appends the import pass and moves the closing
+    pointer."""
+    cfg_a, _fake_a = _composition_sync_fixture(tmp_path, monkeypatch, "a")
+    res_a = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg_a)])
+    cfg_b, _fake_b = _composition_sync_fixture(tmp_path, monkeypatch, "b")
+    res_b = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg_b), "--also-import-gmail"],
+    )
+    assert res_a.exit_code == 0, res_a.output
+    assert res_b.exit_code == 0, res_b.output
+    marker = "\nNext: run `dataset analyze`"
+    tail = (
+        " for the updated candidate gates (ADR-0005 keeps retraining "
+        "and applying human-gated)\n"
+    )
+    body_a, found_a, tail_a = res_a.stdout.partition(marker)
+    body_b, found_b, tail_b = res_b.stdout.partition(marker)
+    assert found_a and found_b and tail_a == tail_b == tail
+    assert body_b.startswith(body_a)  # the sync report body did not move
+    assert body_b == (
+        body_a + "import-gmail (also): scanned=2 written=1 skipped_present=1 "
+        "retried=0 failed=0\n"
+    )
+
+
+def test_import_gmail_composite_body_is_byte_identical_to_standalone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #3 (import side): the standalone import report is untouched, and
+    the composite appends the sync pass after it verbatim."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    def build(root_name: str) -> Path:
+        root = tmp_path / root_name
+        root.mkdir(parents=True)
+        fake = _sync_fake(
+            messages=[
+                FakeMessage(
+                    id="a1",
+                    eml=_COMPOSITE_OLD_EML,
+                    label_ids=("L1", "L9"),
+                    thread_id="ta1",
+                    internal_date_ms=1761818400000,
+                    history_id=100,
+                )
+            ],
+            history_pages=[
+                HistoryPage(
+                    history_id=500,
+                    next_page_token=None,
+                    records=history_records([LabelsAdded("a1", ("L9",))]),
+                )
+            ],
+        )
+        monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+        return _import_gmail_cfg(root)
+
+    cfg_a = build("a")
+    res_a = runner.invoke(app, ["dataset", "import-gmail", "--config", str(cfg_a)])
+    cfg_b = build("b")
+    res_b = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg_b), "--also-sync-labels"],
+    )
+    assert res_a.exit_code == 0, res_a.output
+    assert res_b.exit_code == 0, res_b.output
+    assert res_a.stdout == (
+        "import-gmail: scanned=1 written=1 skipped_present=0 retried=0 failed=0\n"
+    )
+    assert res_b.stdout.startswith(res_a.stdout)  # the import report did not move
+    marker = "\nNext: run `dataset analyze`"
+    tail = (
+        " for the updated candidate gates (ADR-0005 keeps retraining "
+        "and applying human-gated)\n"
+    )
+    # the appended sync body is pinned exactly, tail included (round 1 nit:
+    # startswith alone left the pointer placement unpinned on this side)
+    assert res_b.stdout[len(res_a.stdout) :] == (
+        "sync-labels (also): events=1 stale=1 revised=1 deleted_kept=0 "
+        "new_match=0 retried=0 failed=0\n" + marker + tail
+    )
+
+
+def test_sync_labels_dry_run_with_also_import_gmail_is_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The contradictory quadrant: --dry-run promises zero writes, and the
+    import pass writes records — so the combination is refused as a usage
+    error (exit 2) BEFORE any quota spend, not silently degraded into a
+    one-pass run."""
+    cfg, _fake = _composition_sync_fixture(tmp_path, monkeypatch, "x")
+    root = tmp_path / "x" / "corpus"
+    records_bytes = (root / "records.jsonl").read_bytes()
+    cursor_bytes = (root / "sync-cursor.json").read_bytes()
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--config",
+            str(cfg),
+            "--dry-run",
+            "--also-import-gmail",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--dry-run" in result.stderr and "--also-import-gmail" in result.stderr
+    assert (root / "records.jsonl").read_bytes() == records_bytes
+    assert (root / "sync-cursor.json").read_bytes() == cursor_bytes
+    # the refusal precedes the config read: a bogus --config still exits 2
+    # with the refusal — never the config-error path (round 1 nit: without
+    # this quadrant the test could not tell "before config read" from
+    # "after config read, before quota spend")
+    bogus = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--config",
+            str(tmp_path / "nope.toml"),
+            "--dry-run",
+            "--also-import-gmail",
+        ],
+    )
+    assert bogus.exit_code == 2
+    assert "--also-import-gmail" in bogus.stderr
+    assert "config error" not in bogus.stderr
+
+
+def test_composite_flags_documented_in_help() -> None:
+    """The flags' help names the contract they exist to keep: order
+    (after durability) and the no-rollback failure story."""
+    import gmail_labeler.cli as cli
+
+    sync_flag = inspect.signature(cli.dataset_sync_labels).parameters[
+        "also_import_gmail"
+    ]
+    help_sync = sync_flag.default.help
+    assert "durable" in help_sync and "never invalidates the sync" in help_sync
+    import_flag = inspect.signature(cli.dataset_import_gmail).parameters[
+        "also_sync_labels"
+    ]
+    help_import = import_flag.default.help
+    assert "durably" in help_import and "never invalidates the import" in help_import
+
+
+def test_sync_labels_full_resync_also_import_gmail_composes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The composite flag rides BOTH sync branches: after the
+    --full-resync reconciliation is durable (cursor reseeded), the import
+    pass runs and one report carries both passes' stats."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # a1 with ("Shipping",)
+    _write_sync_cursor(store)
+    fake = _resync_fake(
+        messages=[
+            FakeMessage(id="a1", eml=b"x", label_ids=()),
+            FakeMessage(
+                id="b2",
+                eml=_COMPOSITE_NEW_EML,
+                label_ids=("L1",),
+                internal_date_ms=1761818400000,
+            ),
+        ]
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--config",
+            str(cfg),
+            "--full-resync",
+            "--also-import-gmail",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "sync-labels --full-resync:" in result.stdout
+    assert (
+        "import-gmail (also): scanned=2 written=1 skipped_present=1 "
+        "retried=0 failed=0" in result.stdout
+    )
+    assert result.stdout.count("dataset analyze") == 1
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ()  # the resync's revision resolves
+    assert resolved["b2"].labels == ("Shipping",)  # the import's record
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # the resync seed
+
+
+def test_sync_labels_failed_first_pass_never_reaches_import_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate pin (review round 1, both families): a sync pass that FAILED
+    never reached its durability point, so the composite import pass must
+    not run at all — no import wire call, no (also) line, no pointer — and
+    the cursor stays behind the unconsumed delta (invariant #3)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    fake.fail(
+        "get_message_metadata", GmailPermanentError("boom", status=400)
+    )  # permanent, non-404: a recorded per-message failure
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 5
+    assert "failed=1" in result.stdout
+    assert "import-gmail (also):" not in result.stdout
+    assert "Next: run `dataset analyze`" not in result.stdout
+    assert not any(c.startswith("list_messages") for c in fake.calls)
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # held back
+
+
+def test_import_gmail_failed_first_pass_never_reaches_sync_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate pin, import side: a failed import (a permanently unfetchable
+    message after the page and its birth) gets no sync pass — no history
+    wire call, no (also) line — while the birth-once cursor the import
+    already wrote stands (durable work, no rollback)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1",),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,
+            )
+        ],
+    )
+    fake.fail("get_message", GmailPermanentError("boom", status=400))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 5
+    assert "sync-labels (also):" not in result.stdout
+    assert "Next: run `dataset analyze`" not in result.stdout
+    assert not any(c.startswith("history") for c in fake.calls)
+    # the page fetch succeeded (so the birth ran) and only the body get
+    # failed: the birth-once cursor is durable work the failure keeps
+    cursor = CorpusStore(tmp_path / "corpus").read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # the birth stands
+
+
+def test_composite_report_counts_bootstrap_retried_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-double-count pin (review round 1): the shared settings blip rides
+    the FIRST pass's report only — the composite's second line keeps its
+    own retried honest at zero."""
+    from gmail_labeler.gmail_errors import GmailTransientError
+
+    cfg, fake = _composition_sync_fixture(tmp_path, monkeypatch, "a")
+    fake.fail("list_labels", GmailTransientError("blip"))
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 0, result.output
+    assert (
+        "sync-labels: events=2 stale=1 revised=1 deleted_kept=0 "
+        "new_match=1 retried=1 failed=0" in result.stdout
+    )
+    assert "import-gmail (also):" in result.stdout
+    assert "retried=0" in result.stdout.split("import-gmail (also):")[1]
+
+
+def test_import_gmail_also_sync_labels_store_fault_exits_5_keeps_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second-pass RAISED-fault coverage (round 2 minor): a structural
+    store fault inside the sync walk — not the stats.failed sentinel path —
+    maps through the standalone sync's tuple (exit 5, typed message), and
+    the import's durable records and birthed cursor stand."""
+    import gmail_labeler.cli as cli
+    import gmail_labeler.corpus_store as corpus_store
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    fake = _sync_fake(
+        messages=[
+            FakeMessage(
+                id="a1",
+                eml=_COMPOSITE_OLD_EML,
+                label_ids=("L1", "L9"),
+                thread_id="ta1",
+                internal_date_ms=1761818400000,
+                history_id=100,
+            )
+        ],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+
+    def boom(self: corpus_store.CorpusStore, record: object) -> None:
+        raise corpus_store.CorpusError("disk gone mid-revision")
+
+    monkeypatch.setattr(corpus_store.CorpusStore, "append_revision", boom)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        ["dataset", "import-gmail", "--config", str(cfg), "--also-sync-labels"],
+    )
+    assert result.exit_code == 5
+    assert "sync-labels failed:" in result.stderr
+    assert "Next: run `dataset analyze`" not in result.stdout
+    store = CorpusStore(tmp_path / "corpus")
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")  # import's record
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 100  # birth held
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_sync_labels_also_import_gmail_store_fault_exits_5_keeps_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The import pass's raised-fault twin: a structural store fault inside
+    the import's record write (put — a path the sync pass never takes;
+    write_snapshot would arm the WRONG pass, since write_cursor reuses it)
+    maps to exit 5 with the standalone import's message, and the sync
+    pass's durable revision and advanced cursor stand — no rollback."""
+    import gmail_labeler.corpus_store as corpus_store
+
+    cfg, _fake = _composition_sync_fixture(tmp_path, monkeypatch, "a")
+
+    def boom(self: corpus_store.CorpusStore, record: object, body: object) -> bool:
+        raise corpus_store.CorpusError("disk gone mid-put")
+
+    monkeypatch.setattr(corpus_store.CorpusStore, "put", boom)
+    result = runner.invoke(
+        app,
+        ["dataset", "sync-labels", "--config", str(cfg), "--also-import-gmail"],
+    )
+    assert result.exit_code == 5
+    assert "import failed:" in result.stderr
+    assert "Next: run `dataset analyze`" not in result.stdout
+    store = corpus_store.CorpusStore(tmp_path / "a" / "corpus")
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")  # sync's revision
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # advance held
+    assert "Traceback" not in (result.stdout + result.stderr)

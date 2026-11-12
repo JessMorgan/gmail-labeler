@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
 
-from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+from gmail_labeler.fake_gmail import (
+    FakeGmailClient,
+    FakeMessage,
+    LabelsAdded,
+    LabelsRemoved,
+    MessageAdded,
+    MessageDeleted,
+    history_records,
+)
 from gmail_labeler.gmail_client import (
     FilterInfo,
     GmailClient,
     GmailRestClient,
     HistoryPage,
     LabelInfo,
+    MessageMetadata,
     MessagePage,
     MessageStub,
+    ProfileInfo,
     RawMessage,
 )
 from gmail_labeler.gmail_errors import (
@@ -20,6 +31,7 @@ from gmail_labeler.gmail_errors import (
     GmailError,
     GmailPermanentError,
     GmailRateLimitedError,
+    GmailResyncError,
     GmailTransientError,
     classify_status,
 )
@@ -85,7 +97,9 @@ def _rest(payload: Any = None, error: Exception | None = None) -> GmailRestClien
 
         # tree mirrors the REAL discovery doc (#59): labels live under
         # users, never at top level — a fake shaped like the bug cannot
-        # catch the bug
+        # catch the bug. getProfile is a users-level METHOD (users.getProfile,
+        # gmail/v1/users/{userId}/profile), not a sub-resource — #71 grows
+        # the leaf exactly where the doc puts it
         class _Mid(_Leaf):
             def labels(self) -> _Mid:
                 return self
@@ -101,6 +115,9 @@ def _rest(payload: Any = None, error: Exception | None = None) -> GmailRestClien
 
             def messages(self) -> _Mid:
                 return self
+
+            def getProfile(self, **_kw: object) -> _Req:
+                return _Req(payload, error)
 
         class _Top:
             def users(self) -> _Mid:
@@ -314,6 +331,121 @@ def test_rest_non_http_error_is_permanent() -> None:
         client.list_labels()
 
 
+# -- #71: metadata get, profile, per-stub historyId, label totals -----------
+# (Label Sync client spine. Wire facts, verified against the bundled
+# discovery doc: ListMessagesResponse has NO page-level historyId — the
+# cursor rides PER MESSAGE (Message.historyId, uint64-as-string); Label.
+# messagesTotal is int32 (a JSON number, not an int64 string); Profile.
+# historyId is uint64-as-string; the metadata format carries no raw/payload
+# field at all.)
+
+
+def test_rest_message_stub_history_id_string_on_wire() -> None:
+    client = _rest(
+        {
+            "messages": [{"id": "a1", "threadId": "t1", "historyId": "77"}],
+            "nextPageToken": "p",
+        }
+    )
+    assert client.list_messages("q").stubs[0].history_id == 77
+
+
+def test_rest_message_stub_history_id_absent_is_none() -> None:
+    # absent-tolerant by contract: a schema-legal absent must never become
+    # a loud permanent error on an import (the profile fallback covers it)
+    client = _rest({"messages": [{"id": "a1", "threadId": "t1"}]})
+    assert client.list_messages("q").stubs[0].history_id is None
+
+
+def test_rest_message_stub_bad_history_id_is_loud() -> None:
+    client = _rest({"messages": [{"id": "a1", "threadId": "t1", "historyId": "-1"}]})
+    with pytest.raises(GmailPermanentError, match="unsigned"):
+        client.list_messages("q")
+
+
+def test_rest_label_messages_total_int32_on_wire() -> None:
+    # int32 arrives as a real JSON number — _opt_int64 tolerates real ints;
+    # absent => None (never strict-required); malformed => loud permanent
+    client = _rest(
+        {"labels": [{"id": "L1", "name": "S", "type": "user", "messagesTotal": 42}]}
+    )
+    assert client.list_labels()[0].messages_total == 42
+    client2 = _rest({"labels": [{"id": "L1", "name": "S", "type": "user"}]})
+    assert client2.list_labels()[0].messages_total is None
+    client3 = _rest(
+        {"labels": [{"id": "L1", "name": "S", "type": "user", "messagesTotal": "x"}]}
+    )
+    with pytest.raises(GmailPermanentError, match="integer"):
+        client3.list_labels()
+
+
+def test_rest_get_message_metadata_parses() -> None:
+    client = _rest(
+        {
+            "id": "m-17",
+            "labelIds": ["INBOX", "L1"],
+            "internalDate": "1790000000000",
+        }
+    )
+    assert client.get_message_metadata("m-17") == MessageMetadata(
+        id="m-17", label_ids=("INBOX", "L1"), internal_date_ms=1790000000000
+    )
+
+
+def test_rest_get_message_metadata_omitted_internal_date_is_none() -> None:
+    # format=metadata commonly reports internalDate alongside id/labelIds,
+    # but presence is not contractually pinned upstream (the bundled
+    # discovery enum text names id/labels/headers only) — tolerate absence,
+    # same discipline as the raw path (never trust presence)
+    client = _rest({"id": "m-17", "labelIds": ["L1"]})
+    assert client.get_message_metadata("m-17").internal_date_ms is None
+
+
+def test_rest_get_message_metadata_malformed_is_loud() -> None:
+    client = _rest({"labelIds": ["L1"]})  # id missing
+    with pytest.raises(GmailPermanentError, match="'id' missing/not-str"):
+        client.get_message_metadata("m")
+    client2 = _rest({"id": "m", "labelIds": "L1"})  # not a list
+    with pytest.raises(GmailPermanentError, match="'labelIds'"):
+        client2.get_message_metadata("m")
+    client3 = _rest({"id": "m", "labelIds": ["L1"], "internalDate": "x"})
+    with pytest.raises(GmailPermanentError, match="integer"):
+        client3.get_message_metadata("m")
+
+
+def test_rest_get_message_metadata_needs_no_raw() -> None:
+    # the raw-only helper _raw_nonempty must NOT be on this path: a
+    # metadata response without 'raw' parses fine — and the SAME payload
+    # is a loud permanent on the raw path, pinning the asymmetry both ways
+    client = _rest({"id": "m", "threadId": "t", "labelIds": ["L1"]})
+    assert client.get_message_metadata("m").id == "m"
+    with pytest.raises(GmailPermanentError, match="'raw'"):
+        client.get_message("m")
+
+
+def test_rest_get_profile_history_id_string_on_wire() -> None:
+    client = _rest(
+        {
+            "emailAddress": "a@b.c",
+            "messagesTotal": 9,
+            "threadsTotal": 3,
+            "historyId": "42",
+        }
+    )
+    assert client.get_profile() == ProfileInfo(history_id=42)
+
+
+def test_rest_get_profile_history_id_absent_is_none() -> None:
+    client = _rest({"emailAddress": "a@b.c", "messagesTotal": 9})
+    assert client.get_profile().history_id is None
+
+
+def test_rest_get_profile_bad_history_id_is_loud() -> None:
+    client = _rest({"emailAddress": "a@b.c", "historyId": "+42"})
+    with pytest.raises(GmailPermanentError, match="unsigned"):
+        client.get_profile()
+
+
 # -- fake behavior ------------------------------------------------------------
 
 
@@ -403,6 +535,334 @@ def test_fake_history_token_chain_and_current_id() -> None:
     assert idle.records == () and idle.history_id == 42  # real API: current id
     with pytest.raises(GmailPermanentError, match="page token"):
         fake.history(42, "junk")
+
+
+def test_fake_get_message_metadata_serves_label_state_without_body() -> None:
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="m",
+                eml=b"Subject: hi\r\n\r\nsecret body",
+                label_ids=("L1",),
+                internal_date_ms=1790000000000,
+            )
+        ]
+    )
+    got = fake.get_message_metadata("m")
+    assert got == MessageMetadata(
+        id="m", label_ids=("L1",), internal_date_ms=1790000000000
+    )
+    # the body must be nowhere in the returned value (invariant #5)
+    assert "secret body" not in repr(got)
+    assert fake.calls == ["get_message_metadata:m"]
+
+
+def test_fake_get_message_metadata_unknown_id_is_typed_404() -> None:
+    fake = FakeGmailClient()
+    with pytest.raises(GmailPermanentError, match="not found") as exc:
+        fake.get_message_metadata("ghost")
+    assert exc.value.status == 404
+
+
+def test_fake_get_profile_serves_current_history_id() -> None:
+    # explicit current id (not the history_pages default-derivation) so the
+    # assertion isolates "profile echoes the CURRENT id"
+    fake = FakeGmailClient(current_history_id=98765)
+    assert fake.get_profile() == ProfileInfo(history_id=98765)
+    assert fake.calls == ["get_profile"]
+
+
+def test_fake_new_methods_are_failure_injectable() -> None:
+    # _KNOWN_METHODS must accept the new names or the taxonomy is
+    # unprovable on their call paths (AC #4)
+    fake = FakeGmailClient(messages=[FakeMessage(id="m", eml=b"x")])
+    fake.fail("get_message_metadata", classify_status(503))
+    with pytest.raises(GmailTransientError):
+        fake.get_message_metadata("m")
+    assert fake.get_message_metadata("m").id == "m"  # fail-once, then serves
+    fake.fail("get_profile", classify_status(403))
+    with pytest.raises(GmailAuthError):
+        fake.get_profile()
+    # the failed calls still ride the log (call-log proofs depend on it)
+    assert fake.calls == [
+        "get_message_metadata:m",
+        "get_message_metadata:m",
+        "get_profile",
+    ]
+
+
+# -- #71: fake history-spine parity + deterministic history events -----------
+
+
+def test_fake_list_messages_stubs_carry_current_history_id() -> None:
+    # wire truth: list stubs carry historyId per message; the fake's
+    # default reproduces the real shape — PRESENT, at the mailbox's
+    # current id (ADR-0008 birth reads the FIRST stub)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="m1", eml=b"x", thread_id="t1")],
+        current_history_id=4242,
+    )
+    assert fake.list_messages("q").stubs[0].history_id == 4242
+
+
+def test_fake_stub_history_id_per_message_override() -> None:
+    # per-message override lets downstream birth tests prove they read the
+    # FIRST stub's id, not the last — uniform values would bless that bug
+    # (the newest message carries the current id; older mail carries less)
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="m1", eml=b"x", thread_id="t1"),  # newest: current
+            FakeMessage(id="m2", eml=b"x", thread_id="t2", history_id=60),
+        ],
+        current_history_id=100,
+    )
+    assert [s.history_id for s in fake.list_messages("q").stubs] == [100, 60]
+
+
+def test_fake_stub_history_id_absence_is_opt_in() -> None:
+    # the absent-tolerant quadrant ticket #72's profile-fallback branch
+    # must be able to program (the real wire may omit the field)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="m1", eml=b"x")],
+        stub_history_id=False,
+        current_history_id=7,
+    )
+    assert fake.list_messages("q").stubs[0].history_id is None
+
+
+def test_fake_expired_cursor_raises_resync_like_the_adapter() -> None:
+    # taxonomy alignment (AC #4): the fake's out-of-window cursor raises
+    # the SAME type the real adapter converts a history 404 into —
+    # GmailResyncError — so sync code detects resync through ONE type on
+    # both spines, and it stays a GmailPermanentError(status=404) for
+    # natural handlers
+    fake = FakeGmailClient(current_history_id=10)
+    with pytest.raises(GmailResyncError) as exc:
+        fake.history(11)
+    assert isinstance(exc.value, GmailPermanentError)
+    assert exc.value.status == 404
+    assert "outside the retained" in str(exc.value)
+
+
+def test_history_records_emit_wire_faithful_events() -> None:
+    # shapes verified against the discovery schemas: HistoryMessageAdded/
+    # Deleted carry only `message`; HistoryLabelAdded/Removed carry
+    # `message` + `labelIds` (list on the wire); the flat `messages[]`
+    # field duplicates the typed entries — Google recommends the typed
+    # fields, so the generator emits typed only
+    records = history_records(
+        [
+            MessageAdded(message_id="m1", thread_id="t1"),
+            LabelsAdded(message_id="m1", label_ids=("L2",)),
+            LabelsRemoved(message_id="m1", label_ids=("INBOX",)),
+            MessageDeleted(message_id="m2"),
+        ]
+    )
+    assert records == (
+        {"id": "1", "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]},
+        {"id": "2", "labelsAdded": [{"message": {"id": "m1"}, "labelIds": ["L2"]}]},
+        {
+            "id": "3",
+            "labelsRemoved": [{"message": {"id": "m1"}, "labelIds": ["INBOX"]}],
+        },
+        {"id": "4", "messagesDeleted": [{"message": {"id": "m2"}}]},
+    )
+
+
+def test_history_records_are_deterministic_with_seeded_ids() -> None:
+    # literal expected render (independent of the generator), not a
+    # self-equality — determinism means THIS shape, every time
+    events = [MessageAdded(message_id="m1", thread_id="t1"), LabelsAdded("m1", ("L1",))]
+    assert history_records(events) == (
+        {"id": "1", "messagesAdded": [{"message": {"id": "m1", "threadId": "t1"}}]},
+        {"id": "2", "labelsAdded": [{"message": {"id": "m1"}, "labelIds": ["L1"]}]},
+    )
+    ids = [r["id"] for r in history_records(events, start_id=50)]
+    assert ids == ["50", "51"]
+
+
+def test_history_records_reject_loud_inputs() -> None:
+    # the generator's doctrine is loud-on-nonsense: a start_id that is not
+    # an integer >= 1 is not a wire-valid id (the fake's own history()
+    # rejects such cursors), an event outside the union must never render a
+    # silent id-only record, and an Any-typed caller's str label_ids must
+    # not character-split into a wire lie
+    with pytest.raises(ValueError, match="start_id"):
+        history_records([], start_id=0)
+    with pytest.raises(ValueError, match="start_id"):
+        history_records([], start_id=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="start_id"):
+        # bool passes isinstance(x, int), so this pins the dedicated arm
+        history_records([], start_id=True)
+    with pytest.raises(TypeError, match="unsupported history event"):
+        history_records([{"message_id": "m"}])  # type: ignore[list-item]
+    with pytest.raises(TypeError, match="sequence of strings"):
+        history_records([LabelsAdded("m1", "INBOX")])  # type: ignore[arg-type]
+
+
+def test_history_records_feed_the_fakes_history_pages() -> None:
+    # the generator's output is exactly what HistoryPage.records carries,
+    # so downstream sync tests program deltas declaratively
+    fake = FakeGmailClient(
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=history_records([LabelsAdded("m1", ("L2",))]),
+            )
+        ],
+        current_history_id=9,
+    )
+    page = fake.history(1)
+    assert page.records[0]["labelsAdded"] == [
+        {"message": {"id": "m1"}, "labelIds": ["L2"]}
+    ]
+
+
+# -- #71 AC3/AC4: call-log & taxonomy proofs (invariant #5 executable) -------
+
+
+def test_message_metadata_type_has_no_body_bearing_field() -> None:
+    # structural proof, not behavioral: the sync direction's message view
+    # has NO raw/payload/snippet field to populate — a metadata get is
+    # incapable of returning a body even if the wire carried one
+    assert {f.name for f in dataclasses.fields(MessageMetadata)} == {
+        "id",
+        "label_ids",
+        "internal_date_ms",
+    }
+
+
+def test_rest_get_message_metadata_never_surfaces_raw_even_if_wire_carries_it() -> None:
+    # adversarial canned wire: raw/snippet present (a metadata-format server
+    # response never has them — if one ever did, the parse must not carry
+    # them out; the not-REQUIRE-ing-them half is pinned by
+    # test_rest_get_message_metadata_needs_no_raw)
+    client = _rest(
+        {
+            "id": "m",
+            "labelIds": ["L1"],
+            "internalDate": "5",
+            "raw": "SECRET-RAW",
+            "snippet": "SECRET-SNIPPET",
+        }
+    )
+    got = client.get_message_metadata("m")
+    assert not isinstance(got, RawMessage)
+    assert "SECRET" not in repr(got)
+
+
+def test_message_get_404_is_plain_permanent_not_resync() -> None:
+    # the resync reading belongs to history.list ONLY: a 404 on a message
+    # get means the message is gone, and must stay a natural permanent
+    client = _rest(error=_HttpError(404))
+    with pytest.raises(GmailPermanentError) as exc:
+        client.get_message_metadata("m")
+    assert not isinstance(exc.value, GmailResyncError)
+
+
+def test_resync_404_is_one_type_on_both_spines() -> None:
+    # AC #4 cross-spine pin: sync code detects the expired cursor through
+    # ONE type whether it runs against the fake (function-seam tests) or
+    # the real adapter (production)
+    client = _rest(error=_HttpError(404))
+    with pytest.raises(GmailResyncError) as real:
+        client.history(5)
+    fake = FakeGmailClient(current_history_id=10)
+    with pytest.raises(GmailResyncError) as scripted:
+        fake.history(11)
+    assert type(real.value) is type(scripted.value)
+    assert real.value.status == scripted.value.status == 404
+
+
+@pytest.mark.parametrize("method", ["get_message_metadata", "get_profile"])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (503, GmailTransientError),
+        (429, GmailRateLimitedError),
+        (403, GmailAuthError),
+        (400, GmailPermanentError),
+    ],
+)
+def test_taxonomy_holds_on_every_new_real_call_path(
+    method: str, status: int, expected: type
+) -> None:
+    # _call is the single chokepoint — the taxonomy rides the new methods
+    # by construction; this is the pin that keeps that construction honest.
+    # Dict dispatch (not an if/else catch-all): a method added to the
+    # parametrize list without a lambda here fails LOUD on KeyError
+    client = _rest(error=_HttpError(status))
+    calls = {
+        "get_message_metadata": lambda: client.get_message_metadata("m"),
+        "get_profile": lambda: client.get_profile(),
+    }
+    with pytest.raises(expected):
+        calls[method]()
+
+
+@pytest.mark.parametrize("method", ["get_message_metadata", "get_profile"])
+def test_taxonomy_holds_on_every_new_fake_call_path(method: str) -> None:
+    fake = FakeGmailClient(messages=[FakeMessage(id="m", eml=b"x")])
+    fake.fail(method, classify_status(503))
+    calls = {
+        "get_message_metadata": lambda: fake.get_message_metadata("m"),
+        "get_profile": lambda: fake.get_profile(),
+    }
+    with pytest.raises(GmailTransientError):
+        calls[method]()
+
+
+def test_sync_relevant_sequence_never_requires_raw_get() -> None:
+    # AC3: the whole freshness path — birth cursor from a list stub, event
+    # walk, refresh-on-any-touch metadata fetch, a profile read (the
+    # ADR-0008 fallback's branch input; the branch itself is #72's), label
+    # totals for the estimator — runs on the fake with NO raw get in the
+    # call log and no body anywhere near it (invariant #5, executable)
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="m1",
+                eml=b"Subject: x\r\n\r\nBODY-SECRET",
+                label_ids=("L1",),
+                thread_id="t1",
+            )
+        ],
+        labels=[LabelInfo("L1", "Shipping", "user", messages_total=42)],
+        history_pages=[
+            HistoryPage(
+                history_id=None,
+                next_page_token=None,
+                records=history_records([LabelsAdded("m1", ("L2",))]),
+            )
+        ],
+        current_history_id=100,
+    )
+    page = fake.list_messages("in:anywhere")
+    assert page.stubs[0].history_id == 100  # ADR-0008 birth value
+    delta = fake.history(page.stubs[0].history_id)
+    assert "m1" in str(delta.records[0])  # the event names the corpus id
+    current = fake.get_message_metadata("m1")
+    # label state as programmed: the fake's history() SERVES records and
+    # never mutates self.messages, so the post-event truth is what the test
+    # set on the FakeMessage (see the history() docstring)
+    assert current.label_ids == ("L1",)  # body-free
+    # get_profile reachable on the sync path; the ADR-0008 FALLBACK branch
+    # itself is #72's, programmed via stub_history_id=False
+    assert fake.get_profile().history_id == 100
+    totals = {la.id: la.messages_total for la in fake.list_labels()}
+    assert totals == {"L1": 42}  # estimator basis, no extra call needed
+    # the log distinguishes the metadata path from a raw get — and shows
+    # the raw path was never taken
+    assert fake.calls == [
+        "list_messages:in:anywhere:",
+        "history:100:",
+        "get_message_metadata:m1",
+        "get_profile",
+        "list_labels",
+    ]
+    assert [c for c in fake.calls if c.startswith("get_message:")] == []
+    assert "BODY-SECRET" not in repr(fake.calls)
 
 
 # -- wire-truth pins for the reviewer-found production classes ---------------
@@ -653,11 +1113,22 @@ def test_fake_fail_typo_raises() -> None:
         fake.fail("get_messsage", classify_status(500))
 
 
+def test_known_failure_targets_cover_the_whole_protocol() -> None:
+    # the same drift class as the surface table (#59): a Protocol method
+    # missing from _KNOWN_METHODS cannot be failure-tested, and the AC
+    # "taxonomy on every call path" would quietly stop covering it
+    public = {n for n in dir(GmailClient) if not n.startswith("_")}
+    assert public | {"any"} == FakeGmailClient._KNOWN_METHODS
+
+
 def test_fake_history_cursor_guards() -> None:
     fake = FakeGmailClient(current_history_id=10)
     with pytest.raises(GmailPermanentError, match="not a valid cursor"):
         fake.history(-999)
-    with pytest.raises(GmailPermanentError, match="outside the retained") as exc:
+    # #71 taxonomy alignment: the out-of-window 404 is the SAME typed
+    # resync the real adapter raises (see
+    # test_fake_expired_cursor_raises_resync_like_the_adapter)
+    with pytest.raises(GmailResyncError, match="outside the retained") as exc:
         fake.history(11)
     assert exc.value.status == 404  # the resync-shaped status
 
@@ -752,10 +1223,19 @@ def test_default_build_path_constructs_offline(monkeypatch) -> None:
 _SURFACE_CASES = [
     pytest.param(
         lambda c: c.list_labels(),
-        {"labels": [{"id": "L1", "name": "Shipping", "type": "user"}]},
+        {
+            "labels": [
+                {
+                    "id": "L1",
+                    "name": "Shipping",
+                    "type": "user",
+                    "messagesTotal": 12,
+                }
+            ]
+        },
         "https://gmail.googleapis.com/gmail/v1/users/me/labels",
         {"alt": "json"},
-        [LabelInfo(id="L1", name="Shipping", type="user")],
+        [LabelInfo(id="L1", name="Shipping", type="user", messages_total=12)],
         id="list_labels",
     ),
     pytest.param(
@@ -784,11 +1264,15 @@ _SURFACE_CASES = [
     ),
     pytest.param(
         lambda c: c.list_messages("in:inbox"),
-        {"messages": [{"id": "a1", "threadId": "t1"}], "nextPageToken": "n2"},
+        {
+            "messages": [{"id": "a1", "threadId": "t1", "historyId": "77"}],
+            "nextPageToken": "n2",
+        },
         "https://gmail.googleapis.com/gmail/v1/users/me/messages",
         {"q": "in:inbox", "maxResults": "500", "alt": "json"},
         MessagePage(
-            stubs=(MessageStub(id="a1", thread_id="t1"),), next_page_token="n2"
+            stubs=(MessageStub(id="a1", thread_id="t1", history_id=77),),
+            next_page_token="n2",
         ),
         id="list_messages",
     ),
@@ -845,6 +1329,41 @@ _SURFACE_CASES = [
         {"startHistoryId": "7", "pageToken": "hp", "alt": "json"},
         HistoryPage(history_id=42, next_page_token=None, records=()),
         id="history_page_token",
+    ),
+    pytest.param(
+        # distinct id again: a path built from the WRONG argument is
+        # unforgeable; format=metadata is the body-free sync path — the
+        # canned payload carries NO raw key (that key is what a raw get
+        # would have to have non-empty; a metadata parse must not care)
+        lambda c: c.get_message_metadata("m-42"),
+        {
+            "id": "m-42",
+            "labelIds": ["INBOX", "L1"],
+            "internalDate": "1790000000000",
+        },
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m-42",
+        {"format": "metadata", "alt": "json"},
+        MessageMetadata(
+            id="m-42", label_ids=("INBOX", "L1"), internal_date_ms=1790000000000
+        ),
+        id="get_message_metadata",
+    ),
+    pytest.param(
+        # discovery: getProfile is a users-level method — path
+        # gmail/v1/users/{userId}/profile, params {userId} only (the fake
+        # REST tree grows a getProfile leaf under users(), mirroring the
+        # REAL doc: a fake shaped like the bug cannot catch the bug, #59)
+        lambda c: c.get_profile(),
+        {
+            "emailAddress": "a@b.c",
+            "messagesTotal": 9,
+            "threadsTotal": 3,
+            "historyId": "42",
+        },
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        {"alt": "json"},
+        ProfileInfo(history_id=42),
+        id="get_profile",
     ),
 ]
 

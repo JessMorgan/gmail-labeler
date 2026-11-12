@@ -1033,7 +1033,13 @@ def test_sync_labels_reports_gains_losses_and_analyze_pointer(
         line.split() for line in result.stdout.splitlines() if line.startswith("id:L9")
     ]
     assert table_rows == [["id:L9", "1", "0"]]  # per-label gains/losses numbers
-    assert "dataset analyze" in result.stdout  # the closing pointer
+    # the closing pointer, pinned exactly (ticket #77 symmetric pin: real
+    # behavior keeps the real text; the dry-run variant must not leak here)
+    assert (
+        "Next: run `dataset analyze` for the updated candidate gates "
+        "(ADR-0005 keeps retraining and applying human-gated)" in result.stdout
+    )
+    assert "dry run wrote nothing" not in result.stdout
     assert "Traceback" not in (result.stdout + result.stderr)
     resolved = {r.id: r for r in store.iter_resolved()}
     assert resolved["a1"].labels == ("Shipping", "id:L9")
@@ -1071,6 +1077,86 @@ def test_sync_labels_dry_run_writes_nothing(
     assert "(dry-run)" in result.stdout and "revised=1" in result.stdout
     assert (store.root / "records.jsonl").read_bytes() == records_bytes
     assert (store.root / "sync-cursor.json").read_bytes() == cursor_bytes
+
+
+def test_sync_labels_dry_run_closes_with_plan_only_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ticket #77 (fix-round deferral, #64 story 4): the closing analyze
+    pointer said "run `dataset analyze` for the updated candidate gates"
+    after a plan-only run — wording that presumes the gates moved while
+    dry-run writes nothing. Same honesty class as the WOULD-birth split
+    (9a6da1c), mirrored here: dry-run gets the honest plan-only variant,
+    the real pointer text must not appear."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--config", str(cfg), "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    # the dry pointer pinned verbatim (round-2 review: a truncation mutant
+    # of the actionable half must not survive)
+    assert (
+        "Next: this dry run wrote nothing \u2014 re-run the same command "
+        "without --dry-run to apply the plan, then `dataset analyze` for "
+        "the updated candidate gates (ADR-0005 keeps retraining and "
+        "applying human-gated)" in result.stdout
+    )
+    # the real-mode pointer (the lie) must be gone, byte-for-byte its opener
+    assert "Next: run `dataset analyze`" not in result.stdout
+
+
+def test_sync_labels_full_resync_dry_run_closes_with_plan_only_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ticket #77, the --full-resync --dry-run path of the same class: the
+    plan-only run must not close with the updated-gates pointer either."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--full-resync",
+            "--dry-run",
+            "--config",
+            str(cfg),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "full-resync estimate:" in result.stdout
+    # the dry pointer pinned verbatim (round-2 review), same pin as the
+    # event-walk twin
+    assert (
+        "Next: this dry run wrote nothing \u2014 re-run the same command "
+        "without --dry-run to apply the plan, then `dataset analyze` for "
+        "the updated candidate gates (ADR-0005 keeps retraining and "
+        "applying human-gated)" in result.stdout
+    )
+    assert "Next: run `dataset analyze`" not in result.stdout
 
 
 def test_sync_labels_expired_cursor_prints_guidance_and_exits_5(
@@ -1369,7 +1455,13 @@ def test_sync_labels_full_resync_scan_prints_estimate_choice_and_revises(
     assert "flag-rate 100%" in out  # the flood guard's number is printed
     assert "revised=1" in out
     assert "sync-labels --full-resync:" in out  # the report names its mode
-    assert "dataset analyze" in out  # the closing pointer
+    # the closing pointer, pinned exactly (round-1 review: symmetric pin on
+    # BOTH real full-resync tests); the plan-only variant must not leak.
+    assert (
+        "Next: run `dataset analyze` for the updated candidate gates "
+        "(ADR-0005 keeps retraining and applying human-gated)" in out
+    )
+    assert "dry run wrote nothing" not in out
     resolved = {r.id: r for r in store.iter_resolved()}
     assert resolved["a1"].labels == ()
     cursor = store.read_cursor()
@@ -1464,6 +1556,13 @@ def test_sync_labels_full_resync_gyb_corpus_births_cursor_and_exits_0(
     assert result.exit_code == 0, result.output
     assert "no Sync Cursor" in result.stdout  # provenance disclosed
     assert "birthed it from the profile seed" in result.stdout  # NOT "WOULD"
+    # ticket #77 symmetric pin: a real full-resync DID write — the real
+    # pointer stands, and the plan-only variant must not leak into it.
+    assert (
+        "Next: run `dataset analyze` for the updated candidate gates "
+        "(ADR-0005 keeps retraining and applying human-gated)" in result.stdout
+    )
+    assert "dry run wrote nothing" not in result.stdout
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 777
     resolved = {r.id: r for r in store.iter_resolved()}

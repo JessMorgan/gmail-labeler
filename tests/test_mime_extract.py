@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import dataclasses
 
 import pytest
 
-from gmail_labeler.mime_extract import decode_gmail_raw, parse_mime
+from gmail_labeler.mime_extract import ParsedMail, decode_gmail_raw, parse_mime
 
 
 def _msg(
@@ -262,3 +263,33 @@ def test_fallback_rejects_dotty_domain_junk() -> None:
     got = parse_mime(raw).recipients
     assert "ok@good.example" in got
     assert all(".." not in r for r in got)
+
+
+def test_repr_hides_subject_and_body_text() -> None:
+    """Ticket #78 (invariant #5 posture, mirroring the RawMessage pin in
+    test_gmail_client.py): repr() into a log IS a log channel, so neither
+    the canonicalized body nor the subject — free message content — may
+    ride it. Envelope identity fields (sender/recipients/date) stay
+    inspectable, and repr=False preserves equality and construction —
+    pinned below."""
+    parsed = parse_mime(_msg(subject="SECRET-SUBJECT", body="SECRET-BODY-TEXT"))
+    r = repr(parsed)
+    assert "SECRET-BODY-TEXT" not in r
+    assert "SECRET-SUBJECT" not in r
+    assert "body_text" not in r  # repr=False omits name AND value
+    assert "subject" not in r
+    # structural census pin (round-1 review): the repr shows EXACTLY the
+    # envelope identity fields — a future content-bearing field added
+    # without repr=False grows this set and goes red here.
+    visible = {f.name for f in dataclasses.fields(ParsedMail) if f"{f.name}=" in r}
+    assert visible == {"sender", "recipients", "date"}
+    assert "alice@example.com" in r  # identity fields stay inspectable
+    assert "me@example.com" in r
+    # the fields themselves are intact — only the rendering drops them
+    assert parsed.subject == "SECRET-SUBJECT"
+    assert parsed.body_text == "SECRET-BODY-TEXT"
+    # dataclass equality unaffected by repr=False — BOTH hidden fields
+    # participate (round-1 review: a compare=False mutant must not pass)
+    assert parsed == parse_mime(_msg(subject="SECRET-SUBJECT", body="SECRET-BODY-TEXT"))
+    assert parsed != parse_mime(_msg(subject="SECRET-SUBJECT", body="OTHER"))
+    assert parsed != parse_mime(_msg(subject="OTHER-SUBJECT", body="SECRET-BODY-TEXT"))

@@ -49,12 +49,11 @@ build-backend = "hatchling.build"
 packages = ["src/gmail_labeler"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/.agents", "/.github"]
+exclude = ["/.github"]
 
 [tool.ruff]
 src = ["src", "tests"]
 target-version = "py312"
-extend-exclude = [".agents"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

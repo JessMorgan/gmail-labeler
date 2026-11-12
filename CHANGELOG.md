@@ -43,7 +43,7 @@ does not ship releases yet.
   labels). The cursor advances only after the delta's revisions are durable
   and only when nothing failed (invariant #3 — crash-retry tests prove the
   last-wins fold absorbs replays). `messagesDeleted`-touched ids keep their
-  record and are counted; non-resident event ids are counted as new-match,
+  record and are counted; non-resident event ids are counted as Unseen Ids,
   never ingested; a cursorless corpus births from one profile call and
   applies nothing (ADR-0008 consequence 1). The report prints per-label
   gains/losses and closes with the `dataset analyze` pointer; `--dry-run`
@@ -88,9 +88,21 @@ does not ship releases yet.
   follow; stored corpus data is untouched (record `source` values and the
   on-disk layout are unchanged). `export` is reserved for a future
   corpus-dump command.
+- The Label Sync report stat for non-resident event ids is named `unseen`
+  (GLOSSARY: Unseen Id; ticket #73 review, renamed before any release):
+  history events cannot establish that an absent id is new mail or that it
+  matches the import query — a `messagesDeleted`-touched id that was never
+  resident lands in this bucket — so the review-stage name `new_match`
+  overstated what the count means.
 
 ### Fixed
 
+- `dataset sync-labels --dry-run` no longer tightens corpus file modes:
+  `corpus_store.enforce_modes` is WRITE-side-only per its own contract
+  ("Call from WRITE-side commands… not from read-only tools"), so the dry
+  run — which writes nothing — now skips it; the non-destructive
+  `verify_modes` WARNINGs still run and name the structural paths the
+  later write run would tighten (#73 review).
 - `dataset import-gmail` no longer dies listing labels: the Gmail v1 discovery
   tree has only `users` at top level — `labels` live under it — and the
   REST client called `svc.labels()`, an `AttributeError` on the first live

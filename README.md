@@ -126,10 +126,12 @@ message an event touched — metadata only, bodies never (invariant #5) —
 so relabels and Backfills reach the corpus without a re-import. The
 cursor advances only after the delta's revisions are durable, a killed
 run is safe to re-run, `--dry-run` prints the identical plan writing no
-records and leaving the cursor byte-identical, event ids not in the
-corpus (typically new mail) are counted and reported but never ingested
-here, and upstream-deleted mail keeps its record (counted). An expired cursor (history 404) exits `5` with recovery
-guidance — a full label-resync command is not built yet, so until it
+records and leaving the cursor byte-identical, event ids the corpus has
+never held are counted as Unseen Ids and reported but never ingested here
+(history events cannot establish that they are new mail or that they match
+the import query), and upstream-deleted mail keeps its record (counted). An
+expired cursor (history 404) exits `5` with recovery guidance — a full
+label-resync command is not built yet, so until it
 lands the guidance points at rebuilding the corpus. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips
 what is already present. Transient failures resume cleanly; a deterministic abort

@@ -115,6 +115,13 @@ Import).
 _Avoid_: corpus update, re-sync ("re-sync" is Gmail's name for the prescribed
 full re-pull; Label Sync re-assembles nothing)
 
+**Unseen Id**:
+An event id the Corpus has never held, named by the history walk. Label Sync
+counts Unseen Ids and never ingests them — ingest is the acquisition paths'
+alone. History events cannot establish that an Unseen Id is new mail or that
+it matches the import query.
+_Avoid_: new match, New Match stat
+
 **Sync Cursor**:
 A Corpus's record of how far it has consumed the mailbox's event stream;
 owned by Label Sync — Gmail Import may birth it when absent, and only a

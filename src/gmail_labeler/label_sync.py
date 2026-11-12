@@ -16,8 +16,11 @@ silent-gap class the ledger exists to prevent.
 Structurally body-free (invariant #5): the only message read is
 ``get_message_metadata`` — no raw payload path is even imported here.
 Ids in events that are not resident in the Corpus are never written
-(ingest stays the acquisition paths' alone) and counted as new-match for
-the report. ``messagesDeleted``-touched resident ids: record kept (v1: no
+(ingest stays the acquisition paths' alone) and counted as Unseen Ids
+(GLOSSARY) for the report — a history event cannot establish that an
+absent id is new mail or that it matches the import query (a
+``messagesDeleted``-touched id that was never resident lands in this
+bucket too). ``messagesDeleted``-touched resident ids: record kept (v1: no
 tombstones), counted. Now-unresolvable label ids keep the ``id:``
 deleted-label convention via the shared normalizer.
 
@@ -35,7 +38,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Final
+from typing import Final, cast
 
 from .corpus_record import CorpusRecord
 from .corpus_store import CorpusStore
@@ -76,14 +79,14 @@ class SyncStats:
     stale: int = 0  # corpus-resident ids the walk marked for refresh
     revised: int = 0  # revisions appended (planned, under dry_run)
     deleted_kept: int = 0  # resident ids confirmed gone; records kept
-    new_match: int = 0  # event ids not resident in the corpus (report only)
+    unseen: int = 0  # Unseen Ids: event ids the corpus never held (report only)
     retried: int = 0  # shared RetryStats protocol counter
     birthed: bool = False  # ADR-0008 consequence 1: cursorless corpus
-    gains: dict[str, int] = field(default_factory=dict)  # label -> count
-    losses: dict[str, int] = field(default_factory=dict)
+    gains: dict[str, int] = field(default_factory=dict[str, int])  # label -> count
+    losses: dict[str, int] = field(default_factory=dict[str, int])
     # (id, reason); "<page>"/"<cursor>" are SENTINELS, not message ids —
     # report renderers must not treat them as ids (gmail_import parity)
-    failed: list[tuple[str, str]] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
 
     @property
     def failed_ids(self) -> list[str]:
@@ -128,7 +131,7 @@ def sync_labels(
 
     stale: dict[str, None] = {}  # insertion-ordered set: walk order is the report order
     deleted_touched: set[str] = set()
-    new_match: set[str] = set()
+    unseen: set[str] = set()
     page_token: str | None = None
     final_history_id: int | None = None
     while True:
@@ -153,13 +156,13 @@ def sync_labels(
                     # if the message came back, the metadata get says so
                     stale.setdefault(message_id, None)
                 else:
-                    new_match.add(message_id)
+                    unseen.add(message_id)
         final_history_id = page.history_id
         page_token = page.next_page_token
         if page_token is None:
             break
     stats.stale = len(stale)
-    stats.new_match = len(new_match)
+    stats.unseen = len(unseen)
 
     gone_confirmed: set[str] = set()
     if stale:
@@ -328,6 +331,23 @@ def _revise(
     stats.revised += 1
 
 
+def _wire_list(value: object) -> list[object] | None:
+    """A wire JSON array as a typed list (None when the node is not one).
+    ``cast`` is a runtime no-op beside the guard that earned it: parsed
+    JSON arrives untyped at the boundary and ``isinstance`` cannot see the
+    element type — the values stay honestly ``object``, decided by the
+    walk's own guards below."""
+    return cast("list[object]", value) if isinstance(value, list) else None
+
+
+def _wire_dict(value: object) -> dict[str, object] | None:
+    """A wire JSON object as a typed mapping (None when the node is not
+    one). JSON object keys are strings by the format's definition; values
+    stay ``object``. Same no-op-cast-beside-guard reasoning as
+    ``_wire_list``."""
+    return cast("dict[str, object]", value) if isinstance(value, dict) else None
+
+
 def _event_message_ids(record: Mapping[str, object]) -> Iterator[tuple[str, bool]]:
     """(lowercased message id, is messagesDeleted) for every entry naming a
     message in one wire History record. Absent-tolerant by shape: a field
@@ -335,15 +355,16 @@ def _event_message_ids(record: Mapping[str, object]) -> Iterator[tuple[str, bool
     walk never guesses at malformed entries, and events that name no
     message cannot touch anything."""
     for field_name in _EVENT_MESSAGE_FIELDS:
-        entries = record.get(field_name)
-        if not isinstance(entries, list):
+        entries = _wire_list(record.get(field_name))
+        if entries is None:
             continue
         is_delete = field_name == "messagesDeleted"
         for entry in entries:
-            if not isinstance(entry, dict):
+            entry_map = _wire_dict(entry)
+            if entry_map is None:
                 continue
-            message = entry.get("message")
-            if not isinstance(message, dict):
+            message = _wire_dict(entry_map.get("message"))
+            if message is None:
                 continue
             mid = message.get("id")
             if isinstance(mid, str) and mid:

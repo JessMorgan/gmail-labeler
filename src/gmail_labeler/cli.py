@@ -328,8 +328,9 @@ def dataset_sync_labels(
 
     Walks the Gmail history from the corpus's Sync Cursor and appends a
     label Revision for every touched message — metadata only, bodies never
-    (invariant #5). New mail is counted and reported, never ingested here;
-    deleted mail keeps its record.
+    (invariant #5). Event ids the corpus has never held are counted as
+    Unseen Ids and reported, never ingested here; deleted mail keeps its
+    record.
     """
     from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
@@ -369,8 +370,17 @@ def dataset_sync_labels(
             err=True,
         )
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
-    store.enforce_modes()  # sync-labels is a WRITE command (revisions + cursor)
+    if not dry_run:
+        # WRITE-side only, per corpus_store.enforce_modes' own contract
+        # ("Call from WRITE-side commands… not from read-only tools",
+        # corpus_store.py ~431): a --dry-run sync writes nothing, so it
+        # must not re-mode anything either
+        store.enforce_modes()
     for offender in store.verify_modes():
+        # non-destructive, so it runs under --dry-run too: the WARNING
+        # names the structural paths the later write run would tighten
+        # (verify_modes is a structural scan; the full-tree tightening is
+        # enforce_modes' job on the write run)
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
         stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
@@ -393,7 +403,7 @@ def dataset_sync_labels(
     typer.echo(
         f"{prefix} events={stats.events} stale={stats.stale} "
         f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
-        f"new_match={stats.new_match} retried={stats.retried} "
+        f"unseen={stats.unseen} retried={stats.retried} "
         f"failed={len(stats.failed)}"
     )
     if stats.birthed:
@@ -415,11 +425,13 @@ def dataset_sync_labels(
                 f"{name:<{width}} {stats.gains.get(name, 0):>6} "
                 f"{stats.losses.get(name, 0):>6}"
             )
-    if stats.new_match:
+    if stats.unseen:
         typer.echo(
-            f"NOTE: {stats.new_match} event id(s) are not in the corpus \u2014 "
-            "new mail is ingested by dataset import-gmail, never by sync "
-            "(spec #64: ingest stays the acquisition paths' alone)",
+            f"NOTE: {stats.unseen} event id(s) are not in the corpus \u2014 "
+            "history events cannot establish that these are new mail or "
+            "that they match the import query; ingest stays the "
+            "acquisition paths' alone (dataset import-gmail/import-gyb), "
+            "never sync's (spec #64)",
             err=True,
         )
     if not stats.failed:

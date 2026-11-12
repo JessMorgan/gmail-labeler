@@ -1027,7 +1027,7 @@ def test_sync_labels_reports_gains_losses_and_analyze_pointer(
     assert result.exit_code == 0, result.output
     assert (
         "sync-labels: events=1 stale=1 revised=1 deleted_kept=0 "
-        "new_match=0 retried=0 failed=0" in result.stdout
+        "unseen=0 retried=0 failed=0" in result.stdout
     )  # full summary shape (retried= survives only here)
     table_rows = [
         line.split() for line in result.stdout.splitlines() if line.startswith("id:L9")
@@ -1071,6 +1071,50 @@ def test_sync_labels_dry_run_writes_nothing(
     assert "(dry-run)" in result.stdout and "revised=1" in result.stdout
     assert (store.root / "records.jsonl").read_bytes() == records_bytes
     assert (store.root / "sync-cursor.json").read_bytes() == cursor_bytes
+
+
+def test_sync_labels_dry_run_does_not_tighten_modes_and_real_run_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run is read-only: enforce_modes must NOT run (its own docstring:
+    call from WRITE-side commands, not read-only tools), so a loosened file
+    keeps its mode byte-for-byte while the non-destructive WARNING still
+    names it; the later write run tightens it."""
+    import os
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    records = store.root / "records.jsonl"
+    os.chmod(records, 0o644)  # loosen one structural path
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = str(_import_gmail_cfg(tmp_path))
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--config", cfg, "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert records.stat().st_mode & 0o077 == 0o044  # byte-unchanged, not tightened
+    assert "WARNING" in result.stderr and "records.jsonl" in result.stderr
+    # the real run tightens it — attribution note: the fake's history
+    # sequence is spent, so this run appends NO revision and therefore
+    # never reaches _open_append_checked's 0600 fchmod; enforce_modes is
+    # the only path that can bring the mode back here (verified by mutant)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", cfg])
+    assert result.exit_code == 0, result.output
+    assert records.stat().st_mode & 0o077 == 0
 
 
 def test_sync_labels_expired_cursor_prints_guidance_and_exits_5(
@@ -1184,7 +1228,7 @@ def test_sync_labels_births_cursorless_corpus_and_reports_provenance(
     assert cursor is not None and cursor.history_id == 777
 
 
-def test_sync_labels_counts_new_match_and_deleted_without_writing(
+def test_sync_labels_counts_unseen_and_deleted_without_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import gmail_labeler.cli as cli
@@ -1210,9 +1254,10 @@ def test_sync_labels_counts_new_match_and_deleted_without_writing(
     cfg = _import_gmail_cfg(tmp_path)
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 0, result.output
-    assert "new_match=1" in result.stdout
+    assert " unseen=1 " in result.stdout  # padded: unseen=10 must not pass
     assert "deleted_kept=1" in result.stdout
     assert "not in the corpus" in result.stderr  # NOTE goes to stderr
+    assert "cannot establish" in result.stderr  # pin the NOTE's honest body
     assert (store.root / "records.jsonl").read_bytes() == records_bytes
 
 

@@ -56,13 +56,26 @@ def _clock() -> datetime:
     return NOW
 
 
+def _assert_no_raw_fetches(fake: FakeGmailClient) -> None:
+    """Invariant #5 call-log postcondition, asserted by EVERY seam test in
+    this file (not just the named structural test): the log holds no raw
+    get and no message-list call — a future raw fetch fails the suite in
+    ANY sync scenario, whichever test catches it first."""
+    offenders = [
+        c
+        for c in fake.calls
+        if c.startswith("get_message:") or c.startswith("list_messages")
+    ]
+    assert not offenders, offenders
+
+
 def test_event_walk_refreshes_resident_ids_advances_cursor_once(
     tmp_path: Path,
 ) -> None:
     """Fake-driven end-to-end (AC #1): seed corpus + synthetic label-change
     events -> correct revisions appended, cursor advanced exactly once,
     counts right. messageRemoved-touched resident id: record kept, counted.
-    Non-resident event id: never written, counted as new-match only."""
+    Non-resident event id: never written, counted as an Unseen Id only."""
     store = store_at(tmp_path)
     _seed(
         store,
@@ -97,11 +110,12 @@ def test_event_walk_refreshes_resident_ids_advances_cursor_once(
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.events == 4
     assert stats.stale == 3  # a1, b2, c3 are corpus-resident touches
     assert stats.revised == 2  # a1, b2; c3 stays (gone upstream)
     assert stats.deleted_kept == 1
-    assert stats.new_match == 1
+    assert stats.unseen == 1
     assert stats.gains == {"id:L9": 1}  # unresolvable id keeps the id: convention
     assert stats.losses == {"Money/Bills": 1}
     assert not stats.failed
@@ -139,7 +153,8 @@ def _page(*events: HistoryEvent, history_id: int = 500) -> HistoryPage:
 def test_sync_path_is_structurally_body_free(tmp_path: Path) -> None:
     """Invariant #5 as an executable check (AC #2): the sync call log
     contains no raw get and no message-list call — only history, metadata
-    gets, and (for a birth) profile."""
+    gets, and (for a birth) profile. The named taxonomy proof; the shared
+    _assert_no_raw_fetches helper now runs in every seam test too."""
     store = store_at(tmp_path)
     _seed(store, _record("a1", ("Shipping",)))
     store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
@@ -148,8 +163,7 @@ def test_sync_path_is_structurally_body_free(tmp_path: Path) -> None:
         history_pages=[_page(LabelsAdded("a1", ("L1",)))],
     )
     sync_labels(fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock)
-    assert not any(c.startswith("get_message:") for c in fake.calls)
-    assert not any(c.startswith("list_messages") for c in fake.calls)
+    _assert_no_raw_fetches(fake)
 
 
 def test_expired_cursor_raises_resync_not_swallowed(tmp_path: Path) -> None:
@@ -165,6 +179,7 @@ def test_expired_cursor_raises_resync_not_swallowed(tmp_path: Path) -> None:
         sync_labels(
             fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
         )
+    _assert_no_raw_fetches(fake)
     assert store.read_cursor() is not None
     assert store.read_cursor() == SyncCursor(history_id=900, last_sync=NOW)
 
@@ -183,14 +198,16 @@ def test_bare_permanent_404_on_history_converts_to_resync(tmp_path: Path) -> Non
     store = store_at(tmp_path)
     _seed(store, _record("a1", ("Shipping",)))
     store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
+    fake = BareFourOhFour()
     with pytest.raises(GmailResyncError):
         sync_labels(
-            BareFourOhFour(),
+            fake,
             store,
             id_to_name=NAMES,
             sleeper=lambda _s: None,
             clock=_clock,
         )
+    _assert_no_raw_fetches(fake)
 
 
 def test_auth_error_propagates_typed(tmp_path: Path) -> None:
@@ -205,6 +222,7 @@ def test_auth_error_propagates_typed(tmp_path: Path) -> None:
         sync_labels(
             fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
         )
+    _assert_no_raw_fetches(fake)
 
 
 def test_transient_history_retries_with_pacing(tmp_path: Path) -> None:
@@ -222,6 +240,7 @@ def test_transient_history_retries_with_pacing(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=slept.append, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.retried == 1 and slept == [1.0]  # _BASE_BACKOFF_S * 2**0
     assert stats.revised == 1 and not stats.failed
 
@@ -239,6 +258,7 @@ def test_page_level_permanent_stops_run_without_advancing_cursor(
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.failed == [("<page>", "history stopped (permanent or exhausted)")]
     assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)
 
@@ -260,6 +280,7 @@ def test_multipage_walk_exhausts_and_lands_on_final_id(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.events == 2 and stats.revised == 2
     assert fake.calls[:2] == ["history:100:", "history:100:1"]  # token chain
     cursor = store.read_cursor()
@@ -281,7 +302,8 @@ def test_event_ids_are_case_insensitive_against_the_corpus(
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
-    assert stats.revised == 1 and stats.new_match == 0
+    _assert_no_raw_fetches(fake)
+    assert stats.revised == 1 and stats.unseen == 0
     assert fake.calls == ["history:100:", "get_message_metadata:a1"]
     resolved = {r.id: r for r in store.iter_resolved()}
     assert resolved["a1"].labels == ()
@@ -307,6 +329,7 @@ def test_failed_refresh_keeps_cursor_behind_the_delta(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.failed == [("a1", "metadata fetch failed (permanent/retries)")]
     assert stats.failed_ids == ["a1"]  # sentinel-safe accessor (gmail_import parity)
     assert stats.revised == 1  # b2's revision is durable, a1's is not
@@ -340,14 +363,16 @@ def test_crash_retry_absorbs_duplicate_revisions(
         raise CorpusError("simulated kill between durable revisions and cursor write")
 
     monkeypatch.setattr(store, "write_cursor", crash)
+    fake1 = fake_mailbox()
     with pytest.raises(CorpusError):
         sync_labels(
-            fake_mailbox(),
+            fake1,
             store,
             id_to_name=NAMES,
             sleeper=lambda _s: None,
             clock=_clock,
         )
+    _assert_no_raw_fetches(fake1)  # the crashed run's call log
     # revisions durable, cursor NOT advanced (durability ordering proof)
     assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)
     raw_lines = (store.root / "records.jsonl").read_text().count("\n")
@@ -356,9 +381,11 @@ def test_crash_retry_absorbs_duplicate_revisions(
     # re-run with a FRESH store instance (new process) and fresh fake: the
     # window replays, the last-wins fold absorbs the duplicates
     store2 = store_at(tmp_path)
+    fake2 = fake_mailbox()
     stats = sync_labels(
-        fake_mailbox(), store2, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+        fake2, store2, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake2)  # the re-run's call log
     assert stats.revised == 2 and not stats.failed
     resolved = {r.id: r for r in store2.iter_resolved()}
     assert resolved["a1"].labels == ("Shipping",)
@@ -392,6 +419,7 @@ def test_dry_run_plans_without_touching_anything(
         clock=_clock,
         dry_run=True,
     )
+    _assert_no_raw_fetches(fake)
     assert stats.revised == 2
     assert stats.gains == {"id:L9": 1} and stats.losses == {"Money/Bills": 1}
     assert not stats.failed
@@ -411,6 +439,7 @@ def test_cursorless_corpus_births_and_applies_nothing(
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.birthed and stats.revised == 0 and not stats.failed
     assert fake.calls == ["get_profile"]  # no history walk, no metadata gets
     assert store.read_cursor() == SyncCursor(history_id=777, last_sync=NOW)
@@ -430,6 +459,7 @@ def test_dry_run_on_cursorless_corpus_does_not_birth(tmp_path: Path) -> None:
         clock=_clock,
         dry_run=True,
     )
+    _assert_no_raw_fetches(fake)
     assert stats.birthed  # the plan says it would birth
     assert not (store.root / "sync-cursor.json").exists()
 
@@ -444,21 +474,24 @@ def test_unusable_seed_on_cursorless_corpus_fails_loudly(tmp_path: Path) -> None
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.failed == [("<cursor>", "no usable historyId seed (profile call)")]
     assert not (store.root / "sync-cursor.json").exists()
 
 
 def test_max_attempts_below_one_is_rejected(tmp_path: Path) -> None:
     store = store_at(tmp_path)
+    fake = FakeGmailClient()
     with pytest.raises(ValueError, match="max_attempts"):
         sync_labels(
-            FakeGmailClient(),
+            fake,
             store,
             id_to_name=NAMES,
             max_attempts=0,
             sleeper=lambda _s: None,
             clock=_clock,
         )
+    _assert_no_raw_fetches(fake)  # rejected before any call at all
 
 
 def test_gone_confirmed_without_delete_event_counts_as_deleted_kept(
@@ -477,6 +510,7 @@ def test_gone_confirmed_without_delete_event_counts_as_deleted_kept(
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.deleted_kept == 1 and stats.revised == 0 and not stats.failed
     resolved = {r.id: r for r in store.iter_resolved()}
     assert resolved["a1"].labels == ("Shipping",)  # kept, not tombstoned
@@ -501,6 +535,7 @@ def test_metadata_transient_retries_then_revises(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=slept.append, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.retried == 1 and slept == [1.0]
     assert stats.revised == 1 and not stats.failed
 
@@ -527,6 +562,7 @@ def test_metadata_retry_exhaustion_fails_and_holds_cursor(tmp_path: Path) -> Non
         sleeper=lambda _s: None,
         clock=_clock,
     )
+    _assert_no_raw_fetches(fake)
     assert stats.retried == 2
     assert stats.failed == [("a1", "metadata fetch failed (permanent/retries)")]
     assert stats.revised == 0
@@ -558,6 +594,7 @@ def test_final_page_without_history_id_holds_the_cursor(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
+    _assert_no_raw_fetches(fake)
     assert stats.revised == 1  # the delta IS durable…
     assert stats.failed == [
         ("<cursor>", "no usable historyId on the final history page")
@@ -593,7 +630,8 @@ def test_malformed_history_entries_name_no_messages(tmp_path: Path) -> None:
     stats = sync_labels(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
-    assert stats.events == 1 and stats.stale == 0 and stats.new_match == 0
+    _assert_no_raw_fetches(fake)
+    assert stats.events == 1 and stats.stale == 0 and stats.unseen == 0
     assert fake.calls == ["history:100:"]  # nothing was refreshed
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 500  # empty delta consumed

@@ -691,6 +691,9 @@ def test_history_records_reject_loud_inputs() -> None:
         history_records([], start_id=0)
     with pytest.raises(ValueError, match="start_id"):
         history_records([], start_id=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="start_id"):
+        # bool passes isinstance(x, int), so this pins the dedicated arm
+        history_records([], start_id=True)
     with pytest.raises(TypeError, match="unsupported history event"):
         history_records([{"message_id": "m"}])  # type: ignore[list-item]
     with pytest.raises(TypeError, match="sequence of strings"):

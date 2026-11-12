@@ -32,3 +32,6 @@ uv-run-venv/
 .DS_Store
 # maintainer-private verified facts (never published)
 AGENTS.local.md
+
+# retired project-local skills — keep the tree out of checkouts and sdists
+.agents/

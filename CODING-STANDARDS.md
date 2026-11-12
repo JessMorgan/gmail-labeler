@@ -46,6 +46,9 @@ concept the glossary lacks, add it there in the same commit.
 
 - OAuth refresh tokens live in the OS keyring; the documented file fallback is
   0600 with a startup warning. No secret or token value in any log line.
+- Live token material — `gh auth token`, `gh auth status -t`,
+  `~/.config/gh/hosts.yml` output — never enters commits, review
+  reports, PR text, or logs.
 - **Message bodies never enter logs or the SQLite DB** — message IDs, label
   IDs, probabilities, and timestamps only. The DB must be safe to attach to a
   public bug report; a test asserts bodies cannot leak into log output.
@@ -62,7 +65,7 @@ deterministic, never string-matched at call sites.
 
 ## Tests
 
-Test-first at the seams (see the project-local `tdd` skill). The Gmail API is
+Test-first at the seams (see the `tdd` skill). The Gmail API is
 **always faked** — a `FakeGmailClient` behind the same `Protocol` powers unit
 and integration tests alike; live-API tests carry a `--live` opt-in marker and
 never run in CI. The one exception that lives in CI is structural: a test may

@@ -58,21 +58,22 @@ capability, not a promise this design leans on.
   and into the candidate gate (invariant #6's unsafe direction).
   Switching analyze to the resolved view eliminates both skews rather
   than guarding them.
-- Physical append-only stays literally true, and the corpus-side
-  vocabulary ADR's "append-only and never merges" survives: both describe
-  ingest. The fold resolves label state at read time and never mutates
-  stored bytes, so "fetch-and-merge" still names something this store
-  does not do at ingest.
+- Physical append-only stays literally true at ingest, and the
+  corpus-side vocabulary ADR's "append-only and never merges" survives:
+  both name the ingest moment. The fold resolves label state at read
+  time and never mutates stored bytes, so "fetch-and-merge" still names
+  something this store does not do at ingest.
 - Re-applying a revision is harmless by construction — the last-wins fold
   absorbs replays, which is what makes crash-retry of a Label Sync safe
   alongside the cursor-durability rule.
 - Messages deleted upstream keep their records (v1: reported, not
   tombstoned); tombstones are a future format change, not a fold change.
-- Compaction of superseded revisions is safe when done atomically
-  (whole-file temp+fsync+rename, the store's established discipline) but
-  never load-bearing for correctness. It is also the answer to fold cost:
-  every consumer reads and folds the whole log, so a revision-heavy
-  corpus compacts when reports go slow.
+- Compaction of superseded revisions is safe when done atomically and
+  exclusively (whole-file temp+fsync+rename, no other writer — ADR-0002's
+  single-writer contract; the store's established discipline) but never
+  load-bearing for correctness. It is also the answer to fold
+  cost: every consumer reads and folds the whole log, so a
+  revision-heavy corpus compacts when reports go slow.
 - Event-sync is an optimization over ground truth: `--full-resync` compares
   the Corpus against the mailbox directly (label-enumeration scan or
   corpus-metadata walk, whichever the up-front cost estimate favors) and

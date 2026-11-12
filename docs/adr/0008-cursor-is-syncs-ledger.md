@@ -76,3 +76,21 @@ and fsynced (invariant #3: durable handling first, cursor second).
   store's single-process contract (ADR-0002: one writer per corpus, no
   cross-process locking) then means the daemon owns the corpus while it
   runs: its door and the CLI's are never concurrent.
+
+## Implementation note (ticket #72, PR #84)
+
+The birth wiring landed with one policy the original text left open: an
+unusable seed degrades loudly, not fatally. Both candidate seeds are
+held to positivity (non-positive is a wire lie — history ids count from
+1): a non-positive page seed takes the single profile call, and if the
+profile seed is unusable too, import warns, ingests normally, and writes
+no cursor — the corpus stays birth-eligible, because seed unavailability
+must never jeopardize acquisition. A cursor *write* fault is the
+opposite case and stays fatal (typed exit 5): half-written ledger state
+is worse than none. An existing-but-invalid cursor is the third case: it
+raises CorpusError before ingesting anything, never a silent re-birth. A
+bounded --max-messages smoke import births as well — the seed is still a
+lower bound. One format asymmetry: the parse census tolerates a stored 0
+(format rule is non-negative), but birth refuses non-positive and no
+advancer may persist < 1 — the API answers such a cursor with a permanent
+400, which the fake pins.

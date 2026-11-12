@@ -8,6 +8,7 @@ import pytest
 
 from gmail_labeler.corpus_store import CorpusStore
 from gmail_labeler.gyb_import import import_gyb, read_gyb_index
+from gmail_labeler.sync_cursor import SIDECAR_CURSOR
 
 
 def make_gyb(root: Path, rows: list[tuple[str, str, list[str]]]) -> Path:
@@ -519,3 +520,20 @@ def test_max_messages_holds_on_skipped_rows(tmp_path: Path) -> None:
     fresh = CorpusStore(tmp_path / "corpus")
     stats = import_gyb(gyb, fresh, max_messages=3)
     assert stats.scanned == 3 and stats.skipped_present == 3
+
+
+def test_import_gyb_never_births_a_cursor(tmp_path: Path) -> None:
+    # ADR-0008 AC #5, at the GYB seam: a backup snapshots messages, not the
+    # event stream — import_gyb takes no client at all (structurally
+    # birth-free), and this pins the absence of the ledger after a real run
+    # (a stray birth would hand the next sync a fake consumed-baseline over
+    # months of unseen drift)
+    make_gyb(
+        tmp_path / "gyb",
+        [("aaaa", "2026-07-15 23:48:51", ["INBOX", "Work"])],
+    )
+    store = CorpusStore(tmp_path / "corpus")
+    stats = import_gyb(tmp_path / "gyb", store, max_messages=None)
+    assert stats.written == 1  # the import itself happened
+    assert not (store.root / SIDECAR_CURSOR).exists()
+    assert store.read_cursor() is None

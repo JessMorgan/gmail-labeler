@@ -33,15 +33,17 @@ what is wired vs. planned, and each gains detail as its phase lands.
   when absent (never advance); `import-gyb` never births; only the Label
   Sync operation advances it, after durable revisions — `sync-labels` when
   wired, the daemon when ADR-0003 lands; expired cursors fail loudly
-  toward `--full-resync`. Planned with spec #64's tickets; not yet wired.
+  toward `--full-resync`. Sidecar storage + Gmail Import birth wired
+  (ticket #72); only Label Sync / daemon advancement is not yet wired.
 
 ## Layout
 
 - `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
-  `corpus_store`, `mime_extract`, `analyze`, `attribution`, `auth`, `tokens`,
-  `gmail_client`, `gmail_errors`, `fake_gmail`, `gmail_import`, `gyb_import`,
-  `cli`. Planned (later phases): model core (`dataset` build,
-  `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.
+  `corpus_store`, `mime_extract`, `analyze`, `attribution`, `sync_cursor`,
+  `auth`, `tokens`, `gmail_client`, `gmail_errors`, `fake_gmail`,
+  `gmail_import`, `gyb_import`, `cli`. Planned (later phases): model core
+  (`dataset` build, `thresholds`, `graduation`, `eval`) + `model` and
+  `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
 - `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.

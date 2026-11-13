@@ -4,12 +4,18 @@ import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
 from gmail_labeler.cli import app
+from gmail_labeler.corpus_store import CorpusStore
+
+if TYPE_CHECKING:
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+    from gmail_labeler.gmail_client import HistoryPage
 
 runner = CliRunner()
 
@@ -24,7 +30,7 @@ def test_help_lists_commands() -> None:
 def test_dataset_help_lists_subcommands() -> None:
     result = runner.invoke(app, ["dataset", "--help"])
     assert result.exit_code == 0
-    for cmd in ("import-gmail", "import-gyb", "analyze"):
+    for cmd in ("import-gmail", "import-gyb", "analyze", "sync-labels"):
         assert cmd in result.output
 
 
@@ -122,6 +128,47 @@ def test_dataset_import_gmail_writes_and_reports(
     )
     assert sidecar[0]["id"] == "f1"  # offline attribution snapshot
     assert sidecar[0]["criteria"] == {"from": "shipper@x.com"}
+
+
+def test_dataset_import_gmail_enforces_modes_on_every_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Import-gmail enforces modes UNCONDITIONALLY (write-side, unlike
+    sync-labels' dry-run gate): a loosened structural path is tightened
+    even when the run itself writes no records — every message is
+    skip-present, so no append path re-fchmods records.jsonl and
+    enforce_modes is the only path that can bring the mode back (mirrors
+    the sync-labels real-run pin; kills an enforce=False mutant at the
+    import call site)."""
+    import os
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+    from gmail_labeler.gmail_client import FilterInfo, LabelInfo
+
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=b"Subject: Hi\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nbody",
+                label_ids=("INBOX", "L1"),
+                thread_id="t",
+                internal_date_ms=1761818400000,
+            )
+        ],
+        labels=[LabelInfo("L1", "Shipping", "user")],
+        filters=[FilterInfo(id="f1", criteria={"from": "shipper@x.com"}, action={})],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = str(_import_gmail_cfg(tmp_path))
+    first = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert first.exit_code == 0, first.output
+    records = tmp_path / "corpus" / "records.jsonl"
+    os.chmod(records, 0o644)  # loosen one structural path
+    second = runner.invoke(app, ["dataset", "import-gmail", "--config", cfg])
+    assert second.exit_code == 0, second.output
+    assert "skipped_present=1" in second.stdout  # the run wrote no record itself
+    assert records.stat().st_mode & 0o077 == 0  # only enforce_modes could tighten
 
 
 def test_dataset_import_gmail_incomplete_exits_5(
@@ -594,7 +641,6 @@ def _seed_corpus(
     from datetime import UTC, datetime, timedelta
 
     from gmail_labeler.corpus_record import CorpusRecord, body_hash
-    from gmail_labeler.corpus_store import CorpusStore
 
     store = CorpusStore(tmp_path / "corpus")
     store.enforce_modes()
@@ -938,3 +984,413 @@ def test_analyze_cli_consumes_resolved_view(tmp_path: Path) -> None:
     by_label = {m["label"]: m for m in payload["labels"]}
     assert by_label["Shipping"]["total"] == 50  # raw log would say 60
     assert by_label["Money"]["total"] == 10
+
+
+# ---- dataset sync-labels (ticket #73) --------------------------------------
+
+
+def _sync_seed_corpus(
+    tmp_path: Path, labels: tuple[str, ...] = ("Shipping",)
+) -> CorpusStore:
+    from datetime import UTC, datetime
+
+    from gmail_labeler.corpus_record import CorpusRecord, body_hash
+
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(
+        CorpusRecord(
+            id="a1",
+            date=datetime(2026, 10, 30, 10, 0, tzinfo=UTC),
+            subject="hi",
+            sender="a@x.com",
+            recipients=("me@x.com",),
+            labels=labels,
+            body_hash=body_hash("body a1"),
+            source="api",
+            thread_id="ta1",
+        ),
+        "body a1",
+    )
+    store.enforce_modes()
+    return store
+
+
+def _sync_fake(
+    *,
+    messages: list[FakeMessage] | None = None,
+    history_pages: list[HistoryPage] | None = None,
+    current_history_id: int | None = None,
+) -> FakeGmailClient:
+    from gmail_labeler.fake_gmail import FakeGmailClient
+    from gmail_labeler.gmail_client import LabelInfo
+
+    return FakeGmailClient(
+        labels=[LabelInfo("L1", "Shipping", "user")],
+        filters=[],
+        messages=messages,
+        history_pages=history_pages,
+        current_history_id=current_history_id,
+    )
+
+
+def _write_sync_cursor(store: CorpusStore, history_id: int = 100) -> None:
+    from datetime import UTC, datetime
+
+    from gmail_labeler.sync_cursor import SyncCursor
+
+    store.write_cursor(
+        SyncCursor(history_id=history_id, last_sync=datetime(2026, 11, 1, tzinfo=UTC))
+    )
+
+
+def test_sync_labels_reports_gains_losses_and_analyze_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert (
+        "sync-labels: events=1 stale=1 revised=1 deleted_kept=0 "
+        "unseen=0 retried=0 failed=0" in result.stdout
+    )  # full summary shape (retried= survives only here)
+    table_rows = [
+        line.split() for line in result.stdout.splitlines() if line.startswith("id:L9")
+    ]
+    assert table_rows == [["id:L9", "1", "0"]]  # per-label gains/losses numbers
+    assert "dataset analyze" in result.stdout  # the closing pointer
+    assert "Traceback" not in (result.stdout + result.stderr)
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500
+
+
+def test_sync_labels_dry_run_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    cursor_bytes = (store.root / "sync-cursor.json").read_bytes()
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--config", str(cfg), "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "(dry-run)" in result.stdout and "revised=1" in result.stdout
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
+    assert (store.root / "sync-cursor.json").read_bytes() == cursor_bytes
+
+
+def test_sync_labels_dry_run_does_not_tighten_modes_and_real_run_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run is read-only: enforce_modes must NOT run (its own docstring:
+    call from WRITE-side commands, not read-only tools), so a loosened file
+    keeps its mode byte-for-byte while the non-destructive WARNING still
+    names it; the later write run tightens it."""
+    import os
+
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    records = store.root / "records.jsonl"
+    os.chmod(records, 0o644)  # loosen one structural path
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = str(_import_gmail_cfg(tmp_path))
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--config", cfg, "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert records.stat().st_mode & 0o077 == 0o044  # byte-unchanged, not tightened
+    assert "WARNING" in result.stderr and "records.jsonl" in result.stderr
+    # the real run tightens it — attribution note: the fake's history
+    # sequence is spent, so this run appends NO revision and therefore
+    # never reaches _open_append_checked's 0600 fchmod; enforce_modes is
+    # the only path that can bring the mode back here (verified by mutant)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", cfg])
+    assert result.exit_code == 0, result.output
+    assert records.stat().st_mode & 0o077 == 0
+
+
+def test_sync_labels_expired_cursor_prints_guidance_and_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #5/#6: non-zero exit + interim guidance that names no vaporware
+    flag (--full-resync lands in ticket #74 and will swap this string)."""
+    import gmail_labeler.cli as cli
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store, history_id=900)  # ahead of the fake's window
+    fake = _sync_fake(current_history_id=500)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5
+    assert "retained history" in result.stderr
+    assert "--full-resync" not in (result.stdout + result.stderr)
+    assert "Traceback" not in (result.stdout + result.stderr)
+    assert store.read_cursor() is not None  # ledger untouched
+
+
+def test_sync_labels_auth_failure_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake()
+    fake.fail("list_labels", GmailAuthError("revoked"))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+
+
+def test_sync_labels_bootstrap_transport_failure_keeps_own_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shared bootstrap's ``failure_prefix`` is the one divergent
+    carrier between import-gmail and sync-labels: pin that a bootstrap
+    transport failure prints THIS command's prefix, not import-gmail's
+    (kills the prefix-swap mutant — exit code and auth paths alone
+    survive it)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.gmail_errors import GmailError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake()
+    fake.fail("list_labels", GmailError("boom"))  # STOP kind: raises at once
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5
+    assert "sync-labels failed:" in result.stderr
+    assert "import failed:" not in result.stderr
+
+
+def test_sync_labels_midrun_auth_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.gmail_errors import GmailAuthError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(history_pages=[])
+    fake.fail("history", GmailAuthError("revoked mid-run"))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+
+
+def test_sync_labels_partial_failure_exits_5_and_holds_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage, LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _sync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L9",))]),
+            )
+        ],
+    )
+    fake.fail("get_message_metadata", GmailPermanentError("boom", status=400))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5  # never silently partial
+    assert "failed a1" in result.stderr
+    assert "dataset analyze" not in result.stdout  # no pointer over a half-sync
+    assert store.read_cursor() == _cursor_at(100)
+
+
+def _cursor_at(history_id: int):
+    from datetime import UTC, datetime
+
+    from gmail_labeler.sync_cursor import SyncCursor
+
+    return SyncCursor(
+        history_id=history_id, last_sync=datetime(2026, 11, 1, tzinfo=UTC)
+    )
+
+
+def test_sync_labels_births_cursorless_corpus_and_reports_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor: GYB-shaped corpus
+    fake = _sync_fake(current_history_id=777)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "no Sync Cursor" in result.stdout  # provenance disclosed
+    assert "applies nothing" in result.stdout.lower()
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 777
+
+
+def test_sync_labels_counts_unseen_and_deleted_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import LabelsAdded, MessageDeleted, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    fake = _sync_fake(
+        messages=[],  # a1 gone upstream; d4 never existed locally
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records(
+                    [LabelsAdded("d4", ("L1",)), MessageDeleted("a1")]
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert " unseen=1 " in result.stdout  # padded: unseen=10 must not pass
+    assert "deleted_kept=1" in result.stdout
+    assert "not in the corpus" in result.stderr  # NOTE goes to stderr
+    assert "cannot establish" in result.stderr  # pin the NOTE's honest body
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
+
+
+def test_sync_labels_missing_corpus_exits_5(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+
+    fake = _sync_fake()
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)  # corpus dir never created
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5
+    assert "missing or not a directory" in result.stderr
+
+
+def test_sync_labels_help_documents_dry_run() -> None:
+    # rendered help truncates at panel width — pin the DECLARED help string
+    import gmail_labeler.cli as cli
+
+    param = inspect.signature(cli.dataset_sync_labels).parameters["dry_run"]
+    assert "plan" in param.default.help
+
+
+def test_sync_labels_local_auth_error_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The likeliest real failure — local credential/store trouble before
+    any API call — keeps the exit-4 mapping (not 5)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.auth import AuthError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+
+    def boom(cfg: object) -> FakeGmailClient:
+        raise AuthError("no credentials")
+
+    monkeypatch.setattr(cli, "_import_gmail_client", boom)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 4
+    assert "auth:" in result.stderr
+    assert "Traceback" not in (result.stdout + result.stderr)
+
+
+def test_sync_labels_unreadable_records_exit_5_no_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """analyze's catch tuple mirrored: an undecodable records index is a
+    typed exit 5, never the contract-breaking exit 1 traceback."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import LabelsAdded, history_records
+    from gmail_labeler.gmail_client import HistoryPage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    (store.root / "records.jsonl").write_bytes(b"\xff\xfe not utf-8 at all")
+    fake = _sync_fake(
+        history_pages=[
+            HistoryPage(
+                history_id=500,
+                next_page_token=None,
+                records=history_records([LabelsAdded("a1", ("L1",))]),
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 5
+    assert "Traceback" not in (result.stdout + result.stderr)

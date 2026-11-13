@@ -87,4 +87,6 @@ strict = [
     "src/gmail_labeler/analyze.py",
     "src/gmail_labeler/attribution.py",
     "src/gmail_labeler/sync_cursor.py",
+    "src/gmail_labeler/label_sync.py",
+    "src/gmail_labeler/retry.py",
 ]

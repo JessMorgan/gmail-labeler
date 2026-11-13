@@ -21,7 +21,9 @@ from .gmail_import import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
-    from .gmail_client import GmailClient
+    from .corpus_store import CorpusStore
+    from .gmail_client import FilterInfo, GmailClient
+    from .gmail_import import GmailImportStats
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -102,7 +104,26 @@ def _load_config(config: str | None):
 
 
 _OPERATION_ERROR_EXIT = 5  # operation failure (transport/corpus) or incomplete
-# run — shared by all dataset commands (import-gmail, import-gyb, analyze)
+# run — shared by all dataset commands (import-gmail, import-gyb,
+# sync-labels, analyze)
+
+# Interim recovery guidance for Label Sync (ticket #73). HONESTY CONTRACT:
+# the flag that would fix an expired cursor (--full-resync) lands in
+# ticket #74 — these strings must not name it as existing, and the CLI
+# test pins that absence. #74 finalizes ADR-0008's wording by swapping
+# these two constants and their pinned test, nothing else.
+_RESYNC_GUIDANCE = (
+    "guidance: the Sync Cursor is outside Gmail's retained history \u2014 "
+    "recovery is never automatic (ADR-0008). A full label-resync command is "
+    "not built yet; until it lands, refresh label state by rebuilding the "
+    "corpus: remove the corpus directory and re-run dataset import-gmail "
+    "(or dataset import-gyb)."
+)
+_RESYNC_GUIDANCE_NOTE = (
+    "A full label-resync command is not built yet; until it lands, reconcile "
+    "older label drift by rebuilding the corpus (dataset import-gmail or "
+    "import-gyb into a fresh corpus directory)."
+)
 
 
 def _import_gmail_client(config: Config) -> GmailClient:
@@ -111,6 +132,54 @@ def _import_gmail_client(config: Config) -> GmailClient:
     from .gmail_client import GmailRestClient
 
     return GmailRestClient(build_credentials(config))
+
+
+def _dataset_auth_bootstrap(
+    cfg: Config, *, failure_prefix: str
+) -> tuple[GmailClient, dict[str, str], list[FilterInfo], GmailImportStats]:
+    """Shared dataset auth gate: build the client and run the settings
+    bootstrap behind the pinned exit-code contract — auth failures print
+    ``auth: …`` and exit 4; a transport failure prints
+    ``{failure_prefix}: …`` and exits 5. The gate runs FIRST: a
+    not-signed-in run must not touch the corpus tree (the dataset commands
+    must not create or re-mode it — a typo'd corpus.dir especially).
+    Raises typer.Exit; on success returns
+    (client, id_to_name, filters, bootstrap-stats)."""
+    from .auth import AuthError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import fetch_settings
+    from .tokens import TokenStoreError
+
+    try:
+        client = _import_gmail_client(cfg)
+        id_to_name, filters, bootstrap = fetch_settings(client)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"{failure_prefix}: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    return client, id_to_name, filters, bootstrap
+
+
+def _dataset_store_modes(store: CorpusStore, *, enforce: bool = True) -> None:
+    """Shared store mode handling for the dataset import and sync
+    commands: tighten the tree, then WARNING-loop over anything still
+    group/world-readable.
+    Pass ``enforce=False`` for read-only runs (``--dry-run``): per
+    corpus_store.enforce_modes' own contract ("Call from WRITE-side
+    commands… not from read-only tools", corpus_store.py ~431), a run
+    that writes nothing must not re-mode anything either. The
+    non-destructive verify_modes WARNING runs either way — it names the
+    structural paths the later write run would tighten (verify_modes is
+    a structural scan; the full-tree tightening is enforce_modes' job)."""
+    if enforce:
+        store.enforce_modes()
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
 
 
 @dataset_app.command("import-gmail")
@@ -127,36 +196,21 @@ def dataset_import_gmail(
     ),
 ) -> None:
     """Import labeled mail from the Gmail API into the corpus."""
-    from .auth import AuthError
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError
     from .gmail_import import (
-        fetch_settings,
         import_gmail,
         write_filters_snapshot,
         write_labels_snapshot,
     )
-    from .tokens import TokenStoreError
 
     cfg = _load_config(config)
-    # Auth gate FIRST: a not-signed-in run must not create or re-mode a
-    # corpus tree (a typo'd corpus.dir especially).
-    try:
-        client = _import_gmail_client(cfg)
-        id_to_name, filters, bootstrap = fetch_settings(client)
-    except (AuthError, TokenStoreError) as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailAuthError as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailError as e:
-        typer.echo(f"import failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    # Auth gate FIRST via the shared bootstrap (_dataset_auth_bootstrap)
+    client, id_to_name, filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="import failed"
+    )
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
@@ -235,9 +289,7 @@ def dataset_import_gyb(
         typer.echo(f"import-gyb: {DB_FILENAME} not found under {root}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         stats = import_gyb(
             root,
@@ -287,6 +339,116 @@ def dataset_import_gyb(
             "the UTC folder date and were corrected to it (times may remain "
             "zone-skewed; a non-UTC backup machine is one possible cause)",
             err=True,
+        )
+    if stats.failed:
+        for message_id, reason in stats.failed[:20]:
+            typer.echo(f"  failed {message_id}: {reason}", err=True)
+        if len(stats.failed) > 20:
+            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+@dataset_app.command("sync-labels")
+def dataset_sync_labels(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show the change plan: identical report, no records or cursor written",
+    ),
+) -> None:
+    """Refresh the corpus's label state from mailbox changes (Label Sync).
+
+    Walks the Gmail history from the corpus's Sync Cursor and appends a
+    label Revision for every touched message — metadata only, bodies never
+    (invariant #5). Event ids the corpus has never held are counted as
+    Unseen Ids and reported, never ingested here; deleted mail keeps its
+    record.
+    """
+    from .corpus_store import CorpusError, CorpusStore
+    from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
+    from .label_sync import sync_labels
+
+    cfg = _load_config(config)
+    # Auth gate FIRST via the shared bootstrap (import-gmail on the same
+    # spine). Deliberate reuse of the landed bootstrap (spec #64 seam 3):
+    # the filters fetch is unused here — a filters-only outage therefore
+    # blocks sync too (loudly, exit 5). Accepted: one cheap shared call
+    # keeps every dataset command on the SAME auth/retry spine; a
+    # labels-only bootstrap is a refactor for the daemon phase.
+    client, id_to_name, _filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="sync-labels failed"
+    )
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        # analyze's gate, same reasoning: a config typo is an operation
+        # failure, NOT an "empty mailbox" — and never a birth target
+        typer.echo(
+            f"sync-labels failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset import-gmail/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    _dataset_store_modes(store, enforce=not dry_run)
+    try:
+        stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
+    except GmailResyncError as e:
+        # the ledger is untouched (advancement is sync's act and this run
+        # never reached it); recovery is never automatic (ADR-0008)
+        typer.echo(f"sync-labels: {e}", err=True)
+        typer.echo(_RESYNC_GUIDANCE, err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    except GmailAuthError as e:  # revoked token mid-run: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError, OSError, UnicodeDecodeError) as e:
+        # analyze's tuple: an undecodable/unreadable records index is exit
+        # 5, never a raw traceback (a `1` would mean an unhandled crash)
+        typer.echo(f"sync-labels failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    stats.retried += bootstrap.retried  # settings blips count too
+    prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
+    typer.echo(
+        f"{prefix} events={stats.events} stale={stats.stale} "
+        f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
+        f"unseen={stats.unseen} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        # ADR-0008 consequence 1: the provenance disclosure — a fresh
+        # cursor over a corpus whose label state may be months old
+        typer.echo(
+            "NOTE: this corpus had no Sync Cursor \u2014 it was birthed from "
+            "the mailbox profile and applies NOTHING (no consumed "
+            "baseline to diff against yet; the corpus's label state may "
+            "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+        )
+    if stats.gains or stats.losses:
+        labels = sorted(set(stats.gains) | set(stats.losses))
+        width = min(max((len(name) for name in labels), default=5) + 1, 64)
+        typer.echo(f"\n{'label':<{width}} {'gains':>6} {'losses':>6}")
+        for name in labels:
+            # NO truncation: slash-nested label paths must stay readable
+            typer.echo(
+                f"{name:<{width}} {stats.gains.get(name, 0):>6} "
+                f"{stats.losses.get(name, 0):>6}"
+            )
+    if stats.unseen:
+        typer.echo(
+            f"NOTE: {stats.unseen} event id(s) are not in the corpus \u2014 "
+            "history events cannot establish that these are new mail or "
+            "that they match the import query; ingest stays the "
+            "acquisition paths' alone (dataset import-gmail/import-gyb), "
+            "never sync's (spec #64)",
+            err=True,
+        )
+    if not stats.failed:
+        # an incomplete run does not recommend analyzing a half-synced
+        # corpus — it exits 5 and says re-run instead
+        typer.echo(
+            "\nNext: run `dataset analyze` for the updated candidate gates "
+            "(ADR-0005 keeps retraining and applying human-gated)"
         )
     if stats.failed:
         for message_id, reason in stats.failed[:20]:

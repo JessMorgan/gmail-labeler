@@ -5,6 +5,10 @@ Layout under a corpus directory:
   bodies/<id[:2]>/<id>.txt   body text sharded by id prefix
   filters.json / labels.json   attribution snapshot sidecars; the store
                 owns their durable I/O surface (read_snapshot/write_snapshot)
+  sync-cursor.json   the Sync Cursor (ADR-0008): versioned JSON ledger,
+                protected state on the same durable discipline (read_cursor/
+                write_cursor), covered by enforce/verify through the
+                protected-file set
 
 Durability and integrity contract:
   - files are created 0600 (and fchmod'd on rewrite, closing the
@@ -12,21 +16,35 @@ Durability and integrity contract:
     Snapshot writes are atomic (tmp+fsync+rename, never a partial read).
     Opening a store NEVER mutates permissions (a read-only command pointed
     at a misconfigured corpus.dir must not clamp someone's $HOME): call
-    enforce_modes() from write-side commands (import-gmail/apply/daemon startup)
+    enforce_modes() from write-side commands (import-gmail/sync-labels/
+    apply/daemon startup)
     to harden the tree; verify_modes() warns (content-free) on read paths;
   - body is written+fsynced BEFORE its record line is appended+fsynced;
     directory fsyncs are best-effort (NFS/FUSE tolerate) — a crash leaves at
     worst an orphaned body (rewritten idempotently), never a record
     pointing at nothing;
   - crash tails: an unparseable final fragment is truncated by the next
-    put(); a COMPLETE line that merely lost its newline is sealed, never
-    dropped; an unterminated tail beyond the scan bound is refused loudly
-    (CorpusError) rather than guessed — whole-file destruction is never an
-    acceptable "repair";
+    put()/append_revision(); a COMPLETE line that merely lost its newline
+    is sealed, never dropped; an unterminated tail beyond the scan bound
+    is refused loudly (CorpusError) rather than guessed — whole-file
+    destruction is never an acceptable "repair";
   - put() verifies the record's body_hash against the body actually stored
     (preprocessing-integrity tripwire);
-  - re-putting an existing id is a no-op (append-only; corrections happen
-    at dataset build, not by mutation).
+  - re-putting an existing id is a no-op: put() stays never-duplicate, so
+    the acquisition commands stay structurally incapable of writing
+    revisions (ADR-0007). Label revisions travel through append_revision()
+    — a full revised line for a resident id, no body rewrite, no marker
+    field (a record's log position is its version); the revision path
+    does no body I/O at all — the store's hash-vs-body check belongs to
+    put()'s write path, and ADR-0007 assigns tamper/corruption detection
+    to the body paths, never to the revision append. Both writers share
+    one index-append sequence (_append_index_line()), so the crash-tail and
+    permission parity between the two paths is structural, not copied
+    discipline;
+  - readers of label state use the resolved view, iter_resolved(): the
+    log folded by id, last occurrence wins. A duplicate-free log folds to
+    itself, so existing corpora need no migration. iter_records() stays
+    the raw log.
 
 Single-process contract (ADR-0002): one writer per corpus directory at a
 time; no cross-process locking. Do not iterate and write concurrently.
@@ -43,6 +61,7 @@ from pathlib import Path
 from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
 from .corpus_record import CorpusRecord
 from .corpus_record import body_hash as _body_hash
+from .sync_cursor import SIDECAR_CURSOR, SyncCursor, parse_cursor, render_cursor
 
 log = logging.getLogger("gmail_labeler.corpus")
 
@@ -59,6 +78,13 @@ _MAX_TAIL_SCAN = 1 << 20
 # Corpus-root attribution snapshots (invariant #6 sidecars): the names come
 # from the pure attribution module — one source of truth for the corpus format.
 _SIDECAR_NAMES = (SIDECAR_FILTERS, SIDECAR_LABELS)
+
+# Protected corpus-root state (ADR-0008): the attribution snapshots PLUS the
+# Sync Cursor. Deliberately split from the attribution-named tuple above —
+# the cursor is sync's ledger, never attribution data, but it rides the same
+# 0700/0600 secret handling, so BOTH enforce_modes and verify_modes walk
+# this set (mode coverage is not automatic from _SIDECAR_NAMES).
+_PROTECTED_FILE_NAMES = (*_SIDECAR_NAMES, SIDECAR_CURSOR)
 
 
 class CorpusStore:
@@ -109,6 +135,25 @@ class CorpusStore:
                     f"{self._records_path}:{lineno}: corrupt record: {e}"
                 ) from e
 
+    def iter_resolved(self) -> Iterator[CorpusRecord]:
+        """The resolved view (ADR-0007): the record log folded by id, last
+        occurrence wins. A duplicate-free log folds to itself — zero
+        migration. Sequence contract: ids in first-appearance order, each
+        carrying its LAST line (log position is the version; the winner is
+        the last-seen record, never the first).
+
+        Strictness is inherited from iter_records: a corrupt middle line
+        raises CorpusError with :lineno:, a torn crash tail is skipped.
+        Memory profile: the whole id->record map is materialized before
+        the first yield — heavier than _ids()' id-only set (full records
+        are retained), and in line with what the bulk consumers already
+        pay: dataset analyze materializes its record list today.
+        """
+        resolved: dict[str, CorpusRecord] = {}
+        for rec in self.iter_records():
+            resolved[rec.id] = rec
+        yield from resolved.values()
+
     def has(self, message_id: str) -> bool:
         return message_id in self._ids()
 
@@ -138,8 +183,61 @@ class CorpusStore:
                 f"corpus: body write failed ({type(e).__name__})"
             ) from None
         _fsync_dir(body_path.parent, body_path)  # ...then its dirent
+        self._append_index_line(record)  # ...then the index line
+        self._ids().add(record.id)
+        return True
+
+    def append_revision(self, record: CorpusRecord) -> bool:
+        """Append a full revised record for an id already in the log
+        (ADR-0007: log position is the version; readers see the resolved
+        view). Deliberately separate from put() — the acquisition paths
+        stay structurally incapable of writing revisions.
+
+        The id MUST already have a record: appending a line whose body was
+        never stored would violate the durability contract (never a record
+        pointing at nothing). Callers gate on has() first — a non-resident
+        id is routine (mailbox events name mail outside the corpus), so
+        this raise marks a caller bug, not a corpus fault.
+        No body is written or re-read: Gmail content immutability means a
+        revision differs only in labels, and the store's hash-vs-body
+        check stays with put()'s write path (ADR-0007 assigns detection to
+        the body paths, never to the revision append). Replays append
+        harmlessly — the last-wins fold absorbs them, which is what makes
+        crash-retry of a Label Sync safe. Field parity with the resident
+        record (body_hash, date, source, envelope unchanged — the glossary
+        Revision) is the caller's contract: revisions are built with
+        dataclasses.replace(); store-side enforcement is deferred to the
+        sync ticket. Crash-tail repair and the flush/fsync + 0600 append
+        ordering are the shared _append_index_line() sequence — one copy
+        with put(), so the AC4 parity is structural, not copied discipline.
+        True on success.
+        """
+        if record.id not in self._ids():
+            raise CorpusError(
+                f"corpus: cannot revise absent id {record.id}: a Revision "
+                "supersedes a resident record, it does not create one"
+            )
+        self._append_index_line(record)
+        self._ids().add(record.id)
+        return True
+
+    def _append_index_line(self, record: CorpusRecord) -> None:
+        """The one index-append sequence, shared by put() and append_revision().
+
+        Crash-tail repair, then the record line appended to the index —
+        created 0600 at the fd (fchmod'd if pre-existing) — flushed and
+        fsynced; the root's dirent is fsynced only when the index file was
+        absent: live on put()'s first write; dead thereafter —
+        append_revision()'s residency precondition implies the index
+        exists, and for put() the file is present from its second write on
+        because the single-writer contract (module docstring, citing
+        ADR-0002) admits no deleter. Cache maintenance (_ids().add) stays
+        with the callers deliberately: put() returns False without ever
+        reaching this helper. One copy for both paths: the AC4
+        crash/permission parity the duplicated sequence used to police by
+        comment now holds structurally.
+        """
         self._repair_tail()
-        # ...then the index line, created 0600 (fchmod'd if pre-existing).
         existed = self._records_path.exists()
         fd = self._open_append_checked()
         with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as fh:
@@ -148,8 +246,6 @@ class CorpusStore:
             os.fsync(fh.fileno())
         if not existed:
             _fsync_dir(self.root, self._records_path)
-        self._ids().add(record.id)
-        return True
 
     def _ensure_written_dirs(self, shard: Path) -> None:
         """Create the chain root -> bodies/ -> shard (parents allowed — a
@@ -186,7 +282,7 @@ class CorpusStore:
             ) from e
 
     def _repair_tail(self) -> None:
-        """Make the file append-ready (put only) without re-reading it.
+        """Make the file append-ready (put/append_revision) without re-reading it.
 
         A tail after the last newline is either a COMPLETE record line that
         lost its terminator (sealed, kept — it parses) or torn bytes that can
@@ -264,6 +360,30 @@ class CorpusStore:
         path = self._snapshot_path(name)
         return path.read_text(encoding="utf-8") if path.is_file() else None
 
+    def read_cursor(self) -> SyncCursor | None:
+        """The Sync Cursor (ADR-0008), or None when absent. An existing
+        cursor that does not parse OR validate raises CorpusError — never
+        None: None is the birth gate, and reading invalid state as absent
+        would be the silent re-birth this ledger exists to prevent. The read
+        itself is guarded too: undecodable bytes or an unreadable file are
+        typed CorpusError (the CLI's exit-5 surface), never a raw traceback."""
+        try:
+            text = self.read_snapshot(SIDECAR_CURSOR)
+            if text is None:
+                return None
+            return parse_cursor(text)
+        except (ValueError, OSError) as e:
+            # UnicodeDecodeError is a ValueError subclass; OSError covers
+            # EACCES/ENOENT at the read (write_snapshot's same wrap)
+            raise CorpusError(f"corpus sync cursor invalid or unreadable: {e}") from e
+
+    def write_cursor(self, cursor: SyncCursor) -> None:
+        """Write the Sync Cursor on the snapshot discipline: 0600-at-fd,
+        fsynced, atomic replace (the durable surface is write_snapshot's,
+        verbatim). Birth callers must gate on read_cursor() is None first —
+        this method itself is a plain write, ownership lives in the caller."""
+        self.write_snapshot(SIDECAR_CURSOR, render_cursor(cursor))
+
     def write_snapshot(self, name: str, payload: str) -> None:
         """Created 0600 at the fd (never 0644-then-chmod), fsynced, atomically
         replaced; any OS failure is a CorpusError (CLI's typed exit-5 surface)."""
@@ -306,16 +426,17 @@ class CorpusStore:
 
     def enforce_modes(self) -> None:
         """Harden the corpus tree: dirs 0700, every file 0600 (one bounded
-        walk of ~256 shard dirs, plus the root-level snapshot sidecars and
-        their stray ``*.tmp`` remnants). Call from WRITE-side commands at
-        startup (import-gmail/apply/daemon) — not from read-only tools."""
+        walk of ~256 shard dirs, plus the protected root-level files — the
+        attribution snapshots and the Sync Cursor — and their stray ``*.tmp``
+        remnants). Call from WRITE-side commands at startup
+        (import-gmail/sync-labels/apply/daemon) — not from read-only tools."""
         if not self.root.is_dir():
             return
         _chmod_if(self.root, _DIR_MODE)
         records = self._records_path
         if records.is_file():
             _chmod_if(records, _FILE_MODE)
-        for name in _SIDECAR_NAMES:
+        for name in _PROTECTED_FILE_NAMES:
             sidecar = self.root / name
             if sidecar.is_file():
                 _chmod_if(sidecar, _FILE_MODE)
@@ -334,12 +455,12 @@ class CorpusStore:
 
     def verify_modes(self) -> list[str]:
         """Non-destructive check for group/world-readable STRUCTURAL paths
-        (root, bodies/, records index, snapshot sidecars) — not a full-tree
-        scan; call enforce_modes() from write-side commands for the whole
-        tree."""
+        (root, bodies/, records index, protected root-level files: the
+        attribution snapshots and the Sync Cursor) — not a full-tree scan;
+        call enforce_modes() from write-side commands for the whole tree."""
         offenders: list[str] = []
         paths = [self.root, self._bodies_dir, self._records_path]
-        paths += [self.root / name for name in _SIDECAR_NAMES]
+        paths += [self.root / name for name in _PROTECTED_FILE_NAMES]
         for p in paths:
             try:
                 if p.exists() and p.stat().st_mode & 0o077:

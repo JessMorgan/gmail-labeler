@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from gmail_labeler.analyze import analyze_corpus
 from gmail_labeler.corpus_record import (
     CorpusRecord,
     body_hash,
@@ -12,6 +14,7 @@ from gmail_labeler.corpus_record import (
     with_body,
 )
 from gmail_labeler.corpus_store import CorpusError, CorpusStore
+from gmail_labeler.sync_cursor import SyncCursor
 
 NOW = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 DUMMY_HASH = body_hash("placeholder")
@@ -434,3 +437,422 @@ def test_snapshot_names_are_bare_filenames(tmp_path: Path) -> None:
             store.write_snapshot(bad, "x")
     assert secret.read_text(encoding="utf-8") == "outside"  # untouched
     assert not (tmp_path / "corpus").exists()  # refused before mkdir
+
+
+# ---- revision log: resolved view + append_revision (ADR-0007, ticket #70) --
+
+
+def test_resolved_view_is_identity_on_duplicate_free_log(tmp_path: Path) -> None:
+    # Zero-migration promise (ADR-0007): a log written only through put()
+    # folds to itself — old corpora read identically through the new seam.
+    store = CorpusStore(tmp_path / "corpus")
+    for i in ("aaaa", "bbbb", "cccc"):
+        store.put(with_body(rec(i), f"body {i}"), f"body {i}")
+    assert list(store.iter_resolved()) == list(store.iter_records())
+
+
+def test_resolved_view_folds_last_occurrence_wins(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r1 = with_body(rec("aaaa"), "a")
+    store.put(r1, "a")
+    r2 = replace(r1, labels=("Shipping", "Bills"))
+    assert store.append_revision(r2) is True
+    assert list(store.iter_resolved()) == [r2]  # the newer label set wins
+    assert len(list(store.iter_records())) == 2  # the raw log keeps both
+
+
+def test_resolved_view_order_is_first_appearance(tmp_path: Path) -> None:
+    # Log position is the version, but the fold's sequence contract is
+    # first-appearance order carrying each id's LAST line (pinned so a
+    # refactor cannot silently flip it).
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    b = with_body(rec("bbbb"), "b")
+    store.put(a, "a")
+    store.put(b, "b")
+    store.append_revision(replace(a, labels=("Z",)))
+    assert [r.id for r in store.iter_resolved()] == ["aaaa", "bbbb"]
+
+
+def test_resolved_view_keeps_the_strict_reader(tmp_path: Path) -> None:
+    # The fold inherits iter_records' posture: corrupt middle line raises
+    # with :lineno:, never a silent guess.
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(with_body(rec("aaaa"), "a"), "a")
+    store.put(with_body(rec("bbbb"), "b"), "b")
+    p = tmp_path / "corpus" / "records.jsonl"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    lines[0] = "{not json}"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with pytest.raises(CorpusError, match=":1: corrupt record"):
+        list(CorpusStore(tmp_path / "corpus").iter_resolved())
+
+
+def test_resolved_view_skips_torn_tail(tmp_path: Path) -> None:
+    # A crash tail is skipped by the resolved view exactly as iter_records
+    # skips it — the fold never resurrects or refuses it differently.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    with (tmp_path / "corpus" / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"id": "partial", "date": ')  # torn, no newline
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert list(reopened.iter_resolved()) == [a]
+
+
+def test_resolved_view_survives_reload(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    rev = replace(r, labels=("New",))
+    store.append_revision(rev)
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert list(reopened.iter_resolved()) == [rev]
+
+
+def test_append_revision_refuses_absent_id(tmp_path: Path) -> None:
+    # A revision for an id with no resident record would append a line
+    # pointing at a body that does not exist — the durability contract
+    # forbids it, and sync only ever revises corpus-resident ids.
+    store = CorpusStore(tmp_path / "corpus")
+    store.put(with_body(rec("aaaa"), "a"), "a")
+    with pytest.raises(CorpusError, match="cannot revise absent id"):
+        store.append_revision(with_body(rec("ffff"), "ghost"))
+    assert len(list(store.iter_records())) == 1  # nothing was appended
+
+
+def test_append_revision_writes_present_id_without_touching_body(
+    tmp_path: Path,
+) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "original body")
+    store.put(r, "original body")
+    body = tmp_path / "corpus" / "bodies" / "aa" / "aaaa.txt"
+    before = body.read_bytes()
+    rev = replace(r, labels=("New",))
+    assert store.append_revision(rev) is True
+    assert body.read_bytes() == before  # the store neither rewrote nor read it
+    assert store.get_body("aaaa") == "original body"
+    assert list(store.iter_resolved()) == [rev]
+
+
+def test_append_revision_never_reads_the_body(tmp_path: Path) -> None:
+    # ADR-0007: the revision path does no body I/O — sync never has the
+    # body at hand, and the hash-vs-body tripwire stays on the body-READ
+    # path. Proven structurally: with the body file removed from disk the
+    # revision still appends (any read or hash-vs-body check would fail
+    # or diverge). Deliberately does NOT pin the absence of a future
+    # in-memory field-parity check (round-1 review finding).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    body = tmp_path / "corpus" / "bodies" / "aa" / "aaaa.txt"
+    body.unlink()
+    assert store.append_revision(replace(r, labels=("New",))) is True
+    assert not body.exists()  # no read, no resurrection
+
+
+def test_append_revision_line_is_newline_terminated(tmp_path: Path) -> None:
+    # The terminator is part of the durability contract: without it the
+    # next append glues two records into one unparseable line (mutant-
+    # verified: dropping the newline terminator here was invisible to
+    # every other test).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    store.append_revision(replace(r, labels=("New",)))
+    raw = (tmp_path / "corpus" / "records.jsonl").read_text(encoding="utf-8")
+    assert raw.endswith("\n")
+    assert len(raw.splitlines()) == 2
+
+
+def test_append_revision_replay_is_harmless(tmp_path: Path) -> None:
+    # Crash-retry of a Label Sync re-appends the identical line; the
+    # last-wins fold absorbs replays (ADR-0007).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    rev = replace(r, labels=("New",))
+    assert store.append_revision(rev) is True
+    assert store.append_revision(rev) is True
+    assert len(list(store.iter_records())) == 3  # the log is honest
+    assert list(store.iter_resolved()) == [rev]  # the view is stable
+
+
+def test_append_revision_repairs_torn_tail_like_put(tmp_path: Path) -> None:
+    # AC4: the crash-tail contract is put's, verbatim — an unparseable
+    # fragment is truncated, then the revision appends cleanly.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    with (tmp_path / "corpus" / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"id": "partial", "date": ')
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.append_revision(replace(a, labels=("New",))) is True
+    assert len(list(reopened.iter_records())) == 2  # torn line gone, both real
+
+
+def test_append_revision_seals_parseable_tail(tmp_path: Path) -> None:
+    # A COMPLETE line that merely lost its newline is sealed and kept,
+    # mirroring test_parseable_unterminated_tail_is_sealed_not_dropped.
+    store = CorpusStore(tmp_path / "corpus")
+    a = with_body(rec("aaaa"), "a")
+    store.put(a, "a")
+    rp = tmp_path / "corpus" / "records.jsonl"
+    rp.write_text(rp.read_text(encoding="utf-8").removesuffix("\n"), encoding="utf-8")
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.append_revision(replace(a, labels=("New",))) is True
+    assert len(list(reopened.iter_records())) == 2
+
+
+def test_append_revision_tightens_loose_records_file(tmp_path: Path) -> None:
+    # AC4: permission behavior identical — 0600 at the fd plus fchmod
+    # tightening of a pre-existing loose file (put's _open_append_checked).
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("deadbeef"), "x")
+    store.put(r, "x")
+    records = tmp_path / "corpus" / "records.jsonl"
+    records.chmod(0o644)
+    store.append_revision(replace(r, labels=("New",)))
+    assert records.stat().st_mode & 0o077 == 0
+
+
+def test_put_still_refuses_present_ids_after_revisions(tmp_path: Path) -> None:
+    # AC2: put()'s never-duplicate contract survives the revision log —
+    # the acquisition commands stay structurally incapable of revising.
+    store = CorpusStore(tmp_path / "corpus")
+    r = with_body(rec("aaaa"), "a")
+    store.put(r, "a")
+    store.append_revision(replace(r, labels=("New",)))
+    assert store.put(with_body(rec("aaaa"), "other"), "other") is False
+    assert store.get_body("aaaa") == "a"  # body untouched by the refusal
+    assert len(list(store.iter_records())) == 2  # only the revision line
+
+
+# ---- AC3 demo: analyze reads the resolved view through the store seam ----
+
+
+def test_analyze_demo_resolved_view_reads_latest_labels(tmp_path: Path) -> None:
+    # Ticket #70 AC3: same id, two label sets — analyze's input (the
+    # store's resolved view) carries the newest label set only. The
+    # contrast assertions show exactly what the fold removes: pre-fold,
+    # revisions count as extra mail and double-count every body.
+    store = CorpusStore(tmp_path / "corpus")
+    originals = []
+    for i in (1, 2, 3):
+        r = with_body(rec(f"aa0{i}", labels=("Old",)), f"body {i}")
+        store.put(r, f"body {i}")
+        originals.append(r)
+    for r in originals:
+        assert store.append_revision(replace(r, labels=("New",))) is True
+
+    summary, metrics = analyze_corpus(
+        list(store.iter_resolved()), filters=None, id_to_name={}, now=NOW
+    )
+    assert summary.messages == 3  # not 6: revisions are not new mail
+    assert {m.label for m in metrics} == {"New"}  # the newer label set wins
+    new = next(m for m in metrics if m.label == "New")
+    assert (new.total, new.recent, new.dup_rate) == (3, 3, 0.0)
+
+    # The regression the fold exists for, demonstrated at the same seam:
+    summary_raw, metrics_raw = analyze_corpus(
+        list(store.iter_records()), filters=None, id_to_name={}, now=NOW
+    )
+    assert summary_raw.messages == 6
+    by_label = {m.label: m for m in metrics_raw}
+    assert by_label["Old"].total == 3 and by_label["New"].total == 3
+    assert by_label["New"].dup_rate == 1.0  # every body double-counted
+
+
+def test_analyze_attribution_ratio_not_deflated_by_revisions(tmp_path: Path) -> None:
+    # The invariant-#6-unsafe trap: attributed is a SET of ids while
+    # total counts LINES — pre-fold, revisions DEFLATE attribution_ratio
+    # and a fully filter-covered label slips the strict-greater
+    # filter-covered gate. The resolved view eliminates the asymmetry:
+    # the ratio stays 1.0 and the gate fires. (Ratio asserted, not just
+    # counts — manager note 10.5.)
+    store = CorpusStore(tmp_path / "corpus")
+    for i in ("bb01", "bb02"):
+        store.put(
+            with_body(rec(i, labels=("Shipping",), sender="shop@x.z"), f"body {i}"),
+            f"body {i}",
+        )
+    for r in list(store.iter_records()):
+        store.append_revision(replace(r, labels=("Shipping", "Bills")))
+    filters = [{"action": {"addLabelIds": ["L1"]}, "criteria": {"from": "shop@x.z"}}]
+
+    _, metrics = analyze_corpus(
+        list(store.iter_resolved()),
+        filters=filters,
+        id_to_name={"L1": "Shipping"},
+        now=NOW,
+    )
+    ship = next(m for m in metrics if m.label == "Shipping")
+    assert (ship.total, ship.filter_attributed) == (2, 2)
+    assert ship.attribution_ratio == 1.0
+    assert "filter-covered" in ship.reasons  # the gate fires, as it must
+
+    _, metrics_raw = analyze_corpus(
+        list(store.iter_records()),
+        filters=filters,
+        id_to_name={"L1": "Shipping"},
+        now=NOW,
+    )
+    ship_raw = next(m for m in metrics_raw if m.label == "Shipping")
+    assert (ship_raw.total, ship_raw.filter_attributed) == (4, 2)
+    assert ship_raw.attribution_ratio == 0.5  # deflated...
+    assert "filter-covered" not in ship_raw.reasons  # ...past the strict gate
+
+
+# ---- Sync Cursor sidecar I/O (ADR-0008, ticket #72) -------------------------
+
+
+def _cursor() -> SyncCursor:
+    return SyncCursor(
+        history_id=4242, last_sync=datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    )
+
+
+def test_write_cursor_creates_root_0700_and_file_0600(tmp_path: Path) -> None:
+    # secret material from the FIRST byte: the cursor rides the snapshot
+    # discipline exactly — root 0700, file 0600-at-fd (AC #1)
+    store = CorpusStore(tmp_path / "deep" / "corpus")
+    store.write_cursor(_cursor())
+    assert (tmp_path / "deep" / "corpus").stat().st_mode & 0o777 == 0o700
+    cursor_path = tmp_path / "deep" / "corpus" / "sync-cursor.json"
+    assert cursor_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_cursor_fsyncs_file_and_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the rename-durability dir fsync must stay pinned at the cursor seam too
+    import os as _os
+
+    synced: list[str] = []
+    real_fsync = _os.fsync
+
+    def spy(fno: int) -> None:
+        synced.append("fsync")
+        real_fsync(fno)
+
+    monkeypatch.setattr(_os, "fsync", spy)
+    CorpusStore(tmp_path / "c").write_cursor(_cursor())
+    assert synced.count("fsync") >= 2  # file + directory (snapshot parity)
+
+
+def test_read_cursor_absent_returns_none(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    assert store.read_cursor() is None
+
+
+def test_read_cursor_roundtrips_the_written_cursor(tmp_path: Path) -> None:
+    store = CorpusStore(tmp_path / "corpus")
+    store.write_cursor(_cursor())
+    reopened = CorpusStore(tmp_path / "corpus")
+    assert reopened.read_cursor() == _cursor()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json at all",
+        '{"history_id": 1, "last_sync": "2026-11-04T12:00:00+00:00", "version": 99}',
+        '{"version": 1, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": null, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": -5, "last_sync": "2026-11-04T12:00:00+00:00"}',
+        '{"version": 1, "history_id": "42", "last_sync": "2026-11-04T12:00:00+00:00"}',
+    ],
+)
+def test_read_cursor_invalid_state_fails_loud_never_reads_as_absent(
+    tmp_path: Path, payload: str
+) -> None:
+    # the ADR's never-silent-re-birth rule at the store seam: an existing
+    # cursor that does not parse OR validate raises CorpusError — it must
+    # NEVER return None (None means absent, and absent is the birth gate)
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sync-cursor.json").write_text(payload, encoding="utf-8")
+    store = CorpusStore(corpus)
+    with pytest.raises(CorpusError, match="sync cursor"):
+        store.read_cursor()
+
+
+def test_read_cursor_undecodable_bytes_is_typed_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    # deepseek segment-1 major: the READ sits inside the guard too — a
+    # non-UTF-8 cursor is CorpusError (CLI exit 5), never a raw
+    # UnicodeDecodeError escaping to exit 1
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sync-cursor.json").write_bytes(b'{"version": 1\xff\xfe\x00garbage')
+    store = CorpusStore(corpus)
+    with pytest.raises(CorpusError, match="sync cursor"):
+        store.read_cursor()
+
+
+def test_read_cursor_unreadable_file_is_typed_not_a_traceback(
+    tmp_path: Path,
+) -> None:
+    import os as _os
+
+    if hasattr(_os, "geteuid") and _os.geteuid() == 0:
+        pytest.skip("running as root: mode-000 does not deny the read")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    cursor = corpus / "sync-cursor.json"
+    cursor.write_text('{"version": 1}', encoding="utf-8")
+    cursor.chmod(0o000)
+    try:
+        with pytest.raises(CorpusError, match="sync cursor") as excinfo:
+            CorpusStore(corpus).read_cursor()
+        # pin the WRAP, not just the type: the cause must be the permission
+        # error, never a validation ValueError riding the same except arm
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+    finally:
+        cursor.chmod(0o600)
+
+
+def test_enforce_modes_hardens_the_cursor_and_its_tmp(tmp_path: Path) -> None:
+    # the cursor FILE is what the protected-file-set split brings into the
+    # hardening walk (the .tmp remnant rides the pre-existing *.tmp glob);
+    # both must land at 0600
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    cursor = corpus / "sync-cursor.json"
+    remnant = corpus / "sync-cursor.json.tmp"
+    for p in (cursor, remnant):
+        p.write_text("{}", encoding="utf-8")
+        p.chmod(0o644)
+    store.enforce_modes()
+    for p in (cursor, remnant):
+        assert p.stat().st_mode & 0o077 == 0
+
+
+def test_verify_modes_lists_loose_cursor_offender(tmp_path: Path) -> None:
+    # read paths warn symmetrically: a group/world-readable cursor is an
+    # offender (the ticket's explicit pin — mode coverage is NOT automatic
+    # from _SIDECAR_NAMES, it comes from the protected-file set)
+    corpus = tmp_path / "corpus"
+    store = CorpusStore(corpus)
+    store.put(with_body(rec("deadbeef"), "x"), "x")
+    cursor = corpus / "sync-cursor.json"
+    cursor.write_text("{}", encoding="utf-8")
+    cursor.chmod(0o600)
+    assert store.verify_modes() == []  # 0600 cursor: clean
+    cursor.chmod(0o644)
+    assert str(cursor) in store.verify_modes()
+
+
+def test_cursor_is_protected_state_not_an_attribution_sidecar() -> None:
+    # the split is the contract (ADR-0008 / wire fact #6): the cursor joins
+    # the protected-file set, NOT the attribution-named tuple — conflating
+    # them would mislabel sync's ledger as attribution data
+    from gmail_labeler import corpus_store as cs
+    from gmail_labeler.sync_cursor import SIDECAR_CURSOR
+
+    assert SIDECAR_CURSOR not in cs._SIDECAR_NAMES
+    assert SIDECAR_CURSOR in cs._PROTECTED_FILE_NAMES
+    assert set(cs._SIDECAR_NAMES) < set(cs._PROTECTED_FILE_NAMES)

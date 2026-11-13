@@ -25,22 +25,39 @@ what is wired vs. planned, and each gains detail as its phase lands.
 - ADR-0006 acquisition commands speak from the Corpus's perspective —
   `import-gmail`/`import-gyb`; `export` is reserved for a future corpus-dump
   command, never re-proposed for corpus population.
+- ADR-0007 the Corpus is a revision log — label revisions append with the
+  same id; readers resolve last-occurrence-wins; no marker field, no
+  compaction requirement, no body fetching on the sync path. The fold,
+  `append_revision`, and the body-free event walk are wired (tickets
+  #70/#73); `--full-resync` arrives with #74.
+- ADR-0008 the Sync Cursor is sync's ledger — `import-gmail` may birth it
+  when absent (never advance); `import-gyb` never births; only the Label
+  Sync operation advances it, after durable revisions — `dataset
+  sync-labels` (the event walk, ticket #73) is wired; the daemon advances
+  it when ADR-0003 lands. Expired cursors fail loudly; the
+  `--full-resync` remedy lands in ticket #74, so today's guidance string
+  points at rebuilding the corpus instead of naming the unbuilt flag.
+  Sidecar storage + Gmail Import birth wired (ticket #72).
 
 ## Layout
 
 - `src/gmail_labeler/` — landed: `config`, `labels`, `corpus_record`,
-  `corpus_store`, `mime_extract`, `analyze`, `attribution`, `auth`, `tokens`,
-  `gmail_client`, `gmail_errors`, `fake_gmail`, `gmail_import`, `gyb_import`,
-  `cli`. Planned (later phases): model core (`dataset` build,
-  `thresholds`, `graduation`, `eval`) + `model` and `daemon` adapters.
+  `corpus_store`, `mime_extract`, `analyze`, `attribution`, `sync_cursor`,
+  `auth`, `tokens`, `gmail_client`, `gmail_errors`, `fake_gmail`,
+  `gmail_import`, `gyb_import`, `retry`, `label_sync`, `cli`. Planned (later phases): model core
+  (`dataset` build, `thresholds`, `graduation`, `eval`) + `model` and
+  `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
 - `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.
 - CLI surface: `auth` (status) + `auth login` and
-  `dataset {import-gmail,import-gyb,analyze}` are wired (the acquisition pair
-  is pinned by ADR-0006; the old `export` name is a usage error, no alias);
-  `train`, `eval`, `shadow {run,report}`, `apply`, `daemon`, `status` are
-  frozen by the design conversation, not yet wired — change names with cause.
+  `dataset {import-gmail,import-gyb,sync-labels,analyze}` are wired (the
+  acquisition pair is pinned by ADR-0006; the old `export` name is a usage
+  error, no alias; `sync-labels` is the spec #64 event walk — its
+  `--full-resync` arrives with ticket #74, `--also-*` composites with #75);
+  `train`, `eval`,
+  `shadow {run,report}`, `apply`, `daemon`, `status` are frozen by the
+  design conversation, not yet wired — change names with cause.
 
 ## Commands
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -144,7 +144,11 @@ class GmailClient(Protocol):
     def list_filters(self) -> list[FilterInfo]: ...
 
     def list_messages(
-        self, query: str, page_token: str | None = None
+        self,
+        query: str,
+        page_token: str | None = None,
+        *,
+        label_ids: Sequence[str] | None = None,
     ) -> MessagePage: ...
 
     def get_message(self, message_id: str) -> RawMessage: ...
@@ -282,12 +286,36 @@ class GmailRestClient:
             for item in _obj_list(data, "filter")
         ]
 
-    def list_messages(self, query: str, page_token: str | None = None) -> MessagePage:
+    def list_messages(
+        self,
+        query: str,
+        page_token: str | None = None,
+        *,
+        label_ids: Sequence[str] | None = None,
+    ) -> MessagePage:
+        # labelIds (repeated query param, discovery doc): AND-filter to
+        # messages carrying ALL listed label IDS — the full-resync
+        # inventory scan's protocol extension (#74). An empty/None query
+        # rides as ABSENT q (googleapiclient drops None params), never as
+        # an empty q= the wire might read as a search. An EMPTY label_ids
+        # list is a caller bug, refused loud (doctrine): silently dropping
+        # the param would turn an inventory scan into a whole-mailbox sweep.
+        if label_ids is not None and not label_ids:
+            raise ValueError(
+                "label_ids=[] would enumerate the whole mailbox — "
+                "pass None for no label filter"
+            )
         req = (
             self._svc()
             .users()
             .messages()
-            .list(userId="me", q=query, maxResults=500, pageToken=page_token)
+            .list(
+                userId="me",
+                q=query or None,
+                maxResults=500,
+                pageToken=page_token,
+                labelIds=label_ids or None,
+            )
         )
         data = self._call(req)
         stubs = tuple(

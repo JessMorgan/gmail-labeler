@@ -1161,8 +1161,10 @@ def test_sync_labels_dry_run_does_not_tighten_modes_and_real_run_does(
 def test_sync_labels_expired_cursor_prints_guidance_and_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC #5/#6: non-zero exit + interim guidance that names no vaporware
-    flag (--full-resync lands in ticket #74 and will swap this string)."""
+    """AC #5/#6: non-zero exit + ADR-0008's FINAL guidance naming the exact
+    recovery command. The #73 vaporware-absence pin ("--full-resync" must
+    NOT appear while the flag was unbuilt) flips to a presence pin now that
+    ticket #74 made the flag real."""
     import gmail_labeler.cli as cli
 
     store = _sync_seed_corpus(tmp_path)
@@ -1173,7 +1175,8 @@ def test_sync_labels_expired_cursor_prints_guidance_and_exits_5(
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 5
     assert "retained history" in result.stderr
-    assert "--full-resync" not in (result.stdout + result.stderr)
+    assert "dataset sync-labels --full-resync" in (result.stdout + result.stderr)
+    assert "not built yet" not in (result.stdout + result.stderr)
     assert "Traceback" not in (result.stdout + result.stderr)
     assert store.read_cursor() is not None  # ledger untouched
 
@@ -1394,3 +1397,443 @@ def test_sync_labels_unreadable_records_exit_5_no_traceback(
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 5
     assert "Traceback" not in (result.stdout + result.stderr)
+
+
+# ---- dataset sync-labels --full-resync (ticket #74) -------------------------
+
+
+def _resync_fake(
+    *,
+    messages: list[FakeMessage] | None = None,
+    labels: list[tuple[str, str, int]] | None = None,
+    current_history_id: int = 500,
+) -> FakeGmailClient:
+    from gmail_labeler.fake_gmail import FakeGmailClient
+    from gmail_labeler.gmail_client import LabelInfo
+
+    return FakeGmailClient(
+        labels=[
+            LabelInfo(id, name, "user", messages_total=total)
+            for id, name, total in (
+                labels
+                if labels is not None
+                else [("L1", "Shipping", 4), ("L2", "Money/Bills", 2)]
+            )
+        ],
+        filters=[],
+        messages=messages,
+        current_history_id=current_history_id,
+    )
+
+
+def test_sync_labels_full_resync_scan_prints_estimate_choice_and_revises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #1/#6 at the CLI seam: the estimate + strategy lines print (with
+    numbers), the flag-rate rides the report, the revision lands, and the
+    cursor reseeds to the up-front profile value."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # a1 with ("Shipping",)
+    _write_sync_cursor(store)
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    out = result.stdout
+    assert "full-resync estimate:" in out and "walk ≈ 20 units" in out
+    assert "full-resync strategy: scan" in out  # 10-unit floor < 20-unit walk
+    assert "flag-rate 100%" in out  # the flood guard's number is printed
+    assert "revised=1" in out
+    assert "sync-labels --full-resync:" in out  # the report names its mode
+    assert "dataset analyze" in out  # the closing pointer
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ()
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # the seed
+    # the CLI bootstrap (fetch_settings) precedes the core; WITHIN the core
+    # the seed rides first — get_profile before any list/metadata spend
+    spend = [
+        i
+        for i, c in enumerate(fake.calls)
+        if c.startswith(("list_messages", "get_message_metadata"))
+    ]
+    assert fake.calls.index("get_profile") < min(spend)
+
+
+def test_sync_labels_full_resync_walk_chosen_for_small_corpus_big_mailbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _resync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1",))],
+        labels=[("L1", "Shipping", 50_000), ("L2", "Money/Bills", 30_000)],
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "full-resync strategy: walk" in result.stdout
+    assert "scan enumeration floor ≈ 800 units" in result.stdout
+    # the walk fetches every id BY CONSTRUCTION — quoting a 100%
+    # flag-rate there would read as drift that never happened
+    assert "(flag-rate" not in result.stdout
+    assert "corpus-wide drift" not in result.stdout
+
+
+def test_sync_labels_full_resync_dry_run_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #4 (dry-run half): estimate + choice + plan print; zero writes;
+    cursor byte-identical."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    cursor_bytes = (store.root / "sync-cursor.json").read_bytes()
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--full-resync",
+            "--dry-run",
+            "--config",
+            str(cfg),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "full-resync estimate:" in result.stdout
+    assert "(dry-run)" in result.stdout and "revised=1" in result.stdout
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
+    assert (store.root / "sync-cursor.json").read_bytes() == cursor_bytes
+
+
+def test_sync_labels_full_resync_gyb_corpus_births_cursor_and_exits_0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #7 at the CLI seam: a cursorless (GYB-shaped) corpus reconciles
+    end-to-end and births the ledger with the up-front seed."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor written
+    fake = _resync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=())],
+        current_history_id=777,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no Sync Cursor" in result.stdout  # provenance disclosed
+    assert "birthed it from the profile seed" in result.stdout  # NOT "WOULD"
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 777
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ()
+
+
+def test_sync_labels_full_resync_reconciles_a_real_gyb_import_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec #64 AC, honest half: a GYB-BUILT corpus (real `dataset
+    import-gyb` over a backup dir, not a fabricated store.put(source=
+    "gyb")) reconciles end-to-end against the fake — drifted labels
+    revise, the cursorless ledger births from the profile seed, and the
+    report reads sane. Field parity rides the real source stamp."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    gyb = _gyb_fixture(tmp_path)  # one message: id "abcd", GYB label "Work"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[gmail]\ntoken_backend = "file"\n'
+        f'token_file = "{tmp_path / "tok.json"}"\n'
+        f'[corpus]\ndir = "{tmp_path / "corpus"}"\n'
+        f'[gyb]\npath = "{gyb}"\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["dataset", "import-gyb", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "written=1" in result.stdout
+
+    # the mailbox drifted: abcd now carries ONLY L1 (Shipping) — the GYB
+    # "Work" label is gone. Default _resync_fake totals (4+2) price the
+    # scan at a 10-unit floor vs the 20-unit walk -> the scan runs.
+    fake = _resync_fake(
+        messages=[FakeMessage(id="abcd", eml=b"x", label_ids=("L1",))],
+        current_history_id=777,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    out = result.stdout
+    assert "sync-labels --full-resync:" in out
+    assert "strategy=scan" in out
+    assert "revised=1" in out and "unseen=0" in out
+    assert "no Sync Cursor" in out  # GYB corpus: the run births the ledger
+    assert "birthed it from the profile seed" in out  # completed, not WOULD
+    store = CorpusStore(tmp_path / "corpus")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 777
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["abcd"].labels == ("Shipping",)  # the Work -> Shipping drift
+    assert resolved["abcd"].source == "gyb"  # parity: the real source survives
+    # invariant #5 holds on the real-corpus path: metadata + labelIds
+    # inventory only, never a raw get
+    assert not any(c.startswith("get_message:") for c in fake.calls)
+
+
+def test_sync_labels_full_resync_dry_run_cursorless_says_would_birth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The honesty branch (deepseek review): under --dry-run nothing is
+    written, so the birth NOTE must say WOULD birth — and the cursor file
+    must stay absent while the plan still counts the revision."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor: birth-eligible
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--full-resync",
+            "--dry-run",
+            "--config",
+            str(cfg),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "WOULD birth" in result.stdout
+    assert "birthed it from" not in result.stdout
+    assert "revised=1" in result.stdout  # the plan says what WOULD be written
+    assert not (store.root / "sync-cursor.json").exists()
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
+
+
+def test_sync_labels_full_resync_failure_exits_5_and_holds_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    fake.fail("get_message_metadata", GmailPermanentError("boom", status=400))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 5  # never silently partial
+    assert "failed a1" in result.stderr
+    assert "dataset analyze" not in result.stdout
+    assert store.read_cursor() == _cursor_at(100)
+
+
+def test_sync_labels_full_resync_failure_on_rollback_state_prints_no_step_down_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#95's failed-run quadrant (manager-gate minor, reviewer recipe): a
+    held ledger is NOT a step-down. Rollback state programmed (stored
+    900, seed 500) but a permanent metadata failure — the run exits 5,
+    the cursor stays held at 900, and the NOTE stays SILENT: the field
+    is set only past the failed-return guard. Kills the mutant that
+    hoists the assignment above the guard (which kept the rest of the
+    suite green)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store, history_id=900)
+    fake = _resync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=())],
+        current_history_id=500,
+    )
+    fake.fail("get_message_metadata", GmailPermanentError("boom", status=400))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 5  # never silently partial
+    assert "stepped down" not in result.stdout  # held ledger, no disclosure
+    assert store.read_cursor() == _cursor_at(900)  # ledger held, unmoved
+
+
+# ---- --full-resync step-down NOTE (ticket #95) ------------------------------
+
+
+_STEP_DOWN_NOTE = (
+    "NOTE: Sync Cursor stepped down from 900 to 500 — the mailbox reported "
+    "below the stored ledger; the kept-high watermark was unreachable and "
+    "the reconciliation just wrote ground truth (ADR-0008)."
+)
+_STEP_DOWN_PLAN_NOTE = (
+    "NOTE: plan includes stepping the Sync Cursor down from 900 to 500 "
+    "(ADR-0008 — unreachable watermark; ground truth written on completion)."
+)
+
+
+def test_sync_labels_full_resync_rollback_prints_the_step_down_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #95 (fire direction): a rolled-back mailbox (stored 900, seed
+    500) prints the one NOTE naming BOTH values, and the ledger really
+    stepped down."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # a1 with ("Shipping",)
+    _write_sync_cursor(store, history_id=900)
+    fake = _resync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=())],
+        current_history_id=500,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert _STEP_DOWN_NOTE in result.stdout  # full-line pin: both numbers
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # stepped down
+
+
+def test_sync_labels_full_resync_normal_reseed_prints_no_step_down_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #95 (silent direction, the pair that kills the always-print
+    mutant): an ordinary advance (stored 100, seed 500) prints NO
+    step-down NOTE."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store)  # history_id=100
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "stepped down" not in result.stdout
+    assert "stepping the Sync Cursor down" not in result.stdout
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # plain advance
+
+
+def test_sync_labels_full_resync_birth_prints_no_step_down_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #95 (birth quadrant): a cursorless corpus births — the NOTE
+    stays silent (the birth-provenance NOTE is a different line)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor: birth
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no Sync Cursor" in result.stdout  # the birth NOTE is present…
+    assert "stepped down" not in result.stdout  # …the step-down NOTE is not
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500
+
+
+def test_sync_labels_full_resync_dry_run_rollback_plans_the_step_down_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC #95 (dry-run half): the PLAN NOTE prints with both numbers and
+    the completed wording is absent; the cursor and records stay
+    byte-identical — the plan discloses, it never writes."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    store = _sync_seed_corpus(tmp_path)
+    _write_sync_cursor(store, history_id=900)
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    cursor_bytes = (store.root / "sync-cursor.json").read_bytes()
+    fake = _resync_fake(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=())],
+        current_history_id=500,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "dataset",
+            "sync-labels",
+            "--full-resync",
+            "--dry-run",
+            "--config",
+            str(cfg),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _STEP_DOWN_PLAN_NOTE in result.stdout
+    assert "stepped down from" not in result.stdout  # completed wording absent
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
+    assert (store.root / "sync-cursor.json").read_bytes() == cursor_bytes
+
+
+def test_sync_labels_birth_note_recommends_the_real_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cursorless-birth NOTE (event walk) now points at the real
+    --full-resync command instead of the interim rebuild advice."""
+    import gmail_labeler.cli as cli
+
+    _sync_seed_corpus(tmp_path)  # no cursor: the event-walk birth path
+    fake = _sync_fake(current_history_id=777)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    out = result.stdout + result.stderr
+    assert "dataset sync-labels --full-resync" in out
+    assert "not built yet" not in out
+
+
+def test_sync_labels_help_documents_full_resync() -> None:
+    import gmail_labeler.cli as cli
+
+    param = inspect.signature(cli.dataset_sync_labels).parameters["full_resync"]
+    assert "no history" in param.default.help.lower()

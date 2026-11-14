@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from .corpus_store import CorpusStore
     from .gmail_client import FilterInfo, GmailClient
     from .gmail_import import GmailImportStats
+    from .label_sync import FullResyncStats, SyncStats
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -381,12 +382,15 @@ def dataset_sync_labels(
     gone or was never consumed — cost-estimated up front from one
     labels.list plus local resolved-view counts, cheaper of the
     label-inventory scan and the corpus-metadata walk picked with a printed
-    rationale, the cursor reseeded (from the seed captured BEFORE the scan)
-    only after the reconciliation's revisions are durable (ADR-0008).
+    rationale, the cursor reseeded to the seed captured BEFORE the scan
+    (step-down-permitted: a rolled-back mailbox's higher stored cursor
+    yields to the seed — replay from the lower seed is harmless under
+    ADR-0007) only after the reconciliation's revisions are durable
+    (ADR-0008).
     """
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
-    from .label_sync import FullResyncStats, SyncStats, sync_labels
+    from .label_sync import FullResyncStats, sync_labels
     from .label_sync import full_resync as run_full_resync
 
     cfg = _load_config(config)
@@ -441,56 +445,17 @@ def dataset_sync_labels(
         typer.echo(f"sync-labels failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     stats.retried += bootstrap.retried  # settings blips count too
-    if full_resync:
-        assert isinstance(stats, FullResyncStats)  # branch-shaped narrowing
-        prefix = (
-            "sync-labels --full-resync (dry-run):"
-            if dry_run
-            else "sync-labels --full-resync:"
-        )
-        # the flag-rate is the scan's drift signal; on the walk every id
-        # is fetched by construction, so quoting a 100% "flag-rate" there
-        # would read as drift that never happened (deepseek review)
-        rate = f" (flag-rate {stats.flag_rate:.0%})" if stats.strategy == "scan" else ""
-        typer.echo(
-            f"{prefix} strategy={stats.strategy} "
-            f"corpus={stats.corpus_messages} "
-            f"flagged={stats.flagged}{rate} "
-            f"revised={stats.revised} unchanged={stats.unchanged} "
-            f"deleted_kept={stats.deleted_kept} unseen={stats.unseen} "
-            f"retried={stats.retried} failed={len(stats.failed)}"
-        )
-        if stats.birthed:
-            # honesty under dry_run: the plan says WOULD birth — nothing was
-            # written (the core sets birthed from the read, not the write)
-            typer.echo(
-                "NOTE: this corpus had no Sync Cursor \u2014 full-resync "
-                + (
-                    "WOULD birth it from the profile seed captured BEFORE the scan"
-                    if dry_run
-                    else "birthed it from the profile seed captured BEFORE the scan"
-                )
-                + " (ADR-0008: changes made during the scan carry higher "
-                "ids and land in the next sync's window)"
-            )
+    if isinstance(stats, FullResyncStats):
+        # structural narrowing (PR #86 review): the concrete type IS the
+        # discriminator — only the --full-resync call above can have
+        # produced a FullResyncStats. Structural honesty, not a bug fix:
+        # the replaced asserts never fired (output was already
+        # byte-identical under -O), but a stripped assert is a narrowing
+        # that silently disappears, while this type test stays visible
+        # to every reader and to pyright
+        _report_full_resync(stats, dry_run=dry_run)
     else:
-        assert isinstance(stats, SyncStats)  # branch-shaped narrowing
-        prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
-        typer.echo(
-            f"{prefix} events={stats.events} stale={stats.stale} "
-            f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
-            f"unseen={stats.unseen} retried={stats.retried} "
-            f"failed={len(stats.failed)}"
-        )
-        if stats.birthed:
-            # ADR-0008 consequence 1: the provenance disclosure — a fresh
-            # cursor over a corpus whose label state may be months old
-            typer.echo(
-                "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
-                "from the mailbox profile and applies NOTHING (no consumed "
-                "baseline to diff against yet; the corpus's label state may "
-                "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
-            )
+        _report_sync(stats, dry_run=dry_run)
     _render_gains_losses(stats.gains, stats.losses)
     if stats.unseen:
         typer.echo(
@@ -514,6 +479,67 @@ def dataset_sync_labels(
         if len(stats.failed) > 20:
             typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
+    """The --full-resync report: mode-named summary line + the birth NOTE.
+    Takes the CONCRETE stats type (PR #86 review) — the caller dispatches
+    on isinstance, so no runtime assert narrows here: the replaced assert
+    never fired (it is structural honesty, not a bug fix), but a stripped
+    assert disappears under ``python -O`` while this signature stays
+    visible to every reader and to pyright."""
+    prefix = (
+        "sync-labels --full-resync (dry-run):"
+        if dry_run
+        else "sync-labels --full-resync:"
+    )
+    # the flag-rate is the scan's drift signal; on the walk every id
+    # is fetched by construction, so quoting a 100% "flag-rate" there
+    # would read as drift that never happened (deepseek review)
+    rate = f" (flag-rate {stats.flag_rate:.0%})" if stats.strategy == "scan" else ""
+    typer.echo(
+        f"{prefix} strategy={stats.strategy} "
+        f"corpus={stats.corpus_messages} "
+        f"flagged={stats.flagged}{rate} "
+        f"revised={stats.revised} unchanged={stats.unchanged} "
+        f"deleted_kept={stats.deleted_kept} unseen={stats.unseen} "
+        f"retried={stats.retried} failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        # honesty under dry_run: the plan says WOULD birth — nothing was
+        # written (the core sets birthed from the read, not the write)
+        typer.echo(
+            "NOTE: this corpus had no Sync Cursor \u2014 full-resync "
+            + (
+                "WOULD birth it from the profile seed captured BEFORE the scan"
+                if dry_run
+                else "birthed it from the profile seed captured BEFORE the scan"
+            )
+            + " (ADR-0008: changes made during the scan carry higher "
+            "ids and land in the next sync's window)"
+        )
+
+
+def _report_sync(stats: SyncStats, *, dry_run: bool) -> None:
+    """The event-walk report: summary line + the birth NOTE (ADR-0008
+    consequence 1's provenance disclosure). The concrete-stats twin of
+    ``_report_full_resync`` — same isinstance-dispatch rationale."""
+    prefix = "sync-labels (dry-run):" if dry_run else "sync-labels:"
+    typer.echo(
+        f"{prefix} events={stats.events} stale={stats.stale} "
+        f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
+        f"unseen={stats.unseen} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        # ADR-0008 consequence 1: the provenance disclosure — a fresh
+        # cursor over a corpus whose label state may be months old
+        typer.echo(
+            "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
+            "from the mailbox profile and applies NOTHING (no consumed "
+            "baseline to diff against yet; the corpus's label state may "
+            "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+        )
 
 
 def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:

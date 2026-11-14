@@ -60,8 +60,11 @@ does not ship releases yet.
   `label_sync.full_resync(client, store, id_to_name, sleeper, clock,
   dry_run, progress)` (pure core, daemon-reusable) captures the profile
   seed BEFORE the scan and persists it only after the reconciliation's
-  revisions are durable — an advance, or a birth-when-absent on a
-  cursorless corpus with the same ordering (ADR-0008). ONE `labels.list`
+  revisions are durable — a reseed, or a birth-when-absent on a
+  cursorless corpus with the same ordering; the reseed is
+  step-down-permitted when a rolled-back mailbox reports below the
+  stored cursor (a kept-high watermark would be unreachable; replay
+  from the lower seed is harmless under ADR-0007) (ADR-0008). ONE `labels.list`
   (per-label `messagesTotal`) plus local resolved-view counts yield the
   cost estimate, printed with the strategy choice before any enumeration
   spend; the estimator runs the cheaper of the label-inventory scan

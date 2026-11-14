@@ -9,7 +9,8 @@ lands, advances the same ledger through the shared sync code. Gmail Import
 overwrite an existing one, and GYB Import (`dataset import-gyb`) never
 births at all: a backup snapshots messages, not the event stream, and
 yields no `historyId` comparable to one. Birth is always
-birth-when-absent: no command ever overwrites an existing cursor.
+birth-when-absent: no acquisition command ever overwrites an existing
+cursor (only Label Sync moves one — by advance or by reseed, below).
 
 Birth seeds the cursor from the history id the sync guide prescribes —
 that of the most recent message, the first in the list response —
@@ -43,8 +44,18 @@ secrecy is for tokens. A cursor that exists but does not parse *or*
 validate — wrong version, or a missing, null, negative, or non-integer
 `history_id` — fails loud (CorpusError): never a silent re-birth, because
 guessing here is the silent-gap class this ledger exists to prevent.
-Advancement happens only after the delta's revision lines are appended
-and fsynced (invariant #3: durable handling first, cursor second).
+Advancement happens only after the delta's revision lines are appended and fsynced
+(invariant #3: durable handling first, cursor second). The Full Resync reseed may step
+a higher stored cursor DOWN to the profile seed: a rolled-back mailbox can report a
+history id below the ledger, and there the kept-high watermark is unreachable — it
+404s every future walk and defeats the very command that exists to recover. The step-
+down is harmless: the reconciliation just wrote ground truth, and ADR-0007's fold
+absorbs any replay the lower seed re-opens — on a genuinely rolled-back mailbox no
+retained history sits between the seed and the old watermark, so the step-down itself
+re-appends nothing; where a bogus seed re-opens a window that does hold history, the
+walk re-appends duplicate revision lines (it appends even when nothing moved) and the
+fold absorbs them — the same harmless-replay consequence a second Gmail Import already
+accepts.
 
 ## Considered Options
 

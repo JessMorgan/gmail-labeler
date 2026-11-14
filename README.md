@@ -147,10 +147,12 @@ corpus id's current labels, diff, revise). On the scan the report prints
 the flag-rate before the metadata pass, so a corpus-wide drift is visible
 early with the honest worst-case cost story; the walk prices its full
 fetch up front instead — every id is read by construction there, so drift
-is measured by the diff, not a flag-rate. The profile seed is captured before the scan
-and written only after the reconciliation's revisions are durable, so a
-relabel made mid-run lands in the next sync's window; `--dry-run` prints
-the estimate, the choice, and the plan, writing nothing. Both imports are resumable:
+is measured by the diff, not a flag-rate. The profile seed is captured
+before the scan and written only after the reconciliation's revisions
+are durable — stepping a higher stored cursor down when the mailbox has
+rolled back, since replay from the lower seed is harmless (ADR-0007) —
+so a relabel made mid-run lands in the next sync's window; `--dry-run`
+prints the estimate, the choice, and the plan, writing nothing. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips
 what is already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself

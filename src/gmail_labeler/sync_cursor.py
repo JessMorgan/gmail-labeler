@@ -7,8 +7,8 @@ mailbox's event stream (GLOSSARY: Sync Cursor): versioned JSON
 parse/render contract only (CODING-STANDARDS pure core: no I/O, no Gmail or
 config imports); the durable I/O is ``CorpusStore.read_cursor``/
 ``write_cursor`` on the established snapshot discipline, and birth belongs to
-Gmail Import (which seeds it) while advancement belongs exclusively to Label
-Sync.
+Gmail Import (which seeds it) while movement — advance, or reseed with a
+step-down after a rollback — belongs exclusively to Label Sync.
 
 Loud-by-doctrine, like the attribution snapshot parser: a cursor that exists
 but does not parse *or* validate — wrong/missing version, or a missing, null,

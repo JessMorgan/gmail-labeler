@@ -838,6 +838,57 @@ def test_seed_captured_up_front_is_the_ledger_value_mid_run_change_survives(
     assert resolved["a1"].labels == ("Shipping", "id:L9", "Money/Bills")
 
 
+def test_reseed_steps_a_rolled_back_cursor_down_and_the_next_walk_succeeds(
+    tmp_path: Path,
+) -> None:
+    """ADR-0008 (step-down-permitted — owner reversal after the #74
+    review): a rolled-back mailbox reports a profile id BELOW the stored
+    cursor, and the reseed steps the ledger DOWN to the seed. A
+    kept-high watermark is unreachable — it 404s every future walk and
+    defeats the very command that exists to recover — while the replay
+    the lower seed re-opens is harmless under ADR-0007's fold. The
+    liveness half is the load-bearing pin (round-1 major): the NEXT
+    event walk must succeed, not loop on the resync guidance."""
+    store = store_at(tmp_path)
+    _seed(store, _record("a1", ()))  # mailbox says Shipping: real drift
+    store.write_cursor(SyncCursor(history_id=900, last_sync=NOW))
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1",))],
+        labels=_big_mailbox_labels(),
+        current_history_id=500,  # rolled-back mailbox: seed < stored cursor
+    )
+    stats = full_resync(
+        fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    _assert_no_raw_fetches(fake)
+    assert not stats.failed and not stats.birthed
+    assert stats.revised == 1  # the delta lands regardless of the step-down
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping",)
+    cursor = store.read_cursor()
+    assert cursor is not None
+    assert cursor.history_id == 500  # stepped DOWN to the profile seed
+    assert cursor.last_sync == NOW  # the run's stamp refreshes with it
+    # the ledger is now USABLE: the next walk resumes from 500 instead
+    # of 404-looping on the kept-high 900 — replay from the lower seed
+    # is harmless (the fold absorbs), and the walk advances for real
+    fake2 = FakeGmailClient(
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L2"))],
+        labels=_big_mailbox_labels(),
+        history_pages=[_page(LabelsAdded("a1", ("L2",)), history_id=501)],
+        current_history_id=501,
+    )
+    stats2 = sync_labels(
+        fake2, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    assert not stats2.failed
+    assert stats2.revised == 1
+    cursor2 = store.read_cursor()
+    assert cursor2 is not None and cursor2.history_id == 501
+    resolved2 = {r.id: r for r in store.iter_resolved()}
+    assert resolved2["a1"].labels == ("Shipping", "Money/Bills")
+
+
 def test_full_resync_unusable_seed_and_bad_attempts_fail_loudly(
     tmp_path: Path,
 ) -> None:

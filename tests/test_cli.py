@@ -1551,6 +1551,60 @@ def test_sync_labels_full_resync_gyb_corpus_births_cursor_and_exits_0(
     assert resolved["a1"].labels == ()
 
 
+def test_sync_labels_full_resync_reconciles_a_real_gyb_import_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec #64 AC, honest half: a GYB-BUILT corpus (real `dataset
+    import-gyb` over a backup dir, not a fabricated store.put(source=
+    "gyb")) reconciles end-to-end against the fake — drifted labels
+    revise, the cursorless ledger births from the profile seed, and the
+    report reads sane. Field parity rides the real source stamp."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.corpus_store import CorpusStore
+    from gmail_labeler.fake_gmail import FakeMessage
+
+    gyb = _gyb_fixture(tmp_path)  # one message: id "abcd", GYB label "Work"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[gmail]\ntoken_backend = "file"\n'
+        f'token_file = "{tmp_path / "tok.json"}"\n'
+        f'[corpus]\ndir = "{tmp_path / "corpus"}"\n'
+        f'[gyb]\npath = "{gyb}"\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["dataset", "import-gyb", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "written=1" in result.stdout
+
+    # the mailbox drifted: abcd now carries ONLY L1 (Shipping) — the GYB
+    # "Work" label is gone. Default _resync_fake totals (4+2) price the
+    # scan at a 10-unit floor vs the 20-unit walk -> the scan runs.
+    fake = _resync_fake(
+        messages=[FakeMessage(id="abcd", eml=b"x", label_ids=("L1",))],
+        current_history_id=777,
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    out = result.stdout
+    assert "sync-labels --full-resync:" in out
+    assert "strategy=scan" in out
+    assert "revised=1" in out and "unseen=0" in out
+    assert "no Sync Cursor" in out  # GYB corpus: the run births the ledger
+    assert "birthed it from the profile seed" in out  # completed, not WOULD
+    store = CorpusStore(tmp_path / "corpus")
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 777
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["abcd"].labels == ("Shipping",)  # the Work -> Shipping drift
+    assert resolved["abcd"].source == "gyb"  # parity: the real source survives
+    # invariant #5 holds on the real-corpus path: metadata + labelIds
+    # inventory only, never a raw get
+    assert not any(c.startswith("get_message:") for c in fake.calls)
+
+
 def test_sync_labels_full_resync_dry_run_cursorless_says_would_birth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

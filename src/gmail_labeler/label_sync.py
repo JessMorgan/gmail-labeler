@@ -38,11 +38,16 @@ vanished labels' corpus members are fetched directly; or (b) the corpus-
 metadata walk — fetch every corpus id's current labels, diff, revise.
 Seed discipline (ADR-0008 / manager note 9): the profile historyId is
 captured ONCE UP FRONT, before the scan, and persisted only after the
-reconciliation's revisions are durable — an ADVANCE of the ledger (a
+reconciliation's revisions are durable — a RESEED of the ledger (a
 birth on a cursorless corpus, same ordering), never a re-birth and never
-a last-page-wins value the event walk reads. A change made between seed
-capture and scan end carries a higher id and lands in the next event
-sync's window.
+a last-page-wins value the event walk reads. The reseed is
+step-down-permitted: a rolled-back mailbox can report a profile id below
+the stored cursor, and there the seed steps the ledger DOWN — a
+kept-high watermark would be unreachable (it 404s every future walk and
+defeats the recovery command itself), while replay from the lower seed
+is harmless under ADR-0007's fold. A change made between seed capture
+and scan end carries a higher id and lands in the next event sync's
+window.
 
 Pure core (CODING-STANDARDS, like gmail_import): client + store +
 injected sleeper/clock/progress, no typer/config imports — the ADR-0003
@@ -55,10 +60,10 @@ from __future__ import annotations
 import dataclasses
 import logging
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Final, cast
+from typing import Final, Literal, cast
 
 from .corpus_record import CorpusRecord
 from .corpus_store import CorpusStore
@@ -192,38 +197,18 @@ def sync_labels(
         # corpus — the daemon's idle 30 s poll never pays the whole-log
         # fold (ADR-0007 accepts the fold cost; it need not be paid empty).
         resolved = {rec.id: rec for rec in store.iter_resolved()}
-        for message_id in stale:
-            meta = retrying(
-                lambda mid=message_id: _metadata_or_gone(client, mid),
-                max_attempts=max_attempts,
-                stats=stats,
-                sleeper=sleeper,
-                what=f"get_message_metadata:{message_id}",
-            )
-            if isinstance(meta, _Gone):  # narrows the union for the get below
-                gone_confirmed.add(message_id)
-                continue
-            if meta is None:
-                stats.failed.append(
-                    (message_id, "metadata fetch failed (permanent/retries)")
-                )
-                continue
-            resident = resolved.get(message_id)
-            if resident is None or not store.has(message_id):
-                # the has() gate (caller-side duty): a Revision supersedes
-                # a resident record, it never creates one. Unreachable for
-                # a consistent log (has() and iter_resolved() share one
-                # reader) — if it ever fires that IS a gap, so record it,
-                # never drop it silently (invariant #3's posture)
-                stats.failed.append((message_id, "resolved record vanished mid-run"))
-                continue
-            _revise(
-                resident,
-                meta,
-                id_to_name,
-                stats,
-                store=store if not dry_run else None,
-            )
+        gone_confirmed, _ = _fetch_gate_revise(
+            client,
+            store,
+            resolved,
+            stale,
+            id_to_name,
+            stats,
+            max_attempts=max_attempts,
+            sleeper=sleeper,
+            dry_run=dry_run,
+            diff_gate=False,  # the event walk self-heals: no diff gate
+        )
     stats.deleted_kept = len(deleted_touched | gone_confirmed)
 
     if stats.failed:
@@ -351,6 +336,75 @@ def _revise(
     stats.revised += 1
 
 
+def _fetch_gate_revise(
+    client: GmailClient,
+    store: CorpusStore,
+    resolved: Mapping[str, CorpusRecord],
+    message_ids: Iterable[str],
+    id_to_name: Mapping[str, str],
+    stats: SyncStats | FullResyncStats,
+    *,
+    max_attempts: int,
+    sleeper: Callable[[float], None],
+    dry_run: bool,
+    diff_gate: bool,
+) -> tuple[set[str], int]:
+    """The shared fetch-gate-revise skeleton of both reconciliation paths
+    (the event walk's stale loop and the full resync's flagged loop):
+    retry the metadata get → ``_Gone`` marks the id confirmed-gone → a
+    None (permanent/retries) records a failure → the resolved-view/``has()``
+    gate records a vanished record → ``_revise``. The two paths diverge in
+    exactly ONE place: with ``diff_gate`` (the resync) a fetched id whose
+    normalized labels already match the resident's counts as unchanged and
+    appends NOTHING — reconciliation diffs before appending, while the
+    event walk self-heals (the walk said something moved; the fold
+    absorbs). Returns ``(gone_confirmed_ids, unchanged_count)``; failures
+    ride ``stats.failed`` and stop nothing — the caller holds the ledger
+    whenever the list is non-empty (invariant #3)."""
+    gone_confirmed: set[str] = set()
+    unchanged = 0
+    for message_id in message_ids:
+        meta = retrying(
+            lambda mid=message_id: _metadata_or_gone(client, mid),
+            max_attempts=max_attempts,
+            stats=stats,
+            sleeper=sleeper,
+            what=f"get_message_metadata:{message_id}",
+        )
+        if isinstance(meta, _Gone):  # narrows the union for the get below
+            gone_confirmed.add(message_id)
+            continue
+        if meta is None:
+            stats.failed.append(
+                (message_id, "metadata fetch failed (permanent/retries)")
+            )
+            continue
+        resident = resolved.get(message_id)
+        if resident is None or not store.has(message_id):
+            # the has() gate (caller-side duty, note 9a): a Revision
+            # supersedes a resident record, it never creates one.
+            # Unreachable for a consistent log (has() and iter_resolved()
+            # share one reader) — if it ever fires that IS a gap, so
+            # record it, never drop it silently (invariant #3's posture)
+            stats.failed.append((message_id, "resolved record vanished mid-run"))
+            continue
+        if diff_gate:
+            new_labels = tuple(normalize_label_names(list(meta.label_ids), id_to_name))
+            if set(new_labels) == set(resident.labels):
+                # a full-corridor re-append on every resync would double
+                # the revision log for no signal
+                unchanged += 1
+                continue
+        _revise(
+            resident,
+            meta,
+            id_to_name,
+            stats,
+            store=store if not dry_run else None,
+        )
+    return gone_confirmed, unchanged
+
+
 # -- --full-resync: estimate-picked ground-truth reconciliation (#74) --------
 
 #: Cost constants for the up-front estimate (spec #64 "Further Notes",
@@ -371,7 +425,7 @@ class FullResyncStats:
     """Report counts for one reconciliation. ``strategy`` names the choice
     the estimator printed; the unit fields are the numbers behind it."""
 
-    strategy: str = ""  # "scan" | "walk" ("" until the estimate lands)
+    strategy: Literal["", "scan", "walk"] = ""  # estimate lands the choice
     corpus_messages: int = 0
     enumerated_labels: int = 0  # mailbox user labels the scan would page
     scan_list_units: int = 0  # enumeration floor; flagged metadata is on top
@@ -493,7 +547,7 @@ def full_resync(
     # tie goes to the WALK (deepseek review nit): the scan number is only
     # an enumeration FLOOR that flagged metadata can exceed, while the
     # walk number is exact — at parity the exact cost wins
-    strategy = (
+    strategy: Literal["scan", "walk"] = (
         "walk" if (unpriceable or stats.walk_units <= stats.scan_list_units) else "scan"
     )
     stats.strategy = strategy
@@ -563,43 +617,18 @@ def full_resync(
         )
 
     # 5. metadata-fetch ONLY flagged ids; diff; revise drifted ones
-    gone_confirmed: set[str] = set()
-    for message_id in flagged:
-        meta = retrying(
-            lambda mid=message_id: _metadata_or_gone(client, mid),
-            max_attempts=max_attempts,
-            stats=stats,
-            sleeper=sleeper,
-            what=f"get_message_metadata:{message_id}",
-        )
-        if isinstance(meta, _Gone):  # narrows the union for the get below
-            gone_confirmed.add(message_id)
-            continue
-        if meta is None:
-            stats.failed.append(
-                (message_id, "metadata fetch failed (permanent/retries)")
-            )
-            continue
-        resident = resolved.get(message_id)
-        if resident is None or not store.has(message_id):
-            # the has() gate (caller-side duty, note 9a): a Revision
-            # supersedes a resident record, it never creates one
-            stats.failed.append((message_id, "resolved record vanished mid-run"))
-            continue
-        new_labels = tuple(normalize_label_names(list(meta.label_ids), id_to_name))
-        if set(new_labels) == set(resident.labels):
-            # reconciliation diffs before appending (unlike the event
-            # walk's self-heal): a full-corridor re-append on every
-            # resync would double the revision log for no signal
-            stats.unchanged += 1
-            continue
-        _revise(
-            resident,
-            meta,
-            id_to_name,
-            stats,
-            store=store if not dry_run else None,
-        )
+    gone_confirmed, stats.unchanged = _fetch_gate_revise(
+        client,
+        store,
+        resolved,
+        flagged,
+        id_to_name,
+        stats,
+        max_attempts=max_attempts,
+        sleeper=sleeper,
+        dry_run=dry_run,
+        diff_gate=True,  # the resync diffs before appending (no self-heal)
+    )
     stats.deleted_kept = len(gone_confirmed)
 
     # 6. the ledger moves only over durable revisions (invariant #3) —
@@ -614,7 +643,16 @@ def full_resync(
     stats.birthed = not had_cursor
     if not dry_run:
         # every revision line above was appended+fsynced through
-        # append_revision BEFORE this write
+        # append_revision BEFORE this write. The reseed is STEP-DOWN-
+        # PERMITTED (ADR-0008, owner reversal after the #74 review): a
+        # rolled-back mailbox can report a seed BELOW the stored cursor,
+        # and there the kept-high watermark is unreachable — it 404s
+        # every future walk and defeats the very command that exists to
+        # recover. The step-down is harmless: ground truth was just
+        # written, and ADR-0007's fold absorbs any replay the lower seed
+        # re-opens — a genuine rollback re-appends nothing (no retained
+        # history between seed and watermark); a bogus seed's duplicate
+        # lines are absorbed, as a second Gmail Import already accepts.
         store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
     return stats
 

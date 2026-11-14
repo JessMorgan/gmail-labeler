@@ -482,7 +482,8 @@ def dataset_sync_labels(
 
 
 def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
-    """The --full-resync report: mode-named summary line + the birth NOTE.
+    """The --full-resync report: mode-named summary line + the birth NOTE
+    + the step-down NOTE (#95).
     Takes the CONCRETE stats type (PR #86 review) — the caller dispatches
     on isinstance, so no runtime assert narrows here: the replaced assert
     never fired (it is structural honesty, not a bug fix), but a stripped
@@ -518,6 +519,25 @@ def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
             + " (ADR-0008: changes made during the scan carry higher "
             "ids and land in the next sync's window)"
         )
+    if stats.stepped_down_from is not None:
+        # the step-down disclosure (#95): data rides the core's stats, the
+        # NOTE renders here (the birth-provenance precedent) — one line,
+        # honest about plan-vs-completed under --dry-run
+        if dry_run:
+            typer.echo(
+                f"NOTE: plan includes stepping the Sync Cursor down from "
+                f"{stats.stepped_down_from} to {stats.seed_history_id} "
+                f"(ADR-0008 \u2014 unreachable watermark; ground truth "
+                f"written on completion)."
+            )
+        else:
+            typer.echo(
+                f"NOTE: Sync Cursor stepped down from "
+                f"{stats.stepped_down_from} to {stats.seed_history_id} \u2014 "
+                f"the mailbox reported below the stored ledger; the kept-high "
+                f"watermark was unreachable and the reconciliation just wrote "
+                f"ground truth (ADR-0008)."
+            )
 
 
 def _report_sync(stats: SyncStats, *, dry_run: bool) -> None:

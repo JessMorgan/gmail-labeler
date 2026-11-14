@@ -150,7 +150,8 @@ fetch up front instead — every id is read by construction there, so drift
 is measured by the diff, not a flag-rate. The profile seed is captured
 before the scan and written only after the reconciliation's revisions
 are durable — stepping a higher stored cursor down when the mailbox has
-rolled back, since replay from the lower seed is harmless (ADR-0007) —
+rolled back (the report prints a NOTE naming both values — on
+`--dry-run`, as a plan), since replay from the lower seed is harmless (ADR-0007) —
 so a relabel made mid-run lands in the next sync's window; `--dry-run`
 prints the estimate, the choice, and the plan, writing nothing. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips

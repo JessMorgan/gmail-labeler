@@ -87,6 +87,13 @@ does not ship releases yet.
   finalized to ADR-0008's wording printing the exact
   `dataset sync-labels --full-resync` command (#73's vaporware-absence pin
   flipped to a presence pin).
+- `dataset sync-labels --full-resync` step-down NOTE (ticket #95, PR #86
+  follow-up closing the round-2 review's observability nit): the report
+  prints one NOTE line when the reseed steps a higher stored cursor down
+  (`FullResyncStats.stepped_down_from` carries the stored value; the CLI
+  renders — data in the pure core, disclosure in the report, the
+  birth-provenance precedent), and `--dry-run` shows the planned step-down;
+  silent on birth, equal, and advance.
 - Sync Cursor sidecar (`sync_cursor.py`, `corpus_store.py`, ADR-0008,
   ticket #72): `dataset import-gmail` births `sync-cursor.json`
   (`{version, history_id, last_sync}`, tz-aware UTC `last_sync`) inside the

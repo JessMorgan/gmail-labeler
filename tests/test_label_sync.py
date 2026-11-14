@@ -889,6 +889,61 @@ def test_reseed_steps_a_rolled_back_cursor_down_and_the_next_walk_succeeds(
     assert resolved2["a1"].labels == ("Shipping", "Money/Bills")
 
 
+def test_resync_stats_carry_the_step_down_only_when_it_fires(
+    tmp_path: Path,
+) -> None:
+    """Ticket #95 (core seam): FullResyncStats.stepped_down_from carries
+    the stored cursor the seed stepped below — set EXACTLY in the fire
+    case (seed < stored), None on advance, equal, and birth, and set on
+    a dry-run too (the planned step-down is disclosed, nothing
+    written). The field is observability only: the write stays
+    unconditional (ADR-0008 step-down contract)."""
+    labels = _big_mailbox_labels()
+
+    def run(
+        corpus_dir: Path, stored_id: int | None, seed_id: int, *, dry: bool = False
+    ):
+        store = store_at(corpus_dir)
+        _seed(store, _record("a1", ("Shipping",)))
+        if stored_id is not None:
+            store.write_cursor(SyncCursor(history_id=stored_id, last_sync=NOW))
+        fake = FakeGmailClient(
+            messages=[FakeMessage(id="a1", eml=b"x", label_ids=())],
+            labels=labels,
+            current_history_id=seed_id,
+        )
+        stats = full_resync(
+            fake,
+            store,
+            id_to_name=NAMES,
+            sleeper=lambda _s: None,
+            clock=_clock,
+            dry_run=dry,
+        )
+        return store, stats
+
+    # fire: stored 900, seed 500 -> the stored value is carried
+    store, stats = run(tmp_path / "fire", 900, 500)
+    assert stats.stepped_down_from == 900
+    assert stats.seed_history_id == 500 and not stats.failed
+    assert store.read_cursor() == SyncCursor(history_id=500, last_sync=NOW)
+    # advance: stored 100, seed 500 -> None
+    _, stats = run(tmp_path / "advance", 100, 500)
+    assert stats.stepped_down_from is None
+    # equal: stored 500, seed 500 -> None (strictly below fires)
+    _, stats = run(tmp_path / "equal", 500, 500)
+    assert stats.stepped_down_from is None
+    # birth: no stored cursor -> None
+    _, stats = run(tmp_path / "birth", None, 500)
+    assert stats.stepped_down_from is None and stats.birthed
+    # dry-run fire: the PLANNED step-down is recorded, nothing written
+    store, stats = run(tmp_path / "dry", 900, 500, dry=True)
+    assert stats.stepped_down_from == 900
+    assert store.read_cursor() == SyncCursor(history_id=900, last_sync=NOW)
+    raw_lines = (store.root / "records.jsonl").read_text().count("\n")
+    assert raw_lines == 1  # the seed line only — the plan wrote no revision
+
+
 def test_full_resync_unusable_seed_and_bad_attempts_fail_loudly(
     tmp_path: Path,
 ) -> None:

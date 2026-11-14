@@ -438,6 +438,9 @@ class FullResyncStats:
     retried: int = 0  # shared RetryStats protocol counter
     birthed: bool = False  # cursorless corpus: this run births (ADR-0008)
     seed_history_id: int | None = None  # the up-front profile value written
+    stepped_down_from: int | None = None  # the stored cursor the seed stepped
+    # below (#95 observability — set on dry-run too, as the PLANNED
+    # step-down; None on birth/equal/advance; the write stays unconditional)
     gains: dict[str, int] = field(default_factory=dict[str, int])  # label -> count
     losses: dict[str, int] = field(default_factory=dict[str, int])
     # (id, reason); "<cursor>"/"<labels>"/"<label:ID>" are SENTINELS, not
@@ -491,9 +494,11 @@ def full_resync(
         # a zero-attempt loop would be a silent no-op resync (import parity)
         raise ValueError("max_attempts must be >= 1")
     stats = FullResyncStats()
-    # the birth flag reads the ledger locally — no quota call, and an
-    # unparseable cursor raises CorpusError here (never a silent re-birth)
-    had_cursor = store.read_cursor() is not None
+    # the birth flag AND the #95 step-down disclosure read the ledger
+    # locally — no quota call, and an unparseable cursor raises
+    # CorpusError here (never a silent re-birth)
+    stored = store.read_cursor()
+    had_cursor = stored is not None
 
     # 1. SEED UP FRONT (note 9, binding): ONE profile call before any
     #    enumeration. Events after capture carry higher ids, so persisting
@@ -641,6 +646,12 @@ def full_resync(
         )
         return stats
     stats.birthed = not had_cursor
+    # #95 observability: this comparison feeds ONLY the report field —
+    # the write below stays unconditional (ADR-0008 step-down contract).
+    # Under dry_run it records the PLANNED step-down; nothing is written,
+    # same as everything else the plan computes.
+    if stored is not None and seed < stored.history_id:
+        stats.stepped_down_from = stored.history_id
     if not dry_run:
         # every revision line above was appended+fsynced through
         # append_revision BEFORE this write. The reseed is STEP-DOWN-

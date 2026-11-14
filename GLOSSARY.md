@@ -107,6 +107,21 @@ than pulling through the Gmail API. Optional fast path; the Gmail Import is
 the canonical source.
 _Avoid_: backup restore (this reads, never restores)
 
+**Full Resync**:
+The ground-truth Label Reconciliation that needs no history: one
+`labels.list` plus local resolved-view counts price both strategies up
+front, and the cheaper runs — the Label Inventory Scan (enumerate every
+mailbox user label's current members by label id and diff against the
+Corpus's sets, metadata-fetching only flagged ids; vanished labels'
+corpus members fetched directly) or the Corpus Metadata Walk (fetch every
+corpus id's current labels, diff, revise). The remedy for an expired Sync
+Cursor and the first reconciliation for GYB-sourced Corpora; its reseed
+writes the profile seed, stepping a higher stored Cursor down when the
+mailbox has rolled back — replay from the lower seed is harmless
+(ADR-0007).
+_Avoid_: re-import (nothing is re-assembled), re-sync (Gmail's name for
+the prescribed full re-pull)
+
 **Label Sync**:
 Bringing a Corpus's label state up to the mailbox's current label state,
 without re-assembling the Corpus. An operation on freshness, not on ingest:
@@ -116,16 +131,18 @@ _Avoid_: corpus update, re-sync ("re-sync" is Gmail's name for the prescribed
 full re-pull; Label Sync re-assembles nothing)
 
 **Unseen Id**:
-An event id the Corpus has never held, named by the history walk. Label Sync
-counts Unseen Ids and never ingests them — ingest is the acquisition paths'
-alone. History events cannot establish that an Unseen Id is new mail or that
-it matches the import query.
+An id the Corpus has never held, surfaced by the Label Sync history walk or by
+Full Resync's Label Inventory Scan. Both sync paths count Unseen Ids and never
+ingest them — ingest is the acquisition paths' alone. Neither history events nor
+label inventories can establish that an Unseen Id is new mail or that it matches
+the import query.
 _Avoid_: new match, New Match stat
 
 **Sync Cursor**:
 A Corpus's record of how far it has consumed the mailbox's event stream;
 owned by Label Sync — Gmail Import may birth it when absent, and only a
-sync advances it. Distinct from the Gmail Import resume point (the corpus
+Label Sync moves it: advancing, or reseeding (step-down permitted after a
+rollback, ADR-0008). Distinct from the Gmail Import resume point (the corpus
 id set).
 _Avoid_: watermark, checkpoint
 

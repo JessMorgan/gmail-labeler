@@ -99,7 +99,7 @@ gmail-labeler auth                    # credential status
 gmail-labeler auth login              # one-time desktop OAuth consent flow
 gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
-gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (no re-import)
+gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (--full-resync: no history needed)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
 ```
 
@@ -126,13 +126,34 @@ message an event touched — metadata only, bodies never (invariant #5) —
 so relabels and Backfills reach the corpus without a re-import. The
 cursor advances only after the delta's revisions are durable, a killed
 run is safe to re-run, `--dry-run` prints the identical plan writing no
-records and leaving the cursor byte-identical, event ids the corpus has
-never held are counted as Unseen Ids and reported but never ingested here
-(history events cannot establish that they are new mail or that they match
-the import query), and upstream-deleted mail keeps its record (counted). An
-expired cursor (history 404) exits `5` with recovery guidance — a full
-label-resync command is not built yet, so until it
-lands the guidance points at rebuilding the corpus. Both imports are resumable:
+records and leaving the cursor byte-identical, ids the mailbox names that
+the corpus has never held are counted as Unseen Ids and reported but never
+ingested here (history events and label inventories cannot establish that
+they are new mail or that they match the import query), and
+upstream-deleted mail keeps its record (counted). An expired cursor
+(history 404) exits `5` printing the
+exact recovery command — recovery is never automatic (ADR-0008).
+`dataset sync-labels --full-resync` is that recovery: a ground-truth
+reconciliation that needs no history at all — the remedy for a cursor aged
+past Gmail's retention and the first reconciliation path for GYB-sourced
+Corpora (which never had a cursor). One `labels.list` call (per-label
+`messagesTotal`) plus local resolved-view counts yield a cost estimate, and
+the strategy choice prints with its numbers before any enumeration quota is
+spent, running the cheaper of the label-inventory scan (enumerate every
+mailbox user label's current members by label id, diff against the
+Corpus's sets, metadata-fetch only flagged ids — vanished labels' corpus
+members are fetched directly) or the corpus-metadata walk (fetch every
+corpus id's current labels, diff, revise). On the scan the report prints
+the flag-rate before the metadata pass, so a corpus-wide drift is visible
+early with the honest worst-case cost story; the walk prices its full
+fetch up front instead — every id is read by construction there, so drift
+is measured by the diff, not a flag-rate. The profile seed is captured
+before the scan and written only after the reconciliation's revisions
+are durable — stepping a higher stored cursor down when the mailbox has
+rolled back (the report prints a NOTE naming both values — on
+`--dry-run`, as a plan), since replay from the lower seed is harmless (ADR-0007) —
+so a relabel made mid-run lands in the next sync's window; `--dry-run`
+prints the estimate, the choice, and the plan, writing nothing. Both imports are resumable:
 the corpus id set is the resume point, so re-running after a failure skips
 what is already present. Transient failures resume cleanly; a deterministic abort
 (a corrupt backup row, an escaping filename) repeats until the backup itself

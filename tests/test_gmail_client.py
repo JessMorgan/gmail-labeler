@@ -623,7 +623,7 @@ def test_fake_history_token_chain_and_current_id() -> None:
     p2 = fake.history(1, p1.next_page_token)
     assert [r for p in (p1, p2) for r in p.records] == [{"a": 1}, {"b": 2}]
     # wire truth (discovery doc): EVERY page carries the mailbox's CURRENT
-    # id, never a per-page watermark — persisting p1's id mid-delta would
+    # id, never a per-page progress id — persisting p1's id mid-delta would
     # skip page 2's events (invariant #3); the fake cannot bless that bug
     assert p1.history_id == p2.history_id == 42
     idle = fake.history(42, p2.next_page_token)

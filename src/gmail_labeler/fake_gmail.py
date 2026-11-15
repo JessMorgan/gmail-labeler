@@ -416,7 +416,7 @@ class FakeGmailClient:
             self._history_index += 1
             self._history_expected = nxt
             # wire truth: every page echoes the MAILBOX'S CURRENT id, never
-            # a per-page watermark — a test must not be able to bless the
+            # a per-page progress id — a test must not be able to bless the
             # page-1-cursor bug (invariant #3)
             return HistoryPage(
                 history_id=self.current_history_id,

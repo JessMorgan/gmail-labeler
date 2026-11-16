@@ -27,11 +27,13 @@ def test_empty_config_is_all_defaults(
     # directory (never the invocation cwd).
     assert loaded.corpus.dir == tmp_path / "corpus"
     assert loaded.model.checkpoint_dir == tmp_path / "checkpoints/latest"
+    assert loaded.store.db_path == tmp_path / "gmail-labeler.db"
     bare = Config()
     assert loaded.model_dump() == bare.model_dump() | {
         "corpus": bare.corpus.model_dump() | {"dir": loaded.corpus.dir},
         "model": bare.model.model_dump()
         | {"checkpoint_dir": loaded.model.checkpoint_dir},
+        "store": bare.store.model_dump() | {"db_path": loaded.store.db_path},
     }
 
 
@@ -61,6 +63,32 @@ def test_example_toml_matches_code_defaults(tmp_path: Path) -> None:
     empty = tmp_path / "empty.toml"
     empty.write_text("", encoding="utf-8")
     assert load_config(str(example)) == load_config(str(empty))
+
+
+def test_example_toml_store_db_path_uncomments_to_the_default(
+    tmp_path: Path,
+) -> None:
+    # S5: the [store] db_path in example.toml is COMMENTED (a default),
+    # so the defaults-pin above can't see it — pin it here: uncommenting
+    # the documented line yields the code default (anchored to the
+    # config dir), so a drift in either direction turns this red.
+    text = (REPO_ROOT / "example.toml").read_text(encoding="utf-8")
+    out: list[str] = []
+    in_store = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_store = stripped == "[store]"
+        if in_store and stripped.startswith("# db_path = "):
+            out.append(line.removeprefix("# "))
+        else:
+            out.append(line)
+    p = tmp_path / "config.toml"
+    p.write_text("".join(out), encoding="utf-8")
+    cfg = load_config(str(p))
+    # the uncommented value anchors to the config dir, matching the
+    # code default (./gmail-labeler.db → <config dir>/gmail-labeler.db)
+    assert cfg.store.db_path == tmp_path / "gmail-labeler.db"
 
 
 def test_example_toml_bands_example_uncomments_to_a_valid_override(

@@ -8,6 +8,12 @@ does not ship releases yet.
 
 ### Added
 
+- `dataset export` progress: opt-in `-v` prints per-page summaries and
+  `-vv` per-message outcome lines to STDERR, fed by engine callbacks
+  (`on_page`/`on_message`) that hand the CLI frozen `ProgressSnapshot`s —
+  the engine stays I/O-free, a broken progress pipe closes only the stderr
+  channel (never the run), the default run is byte-identical, and #62's
+  progress bar is specified to consume the same seam (ticket #61).
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):
   export stamps server `internalDate` vs MIME `Date`-header fallback
   distinctly, GYB import stamps its own source; pre-existing lines lacking
@@ -135,6 +141,29 @@ does not ship releases yet.
   folder-date correction, `--system-labels`.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
+- Phase 1 dataset builder core (`dataset_build.py`): the shared pure
+  Corpus → Training Example transform — Label Path vocabulary (a leaf
+  path is a distinct class; a parent may scope its subtree), examples
+  sorted by id with canonical sorted label tuples and Date Provenance
+  stamped, required `now`, input-order invariant.
+- Dataset builder bridge (invariant #6): Filter-Authored evidence is
+  excluded from training examples (per-message for simulatable filters,
+  whole-label for unverifiable/malformed ones); a missing, incomplete,
+  or malformed filters/labels snapshot aborts the build loudly
+  (`BuildAbortedError`, a `ValueError`). The effective bridge is pinned
+  in the Split Manifest (`bridge_hash`, canonical — insensitive to filter
+  order and unreferenced label entries) so a drifted snapshot refuses the
+  rebuild. The filter-shape rule is shared with `dataset analyze`
+  (`filter_label_ids` / `filter_label_ids_strict`).
+- Dataset builder recency weighting: each Training Example carries a
+  recency weight (1.0 at/after the cutoff, `old_weight` before) mirroring
+  analyze's `months_ago` window shape; the cutoff (UTC-normalized) and
+  both constants ride in the Split Manifest (FORMAT_VERSION=3) so a
+  21-year corpus is not dominated by its oldest mail and a manifest-input
+  rebuild is reproducible from the artifact alone.
+
+- Design finalized: ADRs 0001–0005, GLOSSARY, CODING-STANDARDS, AGENTS.
+- Project scaffolded; implementation begins at Phase 0 (export + analysis).
 - Design finalized: ADRs 0001–0005 (initial set), GLOSSARY,
   CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (import + analysis).
@@ -177,7 +206,32 @@ does not ship releases yet.
   report-surfaced **Stale Id** term; and ADR-0008 records that the list
   response carries no page-level `historyId` in the current wire
   contract, superseding spec #64's seed-source sentence.
-- `dataset import-gmail` scope excludes DRAFT and CHAT (maintainer decision
+- `dataset import-gyb` rejects DRAFT/CHAT rows at ingest (maintainer decision
+  2026-11-02, ticket #32, completing #17 corpus-wide): a backup row
+  whose raw label tokens carry the canonical token DRAFT or CHAT is
+  counted `skipped_draft_chat` and never stored (a row already in the
+  corpus answers `skipped_present`; a not-yet-stored row whose
+  backup-index path escapes the backup root aborts the run, exit 5,
+  uncounted) — previously
+  the token was stripped from the row's label set and the
+  contaminated row imported silently. The exclusion pair now has one
+  shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both ingest
+  layers import,
+  so the two layers cannot drift; `dataset import-gyb` reports the
+  count in its summary line.
+  Upgrade consequence: corpora assembled before the pair landed keep
+  their DRAFT/CHAT-contaminated records — anything exported before #17
+  (2026-11-01) may carry it (an explicit `--query` may already have
+  dropped drafts, but chats had no reliable exclusion), anything
+  GYB-imported before #32 carries it, and the store never deletes in
+  place. Resume runs report those ids as
+  `skipped_present` (skip-present wins), never `skipped_draft_chat`, so
+  pre-existing contamination stays invisible to the counter; remediation
+  is a fresh `corpus.dir` (the corpus store is rooted at exactly that
+  path) plus a full re-ingest — a GYB re-import, or a fresh
+  Gmail Import for API-sourced corpora.
+- `dataset import-gmail` scope (now recorded as Corpus Exclusion) excludes
+  DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message
   whose raw wire labelIds contain the system label id DRAFT or CHAT —

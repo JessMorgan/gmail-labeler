@@ -16,23 +16,36 @@ records the deviations from that session.
 - Forward-fix the Phase 0 review non-blockers (#10 items 1–3 plus the
   post-push additions) — comment/wording/test only, zero behavior changes
   (#16).
-- Export scope (maintainer decision recorded in #17, 2026-11-01):
-  DRAFT and CHAT are excluded from the API export — the query carries
-  the documented `-in:draft` token, and the ingest-layer labelIds
-  rejection (raw wire DRAFT/CHAT) is the load-bearing layer, covering
-  chat where no documented query token exists. The rationale: the
-  previous default `in:anywhere -in:spam -in:trash` included both, and
-  under append-only corpus storage + skip-present that was a one-way
-  door. Implementation lands in #17 — before Phase 1 trains.
+- Corpus Exclusion (maintainer decision recorded in #17,
+  2026-11-01; completed corpus-wide in #32, 2026-11-02): DRAFT and
+  CHAT never enter the Corpus, from this policy onward — one policy
+  across both ingest layers (pre-policy corpora keep their records;
+  the CHANGELOG's upgrade note covers remediation).
+  API export: the query carries the documented `-in:draft` token, and
+  the ingest layer hard-rejects raw wire labelIds DRAFT/CHAT (the
+  load-bearing layer — chat has no documented query token, and an
+  explicit `--query` cannot bypass it). GYB import: row-level
+  rejection on raw label tokens (ticket #32) — a matching row is
+  counted `skipped_draft_chat`, never stripped-and-imported, with
+  two boundaries: a row already in the corpus answers
+  `skipped_present` (the path guard and the policy are never asked),
+  and a not-yet-stored row whose backup-index path escapes the backup
+  root aborts the run (exit 5) uncounted, before any policy decision.
+  Both layers import the one shared home,
+  `labels.EXCLUDED_CORPUS_LABEL_IDS` (exact-case tokens), so the two
+  cannot drift. The rationale: the previous default
+  `in:anywhere -in:spam -in:trash` included both, and under
+  append-only corpus storage + skip-present that was a one-way
+  door. Landed in #17 and #32 — before Phase 1 trains.
 - Date-provenance field on the record contract (#17): a record's date may
   come from the server's internalDate, a fallback to the MIME `Date`
   header, or GYB's internal date — the record stamps which. A forged or
   future `Date` header can shift a fallback-sourced record across
   the temporal split (invariant #7) undetectably. A schema change —
-  must land before Phase 1 trains.
+  landed in #17 (2026-11-01), before Phase 1 trains.
 
-**Exit:** all remnants closed — the open PRs merged and #16/#17 landed —
-before Phase 1 trains.
+**Exit:** all remnants closed — the open PRs merged and #16/#17/#32
+landed — before Phase 1 trains.
 
 ## Phase 1 — train, eval, and the gates (nothing live)
 
@@ -129,6 +142,8 @@ maintainer: future quality-of-life, not a gate in any phase.
   [#16](https://github.com/JessMorgan/gmail-labeler/issues/16)
   (the Phase 0 hygiene forward-fixes);
   [#17](https://github.com/JessMorgan/gmail-labeler/issues/17)
-  (the record contract: export scope + date provenance).
+  (the record contract: corpus exclusion + date provenance);
+  [#32](https://github.com/JessMorgan/gmail-labeler/issues/32)
+  (GYB ingest: the DRAFT/CHAT exclusion completed corpus-wide).
 - [ADRs 0001–0005](adr/), [GLOSSARY.md](../GLOSSARY.md) (normative
   vocabulary), [CODING-STANDARDS.md](../CODING-STANDARDS.md).

@@ -23,7 +23,11 @@ if TYPE_CHECKING:
     from .config import Config
     from .corpus_store import CorpusStore
     from .gmail_client import FilterInfo, GmailClient
-    from .gmail_import import GmailImportStats
+    from .gmail_import import (  # the progress pair is annotations only
+        GmailImportStats,
+        ImportOutcome,
+        ProgressSnapshot,
+    )
     from .label_sync import FullResyncStats, SyncStats
 
 app = typer.Typer(
@@ -270,6 +274,21 @@ def dataset_import_gmail(
             "append-new-messages contract"
         ),
     ),
+    verbose: int = typer.Option(
+        0,
+        "--verbose",
+        "-v",
+        count=True,
+        metavar="",  # count option: the inferred <int> metavar would
+        # advertise a value the flag never takes (fix round NIT)
+        help=(
+            "Repeat for more progress on STDERR (no value): -v one page "
+            "summary per completed page, plus one final line when the loop "
+            "returns early (max-messages bound or page-fetch failure); -vv "
+            "adds per-message outcome lines; stdout and exit codes are "
+            "unchanged at every level (ticket #61)"
+        ),
+    ),
 ) -> None:
     """Import labeled mail from the Gmail API into the corpus.
 
@@ -295,6 +314,51 @@ def dataset_import_gmail(
     )
     store = CorpusStore(cfg.corpus.dir)
     _dataset_store_modes(store)
+    # Opt-in progress (#61): the engine stays I/O-free and hands frozen
+    # ProgressSnapshots here; ALL printing lives in this adapter. STDERR on
+    # purpose — the stdout summary is a machine-parseable contract at every
+    # level. Level 0 wires nothing (byte-identical default run, pinned).
+    # That byte-identity is exact for a HEALTHY stderr: the deliberate
+    # dead-stderr divergence (typed exit 5 where the base run died at 1)
+    # lives in this channel by choice (#61 fix round 2), not pin scope.
+    #
+    # Callback safety is the ADAPTER's duty (engine contract: callbacks must
+    # not raise): ONE BrokenPipeError — e.g. `dataset import-gmail -v 2>&1 | head`
+    # — permanently closes the progress channel (#52's guard-precedence
+    # style: the first failure decides; no repeated attempts against a dead
+    # pipe, no spam, no traceback), the run continues to its typed outcome,
+    # and resume stays structural. Any OTHER callback error stays fail-loud.
+    # The post-run failure LIST shares this channel (fix round 2), so a
+    # dead pipe costs the listing, never the typed exit code.
+    progress_closed = False
+
+    def _emit(line: str) -> None:
+        nonlocal progress_closed
+        if progress_closed:
+            return
+        try:
+            typer.echo(line, err=True)
+        except BrokenPipeError:
+            progress_closed = True
+
+    def _page_line(snap: ProgressSnapshot) -> None:
+        _emit(
+            f"import-gmail: page scanned={snap.scanned} written={snap.written} "
+            f"skipped_present={snap.skipped_present} "
+            f"skipped_draft_chat={snap.skipped_draft_chat} "
+            # bootstrap blips happened BEFORE the loop, so the engine's
+            # retried= excludes them while the stdout summary merges them —
+            # offset here so every -v line and the summary share one scale
+            # (deepseek r1 MINOR; both sources pinned in test_cli)
+            f"retried={snap.retried + bootstrap.retried} "
+            f"failed={snap.failed_count}"
+        )
+
+    def _message_line(message_id: str, outcome: ImportOutcome) -> None:
+        _emit(f"import-gmail: {message_id} {outcome}")
+
+    on_page = _page_line if verbose >= 1 else None
+    on_message = _message_line if verbose >= 2 else None
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
@@ -304,6 +368,8 @@ def dataset_import_gmail(
             id_to_name=id_to_name,
             query=query,
             max_messages=max_messages,
+            on_page=on_page,
+            on_message=on_message,
         )
     except GmailAuthError as e:  # revoked token mid-run: the fix is human
         typer.echo(f"auth: {e}", err=True)
@@ -319,7 +385,16 @@ def dataset_import_gmail(
         f"retried={stats.retried} failed={len(stats.failed)}"
     )
     if stats.failed:
-        _render_failures(stats.failed)
+        # the failure list shares the guarded stderr channel (#61 fix
+        # round 2): a dead pipe stops the LIST too, never the typed exit;
+        # ids normalized like the store key and the -vv events so all
+        # three surfaces agree (one .lower() at this site). Same 20-line
+        # cap and stderr channel as _render_failures; this site adds the
+        # dead-pipe guard and the normalization the progress surfaces need.
+        for message_id, reason in stats.failed[:20]:
+            _emit(f"  failed {message_id.lower()}: {reason}")
+        if len(stats.failed) > 20:
+            _emit(f"  ... and {len(stats.failed) - 20} more")
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
     if also_sync_labels:
         _sync_labels_pass(client, store, id_to_name=id_to_name)
@@ -347,7 +422,10 @@ def dataset_import_gyb(
         help=(
             "Comma-separated extra label names to treat as System Labels "
             "(e.g. 'INKASSIE'); the delimiter is a comma, so label names "
-            "containing commas cannot be expressed via this flag"
+            "containing commas cannot be expressed via this flag. Extra "
+            "tokens are stripped from label sets only — they do NOT "
+            "trigger DRAFT/CHAT row rejection, which matches canonical "
+            "tokens alone"
         ),
     ),
 ) -> None:
@@ -358,6 +436,9 @@ def dataset_import_gyb(
 
     Fully offline — msg-db.sqlite is opened read-only (your backup is
     never mutated) and bodies go through the same MIME parser as import-gmail.
+    DRAFT/CHAT rows are rejected at ingest exactly like the API import's
+    policy layer (ticket #32's completion of #17: one corpus-wide policy,
+    two ingest layers).
     """
     from .corpus_store import CorpusError, CorpusStore
     from .gyb_import import DB_FILENAME, GybImportError, import_gyb
@@ -395,8 +476,12 @@ def dataset_import_gyb(
         # into an operator message.
         partial = getattr(e, "stats", None)
         state = (
+            # the rejection count rides the aborted-run echo too (ticket
+            # #32): rows rejected BEFORE the stop must not vanish from the
+            # operator's accounting
             f" — {partial.written} record(s) durably imported so far are "
-            "kept; re-running resumes"
+            f"kept (skipped_draft_chat={partial.skipped_draft_chat}); "
+            "re-running resumes"
             if partial is not None
             else " — records durably imported so far are kept; re-running resumes"
         )
@@ -404,7 +489,9 @@ def dataset_import_gyb(
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     typer.echo(
         f"import-gyb: scanned={stats.scanned} written={stats.written} "
-        f"skipped_present={stats.skipped_present} failed={len(stats.failed)}"
+        f"skipped_present={stats.skipped_present} "
+        f"skipped_draft_chat={stats.skipped_draft_chat} "
+        f"failed={len(stats.failed)}"
     )
     if stats.date_conflict:
         typer.echo(

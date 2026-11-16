@@ -1,6 +1,6 @@
 # Coding Standards
 
-Python ≥ 3.12 (CI on 3.12 + 3.13). `uv` for environments, lockfiles, and
+Python ≥ 3.12 (CI on 3.12 + 3.15, floor + latest). `uv` for environments, lockfiles, and
 builds. Single package, `src/gmail_labeler/` layout. Format and lint with
 `ruff` (`ruff format` + `ruff check`); both are gates, not suggestions.
 

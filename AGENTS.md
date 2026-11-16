@@ -73,8 +73,10 @@ live-test exclusion live in `pyproject.toml`
 (`[tool.pytest.ini_options]`, `[tool.coverage.*]`), so a bare
 `uv run pytest` cannot bypass either.
 
-CI parity (`.github/workflows/ci.yml`: ubuntu + macOS, Python 3.12/3.13)
-is the merge gate; `--live` Gmail tests never run there (invariant #9).
+CI parity (`.github/workflows/ci.yml`: ubuntu on 3.12/3.15, macOS on 3.15 only)
+is the merge gate, and `scripts/local-ci.sh` accepts only the CI Python
+versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
+`--live` Gmail tests never run there (invariant #9).
 
 ## Git management — project inputs
 

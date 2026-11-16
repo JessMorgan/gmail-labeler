@@ -10,7 +10,8 @@ does not ship releases yet.
 
 - Phase 0 (corpus) scaffold and CI: pyproject/uv packaging, `gmail-labeler`
   CLI entry point, GitHub Actions workflow (ubuntu + macOS, Python
-  3.12/3.13), `scripts/local-ci.sh` pre-push gate.
+  3.12/3.13; matrix later re-shaped to floor + latest — see Changed),
+  `scripts/local-ci.sh` pre-push gate.
 - Config (`config.py`): TOML discovery, config-dir-relative path anchoring,
   typed all-problems validation; `example.toml`.
 - Label vocabulary (`labels.py`): System Label filtering, label paths,
@@ -138,6 +139,10 @@ does not ship releases yet.
 
 ### Changed
 
+- CI matrix: floor + latest. Minimum supported (3.12) runs on ubuntu only;
+  latest (3.15) runs on ubuntu and macOS. Drops the macOS 3.12 cell (runner
+  queue pressure) and replaces 3.13 with 3.15 as the tested latest; 3.13 and
+  3.14 remain allowed by `requires-python >=3.12`, just untested.
 - Renamed `dataset export` to `dataset import-gmail` (ticket #68, ADR-0006):
   the acquisition commands speak from the Corpus's side, symmetric with
   `import-gyb`. Hard cut — no compat alias (pre-1.0); the old name exits 2

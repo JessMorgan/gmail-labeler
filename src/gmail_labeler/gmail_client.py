@@ -113,6 +113,11 @@ class RawMessage:
     # repr=False: repr() into a log is a log channel (invariant #5) — the
     # body rides the value for the import to parse, never its rendering.
     raw_b64url: str = field(repr=False)
+    # Message.historyId (uint64-as-string): the mailbox record that last
+    # modified THIS message — the per-get twin of the list-stub field (#25):
+    # the daemon bootstraps its Sync Cursor from a direct get of the newest
+    # message. Absent-tolerant (None); never trust presence (#71 doctrine).
+    history_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

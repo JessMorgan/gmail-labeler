@@ -8,6 +8,61 @@ does not ship releases yet.
 
 ### Added
 
+- Auth onboarding wizard (ticket #28): `auth setup` walks a new user through
+  ADR-0004 — create your own GCP project + desktop OAuth client, point the tool
+  at its JSON, wire the token store — then COMPOSES the existing `auth login`
+  loopback flow to sign in. A bare `auth` with no credentials offers the wizard
+  on a terminal; in a script it stays exit 4 (auth/config unusable) while naming
+  `auth setup` — the ticket's brief proposed exit 5 for that case, but the AC's
+  "exit-code contract preserved" wins and 4 is restored (brief corrected at
+  source).
+  - `wizard.py`: the onboarding decision core as a PURE state machine over
+    injected prompts + an `EnvironmentProbe` (typer wires the real I/O; the
+    whole matrix is tested offline). Declared steps with ids; each verifies
+    LOCALLY what it can (the client file exists / parses / is a desktop-type
+    client) and says PLAINLY what it cannot (Gmail API enablement, the consent
+    screen's In-production mode) — no verification theater; it names the real
+    proofs precisely (sign-in → the client + consent; the first Gmail call →
+    API enablement; a 7-day-surviving token → In-production mode).
+  - Secret discipline (invariant #8): paths and env names only; the client
+    JSON's id/secret and the typed project id never reach output or logs
+    (sentinel-absence pins, mutation-tested); the refresh token lands in the
+    keyring via the composed login — no free-form token entry is ever offered.
+  - Confirm-before-overwrite on the config path (a `resolve()`-compare posture,
+    stated; the samefile/fd family is #47's scope). The exit contract gains 130
+    for a cancelled run — Ctrl-C (SIGINT) at a prompt AND a lost/closed stdout
+    (`auth setup | head` pipe break, or `>&-` with fd 1 closed) all land on 130,
+    keeping the contract a CLOSED set {0,2,3,4,5,130}; 130 is the SIGINT
+    convention reused for the lost-output-channel cases rather than inventing a
+    new code. F3: this is now true at the PROCESS boundary, not just in-process.
+    The pipe break (`| head`) used to return 120 + "Exception ignored on flushing
+    sys.stdout" because the buffered stdout only failed at interpreter shutdown,
+    past the handler — the 130 handler now redirects stdout to /dev/null first so
+    that shutdown flush can neither fail nor print (the load-bearing piece; the
+    wizard's per-line flush is belt-and-suspenders since click.echo flushes too).
+    The lost-stdout case (`>&-`, fd 1 closed so `sys.stdout is None`) used to
+    crash with a `RuntimeError: lost sys.stdout` traceback (exit 1) from the first
+    prompt; it is now caught up front by a `sys.stdout is None` guard that prints
+    a one-line stderr diagnosis and exits 130. F3 round-2: the diagnosis itself
+    rides STDERR, so a merged stream (`auth setup 2>&1 | head`, where stderr SHARES
+    the dead pipe) used to EPIPE on `write(2, "setup cancelled.")` and escape the
+    handler with exit 1 — the cancel/error handlers now swallow a broken-stderr
+    diagnosis and retarget BOTH fds to /dev/null before exiting, so 130/5 hold even
+    when the two output channels are one dead pipe.
+  - F2 robustness: the project-id shape loop caps at 3 malformed strikes then
+    forces a final skip decision (accept → continue, decline → abort), so THAT
+    loop terminates on every input (the old one could hang on a declined skip);
+    a crashed status check and a failed config write become named `status-error`
+    / `write-error` outcomes (exit 5, reported on stderr) instead of escaping the
+    exit contract as a traceback (exit 1).
+  - Wording-drift ledger (honesty): the C2-era rewrite silently dropped the
+    looked-in-paths + "copy example.toml" hint from the fresh-profile `auth`
+    message — the exit code was preserved but the guidance vanished without a
+    note. F2 restores the informative text (still exit 4). Recorded so both the
+    drift and its fix are on the ledger.
+  - README Setup now leads with the wizard (the manual steps remain as a
+    collapsible fallback); ADR-0004's Status note is updated in the same commit
+    it explicitly awaited.
 - Correction capture + `status` (ticket #27): the daemon records your
   hand-fixes of applied mail as training signal, and `status` answers
   "is it working?" with realized precision from the local store alone.

@@ -8,6 +8,12 @@ does not ship releases yet.
 
 ### Added
 
+- Date Provenance on the record contract (`CorpusRecord.date_provenance`):
+  export stamps server `internalDate` vs MIME `Date`-header fallback
+  distinctly, GYB import stamps its own source; pre-existing lines lacking
+  the field read as explicit `unknown` (append-only corpus, never rewritten).
+  Temporal-split consumers can now filter on the flag (invariant #7).
+
 - Phase 0 (corpus) scaffold and CI: pyproject/uv packaging, `gmail-labeler`
   CLI entry point, GitHub Actions workflow (ubuntu + macOS, Python
   3.12/3.13; matrix later re-shaped to floor + latest — see Changed),
@@ -171,6 +177,15 @@ does not ship releases yet.
   report-surfaced **Stale Id** term; and ADR-0008 records that the list
   response carries no page-level `historyId` in the current wire
   contract, superseding spec #64's seed-source sentence.
+- `dataset import-gmail` scope excludes DRAFT and CHAT (maintainer decision
+  2026-11-01, ticket #17): the default query now carries the documented
+  `-in:draft` token only, and the ingest layer hard-skips any message
+  whose raw wire labelIds contain the system label id DRAFT or CHAT —
+  no documented chat query token exists (is:chat retired; -in:chat
+  undocumented, with a word-degradation hazard), so chat exclusion
+  lives in code, where an explicit `--query` override cannot bypass
+  it. With Additive-only + skip-present and the append-only corpus,
+  the old implicit inclusion would be a permanent one-way door.
 
 ### Fixed
 

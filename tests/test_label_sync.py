@@ -49,6 +49,7 @@ def _record(mid: str, labels: tuple[str, ...]) -> CorpusRecord:
         labels=labels,
         body_hash=body_hash(f"body {mid}"),
         source="api",
+        date_provenance="internal_date",
         thread_id=f"t{mid}",
     )
 

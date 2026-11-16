@@ -74,7 +74,9 @@ table are candidates (the join AC). A ``labelsRemoved`` of a label that
 IS that message's Application label is a 'removed' Correction (a human
 undid our work); a ``labelsAdded`` of a MANAGED-VOCABULARY (graduated,
 non-System) label the daemon did NOT write (no Application row for it)
-is an 'added' Correction (a human did our job — positive signal).
+is an 'added' Correction CANDIDATE — whether it is positive training signal
+depends on its attribution (only ``"human"`` is; ``"filter_covered"`` and
+``"unverifiable"`` — including the crash-replay withhold below — are not).
 ANYTHING else on an applied message — System Labels, non-vocabulary
 labels, a removed NON-applied label, INBOX churn — records NOTHING:
 noise is not correction. An 'added' Correction carries an
@@ -88,7 +90,15 @@ snapshot is UNKNOWN attribution, not "no filters": every 'added' is then
 ``"unverifiable"`` (withheld), and the daemon warns at startup. Only
 ``"human"`` adds are training signal. A 'removed' Correction is always
 attributed ``"human"`` (a human removing is human signal regardless of
-filters — invariant #6).
+filters — invariant #6). A fourth UNVERIFIABLE trigger (S1 C2): when the
+delta carries a ``labelsAdded`` for a label this tick's plan SKIPPED as
+already-present yet no Application row exists for it, the HUMAN credit is the
+crash-replay ambiguity — our own landed write whose row was lost before the
+commit, indistinguishable from a human who added exactly what we would have —
+so a would-be ``"human"`` add is routed to ``"unverifiable"`` (withheld), never
+credited (which would poison human_added and the training fold). It overrides
+ONLY the human credit: a PROVEN ``"filter_covered"`` (a filter verifiably
+authored it) or an already-``"unverifiable"`` add is not ambiguous and stands.
 A corrected message is NEVER written this delta (the daemon does not
 fight the human's hand-fix — the landmine: detection never produces a
 write for the corrected message). The correction rows ride the SAME
@@ -119,6 +129,7 @@ from .gmail_errors import GmailAuthError, GmailError, GmailPermanentError, is_40
 from .labels import normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 from .model import Model
+from .tiers import would_apply
 
 __all__ = [
     "BOOTSTRAP_QUERY",
@@ -299,6 +310,55 @@ def predict_conformant(
 #: message (the guide's own claim); its historyId is the cursor seed.
 BOOTSTRAP_QUERY = ""
 
+#: System label ids marking mail that is NOT incoming-from-others mail the
+#: daemon should score. The skip is COMPOUND (see the fetch-loop guard): a
+#: message is skipped iff it carries one of these ids AND is NOT also in INBOX.
+#:
+#: Per-label reason (these ids earn their place for two different reasons):
+#:   DRAFT / CHAT — never legitimate classification targets; the corpus already
+#:     hard-excludes them (export.py _EXCLUDED_SYSTEM_LABEL_IDS), so scoring a
+#:     pre-send draft or a chat would feed the model an inference target it was
+#:     never trained on.
+#:   SENT — the operator's OWN send: a message they send lands a SENT-tagged
+#:     copy in the mailbox that arrives on the history stream as a messageAdded
+#:     (the push guide's notification-loop hazard; MEDIUM confidence — a single
+#:     practitioner report, but the need to not label the operator's own
+#:     outgoing mail holds regardless of the field Gmail signals it with). This
+#:     guard does NOT cover our own apply_labels echo — that echo is a label-only
+#:     MODIFY (labelsAdded, no messagesAdded), already kept out of the scoring
+#:     set by _message_ids (S1); do NOT revert that to the generic messages[]
+#:     field on the assumption this guard catches the echo. SENT is NOT
+#:     corpus-excluded — export's DEFAULT_QUERY is `in:anywhere …`, which
+#:     INCLUDES sent mail — so it is wrong to call it "outside the training
+#:     distribution"; it is here to stop the daemon labelling the operator's own
+#:     outgoing mail, nothing more. "SELF" is a search-query term, not a label
+#:     id, so the SENT system id is the machine-checkable signal.
+#:
+#: WHY THE INBOX EXEMPTION (the compound) — the manager SUSTAINED this over a
+#: reviewer disagreement, both families heard:
+#:   deepseek: a PLAIN set silently under-labels the ONE construct where the
+#:     human's own hand put a SENT-tagged message back in the inbox (a drag);
+#:     a wrong-skip is the rank-one starvation class, and the compound costs
+#:     zero native coverage.
+#:   qwen (dissent, recorded not erased): the plain skip is correct because our
+#:     own outgoing is not incoming-from-others mail.
+#: Both families verified — by wire-reasoning, not CI (the same MEDIUM
+#: confidence as the SENT note; these are external Gmail-flow facts no offline
+#: test can prove) — that the compound is a no-op on the NATIVE flows we can
+#: name: self-addressed mail arrives as a DISTINCT inbox copy Gmail does NOT tag
+#: SENT, and a user label merely NAMED 'sent' never matches the id-guard (it keys
+#: on label IDS). So the practical producer of SENT+INBOX co-occurrence is the
+#: human's own drag (a Trash→Inbox RESTORE of a sent message is a second
+#: human-action path); the list is not exhaustive, but the failure direction is
+#: the SAFE one — the compound scores (INBOX mail's default) rather than skips
+#: (the guard's exception), so an un-named co-occurrence can only under-apply the
+#: guard, never wrongly starve a real arrival. README scopes the daemon to
+#: "scores arriving mail" (line 19), which a dragged-back message is once in the
+#: inbox.
+#: The guard is DAEMON-SCOPED only: ROADMAP's Never-list (line 206) explicitly
+#: permits the deliberate `apply` command to label non-incoming mail.
+NON_INCOMING_LABEL_IDS = frozenset({"SENT", "DRAFT", "CHAT"})
+
 
 @dataclass(frozen=True, slots=True)
 class ServingContext:
@@ -416,25 +476,62 @@ def bootstrap_cursor(client: GmailClient) -> int | None:
 
 
 def _message_ids(records: tuple[dict[str, object], ...]) -> list[str]:
-    """The message-event ids of one page's history records, in wire
-    order, deduplicated (a message touched twice in one delta is
-    processed once — the present-set read makes the later event's state
-    authoritative either way). Records carrying only labels/threadThreads
-    have no message events and pass through; a MALFORMED messages list
-    is a lying wire — loud permanent (the adapter's shape doctrine)."""
+    """The ARRIVAL message-event ids of one page's history records, in wire
+    order, deduplicated (a message touched twice in one delta is processed
+    once — the present-set read makes the later event's state authoritative
+    either way).
+
+    ARRIVALS ONLY — the scoring set is ``messagesAdded[]``, NOT the generic
+    ``messages[]`` field. The Gmail users.history reference describes the
+    generic field as "List of messages changed in this history record" and
+    explicitly recommends the specific change-type fields instead; ``
+    messagesAdded[]`` is "Messages added to the mailbox" (arrivals). Reading
+    the generic field re-enrolled OLD mail that merely got a label change —
+    a user archive/relabel, or the daemon's OWN apply_labels echo (the push
+    guide's notification-loop warning) — for scoring, which is RETROACTIVE
+    LABELING (README 'scores arriving mail'; ROADMAP Never: no retroactive
+    labeling except via the deliberate `apply` command). Records carrying
+    only labels/threadThreads/messages[]-without-messagesAdded have no
+    arrival event and pass through. Two distinct failure shapes, two
+    postures: a record with NO ``messagesAdded`` (a label-only modify) simply
+    contributes FEWER arrivals — it passes through, the cursor advances,
+    never a bad write (ADR-0005 fail-safe); but a ``messagesAdded`` LIST that
+    is present yet MALFORMED (not a list of objects) or whose event carries
+    NO id at all is the loud-permanent OTHER half — it raises and the fetch
+    loop HOLDS the cursor (a lying arrival wire is never silently under-read).
+    The nested Message id is read; a flat id is tolerated defensively (the
+    _label_event_message_id precedent).
+
+    HONEST SCOPE of "arrivals": messagesAdded[] is literally "added to the
+    MAILBOX", which is not identical to "newly received" — a Trash/Spam
+    RESTORE is plausibly reported as an add, so a restored OLD message could
+    still be scored and receive a graduated label it lacks (a narrow
+    retroactivity the field cannot distinguish; the apply command remains the
+    deliberate bulk path). Conversely, if a future wire ever omitted
+    messagesAdded for a true arrival the failure is SILENT (no scoring,
+    visible only as messages=0 in the counter line). Both edges are wire
+    facts to re-confirm at the live opt-in seam, not CI-provable here.
+
+    Why NOT the ``historyTypes[]`` SERVER filter: one might ask history.list
+    to return only messageAdded records. REJECTED — the correction arm needs
+    the SAME delta's labelsAdded/labelsRemoved events, and a type-suppressed
+    list's cursor-advance semantics are undocumented (does the cursor still
+    cover the suppressed records?). We read the full delta and select arrivals
+    client-side, so the correction join and the cursor stay on one honest
+    stream."""
     ids: list[str] = []
     for record in records:
-        events = record.get("messages")
+        events = record.get("messagesAdded")
         if events is None:
             continue
         if not isinstance(events, list) or not all(
             isinstance(event, dict) for event in events
         ):
-            raise GmailPermanentError("history record 'messages' not a list of objects")
+            raise GmailPermanentError(
+                "history record 'messagesAdded' not a list of objects"
+            )
         for event in events:
-            message_id = event.get("id")
-            if not isinstance(message_id, str) or not message_id:
-                raise GmailPermanentError("history message event without a message id")
+            message_id = _label_event_message_id(event, "messagesAdded")
             if message_id not in ids:
                 ids.append(message_id)
     return ids
@@ -587,6 +684,54 @@ def _attribution(
     return "unverifiable" if saw_unverifiable else "human"
 
 
+def _skip_present_pairs(
+    ctx: ServingContext,
+    fetched: list[tuple[str, frozenset[str], str]],
+    vocab: tuple[str, ...],
+    rows: list[tuple[float, ...]],
+) -> frozenset[tuple[str, str]]:
+    """The (message_id, label_name) pairs this tick would have APPLIED but
+    found already PRESENT — a band verdict AND present (skip-present,
+    invariant #2). S1 C2 feeds these to detect_corrections: a labelsAdded
+    event for such a pair with no Application row is the crash-replay
+    ambiguity (our own lost write vs a human who added the same label).
+
+    Reuses ``tiers.would_apply`` (the SAME decision core the plan composes
+    through — never re-derived). A message whose would_apply raises is a
+    lying input the plan loop already routes to a per-message warning; here
+    it contributes NO pair (we cannot claim a skip-present we could not
+    compute), so attribution falls through to the ordinary path."""
+    pairs: set[tuple[str, str]] = set()
+    # the zips are strict-safe: predict_conformant already pinned the row COUNT
+    # (== len(fetched)) and each row's WIDTH (== len(vocab)) before we get here,
+    # so strict=True can never fire — noted so it does not silently become
+    # load-bearing if predict_conformant's checks ever move.
+    for (message_id, present, _text), score_row in zip(fetched, rows, strict=True):
+        scores = dict(zip(vocab, score_row, strict=True))
+        try:
+            decisions = would_apply(
+                scores=scores,
+                bands=ctx.bands,
+                graduated=ctx.graduated,
+                present=present,
+                system_labels=ctx.system_labels,
+            )
+        except Exception:
+            # a lying input contributes NO pair here (we cannot claim a
+            # skip-present we could not compute) AND must not escape _run_tick to
+            # kill daemon_loop — the plan loop turns the same input into a
+            # per-message warning. Netting Exception (not just ValueError) is the
+            # defensive choice; unlike plan_message_write we do NOT re-raise
+            # AssertionError, but that divergence is unreachable: would_apply's
+            # refusals are all ValueError (a lying score/band/vocab), never the
+            # internal-contradiction AssertionError the plan guards against.
+            continue
+        for d in decisions:
+            if d.band is not None and d.present:
+                pairs.add((message_id, d.label))
+    return frozenset(pairs)
+
+
 def detect_corrections(
     records: tuple[dict[str, object], ...],
     *,
@@ -594,6 +739,7 @@ def detect_corrections(
     db: AppDB,
     parsed_by_id: Mapping[str, tuple[str, tuple[str, ...], str]],
     detected_at: datetime,
+    skip_present: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[CorrectionRow]:
     """Classify one page's label-change events into Corrections
     (ticket #27; GLOSSARY: Correction; the module docstring's CORRECTION
@@ -653,13 +799,27 @@ def detect_corrections(
                 continue
             seen.add(key)
             fields = parsed_by_id.get(message_id)
+            attribution = _attribution(ctx, label_id, fields)
+            if attribution == "human" and (message_id, name) in skip_present:
+                # S1 C2 (crash-replay window): _attribution found no filter
+                # explaining the add, so it would credit the HUMAN — but this
+                # tick's plan SKIPPED this add as already-present and there is
+                # NO Application row for it. That makes the human credit
+                # AMBIGUOUS: equally it is the daemon's own landed write whose
+                # row was lost before the commit (a replay). We withhold only
+                # the human credit (invariant #6, withheld-not-guessed); a
+                # PROVEN filter_covered (a filter verifiably authored it) or an
+                # already-unverifiable add is NOT ambiguous here and stands —
+                # downgrading a proof to "unverifiable" would claim an
+                # ignorance we do not have.
+                attribution = "unverifiable"
             rows.append(
                 CorrectionRow(
                     message_id=message_id,
                     label=name,
                     kind="added",
                     detected_at=detected_at,
-                    attribution=_attribution(ctx, label_id, fields),
+                    attribution=attribution,
                 )
             )
     return rows
@@ -797,6 +957,22 @@ def _run_tick(
                     e,
                 )
                 return stop
+            label_ids = set(raw.label_ids)
+            non_incoming = sorted(NON_INCOMING_LABEL_IDS & label_ids)
+            if non_incoming and "INBOX" not in label_ids:
+                # S2 non-incoming guard (see NON_INCOMING_LABEL_IDS for the
+                # per-label rationale + the sustained ruling on the INBOX
+                # exemption). A counted SKIP — named by the triggering label id
+                # (body-free), never scored, never written — the posture of a
+                # ghost skip. A SENT message the human dragged back into the
+                # inbox (SENT+INBOX) is NOT skipped: it is arriving mail again.
+                skipped += 1
+                log.warning(
+                    "daemon: skipped message %s: non-incoming (%s)",
+                    message_id,
+                    ",".join(non_incoming),
+                )
+                continue
             try:
                 data = decode_gmail_raw(raw.raw_b64url)
             except ValueError as e:  # UnicodeEncodeError IS a ValueError
@@ -831,32 +1007,6 @@ def _run_tick(
         if should_stop():
             stop = True  # the delta still drains to its commit point
 
-    # #27 CORRECTION DETECTION (read + local-DB only — never a Gmail
-    # write): classify this delta's label-change events against the
-    # applications join. A corrected message is EXCLUDED from the write
-    # below (the daemon does not fight the human's hand-fix — the landmine
-    # "detection never produces a write for the corrected message, ever").
-    # The correction rows ride the SAME delta transaction as the rows and
-    # the cursor (one commit point, unchanged).
-    try:
-        corrections = detect_corrections(
-            tuple(all_records),
-            ctx=ctx,
-            db=db,
-            parsed_by_id=parsed_by_id,
-            detected_at=applied_at,
-        )
-    except GmailPermanentError as e:
-        # a malformed label-event wire is a lying delta — hold the cursor
-        # (the same posture as a malformed messages list above)
-        log.warning(
-            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
-            cursor,
-            e,
-        )
-        return stop
-    corrected_ids = frozenset(row.message_id for row in corrections)
-
     # the batched predict (the shadow seam: ONE call over the delta's
     # texts, vocab zip like shadow). A model defect is SYSTEMATIC —
     # hold the cursor (every retry fails identically and loudly; a
@@ -865,6 +1015,13 @@ def _run_tick(
     # seam (``predict_conformant`` — apply #26 imports it, never
     # re-implements it); the arms below are the DAEMON's posture: the
     # shape defect and the model's own failure both HOLD the cursor.
+    #
+    # S1 C2: predict now runs BEFORE correction detection — the ambiguous-
+    # add check needs this tick's band verdicts (which labels were skipped
+    # as already-present), and those come from the scores. Both predict and
+    # detection are read-only (model + local DB, no Gmail write), and the
+    # commit point is unchanged, so the reorder is behavior-preserving: on a
+    # model hold nothing is committed either way.
     try:
         vocab, rows = predict_conformant(model, [text for _, _, text in fetched])
     except _PredictionShapeError as e:
@@ -888,6 +1045,37 @@ def _run_tick(
             type(e).__name__,
         )
         return stop
+
+    skip_present = _skip_present_pairs(ctx, fetched, vocab, rows)
+
+    # #27 CORRECTION DETECTION (read + local-DB only — never a Gmail
+    # write): classify this delta's label-change events against the
+    # applications join. A corrected message is EXCLUDED from the write
+    # below (the daemon does not fight the human's hand-fix — the landmine
+    # "detection never produces a write for the corrected message, ever").
+    # The correction rows ride the SAME delta transaction as the rows and
+    # the cursor (one commit point, unchanged). skip_present (computed above
+    # from this tick's verdicts) lets an added-correction that is really the
+    # daemon's own lost write be WITHHELD, not credited (S1 C2).
+    try:
+        corrections = detect_corrections(
+            tuple(all_records),
+            ctx=ctx,
+            db=db,
+            parsed_by_id=parsed_by_id,
+            detected_at=applied_at,
+            skip_present=skip_present,
+        )
+    except GmailPermanentError as e:
+        # a malformed label-event wire is a lying delta — hold the cursor
+        # (the same posture as a malformed messages list above)
+        log.warning(
+            "daemon: delta failed at cursor %d — cursor held, retry next tick: %s",
+            cursor,
+            e,
+        )
+        return stop
+    corrected_ids = frozenset(row.message_id for row in corrections)
 
     # per message: compose (the plan's fail-safe is the net), then the
     # Gmail write FIRST — see the module docstring's safety proof

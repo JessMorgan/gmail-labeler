@@ -42,9 +42,19 @@ def _rec(mid: str, labels: tuple[str, ...]) -> CorpusRecord:
     )
 
 
-def _corr(mid: str, label: str, kind: str, attribution: str = "human") -> CorrectionRow:
+def _corr(
+    mid: str,
+    label: str,
+    kind: str,
+    attribution: str = "human",
+    detected_at: datetime = TS,
+) -> CorrectionRow:
     return CorrectionRow(
-        message_id=mid, label=label, kind=kind, detected_at=TS, attribution=attribution
+        message_id=mid,
+        label=label,
+        kind=kind,
+        detected_at=detected_at,
+        attribution=attribution,
     )
 
 
@@ -175,12 +185,14 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
             "message_id": "aa11",
             "label": "Money/Bills",
             "kind": "removed",
+            "detected_at": TS.isoformat(),
             "attribution": "human",
         },
         {
             "message_id": "bb22",
             "label": "Shipping",
             "kind": "added",
+            "detected_at": TS.isoformat(),
             "attribution": "filter_covered",
         },
         # F1: the raw dump is AUDITABLE — an unverifiable add is written
@@ -190,11 +202,61 @@ def test_export_writes_rows_no_bodies(tmp_path: Path) -> None:
             "message_id": "cc33",
             "label": "Shipping",
             "kind": "added",
+            "detected_at": TS.isoformat(),
             "attribution": "unverifiable",
         },
     ]
     # invariant #5: no body/subject/raw key anywhere in the export
     assert "body" not in out_file.read_text(encoding="utf-8").lower()
+
+
+def test_export_round_trips_to_correction_rows(tmp_path: Path) -> None:
+    # S1 C3a: the export carries detected_at (the field the fold seam needs),
+    # so a consumer can reconstruct a FULL CorrectionRow. Re-parse the JSON
+    # into CorrectionRow instances and assert they EQUAL the store's rows —
+    # the round-trip that makes the artifact a faithful training-signal input,
+    # not a lossy summary.
+    # S2 C: seed with SUB-SECOND microseconds. TS alone (whole second) let the
+    # deepseek ts-trunc mutant (export serialising detected_at with
+    # microsecond=0) SURVIVE at tip — nothing to truncate. A .123456 stamp makes
+    # lossy serialization die: the rebuilt row's detected_at no longer equals
+    # the store's. The store preserves microseconds (appdb writes
+    # detected_at.astimezone(UTC).isoformat(), reads fromisoformat).
+    ts_us = datetime(2026, 11, 1, 12, 0, 0, 123456, tzinfo=UTC)
+    seeded = [
+        _corr("aa11", "Money/Bills", "removed", detected_at=ts_us),
+        _corr(
+            "bb22", "Shipping", "added", attribution="filter_covered", detected_at=ts_us
+        ),
+    ]
+    _seed_corr(tmp_path, seeded)
+    out_file = tmp_path / "corrections.json"
+    result = _export(tmp_path, _cfg(tmp_path), extra=("--out", str(out_file)))
+    assert result.exit_code == 0, result.output
+    payload = json.loads(out_file.read_text(encoding="utf-8"))
+    rebuilt = sorted(
+        (
+            CorrectionRow(
+                message_id=r["message_id"],
+                label=r["label"],
+                kind=r["kind"],
+                detected_at=datetime.fromisoformat(r["detected_at"]),
+                attribution=r["attribution"],
+            )
+            for r in payload
+        ),
+        key=lambda c: c.message_id,
+    )
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    stored = sorted(
+        (row for mid in ("aa11", "bb22") for row in db.corrections_for_message(mid)),
+        key=lambda c: c.message_id,
+    )
+    db.close()
+    assert rebuilt == stored
+    # and the sub-second detected_at survived the round-trip (the fold needs it)
+    assert all(c.detected_at == ts_us for c in rebuilt)
 
 
 def test_export_to_stdout(tmp_path: Path) -> None:

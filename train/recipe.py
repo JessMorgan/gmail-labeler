@@ -24,7 +24,13 @@ Memory: tokenization is LAZY — the dataset holds raw texts and the
 collator tokenizes per batch, so TOKEN memory is O(batch x max
 length), not O(corpus x max length). Raw texts and the multi-hot label
 matrix remain O(corpus) by design (the matrix is ~0.18 GiB at 394k
-messages x 120 labels — held, not streamed).
+messages x 120 labels — held, not streamed). Serving predict is
+BATCHED the same way (``_PREDICT_BATCH_SIZE``): eval is the first bulk
+caller (ticket #20), and a single pass over a large test split would
+pad every text to the longest one in the split — token memory
+O(corpus x max length), the exact hazard the lazy collator exists to
+avoid. Rows are concatenated per batch; row i still corresponds to
+text i (pinned by the smoke test).
 
 Checkpoint output convention: ``output_dir`` is the plain HF-style
 directory (model weights + tokenizer + config); the CLI writes the
@@ -57,6 +63,14 @@ from gmail_labeler.dataset_build import TrainingExample
 
 _MAX_LENGTH = 512
 
+#: Serving batch size for ``HfModel.predict`` (ticket #20): token
+#: memory stays O(batch x max length), not O(corpus x max length), on
+#: a bulk caller like eval over the whole test split. 32 is the token
+#: budget: ~32 x 512 tokens (the _MAX_LENGTH cap) bounded per batch.
+#: Named in one place — the smoke test crosses it at the REAL default
+#: (33 texts) and forces a small value to cross batch boundaries.
+_PREDICT_BATCH_SIZE = 32
+
 
 class HfModel:
     """A loaded encoder behind the ``Model`` Protocol (GLOSSARY: Model
@@ -81,16 +95,23 @@ class HfModel:
         if not texts:
             return ()
         self._model.eval()
-        with torch.no_grad():
-            inputs = self._tokenizer(
-                list(texts),
-                truncation=True,
-                max_length=_MAX_LENGTH,
-                padding=True,
-                return_tensors="pt",
-            ).to(self._device)
-            scores = torch.sigmoid(self._model(**inputs).logits)
-        return tuple(tuple(float(v) for v in row) for row in scores)
+        rows: list[tuple[float, ...]] = []
+        for start in range(0, len(texts), _PREDICT_BATCH_SIZE):
+            batch = texts[start : start + _PREDICT_BATCH_SIZE]
+            with torch.no_grad():
+                inputs = self._tokenizer(
+                    list(batch),
+                    truncation=True,
+                    max_length=_MAX_LENGTH,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(self._device)
+                scores = torch.sigmoid(self._model(**inputs).logits)
+            # one host transfer per batch (cpu().tolist()), not one
+            # per row: tolist() yields Python floats, so no per-value
+            # float() coercion is needed
+            rows.extend(tuple(row) for row in scores.cpu().tolist())
+        return tuple(rows)
 
 
 class _WeightedDataset(Dataset):

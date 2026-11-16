@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
 
-from .dataset_build import TrainingExample, sorted_unique
+from .dataset_build import TrainingExample, is_tenth, sorted_unique
 
 __all__ = [
     "DEFAULT_THRESHOLDS",
@@ -138,7 +138,7 @@ def eval_metrics(
     for t in thresholds:
         if not 0.0 < t < 1.0:
             raise ValueError(f"threshold must be in (0, 1), got {t}")
-        if abs(t * 10 - round(t * 10)) > 1e-9:
+        if not is_tenth(t):
             raise ValueError(
                 f"threshold {t} is not a tenth — the report labels its "
                 "columns to one decimal, so a non-tenth grid would render "

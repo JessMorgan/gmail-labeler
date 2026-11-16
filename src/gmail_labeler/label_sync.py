@@ -21,9 +21,12 @@ never written (ingest stays the acquisition paths' alone) and counted as
 Unseen Ids (GLOSSARY) for the report — history events and label
 inventories cannot establish that an absent id is new mail or that it
 matches the import query (a ``messagesDeleted``-touched id that was never
-resident lands in this bucket too). ``messagesDeleted``-touched resident
-ids and metadata-confirmed-gone ids: record kept (v1: no tombstones),
-counted. Now-unresolvable label ids keep the ``id:`` deleted-label
+resident lands in this bucket too). A gone-upstream id's record is kept
+(v1: no tombstones) and counted ONLY when the refresh get CONFIRMS the 404
+— spec #64's #88-round clarification: the get decides, never the event
+type. A delete-touched id whose get failed confirms nothing and is failure
+accounting alone; a message that came back is revised like any other stale
+id. Now-unresolvable label ids keep the ``id:`` deleted-label
 convention via the shared normalizer.
 
 ``full_resync`` (ticket #74) is the recovery path that needs no history:
@@ -119,8 +122,9 @@ class _SyncStatsBase:
     docstring)."""
 
     revised: int = 0  # revisions appended (planned, under dry_run)
-    deleted_kept: int = 0  # gone-touched ids; records kept — walk:
-    # delete-touched union metadata-404s, resync: metadata-404s only
+    deleted_kept: int = 0  # upstream-gone ids whose kept record is CONFIRMED
+    # by a 404 on the refresh get — both spines; a failed get confirms
+    # nothing and rides the failure accounting, never this count
     unseen: int = 0  # Unseen Ids: event/inventory ids not resident (report only)
     retried: int = 0  # shared RetryStats protocol counter
     birthed: bool = False  # True only when THIS run BIRTHS the ledger (no
@@ -184,7 +188,6 @@ def sync_labels(
         )
 
     stale: dict[str, None] = {}  # insertion-ordered set: walk order is the report order
-    deleted_touched: set[str] = set()
     unseen: set[str] = set()
     page_token: str | None = None
     final_history_id: int | None = None
@@ -202,12 +205,11 @@ def sync_labels(
             return stats
         stats.events += len(page.records)
         for record in page.records:
-            for message_id, is_delete in _event_message_ids(record):
+            for message_id in _event_message_ids(record):
                 if store.has(message_id):
-                    if is_delete:
-                        deleted_touched.add(message_id)
                     # refresh-on-any-touch — a delete touch marks stale too:
-                    # if the message came back, the metadata get says so
+                    # if the message came back, the metadata get says so,
+                    # and only the get's 404 confirms a keep (deleted_kept)
                     stale.setdefault(message_id, None)
                 else:
                     unseen.add(message_id)
@@ -238,7 +240,10 @@ def sync_labels(
             dry_run=dry_run,
             diff_gate=False,  # the event walk self-heals: no diff gate
         )
-    stats.deleted_kept = len(deleted_touched | gone_confirmed)
+    # confirmed-only (spec #64's #88-round clarification): the 404 IS the
+    # keep — a delete-touched id whose get failed sits in stats.failed
+    # alone, and one whose get returned mail was revised like any stale id
+    stats.deleted_kept = len(gone_confirmed)
 
     if stats.failed:
         # never ahead of durability — including the delta's own failed
@@ -841,17 +846,19 @@ def _wire_dict(value: object) -> dict[str, object] | None:
     return cast("dict[str, object]", value) if isinstance(value, dict) else None
 
 
-def _event_message_ids(record: Mapping[str, object]) -> Iterator[tuple[str, bool]]:
-    """(lowercased message id, is messagesDeleted) for every entry naming a
-    message in one wire History record. Absent-tolerant by shape: a field
-    that is not the documented list-of-objects contributes nothing — the
-    walk never guesses at malformed entries, and events that name no
+def _event_message_ids(record: Mapping[str, object]) -> Iterator[str]:
+    """Lowercased message id for every entry naming a message in one wire
+    History record. Event types are not distinguished: the walk refreshes
+    on any touch and the refresh get decides the outcome, so even the
+    ``messagesDeleted`` flag is not needed for accounting — a keep is
+    counted only on the get's confirmed 404. Absent-tolerant by shape: a
+    field that is not the documented list-of-objects contributes nothing —
+    the walk never guesses at malformed entries, and events that name no
     message cannot touch anything."""
     for field_name in _EVENT_MESSAGE_FIELDS:
         entries = _wire_list(record.get(field_name))
         if entries is None:
             continue
-        is_delete = field_name == "messagesDeleted"
         for entry in entries:
             entry_map = _wire_dict(entry)
             if entry_map is None:
@@ -861,4 +868,4 @@ def _event_message_ids(record: Mapping[str, object]) -> Iterator[tuple[str, bool
                 continue
             mid = message.get("id")
             if isinstance(mid, str) and mid:
-                yield (mid.lower(), is_delete)
+                yield mid.lower()

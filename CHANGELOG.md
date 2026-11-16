@@ -43,7 +43,9 @@ does not ship releases yet.
   labels). The cursor advances only after the delta's revisions are durable
   and only when nothing failed (invariant #3 — crash-retry tests prove the
   last-wins fold absorbs replays). `messagesDeleted`-touched ids keep their
-  record and are counted; non-resident event ids are counted as Unseen Ids,
+  record; a keep is counted in `deleted_kept` only when the refresh get
+  confirms the 404 (the get decides, never the event type — a failed get is
+  failure accounting alone); non-resident event ids are counted as Unseen Ids,
   never ingested; a cursorless corpus births from one profile call and
   applies nothing (ADR-0008 consequence 1). The report prints per-label
   gains/losses and closes with the `dataset analyze` pointer; `--dry-run`

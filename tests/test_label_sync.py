@@ -503,9 +503,10 @@ def test_max_attempts_below_one_is_rejected(tmp_path: Path) -> None:
 def test_gone_confirmed_without_delete_event_counts_as_deleted_kept(
     tmp_path: Path,
 ) -> None:
-    """The other half of the deleted_kept union: an id a label event names
-    whose metadata get 404s (vanished upstream with no messagesDeleted in
-    the window) — record kept, counted, NOT a failure."""
+    """deleted_kept is the 404-confirmed set, whichever event touched the
+    id: a label-event-named id whose metadata get 404s (vanished upstream
+    with no messagesDeleted in the window) — record kept, counted, NOT a
+    failure."""
     store = store_at(tmp_path)
     _seed(store, _record("a1", ("Shipping",)))
     store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
@@ -520,6 +521,67 @@ def test_gone_confirmed_without_delete_event_counts_as_deleted_kept(
     assert stats.deleted_kept == 1 and stats.revised == 0 and not stats.failed
     resolved = {r.id: r for r in store.iter_resolved()}
     assert resolved["a1"].labels == ("Shipping",)  # kept, not tombstoned
+    cursor = store.read_cursor()
+    assert cursor is not None and cursor.history_id == 500  # delta fully handled
+
+
+def test_failed_get_on_delete_touched_id_is_failure_not_deleted_kept(
+    tmp_path: Path,
+) -> None:
+    """#64 review fold-in: the keep is confirmed by the get, never by the
+    event type. A messagesDeleted-touched id whose metadata get FAILS (a
+    non-404 permanent) confirms nothing — it lands in the failure
+    accounting ONLY, never in deleted_kept; a sibling whose get 404s still
+    counts as kept, and the failed member holds the cursor behind the
+    delta (invariant #3)."""
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = store_at(tmp_path)
+    _seed(store, _record("a1", ("Shipping",)), _record("c3", ("Shipping",)))
+    store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
+    fake = FakeGmailClient(
+        # a1's get is armed to fail before the fake can answer; c3 is gone
+        # from the mailbox, so its get answers the wire's 404
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1",))],
+        history_pages=[_page(MessageDeleted("a1"), MessageDeleted("c3"))],
+    )
+    fake.fail("get_message_metadata", GmailPermanentError("boom", status=400))
+    stats = sync_labels(
+        fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    _assert_no_raw_fetches(fake)
+    assert stats.failed == [("a1", "metadata fetch failed (permanent/retries)")]
+    assert stats.deleted_kept == 1  # c3's confirmed 404 only — a1 confirms nothing
+    assert stats.revised == 0  # a1 failed, c3 gone: no revision either way
+    assert store.read_cursor() == SyncCursor(history_id=100, last_sync=NOW)
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping",)  # kept, unconfirmed
+    assert resolved["c3"].labels == ("Shipping",)  # kept, confirmed
+
+
+def test_delete_touched_id_that_came_back_revises_only(tmp_path: Path) -> None:
+    """The third branch of the confirmed-only contract: a
+    messagesDeleted-touched corpus id whose metadata get returns the message
+    (it came back) is revised like any other stale id — revised ONLY, never
+    also in deleted_kept, which under the old union semantics double-counted
+    it. The delta is fully handled, so the cursor advances."""
+    store = store_at(tmp_path)
+    _seed(store, _record("a1", ("Shipping",)))
+    store.write_cursor(SyncCursor(history_id=100, last_sync=NOW))
+    fake = FakeGmailClient(
+        # the delete event lied (or the message was restored): the mailbox
+        # still serves a1, now carrying an extra label id
+        messages=[FakeMessage(id="a1", eml=b"x", label_ids=("L1", "L9"))],
+        history_pages=[_page(MessageDeleted("a1"))],
+    )
+    stats = sync_labels(
+        fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
+    )
+    _assert_no_raw_fetches(fake)
+    assert stats.deleted_kept == 0  # the get returned mail: nothing was confirmed gone
+    assert stats.revised == 1 and not stats.failed
+    resolved = {r.id: r for r in store.iter_resolved()}
+    assert resolved["a1"].labels == ("Shipping", "id:L9")  # the refresh landed
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 500  # delta fully handled
 

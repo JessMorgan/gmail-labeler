@@ -6,8 +6,10 @@ mailbox's event stream (GLOSSARY: Sync Cursor): versioned JSON
 ``last_sync`` tz-aware UTC ISO-8601. This module owns the NAME and the
 parse/render contract only (CODING-STANDARDS pure core: no I/O, no Gmail or
 config imports); the durable I/O is ``CorpusStore.read_cursor``/
-``write_cursor`` on the established snapshot discipline, and birth belongs to
-Gmail Import (which seeds it) while movement — advance, or reseed with a
+``write_cursor`` on the established snapshot discipline. Two doors birth the
+ledger and one owns its movement: Gmail Import births it when absent (which
+seeds it), and the first Label Sync on a cursorless corpus births it without
+applying (ADR-0008 consequence 1); movement — advance, or reseed with a
 step-down after a rollback — belongs exclusively to Label Sync.
 
 Loud-by-doctrine, like the attribution snapshot parser: a cursor that exists

@@ -119,7 +119,7 @@ corpus id's current labels, diff, revise). The remedy for an expired Sync
 Cursor and the first reconciliation for GYB-sourced Corpora; its reseed
 writes the profile seed, stepping a higher stored Cursor down when the
 mailbox has rolled back — replay from the lower seed is harmless
-(ADR-0007).
+(ADR-0008).
 _Avoid_: re-import (nothing is re-assembled), re-sync (Gmail's name for
 the prescribed full re-pull)
 
@@ -148,9 +148,10 @@ _Avoid_: dirty id, pending id
 
 **Sync Cursor**:
 A Corpus's record of how far it has consumed the mailbox's event stream;
-owned by Label Sync — Gmail Import may birth it when absent, and only a
-Label Sync moves it: advancing, or reseeding (step-down permitted after a
-rollback, ADR-0008). Distinct from the Gmail Import resume point (the corpus
+owned by Label Sync — two doors may birth it when absent: Gmail Import,
+and the first Label Sync on a cursorless Corpus, which applies nothing
+(ADR-0008 consequence 1); only a Label Sync moves it: advancing, or
+reseeding (step-down permitted after a rollback, ADR-0008). Distinct from the Gmail Import resume point (the corpus
 id set).
 _Avoid_: watermark, checkpoint
 

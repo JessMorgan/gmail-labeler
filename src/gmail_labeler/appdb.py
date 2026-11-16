@@ -4,13 +4,15 @@ Application, Durable Handling).
 The SQLite file behind ``[store] db_path``: the shadow_results table
 (the Shadow Pass's recorded would-apply verdicts), the applications
 table (the Application path's recorded writes — ticket #24; the join
-corrections and ``status`` read later), and the daemon_state table
+corrections and ``status`` read later), the daemon_state table
 (the daemon's persisted history cursor — ticket #25; GLOSSARY: History
-Cursor).
+Cursor), and the corrections table (human hand-fixes of applied mail —
+ticket #27; GLOSSARY: Correction).
 
-UPGRADE STORY (paid #23's recorded debt): ``SCHEMA_VERSION`` is 3. The
-v1→v2 migration (applications table) and the v2→v3 migration
-(daemon_state) are SINGLE-ROW restamps, and EVERY schema transition —
+UPGRADE STORY (paid #23's recorded debt): ``SCHEMA_VERSION`` is 4. The
+v1→v2 migration (applications table), the v2→v3 migration
+(daemon_state) and the v3→v4 migration (corrections table) are
+SINGLE-ROW restamps, and EVERY schema transition —
 fresh create+stamp, v1→vN / v2→vN restamp+append, self-heal of a
 missing table — runs in ONE explicit transaction (``_apply_schema``;
 the F1 fix). A crash leaves the file fully prior-state or fully
@@ -20,13 +22,13 @@ half-restamped, both needing hand-recovery. ``executescript`` is banned
 from the transition (it commits any pending transaction first) and
 python-sqlite3's legacy isolation mode does NOT auto-wrap DDL — hence
 the explicit BEGIN (the mode is pinned by test). The tamper guards
-(``{1}`` WITH a later-version table; ``{2}`` WITH daemon_state; our-
-shape-but-EMPTY version) stay — unreachable by crash now, reachable
-only by hand-editing — and each refusal message names the recovery
-(manual stamp to the right version, or delete). The forward-compat
-story is the HARD version gate, stated honestly: a v2 tool opening the
-migrated file refuses ``{3} != {2}`` (our own v3 is the tool that just
-migrated it — re-opening in-process is v3-clean).
+(``{1}`` WITH a later-version table; ``{2}`` WITH daemon_state; ``{3}``
+WITH corrections; our-shape-but-EMPTY version) stay — unreachable by
+crash now, reachable only by hand-editing — and each refusal message
+names the recovery (manual stamp to the right version, or delete). The
+forward-compat story is the HARD version gate, stated honestly: a v3
+tool opening the migrated file refuses ``{4} != {3}`` (our own v4 is the
+tool that just migrated it — re-opening in-process is v4-clean).
 
 Invariants:
 
@@ -38,10 +40,10 @@ Invariants:
   ``commit_applications`` insert their batch in ONE
   transaction — a crash mid-write (or a mid-write refusal) rolls back,
   leaving no half rows; a committed batch is atomic (``commit_page``
-  carries the delta's rows AND the cursor advance in the SAME
-  transaction — the Durable Handling commit point, invariant #3;
-  ``commit_applications`` is the apply path's rows-only sibling, no
-  cursor — invariant #3 belongs to the daemon alone);
+  carries the delta's rows, its Corrections AND the cursor advance in
+  the SAME transaction — the Durable Handling commit point, invariant
+  #3; ``commit_applications`` is the apply path's rows-only sibling, no
+  cursor and no corrections — invariant #3 belongs to the daemon alone);
 - create-all-if-missing: opening a fresh path creates the schema;
   opening an existing DB verifies the schema BEFORE any write (the
   ownership gate: shape equality per table, the version a HARD gate —
@@ -67,19 +69,23 @@ from typing import Any, NoReturn
 from .applications import ApplicationRow
 
 __all__ = [
+    "CORRECTION_ATTRIBUTIONS",
+    "CORRECTION_KINDS",
     "SCHEMA_VERSION",
     "AppDB",
     "AppDBError",
+    "CorrectionRow",
     "RunNotFoundError",
     "ShadowRow",
 ]
 
 #: The schema version (bump on any change to the tables' field set or
 #: semantics). v2 added the applications table (ticket #24); v3 adds
-#: the daemon_state cursor table (ticket #25); the v1→v2 and v2→v3
-#: migrations are single-row restamps documented in the module
-#: docstring's UPGRADE STORY.
-SCHEMA_VERSION = 3
+#: the daemon_state cursor table (ticket #25); v4 adds the corrections
+#: table (ticket #27); the v1→v2, v2→v3 and v3→v4 migrations are
+#: single-row restamps documented in the module docstring's UPGRADE
+#: STORY.
+SCHEMA_VERSION = 4
 
 # Gmail message ids are hex (the CorpusRecord._ID_RE precedent): a
 # non-hex id is a lying row, refused at the adapter boundary.
@@ -108,12 +114,42 @@ _APPLICATIONS_COLUMNS = frozenset(
     }
 )
 _DAEMON_STATE_COLUMNS = frozenset({"history_cursor"})
+_CORRECTIONS_COLUMNS = frozenset(
+    {"message_id", "label", "kind", "detected_at", "attribution"}
+)
 _SCHEMA_VERSION_COLUMNS = frozenset({"version"})
 
 # The Application source literals (the CHECK constraint's vocabulary —
 # mirrored in the Python validation so a lying row is refused NAMED at
 # the writer, not as a raw sqlite3 CHECK traceback).
 _SOURCES = ("daemon", "apply")
+
+# The Correction kind literals (ticket #27; GLOSSARY: Correction) — the
+# CHECK constraint's vocabulary, following the SOURCES pattern exactly:
+# the DB CHECK is the authority, mirrored in the Python validation so a
+# lying kind is refused NAMED at the writer, not as a raw sqlite3 CHECK
+# traceback. 'removed' = a human undid an applied label; 'added' = a
+# human applied a managed-vocabulary label we did not write.
+CORRECTION_KINDS = ("removed", "added")
+
+# The Correction ATTRIBUTION literals (ticket #27 F1; invariant #6) — the
+# CHECK vocabulary for WHO an 'added' Correction is credited to, following
+# the SOURCES/CORRECTION_KINDS pattern. This replaces the old bool
+# filter_covered, which INVERTED #22's 'exclusion, not guessing' doctrine
+# (an unverifiable filter defaulted the add to the human). Three states:
+#   'human'          — no relevant filter, or a relevant filter verifiably
+#                      does NOT match this message: the human added it
+#                      (positive training signal);
+#   'filter_covered' — a SIMULATABLE filter verifiably WOULD have added it:
+#                      withheld from human credit + the export seam;
+#   'unverifiable'   — a relevant filter's criteria are outside the
+#                      simulatable set (or the message's fields were
+#                      unavailable), so authorship CANNOT be determined:
+#                      WITHHELD, not guessed either way (#22's exclusion
+#                      principle). A 'removed' Correction is always
+#                      'human' (a human removing is human signal regardless
+#                      of filters — invariant #6).
+CORRECTION_ATTRIBUTIONS = ("human", "filter_covered", "unverifiable")
 
 
 class AppDBError(Exception):
@@ -143,6 +179,36 @@ class ShadowRow:
     probability: float
     band: str | None
     run_ts: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionRow:
+    """One Correction (ticket #27; GLOSSARY: Correction) — a human
+    hand-fix of an applied message, captured against the Applications
+    join as training signal for the next HUMAN-GATED retrain. NO bodies
+    (invariant #5): the message id, the Managed Label NAME, the kind
+    (``"removed"`` / ``"added"`` — the CORRECTION_KINDS vocabulary),
+    the UTC detected-at stamp, and the ``attribution``.
+
+    ``attribution`` (invariant #6; the CORRECTION_ATTRIBUTIONS vocabulary,
+    decided at detection by the #22 mechanism): WHO an 'added' Correction
+    is credited to — ``"human"`` (no relevant filter, or a verifiable one
+    that does not match: positive training signal), ``"filter_covered"``
+    (a simulatable filter verifiably would have added it: withheld), or
+    ``"unverifiable"`` (authorship cannot be determined: WITHHELD, not
+    guessed — #22's exclusion principle). Only ``"human"`` adds are
+    training signal (the builder's fold seam credits only those); the
+    ``corrections export`` dump is faithful/auditable and carries every
+    row's attribution, and ``status`` discloses the filter-covered and
+    unverifiable slices as their own withheld counts. A
+    'removed' Correction is ALWAYS ``"human"`` (a human removing is human
+    signal regardless of filters — invariant #6)."""
+
+    message_id: str
+    label: str
+    kind: str
+    detected_at: datetime
+    attribution: str = "human"
 
 
 # The schema as INDIVIDUAL statements: _apply_schema runs them inside ONE
@@ -203,6 +269,36 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
         history_cursor INTEGER NOT NULL
     )
     """,
+    """
+    -- The Corrections table (ticket #27; GLOSSARY: Correction): one row
+    -- per human hand-fix of an applied message, captured against the
+    -- Applications join. kind is the CHECK-vocabularyd authority
+    -- ('removed' / 'added' — the CORRECTION_KINDS set, mirrored in the
+    -- Python validation for named refusals). attribution is the
+    -- invariant-#6 CHECK vocabulary ('human' / 'filter_covered' /
+    -- 'unverifiable' — the CORRECTION_ATTRIBUTIONS set): WHO an 'added'
+    -- Correction is credited to; only 'human' is training signal, an
+    -- unverifiable authorship is WITHHELD not guessed (#22's exclusion
+    -- principle); a 'removed' is always 'human'. The UNIQUE index
+    -- below is the store-level dedupe on (message_id, label, kind):
+    -- history-event REPLAY re-detects the same correction, and the
+    -- writer's INSERT OR IGNORE makes the replay idempotent (unlike the
+    -- applications table, which has NO dedupe constraint — a re-earned
+    -- label is legitimate audit history there; a re-detected correction
+    -- is noise). NO BODIES (invariant #5).
+    CREATE TABLE IF NOT EXISTS corrections (
+        message_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('removed', 'added')),
+        detected_at TEXT NOT NULL,
+        attribution TEXT NOT NULL DEFAULT 'human'
+            CHECK (attribution IN ('human', 'filter_covered', 'unverifiable'))
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_corrections_dedup "
+    "ON corrections(message_id, label, kind)",
+    "CREATE INDEX IF NOT EXISTS idx_corrections_label "
+    "ON corrections(label, message_id)",
 )
 
 #: SQLite's signed INTEGER ceiling: the store's cursor bound (the wire's
@@ -403,11 +499,13 @@ class AppDB:
           NOT advisory: a v3 DB is not consumed by a v2 tool). The
           tolerated MIGRATABLE exceptions: exactly {1} WITHOUT any of
           the later-version tables — the state #23 shipped — and
-          exactly {2} WITHOUT daemon_state — the state #24 shipped —
-          each returns its version for the single-row restamp. The
-          TAMPER dead-ends stay: {1} WITH a later table (no v1 tool
-          ever wrote one) and {2} WITH daemon_state (no v2 tool ever
-          wrote one) are inconsistent, refused, named — unreachable by
+          exactly {2} WITHOUT daemon_state — the state #24 shipped — and exactly
+           {3} WITHOUT corrections — the state #25/#26 shipped — each
+           returns its version for the single-row restamp. The
+           TAMPER dead-ends stay: {1} WITH a later table (no v1 tool
+           ever wrote one), {2} WITH daemon_state (no v2 tool ever
+           wrote one) and {3} WITH corrections (no v3 tool ever wrote
+           one) are inconsistent, refused, named — unreachable by
           crash since the atomic transition, hand-editing only;
         - a DB with a valid ours-table PLUS UNKNOWN extra tables
           COEXISTS (documented decision — our tables are the
@@ -429,6 +527,7 @@ class AppDB:
         shadow_results_valid = False
         applications_valid = False
         daemon_state_valid = False
+        corrections_valid = False
         schema_version_present = False
         from_version: int | None = None
         if "shadow_results" in tables:
@@ -458,6 +557,15 @@ class AppDB:
                     f"— refusing to adopt it: {self.path}"
                 )
             daemon_state_valid = True
+        if "corrections" in tables:
+            cols = self._column_set("corrections")
+            if cols != _CORRECTIONS_COLUMNS:
+                raise AppDBError(
+                    f"state DB corrections has the wrong shape "
+                    f"(columns {sorted(cols)} != {sorted(_CORRECTIONS_COLUMNS)}) "
+                    f"— refusing to adopt it: {self.path}"
+                )
+            corrections_valid = True
         if "schema_version" in tables:
             schema_version_present = True
             cols = self._column_set("schema_version")
@@ -514,14 +622,14 @@ class AppDB:
                 if (
                     versions == {1}
                     and SCHEMA_VERSION >= 2
-                    and not {"applications", "daemon_state"} & tables
+                    and not {"applications", "daemon_state", "corrections"} & tables
                 ):
                     # the legacy v1 stamp (the state #23 shipped): the
                     # migratable exception to the hard gate — the caller
                     # runs the single-row restamp INSIDE the one
                     # transition transaction (the crash story, module
                     # docstring); v3 creates applications AND
-                    # daemon_state on the way
+                    # daemon_state on the way (and v4 corrections)
                     from_version = 1
                 elif versions == {1} and SCHEMA_VERSION >= 2:
                     # {1} WITH a later-version table is inconsistent: no
@@ -529,9 +637,14 @@ class AppDB:
                     # since the atomic transition (F1) — this is a
                     # TAMPER guard. The refusal message names the
                     # offending table(s) and the recovery (manual stamp
-                    # to the current version, or delete).
+                    # to the current version, or delete). corrections is
+                    # v4-only, so a {1}+corrections mix offends exactly as
+                    # the others do (F2 item 5 — the sealed {2}+daemon_state
+                    # doctrine extended to the v4 table).
                     offenders = sorted(
-                        t for t in ("applications", "daemon_state") if t in tables
+                        t
+                        for t in ("applications", "daemon_state", "corrections")
+                        if t in tables
                     )
                     raise AppDBError(
                         f"state DB schema_version [1] is stamped v1 but "
@@ -544,7 +657,7 @@ class AppDB:
                 elif (
                     versions == {2}
                     and SCHEMA_VERSION >= 3
-                    and "daemon_state" not in tables
+                    and not {"daemon_state", "corrections"} & tables
                 ):
                     # the legacy v2 stamp (the state #24 shipped): the
                     # migratable exception — the caller runs the
@@ -552,17 +665,45 @@ class AppDB:
                     # transaction (daemon_state rides the create-all)
                     from_version = 2
                 elif versions == {2} and SCHEMA_VERSION >= 3:
-                    # {2} WITH a daemon_state table is inconsistent: no
-                    # v2 tool ever wrote one, and no crash reaches it
-                    # since the atomic transition (the v2→v3 crash pin)
-                    # — TAMPER guard, recovery named
+                    # {2} WITH a v3/v4-only table (daemon_state or
+                    # corrections) is inconsistent: no v2 tool ever wrote
+                    # one, and no crash reaches it since the atomic
+                    # transition (the v2→v3 crash pin) — TAMPER guard,
+                    # recovery named (F2 item 5: corrections offends exactly
+                    # as daemon_state does)
+                    offenders = sorted(
+                        t for t in ("daemon_state", "corrections") if t in tables
+                    )
                     raise AppDBError(
                         f"state DB schema_version [2] is stamped v2 but "
-                        f"carries a daemon_state table (a v2 tool never "
+                        f"carries {' and '.join(offenders)} (a v2 tool never "
                         f"wrote one) — inconsistent, refusing: {self.path} "
                         f"— recovery: run UPDATE schema_version SET version "
                         f"= {SCHEMA_VERSION} manually, or delete the file "
                         f"(shadow and application history is lost)"
+                    )
+                elif (
+                    versions == {3}
+                    and SCHEMA_VERSION >= 4
+                    and "corrections" not in tables
+                ):
+                    # the legacy v3 stamp (the state #25/#26 shipped): the
+                    # migratable exception — the caller runs the single-row
+                    # restamp inside the one transition transaction
+                    # (corrections rides the create-all)
+                    from_version = 3
+                elif versions == {3} and SCHEMA_VERSION >= 4:
+                    # {3} WITH a corrections table is inconsistent: no v3
+                    # tool ever wrote one, and no crash reaches it since the
+                    # atomic transition (the v3→v4 crash pin) — TAMPER
+                    # guard, recovery named
+                    raise AppDBError(
+                        f"state DB schema_version [3] is stamped v3 but "
+                        f"carries a corrections table (a v3 tool never "
+                        f"wrote one) — inconsistent, refusing: {self.path} "
+                        f"— recovery: run UPDATE schema_version SET version "
+                        f"= {SCHEMA_VERSION} manually, or delete the file "
+                        f"(shadow, application and correction history is lost)"
                     )
                 elif (
                     single is not None
@@ -593,14 +734,19 @@ class AppDB:
                         f"state DB schema_version {sorted(versions, key=repr)} != "
                         f"{SCHEMA_VERSION}: {self.path} — unknown stamp set "
                         f"(this tool writes exactly [{SCHEMA_VERSION}]; the "
-                        f"migratable legacy sets are [1] and [2] with no "
+                        f"migratable legacy sets are [1], [2] and [3] with no "
                         f"later-version tables) — hand-edit or corruption: "
                         f"recovery: inspect the tables by hand, or delete "
                         f"the file (all local history is lost)"
                     )
-        if shadow_results_valid or applications_valid or daemon_state_valid:
+        if (
+            shadow_results_valid
+            or applications_valid
+            or daemon_state_valid
+            or corrections_valid
+        ):
             # ours (coexist with any UNKNOWN extra tables); a DB with
-            # ONLY the applications or daemon_state table (no
+            # ONLY the applications, daemon_state or corrections table (no
             # shadow_results) is ours by the shape gate too
             return from_version
         if schema_version_present:
@@ -790,24 +936,40 @@ class AppDB:
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
 
-    def commit_page(self, rows: Sequence[ApplicationRow], history_cursor: int) -> int:
+    def commit_page(
+        self,
+        rows: Sequence[ApplicationRow],
+        history_cursor: int,
+        corrections: Sequence[CorrectionRow] = (),
+    ) -> int:
         """The daemon's DURABLE HANDLING commit point (ticket #25,
         GLOSSARY: Durable Handling; invariant #3): ONE transaction
-        carrying the delta's Application rows AND the cursor advance —
-        COMMIT = handled. ``rows`` may be EMPTY (a delta whose messages
+        carrying the delta's Application rows, its Corrections AND the
+        cursor advance — COMMIT = handled. The three ride ONE transaction
+        (ticket #27): a crash before the COMMIT leaves ALL THREE absent
+        (never rows-without-corrections or corrections-without-cursor),
+        and the replay is idempotent — the corrections insert is
+        ``INSERT OR IGNORE`` against the (message_id, label, kind) UNIQUE
+        index, so a re-served history event adds no duplicate Correction
+        row (unlike the applications rows, whose replay idempotency comes
+        from skip-present). ``rows`` may be EMPTY (a delta whose messages
         all composed empty plans was still handled — the cursor must
         move; commit_applications' empty-batch refusal is deliberately
-        NOT inherited here). Refusals raise BEFORE the transaction: a
+        NOT inherited here); ``corrections`` may be EMPTY (a delta with
+        no human hand-fix). Refusals raise BEFORE the transaction: a
         row failing validation, a within-batch (message_id, label)
-        duplicate, MORE THAN ONE distinct applied_at stamp across the
-        batch (the #24 homogeneity contract as a store invariant, F1),
-        or a non-cursor value. A crash before the COMMIT
-        replays the delta; skip-present makes the replay idempotent —
-        the safety proof is the daemon loop's write-first ordering
-        (daemon.py, the pinned comment there). Returns the row count."""
+        duplicate, a correction failing validation, MORE THAN ONE distinct
+        applied_at stamp across the batch (the #24 homogeneity contract as
+        a store invariant, F1), or a non-cursor value. A crash before the
+        COMMIT replays the delta; skip-present makes the row replay
+        idempotent — the safety proof is the daemon loop's write-first
+        ordering (daemon.py, the pinned comment there). Returns the
+        Application row count (the correction count is read back via
+        ``corrections_for_*``)."""
         if self._conn is None:
             raise AppDBError("state DB not open — call open() first")
         _check_application_batch(rows)
+        _check_correction_batch(corrections)
         stamps = {row.applied_at.astimezone(UTC).isoformat() for row in rows}
         if len(stamps) > 1:
             # the #24 batch-homogeneity contract AS A STORE INVARIANT
@@ -824,16 +986,23 @@ class AppDB:
         _check_cursor_value(history_cursor)
         try:
             # ONE transaction (the record_run precedent): the context
-            # manager commits rows AND cursor together, and rolls back
-            # BOTH on any failure — a half-committed delta (rows without
-            # the cursor) would double-write the rows on replay (the
-            # atomicity pin: test_commit_page_rolls_back_rows_and_cursor)
+            # manager commits rows, corrections AND cursor together, and
+            # rolls back ALL THREE on any failure — a half-committed delta
+            # (rows/corrections without the cursor, or corrections without
+            # the rows that earned them) would double-write on replay (the
+            # atomicity pin: test_commit_page_rolls_back_rows_and_cursor,
+            # and the #27 three-way replay-idempotency pin)
             with self._conn:
                 if rows:
                     # the ONE applications-insert authority (shared with
                     # commit_applications — a column added to the table
                     # changes in exactly one place)
                     _insert_applications(self._conn, rows)
+                if corrections:
+                    # idempotent add (INSERT OR IGNORE vs the UNIQUE
+                    # (message_id, label, kind) index): a re-served
+                    # history event on a replayed delta adds no duplicate
+                    _insert_corrections(self._conn, corrections)
                 self._conn.execute(_CURSOR_UPSERT, (history_cursor,))
         except sqlite3.DatabaseError as e:
             raise AppDBError(f"state DB write failed: {self.path}: {e}") from e
@@ -1064,6 +1233,204 @@ class AppDB:
             out.append(row)
         return tuple(out)
 
+    # -- corrections reads (the #27 status math + export) -----------------
+
+    def corrections_for_label(self, label: str) -> tuple[CorrectionRow, ...]:
+        """The Corrections recorded for one label (the status math's
+        per-label removals), in (detected_at, message_id) order (a total
+        order). Empty is legitimate; rows are re-validated (the tamper
+        doctrine)."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            rows = self._conn.execute(
+                "SELECT message_id, label, kind, detected_at, attribution "
+                "FROM corrections WHERE label = ? "
+                "ORDER BY detected_at, message_id",
+                (label,),
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return self._correction_rows(rows)
+
+    def corrections_for_message(self, message_id: str) -> tuple[CorrectionRow, ...]:
+        """The Corrections recorded for one message, in (detected_at,
+        label) order. Empty is legitimate; rows are re-validated."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            rows = self._conn.execute(
+                "SELECT message_id, label, kind, detected_at, attribution "
+                "FROM corrections WHERE message_id = ? "
+                "ORDER BY detected_at, label",
+                (message_id,),
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return self._correction_rows(rows)
+
+    def all_corrections(self) -> tuple[CorrectionRow, ...]:
+        """Every recorded Correction (the export seam), in
+        (detected_at, message_id, label) order (a total order). Empty is
+        legitimate; rows are re-validated (the tamper doctrine)."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            rows = self._conn.execute(
+                "SELECT message_id, label, kind, detected_at, attribution "
+                "FROM corrections "
+                "ORDER BY detected_at, message_id, label"
+            ).fetchall()
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return self._correction_rows(rows)
+
+    # -- aggregate reads for `status` (DB-only realized precision) --------
+
+    def application_label_counts(self) -> dict[str, int]:
+        """The number of Application rows per label (the realized-
+        precision DENOMINATOR — 'written'), from the LOCAL DB only (no
+        Gmail call). Labels with no rows are absent (not zero-filled) —
+        the caller reports the graduated set and treats absent as 0.
+
+        Reader doctrine (F2 item 9): revalidates every row's message_id /
+        label shape (the same rules the applications read path enforces),
+        so a hand-made row is refused NAMED here, never silently counted."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        try:
+            # iterate the CURSOR (not fetchall): the shape check is per-row,
+            # and materializing every Application row into a list for a
+            # display command would spike memory on a large store
+            counts: dict[str, int] = {}
+            for message_id, label in self._conn.execute(
+                "SELECT message_id, label FROM applications"
+            ):
+                if not _ID_RE.fullmatch(str(message_id)):
+                    raise AppDBError(
+                        f"state DB corrupt (application message_id "
+                        f"{message_id!r} is not 1-64 hex chars): {self.path}"
+                    )
+                if not str(label).strip():
+                    raise AppDBError(
+                        f"state DB corrupt (application label is empty for "
+                        f"message_id {message_id!r}): {self.path}"
+                    )
+                counts[str(label)] = counts.get(str(label), 0) + 1
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return counts
+
+    def correction_label_stats(self) -> dict[str, tuple[int, int, int, int]]:
+        """Per label the (removed, added, added_filter_covered,
+        added_unverifiable) Correction counts, from the LOCAL DB only. The
+        two invariant-#6 slices (``added_filter_covered``,
+        ``added_unverifiable``) are EXCLUDED from the human signal and
+        disclosed separately by status. A label with no Corrections is
+        absent. 'removed' is always attributed 'human' (invariant #6), so
+        it is not sliced by attribution.
+
+        Reader doctrine (F2 item 9): this aggregate revalidates EVERY row
+        — the message_id/label shape, the kind/attribution vocabularies,
+        and removed-always-human — exactly as the per-row export path
+        (_correction_rows → _check_correction_row) does, so a hand-made
+        row is refused NAMED here too, never silently counted. Iterating
+        row-by-row (not GROUP BY) is what lets it see the message_id."""
+        if self._conn is None:
+            raise AppDBError("state DB not open — call open() first")
+        stats: dict[str, list[int]] = {}
+        try:
+            # iterate the CURSOR (not fetchall): per-row shape revalidation,
+            # without materializing every correction for a display command
+            for message_id, label, kind, attribution in self._conn.execute(
+                "SELECT message_id, label, kind, attribution FROM corrections"
+            ):
+                # the SAME shape rules _check_correction_row enforces on the
+                # export path (F2 item 9: a NOT-A-HEX id or empty label must
+                # not be counted by status while the export refuses it)
+                if not _ID_RE.fullmatch(str(message_id)):
+                    raise AppDBError(
+                        f"state DB corrupt (correction message_id {message_id!r} "
+                        f"is not 1-64 hex chars): {self.path}"
+                    )
+                if not str(label).strip():
+                    raise AppDBError(
+                        f"state DB corrupt (correction label is empty for "
+                        f"message_id {message_id!r}): {self.path}"
+                    )
+                if kind not in CORRECTION_KINDS:
+                    # the tamper doctrine: the per-row readers revalidate; the
+                    # aggregate reader must not SILENTLY drop a hand-edited
+                    # kind into a zero bucket — refuse it, named
+                    raise AppDBError(
+                        f"state DB corrupt (correction kind {kind!r} not in "
+                        f"{CORRECTION_KINDS}): {self.path}"
+                    )
+                if attribution not in CORRECTION_ATTRIBUTIONS:
+                    raise AppDBError(
+                        f"state DB corrupt (correction attribution "
+                        f"{attribution!r} not in {CORRECTION_ATTRIBUTIONS}): "
+                        f"{self.path}"
+                    )
+                if kind == "removed" and attribution != "human":
+                    # the SAME removed-always-human rule _check_correction_row
+                    # enforces on the per-row reads — the aggregate reader
+                    # status uses must agree, so a hand-edited removed+withheld
+                    # row is refused NAMED here too, not bucketed as removed
+                    raise AppDBError(
+                        f"state DB corrupt (a 'removed' correction is always "
+                        f"attributed 'human', not {attribution!r}): {self.path}"
+                    )
+                # [removed, added, added_filter_covered, added_unverifiable]
+                bucket = stats.setdefault(str(label), [0, 0, 0, 0])
+                if kind == "removed":
+                    bucket[0] += 1
+                else:  # 'added'
+                    bucket[1] += 1
+                    if attribution == "filter_covered":
+                        bucket[2] += 1
+                    elif attribution == "unverifiable":
+                        bucket[3] += 1
+        except sqlite3.DatabaseError as e:
+            raise AppDBError(f"state DB read failed: {self.path}: {e}") from e
+        return {
+            label: (removed, added, fc, uv)
+            for label, (removed, added, fc, uv) in stats.items()
+        }
+
+    def _correction_rows(self, rows: list[Any]) -> tuple[CorrectionRow, ...]:
+        # the shared read-back path (the fetchall rows are the DB
+        # boundary): parse the detected_at stamp (a non-ISO value is
+        # corrupt, named — the load_run doctrine), the attribution
+        # TEXT, and re-validate every row (a tampered kind/attribution is
+        # refused, named, not rendered)
+        out: list[CorrectionRow] = []
+        for r in rows:
+            try:
+                detected_at = datetime.fromisoformat(str(r[3]))
+            except ValueError as e:
+                raise AppDBError(
+                    f"state DB corrupt (detected_at {r[3]!r} is not "
+                    f"ISO-8601): {self.path}: {e}"
+                ) from e
+            row = CorrectionRow(
+                message_id=r[0],
+                label=r[1],
+                kind=r[2],
+                detected_at=detected_at,
+                attribution=str(r[4]),
+            )
+            try:
+                _check_correction_row(row)
+            except AppDBError:
+                raise  # already a named refusal — never double-wrap
+            except (ValueError, TypeError, AttributeError) as e:
+                raise AppDBError(
+                    f"state DB corrupt (row {r!r} fails validation): {self.path}: {e}"
+                ) from e
+            out.append(row)
+        return tuple(out)
+
 
 def _check_row(row: ShadowRow) -> None:
     # the row validation (fail-loud — a lying row is refused, named,
@@ -1137,6 +1504,99 @@ def _insert_applications(
             for row in rows
         ],
     )
+
+
+def _check_correction_batch(rows: Sequence[CorrectionRow]) -> None:
+    # the ONE correction batch-validation authority (commit_page rides
+    # it): every row validated, then the within-batch (message_id, label,
+    # kind) uniqueness — one delta carries one Correction row per
+    # (message, label, kind) (the same hand-fix reported by two history
+    # records of one delta is ONE correction, not two). The DB UNIQUE
+    # index is the cross-delta/replay dedupe; this is the within-batch
+    # one, refused NAMED (a lying batch is a caller bug, not silent)
+    for row in rows:
+        _check_correction_row(row)
+    seen: set[tuple[str, str, str]] = set()
+    for row in rows:
+        key = (row.message_id, row.label, row.kind)
+        if key in seen:
+            raise AppDBError(
+                f"duplicate correction for {row.message_id} / {row.label} "
+                f"({row.kind}) in one batch — one hand-fix is one Correction"
+            )
+        seen.add(key)
+
+
+def _insert_corrections(
+    conn: sqlite3.Connection, rows: Sequence[CorrectionRow]
+) -> None:
+    # the ONE corrections-INSERT column authority (the caller owns the
+    # transaction — commit_page rides it). INSERT OR IGNORE against the
+    # UNIQUE (message_id, label, kind) index makes the replay idempotent:
+    # a re-served history event adds no duplicate Correction row (the
+    # #27 three-way-atomicity replay pin)
+    conn.executemany(
+        "INSERT OR IGNORE INTO corrections "
+        "(message_id, label, kind, detected_at, attribution) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                row.message_id,
+                row.label,
+                row.kind,
+                row.detected_at.astimezone(UTC).isoformat(),
+                row.attribution,
+            )
+            for row in rows
+        ],
+    )
+
+
+def _check_correction_row(row: CorrectionRow) -> None:
+    # the row validation (fail-loud — a lying row is refused, named,
+    # BEFORE the transaction): the id shape, the label, the kind
+    # vocabulary (the CHECK constraint's authority, mirrored so the
+    # refusal is named here not a raw sqlite3 traceback), the aware
+    # detected_at (the split_date doctrine), the attribution vocabulary
+    # (the CHECK's authority, mirrored for named refusals), and the
+    # invariant-#6 rule that a 'removed' Correction is ALWAYS 'human'
+    # (a human removing is human signal regardless of filters)
+    if not _ID_RE.fullmatch(row.message_id):
+        raise AppDBError(
+            f"correction row message_id {row.message_id!r} must be 1-64 hex chars"
+        )
+    if not row.label.strip():
+        raise AppDBError(
+            f"correction row for {row.message_id}: label must be non-empty"
+        )
+    if row.kind not in CORRECTION_KINDS:
+        raise AppDBError(
+            f"correction row for {row.message_id} / {row.label}: kind "
+            f"{row.kind!r} must be one of {CORRECTION_KINDS}"
+        )
+    if row.attribution not in CORRECTION_ATTRIBUTIONS:
+        raise AppDBError(
+            f"correction row for {row.message_id} / {row.label}: attribution "
+            f"{row.attribution!r} must be one of {CORRECTION_ATTRIBUTIONS}"
+        )
+    if row.kind == "removed" and row.attribution != "human":
+        raise AppDBError(
+            f"correction row for {row.message_id} / {row.label}: a 'removed' "
+            "Correction is always attributed 'human' (a human removing is "
+            "human signal regardless of filters — invariant #6); "
+            f"got {row.attribution!r}"
+        )
+    if not isinstance(row.detected_at, datetime):
+        raise AppDBError(
+            f"correction row for {row.message_id} / {row.label}: detected_at "
+            f"must be a datetime, got {row.detected_at!r}"
+        )
+    if row.detected_at.tzinfo is None:
+        raise AppDBError(
+            f"correction row for {row.message_id} / {row.label}: detected_at "
+            "must be timezone-aware (a naive timestamp is a caller bug — the "
+            "split_date doctrine)"
+        )
 
 
 def _check_cursor_value(value: object, recovery: str | None = None) -> int:

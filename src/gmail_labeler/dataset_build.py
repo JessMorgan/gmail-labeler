@@ -37,6 +37,7 @@ from .corpus_record import SERVER_AUTHORITATIVE_PROVENANCES, DateProvenance
 from .labels import label_path, path_is_at_or_under
 
 if TYPE_CHECKING:
+    from .appdb import CorrectionRow
     from .corpus_record import CorpusRecord
 
 #: Split Manifest format version (GLOSSARY: Split Manifest). Bump on any
@@ -642,3 +643,49 @@ def _bridge_hash(
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def apply_corrections_to_records(
+    records: Sequence[CorpusRecord],
+    corrections: Sequence[CorrectionRow],
+) -> list[CorpusRecord]:
+    """Fold Corrections into the corpus records as training signal — the
+    builder's COMPOSITION seam (ticket #27): the result feeds
+    ``build_dataset``'s existing ``records`` input; it does NOT fork the
+    builder. A 'removed' Correction drops the label from the message's
+    training labels (a human undid our application — a negative signal);
+    an 'added' Correction adds it (a human did our job — a positive
+    signal). Only an attribution=='human' 'added' is trainable signal:
+    'filter_covered' (a Gmail filter verifiably authored it) and
+    'unverifiable' (authorship cannot be determined) are BOTH EXCLUDED
+    (invariant #6 / #22's exclusion principle — we credit the human only
+    what we can PROVE the human authored; guessing either way is what
+    #22 forbids).
+
+    Pure + deterministic (CODING-STANDARDS): a record with no correction
+    passes through UNCHANGED (identity-preserving); corrected records get
+    their labels re-sorted (the corpus_record label-path order). NO
+    bodies are read or written (invariant #5) — a Correction carries only
+    (message_id, label, kind, attribution). This is a PRE-PROCESSING
+    composition a HUMAN-GATED retrain opts into; nothing here retrains."""
+    adds: dict[str, set[str]] = {}
+    removes: dict[str, set[str]] = {}
+    for c in corrections:
+        if c.kind == "added":
+            if c.attribution != "human":
+                # invariant #6: filter-authored (proven) or authorship
+                # unknown (withheld) — neither is human training signal
+                continue
+            adds.setdefault(c.message_id, set()).add(c.label)
+        elif c.kind == "removed":
+            removes.setdefault(c.message_id, set()).add(c.label)
+    out: list[CorpusRecord] = []
+    for rec in records:
+        a = adds.get(rec.id)
+        r = removes.get(rec.id)
+        if not a and not r:
+            out.append(rec)  # identity-preserving for untouched records
+            continue
+        labels = (set(rec.labels) - (r or set())) | (a or set())
+        out.append(replace(rec, labels=tuple(sorted(labels))))
+    return out

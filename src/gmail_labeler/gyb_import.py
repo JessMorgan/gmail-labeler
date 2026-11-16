@@ -2,8 +2,8 @@
 
 Reads a Got Your Back backup — msg-db.sqlite (READ-ONLY URI: a misconfigured
 import can never mutate someone's only backup) joined as
-``uids.uid`` = Gmail message id (verified against a 21-year, 394k-message
-corpus), ``messages.message_filename`` = the ``.eml`` path relative to the
+``uids.uid`` = Gmail message id (verified against a real corpus),
+``messages.message_filename`` = the ``.eml`` path relative to the
 backup root, ``messages.message_internaldate`` = Gmail timestamp AS WRITTEN BY GYB:
 a naive 'YYYY-MM-DD HH:MM:SS' string in the backup machine's LOCAL time
 (GYB's folder tree, by contrast, is UTC). This module therefore treats the
@@ -113,7 +113,7 @@ class GybImportError(Exception):
 def _parse_internaldate(raw: object) -> datetime:
     """GYB writes message_internaldate as 'YYYY-MM-DD HH:MM:SS'; some GYB
     versions/tools leave a microsecond tail ('.ffffff') whenever epoch-ms
-    are non-zero (0 occurrences in the verified 394k corpus — tolerated as
+    are non-zero (0 occurrences in the verified corpus — tolerated as
     version drift, not observed behavior). The string is the BACKUP
     MACHINE'S LOCAL time; callers must reconcile it against the UTC folder
     date. Anything unparseable is schema drift -> raise."""

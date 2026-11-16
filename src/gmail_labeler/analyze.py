@@ -22,7 +22,7 @@ The three hazards this report exists to surface, per AGENTS.md:
   (``query``, ``negatedQuery``, ``hasAttachment``, ``size``, ...) mark the
   label ``filter-unverifiable`` — exclusion, not guessing: graduation
   must earn itself on what filters do NOT cover.
-* **Recency (21-year corpus)**: total counts over-weight 2005-era mail;
+* **Recency**: total counts over-weight old mail;
   a label must ALSO have recent-window volume to be a candidate.
 * **Templates**: near-duplicate bodies fabricate accuracy; a
   template-heavy label's counts are inflated and it is flagged.

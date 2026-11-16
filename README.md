@@ -7,7 +7,8 @@ confident, reviewably when it isn't.
 > **Status: pre-alpha — Phase 0 (corpus acquisition) has landed.** The
 > architecture decisions, domain language, and development standards are
 > committed; the CLI installs (`uv sync`, then `gmail-labeler --help`) with a
-> working OAuth flow and `dataset import-gmail` / `import-gyb` / `analyze`.
+> working OAuth flow and `dataset import-gmail` / `import-gyb` /
+> `sync-labels` / `analyze`.
 > Training, graduation, and the daemon arrive in later phases — follow the
 > phase plan in [AGENTS.md](AGENTS.md).
 
@@ -34,8 +35,13 @@ you would.
 
 ## How it works
 
-1. **Import** — pull your labeled mail via the Gmail API, or import an
-   existing [Got Your Back](https://github.com/GAM-team/got-your-back) backup.
+1. **Import** — fetch your labeled mail via the Gmail API, or import an
+   existing [Got Your Back](https://github.com/GAM-team/got-your-back)
+   backup. Keep it fresh as you relabel or Backfill by hand:
+   `dataset sync-labels` brings the label changes in without
+   re-assembling the Corpus. A corpus with no Sync Cursor yet — a
+   GYB-only corpus is always one — should start with `--full-resync`;
+   the Backfill→sync→analyze loop, see [CLI](#cli).
 2. **Analyze & train** — per-label report (counts, filter-authored labels,
    duplicates), then fine-tune a small encoder with one sigmoid head per
    label. CPU works; a GPU is faster.
@@ -96,9 +102,16 @@ land without a keyring.
 ```sh
 gmail-labeler auth                    # credential status
 gmail-labeler auth login              # one-time desktop OAuth consent flow
-gmail-labeler dataset import-gmail    # pull labeled mail via the Gmail API
+gmail-labeler dataset import-gmail    # fetch labeled mail via the Gmail API
 gmail-labeler dataset import-gyb      # import a Got Your Back backup (offline)
+gmail-labeler dataset sync-labels     # refresh corpus labels from mailbox changes (--full-resync: no history needed)
 gmail-labeler dataset analyze         # per-label report: counts, recency, dup rate, filter attribution
+
+# The Backfill loop: label Backlog mail by hand in Gmail, then —
+gmail-labeler dataset sync-labels && gmail-labeler dataset analyze
+# Either side refreshes the other in one sitting:
+gmail-labeler dataset sync-labels --also-import-gmail  # sync labels, then the full Gmail Import (import-gmail's default query)
+gmail-labeler dataset import-gmail --also-sync-labels  # import, then the Label Sync delta
 ```
 
 (These assume the project venv is active; from a fresh checkout, prefix any
@@ -108,16 +121,67 @@ Every command takes `--config PATH`. `dataset import-gmail` takes `--query`
 (default `in:anywhere -in:spam -in:trash`) and `--max-messages` (smoke
 runs); it writes `filters.json` and `labels.json` sidecars next to the
 corpus — the offline snapshot `dataset analyze` uses for filter
-attribution. `dataset import-gyb` takes `--path`, `--max-messages`, and
+attribution — and births the `sync-cursor.json` Sync Cursor (ADR-0008)
+when the corpus has none, seeded from the first list page before any
+message is ingested (or warns and leaves the corpus birth-eligible when no
+seed is available); import never advances an existing cursor, and
+`dataset import-gyb` never writes one. `dataset import-gyb` takes
+`--path`, `--max-messages`, and
 `--system-labels` (comma-separated extras — the delimiter is a comma, so
 label names containing commas cannot be expressed via the flag); it does
 not write sidecars, so for GYB-only corpora `dataset analyze` withholds
 candidates unless you pass `--assume-no-filters` (an attestation that the
-mailbox has no labeling filters). Both imports are resumable:
-the corpus id set is the cursor, so re-running after a failure skips what is
-already present. Transient failures resume cleanly; a deterministic abort
-(a corrupt backup row, an escaping filename) repeats until the backup itself
-is fixed — resumable is not the same as completable. `dataset analyze`
+mailbox has no labeling filters). `dataset sync-labels` walks the Gmail
+history from the corpus's Sync Cursor (ADR-0008) and appends a label
+Revision for every corpus message an event touched — metadata only, bodies
+never (invariant #5) — so relabels and Backfills reach the corpus with no
+re-assembly. The cursor advances only after the delta's revisions are
+durable, a killed run is safe to re-run, `--dry-run` prints the identical
+plan writing no records and leaving the cursor byte-identical, ids the
+mailbox names that the corpus has never held are counted as Unseen Ids and
+reported but never ingested here (history events and label inventories
+cannot establish that they are new mail or that they match the import
+query), and upstream-deleted mail keeps its record (counted). An expired
+cursor (history 404) exits `5` printing the exact recovery command —
+recovery is never automatic (ADR-0008).
+`dataset sync-labels --full-resync` is that recovery: a ground-truth
+reconciliation that needs no history at all — the remedy for a cursor aged
+past Gmail's retention and the first reconciliation path for GYB-sourced
+Corpora (which never had a cursor). One `labels.list` call (per-label
+`messagesTotal`) plus local resolved-view counts yield a cost estimate, and
+the strategy choice prints with its numbers before any enumeration quota is
+spent, running the cheaper of the label-inventory scan (enumerate every
+mailbox user label's current members by label id, diff against the
+Corpus's sets, metadata-fetch only flagged ids — vanished labels' corpus
+members are fetched directly) or the corpus-metadata walk (fetch every
+corpus id's current labels, diff, revise). On the scan the report prints
+the flag-rate before the metadata pass, so a corpus-wide drift is visible
+early with the honest worst-case cost story; the walk prices its full
+fetch up front instead — every id is read by construction there, so drift
+is measured by the diff, not a flag-rate. The profile seed is captured
+before the scan and written only after the reconciliation's revisions
+are durable — stepping a higher stored cursor down when the mailbox has
+rolled back (the report prints a NOTE naming both values — on
+`--dry-run`, as a plan), since replay from the lower seed is harmless (ADR-0008's reseed contract; ADR-0007's fold absorbs it) —
+so a relabel made mid-run lands in the next sync's window; `--dry-run`
+prints the estimate, the choice, and the plan, writing nothing. The Gmail Import
+and Label Sync commands compose, opt-in by design:
+`sync-labels --also-import-gmail` runs the full Gmail Import pass after
+the label delta is durable (Sync Cursor advanced), and
+`import-gmail --also-sync-labels` runs the Label Sync walk after the
+import completes durably — one report carries both passes' stats, a
+second-pass failure exits non-zero without ever rolling back the first
+pass's durable records or cursor, and a failed first pass never starts
+the second. Default-off keeps `import-gmail`'s crisp "append new
+messages, never touch existing records" meaning unambiguous (the daemon
+is the eventual freshness owner, ADR-0003/0008); `--dry-run` refuses
+`--also-import-gmail` as a usage error (`2`) — dry-run writes nothing,
+the import pass writes records. Both imports are resumable:
+the corpus id set is the resume point, so re-running after a failure
+skips what is already present. Transient failures resume cleanly; a
+deterministic abort (a corrupt backup row, an escaping filename) repeats
+until the backup itself is fixed — resumable is not the same as
+completable. `dataset analyze`
 gates candidates on volume
 (`--min-total`, `--min-recent`), recency window (`--recent-months`,
 default 24), duplicate-body rate, and filter coverage; attribution needs
@@ -144,7 +208,7 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 - [AGENTS.md](AGENTS.md) — architecture spine and phase plan
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
-- [docs/adr/](docs/adr/) — the six shape-defining decisions
+- [docs/adr/](docs/adr/) — the eight shape-defining decisions
 
 ## License
 

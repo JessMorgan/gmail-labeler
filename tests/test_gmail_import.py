@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from gmail_labeler.corpus_record import CorpusRecord, body_hash
-from gmail_labeler.corpus_store import CorpusStore
+from gmail_labeler.corpus_store import CorpusError, CorpusStore
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
-from gmail_labeler.gmail_errors import classify_status
+from gmail_labeler.gmail_errors import GmailPermanentError, classify_status
 from gmail_labeler.gmail_import import import_gmail
+from gmail_labeler.sync_cursor import SIDECAR_CURSOR, SyncCursor
 
 
 def _eml(
@@ -479,3 +481,296 @@ def test_empty_body_is_a_deliberate_record(tmp_path: Path) -> None:
         fake, store_at(tmp_path), id_to_name=NAMES, sleeper=lambda s: None
     )
     assert stats.written == 1  # label signal survives a body-less mail
+
+
+# ---- Sync Cursor birth-once (ADR-0008, ticket #72) --------------------------
+
+
+def _cursor_path(store: CorpusStore) -> Path:
+    return store.root / SIDECAR_CURSOR
+
+
+def test_import_births_cursor_from_the_newest_first_stub(tmp_path: Path) -> None:
+    # the sync-guide seed: the FIRST (newest) stub's historyId. Distinct
+    # per-stub values make a last-stub read observable — the uniform default
+    # would hide it (fake docstring).
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("One"), history_id=900),
+            FakeMessage(id="bbb", eml=_eml("Two"), history_id=100),
+        ],
+        current_history_id=900,
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    born = store.read_cursor()
+    assert born is not None and born.history_id == 900  # the FIRST stub wins
+    # the page seed saves the quota unit: no profile call at all
+    assert "get_profile" not in fake.calls
+
+
+def test_import_profile_fallback_precedes_first_ingestion(tmp_path: Path) -> None:
+    # the CRITICAL ordering (ADR-0008): every seed — page OR profile — is
+    # captured BEFORE any message is ingested. A profile fallback taken after
+    # page processing would skip label changes made in between; this pins the
+    # call sequence on the fake's log (stub_history_id=False is the
+    # absent-tolerant quadrant that forces the fallback).
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"))],
+        current_history_id=777,
+        stub_history_id=False,
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    profile_at = fake.calls.index("get_profile")
+    first_ingest_at = next(
+        i for i, c in enumerate(fake.calls) if c.startswith("get_message:")
+    )
+    assert profile_at < first_ingest_at
+    assert fake.calls.count("get_profile") == 1  # ONE call, not a per-page leak
+    born = store.read_cursor()
+    assert born is not None and born.history_id == 777
+
+
+def test_import_negative_wire_seed_falls_back_then_refuses(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # a negative historyId is a wire lie the ledger refuses: an unusable
+    # PAGE seed takes the guide-ordered profile fallback, and only a profile
+    # seed that is ALSO unusable degrades loudly (never an untyped
+    # ValueError crash at the CLI). The import stays healthy; the corpus
+    # stays birth-eligible.
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=-5)],
+        current_history_id=-5,
+    )
+    store = store_at(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="gmail_labeler.gmail_import"):
+        stats = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert stats.written == 1 and not stats.failed
+    assert "get_profile" in fake.calls  # the fallback got its turn
+    assert store.read_cursor() is None
+    assert any(
+        r.name == "gmail_labeler.gmail_import"
+        and "no usable historyId seed" in r.getMessage()
+        for r in caplog.records
+    )
+
+    # a healthy profile rescues an unusable page seed
+    fake2 = FakeGmailClient(
+        messages=[FakeMessage(id="bbb", eml=_eml("Two"), history_id=-5)],
+        current_history_id=800,
+    )
+    store2 = CorpusStore(tmp_path / "corpus2")
+    import_gmail(fake2, store2, id_to_name=NAMES, sleeper=lambda s: None)
+    born = store2.read_cursor()
+    assert born is not None and born.history_id == 800
+
+    # 0 is as unusable as a negative: history ids count from 1, and a
+    # startHistoryId=0 ledger would make the first sync die 400
+    fake3 = FakeGmailClient(
+        messages=[FakeMessage(id="ccc", eml=_eml("Three"), history_id=0)],
+        current_history_id=0,
+    )
+    store3 = CorpusStore(tmp_path / "corpus3")
+    import_gmail(fake3, store3, id_to_name=NAMES, sleeper=lambda s: None)
+    assert store3.read_cursor() is None
+
+
+def test_import_zero_wire_seed_falls_back_to_profile(tmp_path: Path) -> None:
+    # history ids count from 1, so a page seed of 0 is a wire lie like any
+    # negative: it must take the profile fallback rather than birth a
+    # 0-cursor the first sync would 400 over — this pins the guard at
+    # <= 0, not < 0
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=0)],
+        current_history_id=800,
+    )
+    store = store_at(tmp_path)
+    stats = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert stats.written == 1 and not stats.failed
+    assert "get_profile" in fake.calls  # the fallback got its turn
+    born = store.read_cursor()
+    assert born is not None and born.history_id == 800
+
+
+def test_import_seed_capture_attempted_once_across_pages(tmp_path: Path) -> None:
+    # the "ONE call, not a per-page leak" claim, pinned: with the fallback
+    # forced on EVERY page (stubs lack historyId) and the profile permanently
+    # down, a per-page seed attempt would spend a quota unit per page — the
+    # seeding_done latch must hold it to exactly one
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("One")),
+            FakeMessage(id="bbb", eml=_eml("Two")),
+        ],
+        current_history_id=777,
+        stub_history_id=False,
+        page_size=1,
+    )
+    fake.fail("get_profile", GmailPermanentError("profile down", status=400))
+    store = store_at(tmp_path)
+    stats = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert stats.written == 2  # both pages ingested
+    assert fake.calls.count("get_profile") == 1
+    assert store.read_cursor() is None  # no seed, no cursor
+
+
+def test_import_empty_mailbox_still_births_from_profile(tmp_path: Path) -> None:
+    fake = FakeGmailClient(messages=[], current_history_id=42)
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    cur = store.read_cursor()
+    assert cur is not None and cur.history_id == 42
+
+
+def test_import_relabel_import_window_never_advances_the_cursor(
+    tmp_path: Path,
+) -> None:
+    # THE ADR-0008 TRAP, executable (AC #3/#4): import → Backfill → import
+    # with no sync between. Import #1 births the lower bound L; the mailbox
+    # moves on (relabels + new mail); import #2 must leave the cursor
+    # BYTE-IDENTICAL so the next sync's window still covers the Backfill.
+    # The naive "refresh every run" version passes every other test — this
+    # is the pin that kills it.
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=900)],
+        current_history_id=900,
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    born = _cursor_path(store).read_bytes()
+    assert b'"history_id": 900' in born  # the lower bound is really on disk
+
+    # the Backfill window: mailbox activity between the two imports
+    fake.messages["aaa"] = FakeMessage(
+        id="aaa", eml=_eml("One"), label_ids=("L1",), history_id=900
+    )
+    fake.messages["ccc"] = FakeMessage(id="ccc", eml=_eml("Three"), history_id=950)
+    fake.order.append("ccc")
+    fake.current_history_id = 950
+
+    stats = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert stats.written == 1  # the new mail still lands...
+    assert _cursor_path(store).read_bytes() == born  # untouched, byte-for-byte
+
+
+def test_import_with_live_cursor_skips_the_profile_call(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # birth-when-absent means the whole seed capture is skipped when a cursor
+    # exists — even in the fallback quadrant, so a warm import spends zero
+    # quota on cursor-adjacent state (it never advances, never re-reads) and
+    # stays silent (no spurious birth warning over a healthy ledger)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"))],
+        current_history_id=777,
+        stub_history_id=False,
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert fake.calls.count("get_profile") == 1
+    fake.messages["ccc"] = FakeMessage(id="ccc", eml=_eml("Three"))
+    fake.order.append("ccc")
+    fake.current_history_id = 999
+    with caplog.at_level(logging.WARNING, logger="gmail_labeler.gmail_import"):
+        import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert fake.calls.count("get_profile") == 1  # no second seed capture
+    assert not [
+        r
+        for r in caplog.records
+        if r.name == "gmail_labeler.gmail_import"
+        and "no usable historyId seed" in r.getMessage()
+    ]  # a warm import has nothing to warn about at the cursor seam
+    born = store.read_cursor()
+    assert born is not None and born.history_id == 777  # never advanced
+
+
+def test_import_invalid_cursor_fails_loud_never_rebirths(tmp_path: Path) -> None:
+    # an existing cursor that does not parse is corruption, not absence: the
+    # run dies typed (CorpusError → CLI exit 5) BEFORE ingesting, and the
+    # garbage stays on disk for a human — never silently overwritten by a
+    # fresh birth (the ADR's never-silent-re-birth rule at the import seam)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=900)],
+        current_history_id=900,
+    )
+    store = store_at(tmp_path)
+    store.root.mkdir(parents=True)
+    garbage = "{ not json"
+    _cursor_path(store).write_text(garbage, encoding="utf-8")
+    with pytest.raises(CorpusError, match="sync cursor"):
+        import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert _cursor_path(store).read_text(encoding="utf-8") == garbage
+    # died BEFORE ingesting anything (the seed gate sits above the stub loop)
+    assert list(store.iter_records()) == []
+    assert not store.get_body("aaa")
+
+
+def test_import_profile_failure_degrades_loudly_not_fatally(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # the cursor is ADDITIVE: a permanently failing profile fallback must not
+    # kill an otherwise-healthy import (existing import behavior unchanged) —
+    # it warns, leaves no cursor, and the corpus stays birth-eligible
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"))],
+        current_history_id=777,
+        stub_history_id=False,
+    )
+    fake.fail("get_profile", GmailPermanentError("profile unavailable", status=400))
+    store = store_at(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="gmail_labeler.gmail_import"):
+        stats = import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert stats.written == 1 and not stats.failed  # the import itself is fine
+    assert store.read_cursor() is None  # no cursor, no fabricated seed
+    assert any(
+        r.name == "gmail_labeler.gmail_import"
+        and "no usable historyId seed" in r.getMessage()
+        for r in caplog.records
+    )  # the birth-refused warning itself, not any cursor-shaped log line
+
+    # and the NEXT import still gets its birth chance (birth-when-absent is
+    # not consumed by a failed attempt)
+    import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert store.read_cursor() is not None
+
+
+def test_import_cursor_write_fault_is_fatal_not_degraded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the ADR note's asymmetry, pinned: seed unavailability degrades (the
+    # test above), a cursor WRITE fault stays fatal — this passes with the
+    # write unguarded today and kills any future try/except downgrade
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=900)],
+        current_history_id=900,
+    )
+    store = store_at(tmp_path)
+
+    def boom(cursor: SyncCursor) -> None:
+        raise CorpusError("simulated write fault")
+
+    monkeypatch.setattr(store, "write_cursor", boom)
+    with pytest.raises(CorpusError, match="simulated write fault"):
+        import_gmail(fake, store, id_to_name=NAMES, sleeper=lambda s: None)
+    assert store.read_cursor() is None  # no cursor file, no half-claim
+
+
+def test_import_clock_stamps_the_born_cursor(tmp_path: Path) -> None:
+    # last_sync is birth time, tz-aware UTC, from the injected clock (the
+    # sleeper's sibling seam — no wall-clock reads in tests)
+    born_at = datetime(2026, 11, 4, 9, 30, tzinfo=UTC)
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=_eml("One"), history_id=50)],
+        current_history_id=50,
+    )
+    store = store_at(tmp_path)
+    import_gmail(
+        fake,
+        store,
+        id_to_name=NAMES,
+        sleeper=lambda s: None,
+        clock=lambda: born_at,
+    )
+    assert store.read_cursor() == SyncCursor(history_id=50, last_sync=born_at)

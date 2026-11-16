@@ -21,7 +21,10 @@ from .gmail_import import DEFAULT_QUERY
 
 if TYPE_CHECKING:
     from .config import Config
-    from .gmail_client import GmailClient
+    from .corpus_store import CorpusStore
+    from .gmail_client import FilterInfo, GmailClient
+    from .gmail_import import GmailImportStats
+    from .label_sync import FullResyncStats, SyncStats
 
 app = typer.Typer(
     help="Strictly-local Gmail auto-labeling, trained on your own inbox.",
@@ -50,6 +53,9 @@ app.add_typer(auth_app, name="auth")
 
 _AUTH_ERROR_EXIT = 4  # 2 = usage, 3 = not implemented, 4 = auth/config unusable
 # (typer requires concrete annotations: str | None, not Any)
+_USAGE_ERROR_EXIT = 2  # typer's own usage-error code, reused for a
+# contradictory flag combination refused before any config read or quota
+# spend (ticket #75: --dry-run + --also-import-gmail)
 
 
 @auth_app.callback(invoke_without_command=True)
@@ -102,7 +108,81 @@ def _load_config(config: str | None):
 
 
 _OPERATION_ERROR_EXIT = 5  # operation failure (transport/corpus) or incomplete
-# run — shared by all dataset commands (import-gmail, import-gyb, analyze)
+# run — shared by all dataset commands (import-gmail, import-gyb,
+# sync-labels, analyze)
+
+# ADR-0008's FINAL recovery wording — the swap site ticket #73 documented
+# and ticket #74 consumed: --full-resync is real, so the 404 guidance
+# prints the exact recovery command and the birth NOTE recommends it. The
+# CLI test pins PRESENCE of `dataset sync-labels --full-resync` (the #73
+# vaporware-absence pin flipped alongside these constants).
+_RESYNC_GUIDANCE = (
+    "guidance: the Sync Cursor is outside Gmail's retained history \u2014 "
+    "recovery is never automatic (ADR-0008). Run "
+    "`dataset sync-labels --full-resync`: it reconciles the corpus's label "
+    "state against the mailbox directly (no history needed), prints a cost "
+    "estimate before any enumeration spend, and reseeds the cursor only "
+    "after the reconciliation's revisions are durable."
+)
+_RESYNC_GUIDANCE_NOTE = (
+    "Run `dataset sync-labels --full-resync` to reconcile label drift older "
+    "than the retained history (cost-estimated up front)."
+)
+
+# The closing pointer and the unseen NOTE are shared between the
+# standalone sync report and the composite second pass (ticket #75): one
+# tail, pinned once. Ticket #77 (fix-round deferral): the pointer
+# claimed "the updated candidate gates" after a --dry-run plan-only run —
+# the same honesty class as the WOULD-birth split (9a6da1c), mirrored the
+# same way: a dry-run twin sharing one tail constant with the real pointer
+# so the modes cannot drift, selected at the command's own echo site
+# (--dry-run refuses composition, so the composite pointer at the
+# import-gmail pass is always a real-behavior close).
+_ANALYZE_POINTER_TAIL = (
+    " for the updated candidate gates (ADR-0005 keeps retraining and "
+    "applying human-gated)"
+)
+_ANALYZE_POINTER = "\nNext: run `dataset analyze`" + _ANALYZE_POINTER_TAIL
+_ANALYZE_POINTER_DRY = (
+    "\nNext: this dry run wrote nothing \u2014 re-run the same command "
+    "without --dry-run to apply the plan, then `dataset analyze`"
+    + _ANALYZE_POINTER_TAIL
+)
+_UNSEEN_NOTE = (
+    "NOTE: {n} mailbox id(s) are not in the corpus \u2014 "
+    "history events and label inventories cannot establish that "
+    "these are new mail or that they match the import query; ingest "
+    "stays the acquisition paths' alone (dataset "
+    "import-gmail/import-gyb), never sync's (spec #64)"
+)
+# ADR-0008 consequence 1 provenance disclosure, shared by the standalone
+# event walk and the composite sync pass (ticket #75): one rendering.
+# The dry-run twin mirrors the --full-resync branch's WOULD-birth split
+# (fix-round review): under --dry-run nothing is written, so the NOTE must
+# say WOULD birth — stats.birthed keeps its core semantics (set from the
+# ledger READ, not the write) and only the rendering branches per mode.
+# One shared tail (deepseek review NIT): the two modes differ in the verb
+# clause only, so the wording cannot drift apart.
+_BIRTH_NOTE_TAIL = (
+    " (no consumed baseline to diff against yet; the corpus's label state "
+    "may predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+)
+_BIRTH_NOTE = (
+    "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
+    "from the mailbox profile and applies NOTHING" + _BIRTH_NOTE_TAIL
+)
+_BIRTH_NOTE_DRY = (
+    "NOTE: this corpus had no Sync Cursor \u2014 sync WOULD birth "
+    "it from the mailbox profile and apply NOTHING" + _BIRTH_NOTE_TAIL
+)
+
+
+def _render_failures(failed: list[tuple[str, str]]) -> None:
+    """Failure detail shared by every dataset report (20-line cap, stderr)."""
+    for message_id, reason in failed[:20]:
+        typer.echo(f"  failed {message_id}: {reason}", err=True)
+    if len(failed) > 20:
+        typer.echo(f"  ... and {len(failed) - 20} more", err=True)
 
 
 def _import_gmail_client(config: Config) -> GmailClient:
@@ -111,6 +191,54 @@ def _import_gmail_client(config: Config) -> GmailClient:
     from .gmail_client import GmailRestClient
 
     return GmailRestClient(build_credentials(config))
+
+
+def _dataset_auth_bootstrap(
+    cfg: Config, *, failure_prefix: str
+) -> tuple[GmailClient, dict[str, str], list[FilterInfo], GmailImportStats]:
+    """Shared dataset auth gate: build the client and run the settings
+    bootstrap behind the pinned exit-code contract — auth failures print
+    ``auth: …`` and exit 4; a transport failure prints
+    ``{failure_prefix}: …`` and exits 5. The gate runs FIRST: a
+    not-signed-in run must not touch the corpus tree (the dataset commands
+    must not create or re-mode it — a typo'd corpus.dir especially).
+    Raises typer.Exit; on success returns
+    (client, id_to_name, filters, bootstrap-stats)."""
+    from .auth import AuthError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import fetch_settings
+    from .tokens import TokenStoreError
+
+    try:
+        client = _import_gmail_client(cfg)
+        id_to_name, filters, bootstrap = fetch_settings(client)
+    except (AuthError, TokenStoreError) as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailAuthError as e:
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except GmailError as e:
+        typer.echo(f"{failure_prefix}: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    return client, id_to_name, filters, bootstrap
+
+
+def _dataset_store_modes(store: CorpusStore, *, enforce: bool = True) -> None:
+    """Shared store mode handling for the dataset import and sync
+    commands: tighten the tree, then WARNING-loop over anything still
+    group/world-readable.
+    Pass ``enforce=False`` for read-only runs (``--dry-run``): per
+    corpus_store.enforce_modes' own contract ("Call from WRITE-side
+    commands… not from read-only tools", corpus_store.py ~431), a run
+    that writes nothing must not re-mode anything either. The
+    non-destructive verify_modes WARNING runs either way — it names the
+    structural paths the later write run would tighten (verify_modes is
+    a structural scan; the full-tree tightening is enforce_modes' job)."""
+    if enforce:
+        store.enforce_modes()
+    for offender in store.verify_modes():
+        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
 
 
 @dataset_app.command("import-gmail")
@@ -125,38 +253,43 @@ def dataset_import_gmail(
         min=1,
         help="Stop after scanning N messages (smoke runs)",
     ),
+    also_sync_labels: bool = typer.Option(
+        False,
+        "--also-sync-labels",
+        help=(
+            "After the import completes durably, run the Label Sync "
+            "delta from the Sync Cursor — one report carries both "
+            "passes' stats; a sync-pass failure exits non-zero but "
+            "never invalidates the import (spec #64). Opt-in by "
+            "design: without it import-gmail keeps its crisp "
+            "append-new-messages contract"
+        ),
+    ),
 ) -> None:
-    """Import labeled mail from the Gmail API into the corpus."""
-    from .auth import AuthError
+    """Import labeled mail from the Gmail API into the corpus.
+
+    --also-sync-labels (ticket #75, opt-in by design): once the import has
+    completed durably, run the Label Sync delta too — one report, both
+    passes. A --max-messages-bounded run completes durably too, so the
+    sync pass still walks from the ledger's seed (birthed or pre-existing).
+    Without the flag the command keeps its crisp "append new messages,
+    never touch existing records" meaning (spec #64).
+    """
     from .corpus_store import CorpusError, CorpusStore
     from .gmail_errors import GmailAuthError, GmailError
     from .gmail_import import (
-        fetch_settings,
         import_gmail,
         write_filters_snapshot,
         write_labels_snapshot,
     )
-    from .tokens import TokenStoreError
 
     cfg = _load_config(config)
-    # Auth gate FIRST: a not-signed-in run must not create or re-mode a
-    # corpus tree (a typo'd corpus.dir especially).
-    try:
-        client = _import_gmail_client(cfg)
-        id_to_name, filters, bootstrap = fetch_settings(client)
-    except (AuthError, TokenStoreError) as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailAuthError as e:
-        typer.echo(f"auth: {e}", err=True)
-        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
-    except GmailError as e:
-        typer.echo(f"import failed: {e}", err=True)
-        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    # Auth gate FIRST via the shared bootstrap (_dataset_auth_bootstrap)
+    client, id_to_name, filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="import failed"
+    )
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         write_filters_snapshot(store, filters)
         write_labels_snapshot(store, id_to_name)
@@ -180,11 +313,14 @@ def dataset_import_gmail(
         f"failed={len(stats.failed)}"
     )
     if stats.failed:
-        for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
-        if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        _render_failures(stats.failed)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+    if also_sync_labels:
+        _sync_labels_pass(client, store, id_to_name=id_to_name)
+        # the pointer closes the WHOLE report and has ONE owner — the
+        # command, after its pass chain — in both composite directions
+        # (review round 1: pointer-inside-the-pass was a double-print trap)
+        typer.echo(_ANALYZE_POINTER)
 
 
 @dataset_app.command("import-gyb")
@@ -235,9 +371,7 @@ def dataset_import_gyb(
         typer.echo(f"import-gyb: {DB_FILENAME} not found under {root}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
     store = CorpusStore(cfg.corpus.dir)
-    store.enforce_modes()
-    for offender in store.verify_modes():
-        typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
+    _dataset_store_modes(store)
     try:
         stats = import_gyb(
             root,
@@ -289,11 +423,380 @@ def dataset_import_gyb(
             err=True,
         )
     if stats.failed:
-        for message_id, reason in stats.failed[:20]:
-            typer.echo(f"  failed {message_id}: {reason}", err=True)
-        if len(stats.failed) > 20:
-            typer.echo(f"  ... and {len(stats.failed) - 20} more", err=True)
+        _render_failures(stats.failed)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+@dataset_app.command("sync-labels")
+def dataset_sync_labels(
+    config: str | None = typer.Option(None, "--config", help="Path to config.toml"),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show the change plan: identical report, no records or cursor written",
+    ),
+    full_resync: bool = typer.Option(
+        False,
+        "--full-resync",
+        help=(
+            "Ground-truth reconciliation for an expired Sync Cursor or a "
+            "cursorless (GYB-shaped) corpus: estimates both strategies from "
+            "one labels.list, prints the choice, runs the cheaper one (ties "
+            "and unpriceable scans go to the exact-cost walk) — no history "
+            "needed"
+        ),
+    ),
+    also_import_gmail: bool = typer.Option(
+        False,
+        "--also-import-gmail",
+        help=(
+            "After the sync delta is durable (Sync Cursor advanced), run "
+            "the full Gmail Import pass (default query) — one report "
+            "carries both passes' stats; an import-pass failure exits "
+            "non-zero but never invalidates the sync (spec #64)"
+        ),
+    ),
+) -> None:
+    """Refresh the corpus's label state from mailbox changes (Label Sync).
+
+    Default path: walks the Gmail history from the corpus's Sync Cursor and
+    appends a label Revision for every touched message — metadata only,
+    bodies never (invariant #5). Event ids the corpus has never held are
+    counted as Unseen Ids and reported, never ingested here; deleted mail
+    keeps its record.
+
+    --full-resync (recovery path, ticket #74): reconciles the corpus's
+    label state against the mailbox directly when the history window is
+    gone or was never consumed — cost-estimated up front from one
+    labels.list plus local resolved-view counts, cheaper of the
+    label-inventory scan and the corpus-metadata walk picked with a printed
+    rationale, the cursor reseeded to the seed captured BEFORE the scan
+    (step-down-permitted: a rolled-back mailbox's higher stored cursor
+    yields to the seed — replay from the lower seed is harmless under
+    ADR-0007) only after the reconciliation's revisions are durable
+    (ADR-0008).
+
+    --also-import-gmail (ticket #75): once this command's own delta is
+    durable, run the full Gmail Import pass too — content and label
+    freshness refreshed in one sitting, each pass's durability its own.
+    """
+    if dry_run and also_import_gmail:
+        # --dry-run promises ZERO writes; the import pass writes records —
+        # the combination is contradictory, not silently degraded (exit 2
+        # before any config read or quota spend)
+        typer.echo(
+            "sync-labels: --dry-run writes nothing, so the "
+            "--also-import-gmail pass has no durability point to follow "
+            "— refusing the combination",
+            err=True,
+        )
+        raise typer.Exit(code=_USAGE_ERROR_EXIT)
+    from .corpus_store import CorpusError, CorpusStore
+    from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
+    from .label_sync import FullResyncStats, sync_labels
+    from .label_sync import full_resync as run_full_resync
+
+    cfg = _load_config(config)
+    # Auth gate FIRST via the shared bootstrap (import-gmail on the same
+    # spine). Deliberate reuse of the landed bootstrap (spec #64 seam 3):
+    # the filters fetch is unused on the standalone path — a filters-only
+    # outage therefore blocks sync too (loudly, exit 5). Accepted: one
+    # cheap shared call keeps every dataset command on the SAME
+    # auth/retry spine; a labels-only bootstrap is a refactor for the
+    # daemon phase. --also-import-gmail puts the filters to their real
+    # use: the import pass's attribution snapshot (ticket #75).
+    client, id_to_name, filters, bootstrap = _dataset_auth_bootstrap(
+        cfg, failure_prefix="sync-labels failed"
+    )
+    store = CorpusStore(cfg.corpus.dir)
+    if not store.root.is_dir():
+        # analyze's gate, same reasoning: a config typo is an operation
+        # failure, NOT an "empty mailbox" — and never a birth target
+        typer.echo(
+            f"sync-labels failed: corpus dir {store.root} is missing or not a "
+            "directory \u2014 run dataset import-gmail/import-gyb first or fix "
+            "[corpus] dir",
+            err=True,
+        )
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    _dataset_store_modes(store, enforce=not dry_run)
+    try:
+        if full_resync:
+            # progress lines (estimate + strategy BEFORE any enumeration
+            # spend; the scan's flag-rate BEFORE the metadata pass) print
+            # as they happen — the flood guard is only a guard if it
+            # lands early
+            stats: SyncStats | FullResyncStats = run_full_resync(
+                client,
+                store,
+                id_to_name=id_to_name,
+                dry_run=dry_run,
+                progress=typer.echo,
+            )
+        else:
+            stats = sync_labels(client, store, id_to_name=id_to_name, dry_run=dry_run)
+    except GmailResyncError as e:
+        # the ledger is untouched (advancement is sync's act and this run
+        # never reached it); recovery is never automatic (ADR-0008)
+        typer.echo(f"sync-labels: {e}", err=True)
+        typer.echo(_RESYNC_GUIDANCE, err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    except GmailAuthError as e:  # revoked token mid-run: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError, OSError, UnicodeDecodeError) as e:
+        # analyze's tuple: an undecodable/unreadable records index is exit
+        # 5, never a raw traceback (a `1` would mean an unhandled crash)
+        typer.echo(f"sync-labels failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    stats.retried += bootstrap.retried  # settings blips count too
+    if isinstance(stats, FullResyncStats):
+        # structural narrowing (PR #86 review): the concrete type IS the
+        # discriminator — only the --full-resync call above can have
+        # produced a FullResyncStats. Structural honesty, not a bug fix:
+        # the replaced asserts never fired (output was already
+        # byte-identical under -O), but a stripped assert is a narrowing
+        # that silently disappears, while this type test stays visible
+        # to every reader and to pyright
+        _report_full_resync(stats, dry_run=dry_run)
+        _render_gains_losses(stats.gains, stats.losses)
+        if stats.unseen:
+            typer.echo(_UNSEEN_NOTE.format(n=stats.unseen), err=True)
+    else:
+        _report_sync(stats, dry_run=dry_run)
+    if stats.failed:
+        # an incomplete run gets NO second pass: the composite's precondition
+        # is the first pass's final durability point (cursor advanced), which
+        # a failed sync never reached (ticket #75)
+        _render_failures(stats.failed)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+    if also_import_gmail:
+        _import_gmail_pass(client, store, id_to_name=id_to_name, filters=filters)
+    # reaching this line means every pass that ran was complete — an
+    # incomplete run does not recommend analyzing a half-synced corpus.
+    # Under --dry-run the gates did NOT move (ticket #77): the plan-only
+    # twin closes instead; composition is refused under the flag, so no
+    # real second pass can hide behind the dry wording here.
+    typer.echo(_ANALYZE_POINTER_DRY if dry_run else _ANALYZE_POINTER)
+
+
+def _import_gmail_pass(
+    client: GmailClient,
+    store: CorpusStore,
+    *,
+    id_to_name: dict[str, str],
+    filters: list[FilterInfo],
+) -> None:
+    """The second pass of ``dataset sync-labels --also-import-gmail``
+    (ticket #75): the FULL Gmail Import — the same snapshot writes +
+    ``import_gmail`` call the standalone command makes, delegated, never
+    re-implemented (spec #64: ingest stays single-sourced in the import
+    path). Reached only after the sync pass cleared its own durability gate,
+    so the Sync Cursor is already advanced and import's birth-when-absent
+    leaves it byte-identical (ADR-0008). ``bootstrap.retried`` is NOT added
+    again here — the sync report already carries it, and one composite
+    report must not double-count the shared settings blips. One bootstrap
+    serves both passes: the snapshots this pass writes reflect the settings
+    read BEFORE the sync walk, not a refetch at import start — label or
+    filter churn during the sync window surfaces in the next standalone
+    import or sync, a deliberate one-call quota trade (spec #64 keeps the
+    dataset commands on one shared bootstrap spine)."""
+    from .corpus_store import CorpusError
+    from .gmail_errors import GmailAuthError, GmailError
+    from .gmail_import import (
+        import_gmail,
+        write_filters_snapshot,
+        write_labels_snapshot,
+    )
+
+    try:
+        write_filters_snapshot(store, filters)
+        write_labels_snapshot(store, id_to_name)
+        stats = import_gmail(client, store, id_to_name=id_to_name, query=DEFAULT_QUERY)
+    except GmailAuthError as e:  # revoked token mid-pass: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError) as e:
+        # the standalone import's mapping, unchanged — snapshot writes
+        # convert their OSError to CorpusError; the record-append block's
+        # write/fsync is the residual pre-existing gap, identical here and
+        # standalone. The sync pass's durable work is never rolled back by
+        # a second-pass fault
+        typer.echo(f"import failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    typer.echo(
+        f"import-gmail (also): scanned={stats.scanned} written={stats.written} "
+        f"skipped_present={stats.skipped_present} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    _render_failures(stats.failed)
+    if stats.failed:
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+def _sync_labels_pass(
+    client: GmailClient,
+    store: CorpusStore,
+    *,
+    id_to_name: dict[str, str],
+) -> None:
+    """The second pass of ``dataset import-gmail --also-sync-labels``
+    (ticket #75): the Label Sync event walk — the same ``sync_labels`` call
+    the standalone command makes, delegated, never re-implemented. Reached
+    only after the import completed durably, so the walk starts from the
+    ledger the import birthed (or found) — seeded BEFORE its paging
+    (ADR-0008): relabels made during the import land in this window, and
+    freshly imported ids touched by events are re-verified (self-healing
+    appends the fold absorbs). ``bootstrap.retried`` already rode the
+    import report — not added again here. The event WALK only:
+    ``--full-resync`` is an explicit recovery decision, never an implicit
+    second pass."""
+    from .corpus_store import CorpusError
+    from .gmail_errors import GmailAuthError, GmailError, GmailResyncError
+    from .label_sync import sync_labels
+
+    try:
+        stats = sync_labels(client, store, id_to_name=id_to_name)
+    except GmailResyncError as e:
+        # the standalone sync's 404 contract, kept whole under composition:
+        # exact recovery command printed, ledger untouched, never automatic
+        typer.echo(f"sync-labels: {e}", err=True)
+        typer.echo(_RESYNC_GUIDANCE, err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    except GmailAuthError as e:  # revoked token mid-pass: the fix is human
+        typer.echo(f"auth: {e}", err=True)
+        raise typer.Exit(code=_AUTH_ERROR_EXIT) from None
+    except (GmailError, CorpusError, OSError, UnicodeDecodeError) as e:
+        # the import pass's durable work is never rolled back by a
+        # second-pass fault (spec #64)
+        typer.echo(f"sync-labels failed: {e}", err=True)
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
+    _render_sync_report(stats, "sync-labels (also):", dry_run=False)
+    _render_failures(stats.failed)
+    if stats.failed:
+        raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
+
+
+def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
+    """The --full-resync report: mode-named summary line + the birth NOTE
+    + the step-down NOTE (#95).
+    Takes the CONCRETE stats type (PR #86 review) — the caller dispatches
+    on isinstance, so no runtime assert narrows here: the replaced assert
+    never fired (it is structural honesty, not a bug fix), but a stripped
+    assert disappears under ``python -O`` while this signature stays
+    visible to every reader and to pyright."""
+    prefix = (
+        "sync-labels --full-resync (dry-run):"
+        if dry_run
+        else "sync-labels --full-resync:"
+    )
+    # the flag-rate is the scan's drift signal; on the walk every id
+    # is fetched by construction, so quoting a 100% "flag-rate" there
+    # would read as drift that never happened (deepseek review). Runs
+    # that never finished ENUMERATING (sentinel failures: "<cursor>",
+    # "<labels>", "<label:ID>") stay silent too — a 0% rate from a scan
+    # that never ran reads as measured absence of drift (PR #88
+    # review). A completed scan with per-message failures KEEPS its
+    # rate: it was really measured, and it is the diagnostic a human
+    # reads after a failed run.
+    rate = (
+        f" (flag-rate {stats.flag_rate:.0%})"
+        if stats.strategy == "scan"
+        and not any(key.startswith("<") for key, _reason in stats.failed)
+        else ""
+    )
+    typer.echo(
+        f"{prefix} strategy={stats.strategy} "
+        f"corpus={stats.corpus_messages} "
+        f"flagged={stats.flagged}{rate} "
+        f"revised={stats.revised} unchanged={stats.unchanged} "
+        f"deleted_kept={stats.deleted_kept} unseen={stats.unseen} "
+        f"retried={stats.retried} failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        # honesty under dry_run: the plan says WOULD birth — nothing was
+        # written (the core sets birthed from the read, not the write)
+        typer.echo(
+            "NOTE: this corpus had no Sync Cursor \u2014 full-resync "
+            + (
+                "WOULD birth it from the profile seed captured BEFORE the scan"
+                if dry_run
+                else "birthed it from the profile seed captured BEFORE the scan"
+            )
+            + " (ADR-0008: changes made during the scan carry higher "
+            "ids and land in the next sync's window)"
+        )
+    if stats.stepped_down_from is not None:
+        # the step-down disclosure (#95): data rides the core's stats, the
+        # NOTE renders here (the birth-provenance precedent) — one line,
+        # honest about plan-vs-completed under --dry-run
+        if dry_run:
+            typer.echo(
+                f"NOTE: plan includes stepping the Sync Cursor down from "
+                f"{stats.stepped_down_from} to {stats.seed_history_id} "
+                f"(ADR-0008 \u2014 the kept-high cursor would be "
+                f"unreachable; ground truth written on completion)."
+            )
+        else:
+            typer.echo(
+                f"NOTE: Sync Cursor stepped down from "
+                f"{stats.stepped_down_from} to {stats.seed_history_id} \u2014 "
+                f"the mailbox reported below the stored ledger; the kept-high "
+                f"Sync Cursor was unreachable and the reconciliation just "
+                f"wrote ground truth (ADR-0008)."
+            )
+
+
+def _report_sync(stats: SyncStats, *, dry_run: bool) -> None:
+    """The event-walk report: summary line + the birth NOTE (ADR-0008
+    consequence 1's provenance disclosure) + the per-label counts and the
+    unseen NOTE. The concrete-stats twin of ``_report_full_resync`` — same
+    isinstance-dispatch rationale; the body itself renders through the
+    one shared source the composite pass also uses (ticket #75)."""
+    _render_sync_report(
+        stats,
+        "sync-labels (dry-run):" if dry_run else "sync-labels:",
+        dry_run=dry_run,
+    )
+
+
+def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:
+    """Per-label gain/loss table, shared by the event-walk and full-resync
+    reports (the sync report closes with these counts, spec #64)."""
+    if not (gains or losses):
+        return
+    labels = sorted(set(gains) | set(losses))
+    width = min(max((len(name) for name in labels), default=5) + 1, 64)
+    typer.echo(f"\n{'label':<{width}} {'gains':>6} {'losses':>6}")
+    for name in labels:
+        # NO truncation: slash-nested label paths must stay readable
+        typer.echo(f"{name:<{width}} {gains.get(name, 0):>6} {losses.get(name, 0):>6}")
+
+
+def _render_sync_report(stats: SyncStats, prefix: str, *, dry_run: bool) -> None:
+    """The event-walk sync report body (summary, birth provenance NOTE,
+    per-label counts, unseen NOTE) — shared by the standalone
+    ``sync-labels`` command and the ``import-gmail --also-sync-labels``
+    composite pass (ticket #75): one rendering, pinned once. ``dry_run`` is
+    a required keyword (deepseek review): a future dry-run-capable call site
+    cannot silently render the actual-birth NOTE by omission — the composite
+    pass states ``dry_run=False`` explicitly (``import-gmail`` offers no
+    ``--dry-run`` flag today, so the composite always writes; were one ever
+    added, the mode must be threaded through rather than defaulting to an
+    actual-birth render). The analyze pointer
+    is the COMMAND's — it closes the whole report after any second pass; the
+    failure detail is printed by each command's own gate."""
+    typer.echo(
+        f"{prefix} events={stats.events} stale={stats.stale} "
+        f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
+        f"unseen={stats.unseen} retried={stats.retried} "
+        f"failed={len(stats.failed)}"
+    )
+    if stats.birthed:
+        typer.echo(_BIRTH_NOTE_DRY if dry_run else _BIRTH_NOTE)
+    _render_gains_losses(stats.gains, stats.losses)
+    if stats.unseen:
+        typer.echo(_UNSEEN_NOTE.format(n=stats.unseen), err=True)
 
 
 @dataset_app.command("analyze")
@@ -340,7 +843,10 @@ def dataset_analyze(
     for offender in store.verify_modes():
         typer.echo(f"WARNING: {offender} is group/world-readable", err=True)
     try:
-        records = list(store.iter_records())
+        # The resolved view, not the raw log (ADR-0007): a revised message
+        # counts once, under its newest label set — duplicate-id inflation
+        # is eliminated by the fold, not guarded against here.
+        records = list(store.iter_resolved())
     except (CorpusError, OSError, UnicodeDecodeError) as e:
         # unreadable/undecodable records are exit 5, never a traceback
         typer.echo(f"analyze failed: records unreadable ({type(e).__name__})", err=True)

@@ -219,9 +219,11 @@ def analyze_corpus(
     """Compute the report. ``filters=None`` means NO snapshot was provided:
     attribution is then UNKNOWN and no label can be a candidate (invariant
     #6 refuses to pretend; the CLI surfaces the --assume-no-filters escape
-    for filterless mailboxes). Duplicate record ids would inflate the
-    volume gates while attribution dedupes by id — id uniqueness is
-    the importers' contract, assumed here."""
+    for filterless mailboxes). Production callers pass the store's RESOLVED
+    view (``CorpusStore.iter_resolved``, ADR-0007): one record per id, the
+    last revision winning. The fold lives in the store — raw log lines
+    would inflate the volume gates while attribution dedupes by id, and
+    the resolved view eliminates that asymmetry instead of guarding it."""
     cutoff = months_ago(now, recent_months)
     body_counts: dict[str, int] = {}
     for rec in records:

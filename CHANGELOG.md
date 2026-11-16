@@ -8,6 +8,63 @@ does not ship releases yet.
 
 ### Added
 
+- `apply --since [--apply]`: the only bulk path (ticket #26) — a
+  human-gated preview/backfill of graduated labels over historical mail,
+  reusing the daemon's exact decision core.
+  - `apply.py`: `run_apply` pages `list_messages` (the wire pageToken
+    chain — apply has NO history cursor) and processes one page per
+    batch: fetch → predict → compose → write-first → commit. It IMPORTS
+    the daemon's seams, never mirrors them — `daemon.compose_plan` (the
+    composition call-shape that threads the ctx maps to THE one
+    `applications.plan_message_write` decision core; apply holds NO
+    `plan_message_write` binding of its own — the one-core truth stands
+    through this seam) and `daemon.present_names` (the present-set
+    reader), `daemon.predict_conformant`
+    (the positive-conformance predict seam, extracted verbatim from
+    `_run_tick`; the daemon's suite rides the extraction untouched), and
+    the `ServingContext`. ONE `clock()` read per batch stamps every row
+    (the #24 homogeneity contract reused at the call site); the batch's
+    commit point is `commit_applications`. A mid-run SIGTERM completes
+    the page to its commit point (the shared shutdown handler — no third
+    copy); a 404 message is a counted skip (a backfill over years WILL
+    hit deleted mail); a transient write error HOLDS NOTHING (no cursor)
+    — the message stays un-labeled and un-rowed and a re-run picks it up;
+    a model shape defect or a page-read failure aborts (a systematic bug,
+    the shadow prediction-failure precedent). Bodies never enter a
+    preview line or log (invariant #5).
+  - `appdb.commit_applications(rows)`: the rows-only sibling of
+    `commit_page` — same explicit transaction, same #24 applied_at
+    homogeneity refusal, same row validation, and ZERO cursor involvement
+    (`daemon_state` is byte-for-byte untouched across a whole backfill;
+    invariant #3 belongs to the daemon alone). Unlike `commit_page`'s
+    empty-tolerance it REFUSES an empty batch (no cursor to advance in
+    exchange — an empty plan is no Application).
+  - `cli._serve_startup`: the daemon's gates-first startup (client/model
+    seams, corpus + checkpoint + bands + graduation identity gates, the
+    `ensure_label` tier resolution with the collision→exit-4 arm, the
+    `ServingContext`) lifted into the ONE helper both `daemon` and
+    `apply` serve from (the daemon's suites ride it VERBATIM — no test
+    edited). A dry preview passes `mint_labels=False`: the Tier Label
+    names resolve by lookup only, and a name the mailbox lacks hits the
+    MINT GUARD (refused named, never silently created — a create is a
+    wire write).
+  - `apply` CLI: `--since` is REQUIRED (the only bulk path never guesses
+    its window), parses through the reused `_backlog_cutoff` (UTC-midnight
+    rule), and builds the query `after:<epoch-seconds>` ONLY — deliberately
+    WITHOUT `in:inbox` (backfill targets historical mail, mostly archived).
+    Without `--apply`: a dry preview, zero Gmail writes (exit 0). With
+    `--apply`: the backfill, Applications recorded identically to
+    daemon-applied ones (`source='apply'`). AC5: corpus records dated at
+    or after the boundary that lack a server-authoritative Date Provenance
+    stamp surface ONE counted warning. Exit contract 0/2/4/5. A
+    per-message READ or WRITE blip (non-404, non-auth) is a counted
+    warning that holds nothing — both arms symmetric, a re-run picks it
+    up (no cursor to retry against); a message served twice in one page
+    is deduped per page (the daemon's `_message_ids` shape) so a
+    double-serve cannot compose a duplicate row after the first write
+    landed. The daemon
+    never invokes any of it — a grep pin on `daemon.py` fails if the apply
+    machinery is ever referenced there (the AC's "never automatic").
 - Daemon: poll, decide, write (ticket #25) — the live application loop
   and its `daemon` command.
   - `daemon.py`: the fully injected poll loop (client/db/model/clock/

@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from gmail_labeler.analyze import LabelMetrics, analyze_corpus, months_ago
+from gmail_labeler.analyze import (
+    LabelMetrics,
+    analyze_corpus,
+    filter_label_ids,
+    filter_label_ids_strict,
+    months_ago,
+)
 from gmail_labeler.corpus_record import CorpusRecord, body_hash
 
 NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
@@ -408,3 +414,39 @@ def test_nonstr_criteria_value_unverifiable() -> None:
         "Lbl",
     )
     assert "filter-unverifiable" in m.reasons
+
+
+# ---- filter_label_ids: lenient base parity vs strict (item 3) ----
+
+
+def test_lenient_filter_label_ids_str_coerces_nonstr_entries() -> None:
+    # base _filter_label_names parity: a type-corrupt id like 42 attributes
+    # as "42" (str-coerced), it does NOT vanish — qwen's 14-case battery
+    # defines this contract; making the lenient path strict would RED here
+    assert filter_label_ids({"action": {"addLabelIds": [42]}}) == ["42"]
+    assert filter_label_ids({"action": {"addLabelIds": ["L1", 42]}}) == ["L1", "42"]
+
+
+def test_lenient_filter_label_ids_base_shapes() -> None:
+    # the full base-parity contract: wrong-shaped action → no ids; list →
+    # str-coerced; absent action → no ids
+    assert filter_label_ids({"action": "junk"}) == []
+    assert filter_label_ids({"action": {"addLabelIds": "L1"}}) == []
+    assert filter_label_ids({"action": {}}) == []
+    assert filter_label_ids({}) == []
+    assert filter_label_ids({"action": {"addLabelIds": ["L1"]}}) == ["L1"]
+
+
+def test_strict_filter_label_ids_raises_on_nonstr_entries() -> None:
+    # the strict variant (shared by the CLI + builder) refuses non-str
+    # entries — the lenient/strict divergence is pinned both ways
+    import pytest
+
+    with pytest.raises(ValueError, match="strings"):
+        filter_label_ids_strict({"action": {"addLabelIds": [42]}})
+    with pytest.raises(ValueError, match="object"):
+        filter_label_ids_strict({"action": "junk"})
+    with pytest.raises(ValueError, match="list"):
+        filter_label_ids_strict({"action": {"addLabelIds": "L1"}})
+    # well-formed passes
+    assert filter_label_ids_strict({"action": {"addLabelIds": ["L1"]}}) == ["L1"]

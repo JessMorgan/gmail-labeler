@@ -1291,9 +1291,37 @@ def test_sync_labels_births_cursorless_corpus_and_reports_provenance(
     result = runner.invoke(app, ["dataset", "sync-labels", "--config", str(cfg)])
     assert result.exit_code == 0, result.output
     assert "no Sync Cursor" in result.stdout  # provenance disclosed
+    assert "it was birthed" in result.stdout  # NOT "WOULD" (deepseek review)
+    assert "WOULD birth" not in result.stdout
     assert "applies nothing" in result.stdout.lower()
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 777
+
+
+def test_sync_labels_dry_run_cursorless_says_would_birth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Honesty under --dry-run on the EVENT WALK (fix-round review, both
+    axes): the full-resync branch already splits WOULD/actual birth, but the
+    event-walk report printed "it was birthed" although dry-run writes
+    nothing. The NOTE must say WOULD birth, the cursor file must stay
+    absent, and the records bytes must not move."""
+    import gmail_labeler.cli as cli
+
+    store = _sync_seed_corpus(tmp_path)  # no cursor: birth-eligible
+    records_bytes = (store.root / "records.jsonl").read_bytes()
+    fake = _sync_fake(current_history_id=777)
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--dry-run", "--config", str(cfg)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "(dry-run)" in result.stdout
+    assert "WOULD birth" in result.stdout
+    assert "was birthed" not in result.stdout
+    assert not (store.root / "sync-cursor.json").exists()
+    assert (store.root / "records.jsonl").read_bytes() == records_bytes
 
 
 def test_sync_labels_counts_unseen_and_deleted_without_writing(
@@ -1432,7 +1460,7 @@ def test_sync_labels_full_resync_scan_prints_estimate_choice_and_revises(
 ) -> None:
     """AC #1/#6 at the CLI seam: the estimate + strategy lines print (with
     numbers), the flag-rate rides the report, the revision lands, and the
-    cursor reseeds to the up-front profile value."""
+    cursor reseeds to the pre-enumeration profile value."""
     import gmail_labeler.cli as cli
     from gmail_labeler.fake_gmail import FakeMessage
 
@@ -1456,8 +1484,10 @@ def test_sync_labels_full_resync_scan_prints_estimate_choice_and_revises(
     assert resolved["a1"].labels == ()
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 500  # the seed
-    # the CLI bootstrap (fetch_settings) precedes the core; WITHIN the core
-    # the seed rides first — get_profile before any list/metadata spend
+    # the CLI bootstrap (fetch_settings) precedes the core; WITHIN the
+    # core the seed still precedes every enumeration spend — get_profile
+    # before the first list/metadata call (the estimate's labels.list is
+    # not an enumeration, US8 prices it)
     spend = [
         i
         for i, c in enumerate(fake.calls)
@@ -1529,7 +1559,7 @@ def test_sync_labels_full_resync_gyb_corpus_births_cursor_and_exits_0(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC #7 at the CLI seam: a cursorless (GYB-shaped) corpus reconciles
-    end-to-end and births the ledger with the up-front seed."""
+    end-to-end and births the ledger with the pre-enumeration seed."""
     import gmail_labeler.cli as cli
     from gmail_labeler.fake_gmail import FakeMessage
 
@@ -1689,7 +1719,39 @@ def test_sync_labels_full_resync_failure_on_rollback_state_prints_no_step_down_n
     )
     assert result.exit_code == 5  # never silently partial
     assert "stepped down" not in result.stdout  # held ledger, no disclosure
+    # the enumeration COMPLETED (failure is per-message): the measured
+    # flag-rate stays in the report — the sentinel-scoped guard spares
+    # exactly this diagnostic (PR #88 round-2 review)
+    assert "(flag-rate" in result.stdout
     assert store.read_cursor() == _cursor_at(900)  # ledger held, unmoved
+
+
+def test_sync_labels_full_resync_failed_seed_bail_names_strategy_without_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #88 fold-in review (deepseek minor): the US8 reorder leaves a
+    NAMED strategy on the seed-failed bail, and the report must not pair
+    it with a "(flag-rate 0%)" drift signal — the scan never enumerated.
+    Kills the mutant that drops ``and not stats.failed`` from the rate
+    guard, and the one that moves the strategy assignment below the seed
+    (which would render strategy=None again)."""
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeMessage
+    from gmail_labeler.gmail_errors import GmailPermanentError
+
+    store = _sync_seed_corpus(tmp_path)  # cursorless fixture: bail may not birth
+    fake = _resync_fake(messages=[FakeMessage(id="a1", eml=b"x", label_ids=())])
+    fake.fail("get_profile", GmailPermanentError("profile down", status=400))
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    cfg = _import_gmail_cfg(tmp_path)
+    result = runner.invoke(
+        app, ["dataset", "sync-labels", "--full-resync", "--config", str(cfg)]
+    )
+    assert result.exit_code == 5
+    assert "strategy=scan" in result.stdout  # named despite the bail
+    assert "(flag-rate" not in result.stdout  # never enumerated: no signal
+    assert "failed=1" in result.stdout
+    assert store.read_cursor() is None  # the bail left no ledger
 
 
 # ---- --full-resync step-down NOTE (ticket #95) ------------------------------
@@ -1697,12 +1759,13 @@ def test_sync_labels_full_resync_failure_on_rollback_state_prints_no_step_down_n
 
 _STEP_DOWN_NOTE = (
     "NOTE: Sync Cursor stepped down from 900 to 500 — the mailbox reported "
-    "below the stored ledger; the kept-high watermark was unreachable and "
+    "below the stored ledger; the kept-high Sync Cursor was unreachable and "
     "the reconciliation just wrote ground truth (ADR-0008)."
 )
 _STEP_DOWN_PLAN_NOTE = (
     "NOTE: plan includes stepping the Sync Cursor down from 900 to 500 "
-    "(ADR-0008 — unreachable watermark; ground truth written on completion)."
+    "(ADR-0008 — the kept-high cursor would be unreachable; ground truth "
+    "written on completion)."
 )
 
 

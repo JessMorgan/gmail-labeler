@@ -139,6 +139,13 @@ label inventories can establish that an Unseen Id is new mail or that it matches
 the import query.
 _Avoid_: new match, New Match stat
 
+**Stale Id**:
+A Corpus-resident id a Label Sync walk touched as changed — owed a
+refresh, after which the Corpus's resolved label state matches the
+mailbox again. A removal event marks a Stale Id too; keep-versus-revise
+is the refresh's outcome, never a guess from the event type.
+_Avoid_: dirty id, pending id
+
 **Sync Cursor**:
 A Corpus's record of how far it has consumed the mailbox's event stream;
 owned by Label Sync — Gmail Import may birth it when absent, and only a
@@ -158,5 +165,13 @@ stored label state)
 **Resolved view**:
 The Corpus's logical state after the store folds its record log by message
 id, last occurrence wins. It is the read interface for label state; the log
-itself stays append-only.
+itself stays append-only at ingest.
 _Avoid_: current state, live view
+
+**Compaction**:
+Rewriting the Corpus's record log so each message id keeps only its newest
+line (a Revision where superseded) — safe when atomic and exclusive, never
+load-bearing for correctness (ADR-0007): the last-wins fold is the truth,
+so compaction changes only the fold's cost, never the resolved state.
+_Avoid_: garbage collection, log rotation (both imply the history itself is
+what's managed; the fold already resolves it)

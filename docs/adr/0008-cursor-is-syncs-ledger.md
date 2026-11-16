@@ -2,9 +2,9 @@
 
 The Corpus must remember how far the mailbox's event stream has been
 consumed, and more than one command touches that memory. We decided the
-Sync Cursor is owned by the Label Sync *operation* — `dataset
-sync-labels` is its first door, and the daemon (ADR-0003), when it
-lands, advances the same ledger through the shared sync code. Gmail Import
+Sync Cursor is owned by the Label Sync *operation* — `dataset sync-labels`
+is its first door, and the daemon (ADR-0003), when it lands, advances the
+same ledger through the shared sync code. Gmail Import
 (`dataset import-gmail`) may *birth* a cursor but never *advance* or
 overwrite an existing one, and GYB Import (`dataset import-gyb`) never
 births at all: a backup snapshots messages, not the event stream, and
@@ -17,10 +17,16 @@ that of the most recent message, the first in the list response —
 wherever the response actually carries it. Gmail's documented list stub is
 `id` plus `threadId` and does not contractually promise more, so one
 profile call (1 quota unit) is the fallback and in practice the reliable
-path. Either seed is captured before any message is ingested — the page
-seed from the first page's newest message, or a profile call taken up
-front: events after capture carry higher ids, so the seed is a lower
-bound and relabels made during the import land in the next sync's window
+path (the list-page response itself carries no page-level `historyId` in
+the current wire contract — API reference, Nov 2026 — so the page tier can
+only ever be a message stub's, where the wire happens to carry one; the
+spec-era phrase "the `historyId` carried by its first list-page response"
+has no such field to read, and this note supersedes that sentence).
+Either seed is captured before any message is ingested — the page
+seed from the first page's newest message, wherever a stub carries the
+value, or a profile call taken before enumeration: events after capture
+carry higher ids, so the seed is a lower bound and relabels made during
+the import land in the next sync's window
 instead of being silently skipped. The page-derived seed carries a known
 trade-off: it is the history id of the newest message *matching the import
 query*, so a corpus of old or narrowly filtered mail can birth a cursor
@@ -28,8 +34,8 @@ already outside the retention window, where a profile seed can never be
 born expired. Birth keeps the guide-ordered page seed with a profile
 fallback to save the call whenever the wire carries the stub field; the
 failure mode it accepts is a first sync that fails loudly as an expired
-cursor — the same never-automatic recovery the last consequence
-prescribes.
+cursor — the same never-automatic recovery the retention consequence
+below prescribes.
 
 The cursor is a versioned JSON sidecar in the corpus root
 (`sync-cursor.json`: `{version, history_id, last_sync}`, `last_sync`
@@ -47,11 +53,11 @@ guessing here is the silent-gap class this ledger exists to prevent.
 Advancement happens only after the delta's revision lines are appended and fsynced
 (invariant #3: durable handling first, cursor second). The Full Resync reseed may step
 a higher stored cursor DOWN to the profile seed: a rolled-back mailbox can report a
-history id below the ledger, and there the kept-high watermark is unreachable — it
+history id below the ledger, and there the kept-high Sync Cursor is unreachable — it
 404s every future walk and defeats the very command that exists to recover. The step-
 down is harmless: the reconciliation just wrote ground truth, and ADR-0007's fold
 absorbs any replay the lower seed re-opens — on a genuinely rolled-back mailbox no
-retained history sits between the seed and the old watermark, so the step-down itself
+retained history sits between the seed and the old cursor, so the step-down itself
 re-appends nothing; where a bogus seed re-opens a window that does hold history, the
 walk re-appends duplicate revision lines (it appends even when nothing moved) and the
 fold absorbs them — the same harmless-replay consequence a second Gmail Import already

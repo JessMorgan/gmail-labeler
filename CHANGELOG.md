@@ -63,7 +63,7 @@ does not ship releases yet.
   revisions are durable — a reseed, or a birth-when-absent on a
   cursorless corpus with the same ordering; the reseed is
   step-down-permitted when a rolled-back mailbox reports below the
-  stored cursor (a kept-high watermark would be unreachable; replay
+  stored cursor (a kept-high Sync Cursor would be unreachable; replay
   from the lower seed is harmless under ADR-0007) (ADR-0008). ONE `labels.list`
   (per-label `messagesTotal`) plus local resolved-view counts yield the
   cost estimate, printed with the strategy choice before any enumeration
@@ -127,11 +127,12 @@ does not ship releases yet.
 - `dataset analyze`: per-label counts, recency, duplicate rate, filter
   attribution, candidate shortlist, `--json`.
 
-- Design finalized: ADRs 0001–0005 (initial set), GLOSSARY, CODING-STANDARDS, AGENTS.
+- Design finalized: ADRs 0001–0005 (initial set), GLOSSARY,
+  CODING-STANDARDS, AGENTS.
 - Project scaffolded; implementation begins at Phase 0 (import + analysis).
 - Design: ADR-0007 (the Corpus is a revision log) and ADR-0008 (the Sync
   Cursor is sync's ledger) for spec #64 (Label Sync), with glossary terms
-  Backfill, Label Sync, Sync Cursor, Revision, and Resolved view.
+  Backfill, Label Sync, Sync Cursor, Revision, Resolved view, and Compaction.
 
 ### Changed
 
@@ -149,9 +150,30 @@ does not ship releases yet.
   matches the import query — a `messagesDeleted`-touched id that was never
   resident lands in this bucket — so the review-stage name `new_match`
   overstated what the count means.
+- Spec #64 pre-merge fold-in (PR #88 round 2): `--full-resync` now prints
+  the cost estimate and strategy BEFORE reading the profile seed (US8's
+  "before spending any quota beyond one `labels.list` call" order; the
+  seed still precedes all enumeration, and the seed-failed report now
+  names the chosen strategy where it once rendered `strategy=None`, with
+  the flag-rate suppressed only for sentinel-failed runs whose scan
+  never enumerated — a completed scan keeps its measured rate); the
+  Sync Cursor `_Avoid_` list is honored in the step-down NOTEs and the
+  ADR/CHANGELOG prose that said "kept-high watermark"; GLOSSARY gains the
+  report-surfaced **Stale Id** term; and ADR-0008 records that the list
+  response carries no page-level `historyId` in the current wire
+  contract, superseding spec #64's seed-source sentence.
 
 ### Fixed
 
+- `dataset sync-labels --dry-run` on a cursorless corpus no longer prints
+  "it was birthed from the mailbox profile" — dry-run writes nothing, so the
+  event-walk report now says WOULD birth, mirroring the
+  `--full-resync` branch's existing WOULD/actual split; both render modes
+  are pinned by CLI tests (#64 fix round).
+- `RawMessage` no longer carries the base64 message body in its `repr()`:
+  repr-into-a-log is a log channel, and invariant #5 keeps bodies out of
+  logs — the field stays on the value (the import parses it), only the
+  rendering drops it (#71 deferral, closed in the #64 fix round).
 - `dataset sync-labels --dry-run` no longer tightens corpus file modes:
   `corpus_store.enforce_modes` is WRITE-side-only per its own contract
   ("Call from WRITE-side commands… not from read-only tools"), so the dry

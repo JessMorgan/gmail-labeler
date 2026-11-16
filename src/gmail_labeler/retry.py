@@ -13,7 +13,9 @@ re-raise is inert: no import call path produces a resync error (only
 ``history`` does).
 
 The stats coupling is a duck-typed ``retried`` counter (small Protocol),
-so GmailImportStats and SyncStats share the loop without a base class.
+so GmailImportStats and SyncStats share the loop without a base class
+(the two sync spines share a private base among themselves — it stays
+inside ``label_sync`` and never reaches across to the import stats).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ _BASE_BACKOFF_S = 1.0
 
 class RetryStats(Protocol):
     """Anything with an honest ``retried`` counter (GmailImportStats,
-    SyncStats) — the loop's only stats need."""
+    SyncStats, FullResyncStats) — the loop's only stats need."""
 
     retried: int
 

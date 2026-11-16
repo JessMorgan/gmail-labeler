@@ -145,11 +145,23 @@ _UNSEEN_NOTE = (
 )
 # ADR-0008 consequence 1 provenance disclosure, shared by the standalone
 # event walk and the composite sync pass (ticket #75): one rendering.
+# The dry-run twin mirrors the --full-resync branch's WOULD-birth split
+# (fix-round review): under --dry-run nothing is written, so the NOTE must
+# say WOULD birth — stats.birthed keeps its core semantics (set from the
+# ledger READ, not the write) and only the rendering branches per mode.
+# One shared tail (deepseek review NIT): the two modes differ in the verb
+# clause only, so the wording cannot drift apart.
+_BIRTH_NOTE_TAIL = (
+    " (no consumed baseline to diff against yet; the corpus's label state "
+    "may predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+)
 _BIRTH_NOTE = (
     "NOTE: this corpus had no Sync Cursor \u2014 it was birthed "
-    "from the mailbox profile and applies NOTHING (no consumed "
-    "baseline to diff against yet; the corpus's label state may "
-    "predate the cursor). " + _RESYNC_GUIDANCE_NOTE
+    "from the mailbox profile and applies NOTHING" + _BIRTH_NOTE_TAIL
+)
+_BIRTH_NOTE_DRY = (
+    "NOTE: this corpus had no Sync Cursor \u2014 sync WOULD birth "
+    "it from the mailbox profile and apply NOTHING" + _BIRTH_NOTE_TAIL
 )
 
 
@@ -644,7 +656,7 @@ def _sync_labels_pass(
         # second-pass fault (spec #64)
         typer.echo(f"sync-labels failed: {e}", err=True)
         raise typer.Exit(code=_OPERATION_ERROR_EXIT) from None
-    _render_sync_report(stats, "sync-labels (also):")
+    _render_sync_report(stats, "sync-labels (also):", dry_run=False)
     _render_failures(stats.failed)
     if stats.failed:
         raise typer.Exit(code=_OPERATION_ERROR_EXIT)  # never silently partial
@@ -665,8 +677,19 @@ def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
     )
     # the flag-rate is the scan's drift signal; on the walk every id
     # is fetched by construction, so quoting a 100% "flag-rate" there
-    # would read as drift that never happened (deepseek review)
-    rate = f" (flag-rate {stats.flag_rate:.0%})" if stats.strategy == "scan" else ""
+    # would read as drift that never happened (deepseek review). Runs
+    # that never finished ENUMERATING (sentinel failures: "<cursor>",
+    # "<labels>", "<label:ID>") stay silent too — a 0% rate from a scan
+    # that never ran reads as measured absence of drift (PR #88
+    # review). A completed scan with per-message failures KEEPS its
+    # rate: it was really measured, and it is the diagnostic a human
+    # reads after a failed run.
+    rate = (
+        f" (flag-rate {stats.flag_rate:.0%})"
+        if stats.strategy == "scan"
+        and not any(key.startswith("<") for key, _reason in stats.failed)
+        else ""
+    )
     typer.echo(
         f"{prefix} strategy={stats.strategy} "
         f"corpus={stats.corpus_messages} "
@@ -696,16 +719,16 @@ def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
             typer.echo(
                 f"NOTE: plan includes stepping the Sync Cursor down from "
                 f"{stats.stepped_down_from} to {stats.seed_history_id} "
-                f"(ADR-0008 \u2014 unreachable watermark; ground truth "
-                f"written on completion)."
+                f"(ADR-0008 \u2014 the kept-high cursor would be "
+                f"unreachable; ground truth written on completion)."
             )
         else:
             typer.echo(
                 f"NOTE: Sync Cursor stepped down from "
                 f"{stats.stepped_down_from} to {stats.seed_history_id} \u2014 "
                 f"the mailbox reported below the stored ledger; the kept-high "
-                f"watermark was unreachable and the reconciliation just wrote "
-                f"ground truth (ADR-0008)."
+                f"Sync Cursor was unreachable and the reconciliation just "
+                f"wrote ground truth (ADR-0008)."
             )
 
 
@@ -715,7 +738,11 @@ def _report_sync(stats: SyncStats, *, dry_run: bool) -> None:
     unseen NOTE. The concrete-stats twin of ``_report_full_resync`` — same
     isinstance-dispatch rationale; the body itself renders through the
     one shared source the composite pass also uses (ticket #75)."""
-    _render_sync_report(stats, "sync-labels (dry-run):" if dry_run else "sync-labels:")
+    _render_sync_report(
+        stats,
+        "sync-labels (dry-run):" if dry_run else "sync-labels:",
+        dry_run=dry_run,
+    )
 
 
 def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:
@@ -731,14 +758,19 @@ def _render_gains_losses(gains: dict[str, int], losses: dict[str, int]) -> None:
         typer.echo(f"{name:<{width}} {gains.get(name, 0):>6} {losses.get(name, 0):>6}")
 
 
-def _render_sync_report(stats: SyncStats, prefix: str) -> None:
+def _render_sync_report(stats: SyncStats, prefix: str, *, dry_run: bool) -> None:
     """The event-walk sync report body (summary, birth provenance NOTE,
     per-label counts, unseen NOTE) — shared by the standalone
     ``sync-labels`` command and the ``import-gmail --also-sync-labels``
-    composite pass (ticket #75): one rendering, pinned once. The analyze
-    pointer is the COMMAND's — it closes the whole report after any
-    second pass; the failure detail is printed by each command's own
-    gate."""
+    composite pass (ticket #75): one rendering, pinned once. ``dry_run`` is
+    a required keyword (deepseek review): a future dry-run-capable call site
+    cannot silently render the actual-birth NOTE by omission — the composite
+    pass states ``dry_run=False`` explicitly (``import-gmail`` offers no
+    ``--dry-run`` flag today, so the composite always writes; were one ever
+    added, the mode must be threaded through rather than defaulting to an
+    actual-birth render). The analyze pointer
+    is the COMMAND's — it closes the whole report after any second pass; the
+    failure detail is printed by each command's own gate."""
     typer.echo(
         f"{prefix} events={stats.events} stale={stats.stale} "
         f"revised={stats.revised} deleted_kept={stats.deleted_kept} "
@@ -746,7 +778,7 @@ def _render_sync_report(stats: SyncStats, prefix: str) -> None:
         f"failed={len(stats.failed)}"
     )
     if stats.birthed:
-        typer.echo(_BIRTH_NOTE)
+        typer.echo(_BIRTH_NOTE_DRY if dry_run else _BIRTH_NOTE)
     _render_gains_losses(stats.gains, stats.losses)
     if stats.unseen:
         typer.echo(_UNSEEN_NOTE.format(n=stats.unseen), err=True)

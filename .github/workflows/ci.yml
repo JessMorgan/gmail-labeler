@@ -20,7 +20,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.12", "3.13"]
+        # Floor + latest: minimum supported (3.12) on ubuntu only; latest
+        # (3.15) on both. macOS runners back up frequently, hence one cell.
+        python-version: ["3.12", "3.15"]
+        exclude:
+          - os: macos-latest
+            python-version: "3.12"
     env:
       # uv fetches its own standalone CPython per UV_PYTHON; the interpreter
       # step below asserts it matches the matrix cell.

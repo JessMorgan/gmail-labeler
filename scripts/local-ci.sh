@@ -12,11 +12,12 @@ uv lock --check
 
 uv sync --group dev --locked -q
 
-echo "== interpreter (must be a CI matrix version)"
+echo "== interpreter (must be a CI Python version)"
 uv run --frozen python - <<'EOF'
 import sys
-assert sys.version_info[:2] in {(3, 12), (3, 13)}, (
-    f"local CI runs on a matrix interpreter (3.12/3.13), got {sys.version_info[:2]}"
+assert sys.version_info[:2] in {(3, 12), (3, 15)}, (
+    f"local CI runs on a CI Python version (3.12/3.15), got {sys.version_info[:2]}"
+    " — rerun with UV_PYTHON=3.12 or UV_PYTHON=3.15"
 )
 print("interpreter %d.%d OK" % sys.version_info[:2])
 EOF

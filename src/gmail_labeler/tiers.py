@@ -44,10 +44,15 @@ module is the PURE core: it names the DEFAULT spellings, NOT the
 operator's configured ``[labels] applied/high/med`` names. The CLI
 maps a band verdict to the CONFIGURED name (the ``[labels]`` surface
 drives the shadow report's tier names — a custom spelling is honored,
-not silently ignored). The daemon (#24) will resolve those configured
-names to Gmail label ids before any live Application (the contract for
-#24: tiers names the default spellings, the config names the operator's
-labels, the daemon bridges the two to the wire).
+not silently ignored). The bridge SHIPPED with #24:
+gmail_client.ensure_label resolves the configured names to Gmail label
+ids (get-or-create: an existing exact-case USER label is used as-is, a
+casefolded System Label name-sake is refused named — minting is what
+the refusal guards) and
+applications.plan_message_write takes the resolved map (the daemon
+#25 / apply #26 call them at startup — the contract: tiers names the
+default spellings, the config names the operator's labels, the client
+resolves to ids, the plan bridges to the wire).
 """
 
 from __future__ import annotations
@@ -180,8 +185,10 @@ def would_apply(
     ``system_labels`` is the System Label set (never targeted).
 
     ``system_labels`` is REQUIRED (keyword-only, no default) on purpose:
-    this module is the single safety authority for the live Application
-    path (#24/#26), and a fail-open default (``frozenset()``) would let
+    this module is the single safety authority for the graduated-NAME
+    vocabulary on the live Application path (#24/#26 — its #24 companion
+    is the composition-level id screen in ``applications._resolve_id``),
+    and a fail-open default (``frozenset()``) would let
     a caller that forgets the argument propose System Labels. Every
     caller must pass the mailbox's System Label set (the ``type ==
     "system"`` names from ``list_labels``) — no caller setup can be

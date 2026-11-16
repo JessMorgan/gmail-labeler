@@ -8,6 +8,41 @@ does not ship releases yet.
 
 ### Added
 
+- Application path, decision core + store (ticket #24): the write
+  composition and its audit record, at the library level (the daemon
+  CLI is #25, `apply` is #26).
+  - `gmail_client` write surface (the Protocol's first writes):
+    `apply_labels` — the wire body is a literal with the ONE key
+    `addLabelIds`, structurally incapable of carrying a removal
+    (invariant #1); `ensure_label` — get-or-create for the configured
+    Tier Label names (startup-only: an existing USER label of exactly
+    that name is used as-is; a casefolded System Label name-sake is
+    REFUSED named — the refusal guards minting a look-alike only).
+    FakeGmailClient records
+    successful writes with full body snapshots (the shadow zero-write
+    pin catches a read-path write by name).
+  - `appdb` schema v2: the `applications` table (message id, label,
+    label id, score, band, tier, applied-at, source CHECK
+    `daemon|apply`; no bodies; no PK — a re-earned label is NEW
+    Application history; indexes on message_id AND label for the
+    corrections/status join). The v1→v2 migration is a single-row
+    restamp, and EVERY schema transition (fresh create+stamp, the
+    migration, self-heals) runs in ONE explicit transaction — a crash
+    leaves the file fully prior-state or fully new-state, never the
+    intermediate; the tamper guards ({1}+applications, empty-version)
+    refuse named with the recovery in the message; the hard version
+    gate stays the forward-compat story.
+  - `applications.py` (pure): `plan_message_write` — the fail-safe
+    composition on the tiers core (imported, never re-derived): adds =
+    would-apply Managed Label ids + umbrella + best band tier (sorted
+    total order); skip-present earns no row and no Tier Labels (empty
+    plan → no API call — invariant #2, crash-retry idempotent); a
+    DATA-PATH compose error means no write for that message plus a
+    counted id-only warning — caller bugs and internal-contradiction
+    guards RAISE instead (the three-class model; the no-write holds
+    for all three, invariant #1); every resolved id is screened
+    through `is_system_label_id` (the composition-level guard on top
+    of tiers' name guard).
 - Shadow Pass (ticket #23): the Phase 1 exit — `shadow run` scores the
   recent Backlog through the sidecar-validated checkpoint, the
   Graduation Table, and the Threshold Bands and APPLIES NOTHING;
@@ -32,10 +67,12 @@ does not ship releases yet.
   - `appdb.py`: the SQLite state DB adapter — create-all-if-missing,
     `schema_version` row, the `shadow_results` table (run id, message
     id, label, probability, band, run_ts — NO bodies, invariant #5),
-    transaction-per-run (a crash mid-run leaves no half rows), the #24
-    applications-table seam (same file; the v1->v2 restamp/migration is
-    UNRESOLVED pending #24's schema design — the HARD version gate is
-    the stopgap that refuses a foreign/future schema_version at read).
+    transaction-per-run (a crash mid-run leaves no half rows), and the
+    #24 applications-table seam (same file; #23 left the v1->v2
+    restamp/migration unresolved — PAID by #24: the applications table
+    under schema v2, the migration a single-row restamp in ONE atomic
+    transaction; the HARD version gate refuses a foreign/future
+    schema_version at read).
   - `shadow run` CLI: auth gate (exit 4) -> sidecar-validated
     checkpoint load (the eval `ExpectedIdentity` pattern) ->
     `verify_bands` AND `verify_graduation` against the run's identity
@@ -45,8 +82,8 @@ does not ship releases yet.
     doctrine) -> Backlog fetch (`list_messages` pageToken loop honoring
     `--limit` across pages; `q = in:inbox after:<epoch-seconds>` —
     `--since` ISO date -> UTC midnight of that day -> epoch, default
-    now - 90d with the time kept, `--query` escape hatch) -> `get_message` per
-    id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
+    now - 90d with the time kept, `--query` escape hatch) -> `get_message`
+    per id -> `preprocess_text` (invariant #4) -> `model.predict` (batched
     seam) -> `tiers.would_apply` -> store. Degraded (body fetch
     failure) = per-message SKIP + stderr warning + count (the
     documented posture choice vs eval's refusal — shadow is a read-only
@@ -64,18 +101,24 @@ does not ship releases yet.
   - Zero-Gmail-writes AC: `FakeGmailClient` call-recording pin asserts
     the recorded calls are a subset of the read surface
     (list_messages, get_message, list_labels, list_filters) — no write
-    method of any shape (the Protocol has none in this ticket; the
-    write surface lands #24/#25).
+    method of any shape (the Protocol had none THEN; the write surface
+    landed in #24 — the name-based pin catches a read-path write by
+    name).
   - The `[labels]` `high`/`med` config drives the report's tier names
     (a custom spelling is honored, not silently ignored —
     refuse-never-drop); `tiers.py` keeps the DEFAULT spellings as the
     pure-core constants. The `applied` umbrella is
     validated at config NOW (stripped, distinct from `high`/`med`) and
-    consumed by the write phase later — the name→Gmail-label-id
-    resolution and the umbrella application are a WRITE-time concern the
-    daemon WILL implement in the Application phase (#24/#25) — unshipped
-    here (the report attaches no labels; it renders the band tier name
-    only).
+    CONSUMED by the Application write composition (ticket #24):
+    `applications.plan_message_write` adds the umbrella plus the best
+    band tier to every write, and `gmail_client.ensure_label` ships the
+    name→Gmail-label-id resolution (get-or-create: an existing USER
+    label of exactly that name is used as-is; a casefolded System
+    Label name-sake is refused named — the refusal guards minting a
+    look-alike only; the daemon / `apply` startup of #25/#26 calls it
+    once per configured name); the live write itself lands with the
+    daemon / `apply` CLI (#25/#26) — the report attaches
+    no labels (it renders the band tier name only).
   - A `--db PATH` flag is a usage-level override of `[store] db_path`
     (the opt-in live demo redirects the state DB to a tmp path).
   - The Backlog query is `in:inbox after:<epoch-seconds>` (the EPOCH

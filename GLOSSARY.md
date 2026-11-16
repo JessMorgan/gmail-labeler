@@ -139,6 +139,13 @@ label inventories can establish that an Unseen Id is new mail or that it matches
 the import query.
 _Avoid_: new match, New Match stat
 
+**Stale Id**:
+A Corpus-resident id a Label Sync walk touched as changed — owed a
+refresh, after which the Corpus's resolved label state matches the
+mailbox again. A removal event marks a Stale Id too; keep-versus-revise
+is the refresh's outcome, never a guess from the event type.
+_Avoid_: dirty id, pending id
+
 **Sync Cursor**:
 A Corpus's record of how far it has consumed the mailbox's event stream;
 owned by Label Sync — Gmail Import may birth it when absent, and only a

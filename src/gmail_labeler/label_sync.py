@@ -37,13 +37,14 @@ names), diff against the Corpus's sets, metadata-fetch only flagged ids;
 vanished labels' corpus members are fetched directly; or (b) the corpus-
 metadata walk — fetch every corpus id's current labels, diff, revise.
 Seed discipline (ADR-0008 / manager note 9): the profile historyId is
-captured ONCE UP FRONT, before the scan, and persisted only after the
-reconciliation's revisions are durable — a RESEED of the ledger (a
+captured ONCE BEFORE THE SCAN (after the printed estimate — US8), and
+persisted only after the reconciliation's revisions are durable — a
+RESEED of the ledger (a
 birth on a cursorless corpus, same ordering), never a re-birth and never
 a last-page-wins value the event walk reads. The reseed is
 step-down-permitted: a rolled-back mailbox can report a profile id below
 the stored cursor, and there the seed steps the ledger DOWN — a
-kept-high watermark would be unreachable (it 404s every future walk and
+kept-high Sync Cursor would be unreachable (it 404s every future walk and
 defeats the recovery command itself), while replay from the lower seed
 is harmless under ADR-0007's fold. A change made between seed capture
 and scan end carries a higher id and lands in the next event sync's
@@ -122,9 +123,13 @@ class _SyncStatsBase:
     # delete-touched union metadata-404s, resync: metadata-404s only
     unseen: int = 0  # Unseen Ids: event/inventory ids not resident (report only)
     retried: int = 0  # shared RetryStats protocol counter
-    birthed: bool = False  # birth/reseed in this run's plan; persisted
-    # unless dry_run — walk: ADR-0008 consequence 1 cursorless birth,
-    # resync: step-6 reseed/birth plan
+    birthed: bool = False  # True only when THIS run BIRTHS the ledger (no
+    # stored cursor at run start): walk: ADR-0008 consequence 1 cursorless
+    # birth; resync: step-6 birth-when-absent (stats.birthed = not
+    # had_cursor). A RESEED never sets it — a step-down reseed discloses
+    # via FullResyncStats.stepped_down_from, an advancing reseed via
+    # seed_history_id alone. Under dry_run it records the plan; nothing
+    # persists.
     gains: dict[str, int] = field(default_factory=dict[str, int])  # label -> count
     losses: dict[str, int] = field(default_factory=dict[str, int])
     failed: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
@@ -277,8 +282,9 @@ def _birth_without_applying(
     label state may be months behind. A seed failure is a recorded failure
     (exit non-zero) — unlike Gmail Import, where birth is a mere side
     effect of the real job."""
-    # Shared read/gate with the resync's up-front capture (_profile_seed,
-    # lockstep); persisted HERE, immediately — the resync defers to step 6.
+    # Shared read/gate with the resync's pre-enumeration capture
+    # (_profile_seed, lockstep); persisted HERE, immediately — the resync
+    # defers to step 6.
     seed = _profile_seed(client, stats, max_attempts=max_attempts, sleeper=sleeper)
     if seed is None:
         return stats
@@ -298,7 +304,7 @@ def _profile_seed(
     """ONE validated historyId seed from get_profile — the two birth spines
     read and gate the seed in deliberate lockstep (the append path's
     shared-machinery precedent): the event walk's birth-without-applying
-    and the full resync's up-front capture (ADR-0008 note 9) share this
+    and the full resync's pre-enumeration capture (ADR-0008 note 9) share this
     read, the same usable-seed gate, and the same "<cursor>" failure
     sentinel; only WHEN they persist it differs (immediately for the
     birth, after the durable revisions for the resync). None means no
@@ -480,7 +486,7 @@ class FullResyncStats(_SyncStatsBase):
     walk_units: int = 0
     flagged: int = 0
     unchanged: int = 0  # flagged/fetched but the diff came back empty
-    seed_history_id: int | None = None  # the up-front profile value written
+    seed_history_id: int | None = None  # the pre-enumeration profile value written
     stepped_down_from: int | None = None  # the stored cursor the seed stepped
     # below (#95 observability — set on dry-run too, as the PLANNED
     # step-down; None on birth/equal/advance; the write stays unconditional)
@@ -534,18 +540,14 @@ def full_resync(
     stored = store.read_cursor()
     had_cursor = stored is not None
 
-    # 1. SEED UP FRONT (note 9, binding): ONE profile call before any
-    #    enumeration. Events after capture carry higher ids, so persisting
-    #    THIS value keeps mid-scan changes inside the next sync's window.
-    #    The read/gate is the event walk's birth seed, shared in lockstep
-    #    (_profile_seed); only the persistence point differs — here, after
-    #    the reconciliation's revisions are durable (step 6).
-    seed = _profile_seed(client, stats, max_attempts=max_attempts, sleeper=sleeper)
-    if seed is None:
-        return stats
-    stats.seed_history_id = seed
-
-    # 2. ONE labels.list — the estimate's only mailbox read besides the seed
+    # 1. ONE labels.list — the estimate is the RESYNC'S FIRST quota spend:
+    #    US8's "before spending any quota beyond one labels.list call",
+    #    scoped to this core (the CLI bootstrap's settings reads precede
+    #    it — accepted since the #73 review — its own labels.list
+    #    included).
+    #    The profile seed moved below the printed estimate (step 3); it
+    #    stays a mailbox read the estimate itself never consumes
+    #    (ProfileInfo surfaces historyId alone).
     labels = retrying(
         client.list_labels,
         max_attempts=max_attempts,
@@ -557,7 +559,7 @@ def full_resync(
         stats.failed.append(("<labels>", "labels.list failed (permanent/retries)"))
         return stats
 
-    # 3. local resolved-view counts (ADR-0007: the ONLY read interface)
+    # 2. local resolved-view counts (ADR-0007: the ONLY read interface)
     resolved = {rec.id: rec for rec in store.iter_resolved()}
     user_labels = [lbl for lbl in labels if not is_system_label_id(lbl.id)]
     if any(not lbl.id for lbl in user_labels):
@@ -606,6 +608,20 @@ def full_resync(
             f"(flagged metadata adds up to "
             f"{_METADATA_GET_UNITS * stats.corpus_messages} more)"
         )
+
+    # 3. SEED BEFORE ENUMERATION (note 9, binding; US8 order): ONE profile
+    #    call AFTER the printed estimate but BEFORE any enumeration.
+    #    Events after capture carry higher ids, so persisting THIS value
+    #    keeps mid-scan changes inside the next sync's window. The read/
+    #    gate is the event walk's birth seed, shared in lockstep
+    #    (_profile_seed); only the persistence point differs — here, after
+    #    the reconciliation's revisions are durable (step 6). A seed bail
+    #    now lands with the strategy already chosen: the report always
+    #    names one (closes the strategy=None render from the #88 review).
+    seed = _profile_seed(client, stats, max_attempts=max_attempts, sleeper=sleeper)
+    if seed is None:
+        return stats
+    stats.seed_history_id = seed
 
     # 4. flag the ids whose label state may have drifted
     if strategy == "walk":
@@ -666,7 +682,7 @@ def full_resync(
     stats.deleted_kept = len(gone_confirmed)
 
     # 6. the ledger moves only over durable revisions (invariant #3) —
-    #    and to the UP-FRONT seed, never an end-of-run read (note 9)
+    #    and to the PRE-ENUMERATION seed, never an end-of-run read (note 9)
     if stats.failed:
         log.warning(
             "full-resync: %d failure(s) — Sync Cursor NOT written; "
@@ -686,12 +702,12 @@ def full_resync(
         # append_revision BEFORE this write. The reseed is STEP-DOWN-
         # PERMITTED (ADR-0008, owner reversal after the #74 review): a
         # rolled-back mailbox can report a seed BELOW the stored cursor,
-        # and there the kept-high watermark is unreachable — it 404s
+        # and there the kept-high Sync Cursor is unreachable — it 404s
         # every future walk and defeats the very command that exists to
         # recover. The step-down is harmless: ground truth was just
         # written, and ADR-0007's fold absorbs any replay the lower seed
         # re-opens — a genuine rollback re-appends nothing (no retained
-        # history between seed and watermark); a bogus seed's duplicate
+        # history between the new seed and the old cursor); a bogus seed's duplicate
         # lines are absorbed, as a second Gmail Import already accepts.
         store.write_cursor(SyncCursor(history_id=seed, last_sync=clock()))
     return stats

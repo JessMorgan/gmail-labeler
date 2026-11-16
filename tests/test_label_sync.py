@@ -682,13 +682,13 @@ def test_estimator_picks_corpus_walk_for_small_corpus_big_mailbox(
     assert stats.revised == 0 and stats.unchanged == 2  # nothing actually moved
     assert not stats.failed
     assert fake.calls == [
-        "get_profile",  # seed FIRST (note 9): before any enumeration spend
-        "list_labels",  # ONE labels.list for the estimate
+        "list_labels",  # ONE labels.list — US8: the core's first spend
+        "get_profile",  # seed BEFORE enumeration (note 9), after the estimate
         "get_message_metadata:a1",
         "get_message_metadata:b2",
     ]
     cursor = store.read_cursor()
-    assert cursor is not None and cursor.history_id == 500  # the up-front seed
+    assert cursor is not None and cursor.history_id == 500  # the pre-scan seed
     assert cursor.last_sync == NOW
 
 
@@ -791,7 +791,7 @@ class _AdvancingFake(FakeGmailClient):
     """Every metadata get stands in for one mailbox event landing mid-scan:
     the current historyId climbs, so a last-page-wins-style end-of-run read
     (the bug #73's handoff warns the resync must not inherit) would print a
-    ledger value strictly ahead of the up-front seed."""
+    ledger value strictly ahead of the pre-enumeration seed."""
 
     def get_message_metadata(self, message_id: str):  # type: ignore[no-untyped-def]
         meta = super().get_message_metadata(message_id)
@@ -799,7 +799,7 @@ class _AdvancingFake(FakeGmailClient):
         return meta
 
 
-def test_seed_captured_up_front_is_the_ledger_value_mid_run_change_survives(
+def test_pre_enumeration_seed_is_the_ledger_value_mid_run_change_survives(
     tmp_path: Path,
 ) -> None:
     """Note 9 (binding): seed = ONE profile call BEFORE the scan; the value
@@ -844,7 +844,7 @@ def test_reseed_steps_a_rolled_back_cursor_down_and_the_next_walk_succeeds(
     """ADR-0008 (step-down-permitted — owner reversal after the #74
     review): a rolled-back mailbox reports a profile id BELOW the stored
     cursor, and the reseed steps the ledger DOWN to the seed. A
-    kept-high watermark is unreachable — it 404s every future walk and
+    kept-high Sync Cursor is unreachable — it 404s every future walk and
     defeats the very command that exists to recover — while the replay
     the lower seed re-opens is harmless under ADR-0007's fold. The
     liveness half is the load-bearing pin (round-1 major): the NEXT
@@ -960,8 +960,14 @@ def test_full_resync_unusable_seed_and_bad_attempts_fail_loudly(
         fake, store, id_to_name=NAMES, sleeper=lambda _s: None, clock=_clock
     )
     assert stats.failed == [("<cursor>", "no usable historyId seed (profile call)")]
+    # US8 reorder: the estimate ran before the seed, so even this bail
+    # carries a named strategy (big scan floor over a 1-msg corpus →
+    # walk). Pins the report's strategy claim against a mutant that
+    # moves the strategy assignment below the seed read.
+    assert stats.strategy == "walk"
     assert not (store.root / "sync-cursor.json").exists()
-    assert fake.calls == ["get_profile"]  # nothing else was spent
+    # estimate spent first (US8); seed bail stops before enumeration
+    assert fake.calls == ["list_labels", "get_profile"]
 
     with pytest.raises(ValueError, match="max_attempts"):
         full_resync(
@@ -1015,8 +1021,8 @@ def test_estimator_picks_scan_and_fetches_metadata_only_for_flagged_ids(
     cursor = store.read_cursor()
     assert cursor is not None and cursor.history_id == 500
     assert fake.calls == [
-        "get_profile",
         "list_labels",
+        "get_profile",
         "list_messages:::L1",
         "list_messages:::L2",
     ]  # not one metadata get over a quiet mailbox
@@ -1055,8 +1061,8 @@ def test_scan_flags_gained_and_lost_membership_including_unlabeled_mail(
     assert resolved["a1"].labels == ("Shipping", "Money/Bills")
     assert resolved["c3"].labels == ("Money/Bills",)
     assert fake.calls == [
-        "get_profile",
         "list_labels",
+        "get_profile",
         "list_messages:::L1",
         "list_messages:::L2",
         "get_message_metadata:a1",  # ONLY the flagged two — b2 untouched
@@ -1128,8 +1134,8 @@ def test_scan_reconciles_vanished_labels_and_keeps_id_convention(
     assert resolved["a1"].labels == ("Shipping", "id:L9")  # name -> id: form
     assert resolved["b2"].labels == ("id:L9", "Shipping")  # untouched: kept
     assert fake.calls == [
-        "get_profile",
         "list_labels",
+        "get_profile",
         "list_messages:::L1",
         "list_messages:::L2",
         "get_message_metadata:a1",
@@ -1154,8 +1160,8 @@ def test_scan_ignores_system_label_only_churn(tmp_path: Path) -> None:
     )
     assert stats.flagged == 0 and stats.revised == 0
     assert fake.calls == [
-        "get_profile",
         "list_labels",
+        "get_profile",
         "list_messages:::L1",
         "list_messages:::L2",
     ]
@@ -1294,8 +1300,9 @@ def test_resync_gyb_corpus_births_ledger_when_absent_end_to_end(
     tmp_path: Path,
 ) -> None:
     """AC #7: a GYB-sourced corpus (no cursor ever existed) reconciles
-    end-to-end against the fake and births the ledger with the up-front
-    seed — the same before/after ordering as an advance (note 9)."""
+    end-to-end against the fake and births the ledger with the
+    pre-enumeration seed — the same before/after ordering as an advance
+    (note 9)."""
     store = store_at(tmp_path)
     rec = _record("a1", ("Shipping",))
     store.put(dataclasses.replace(rec, source="gyb"), f"body {rec.id}")
@@ -1367,15 +1374,16 @@ def test_resync_progress_prints_estimate_before_spend_and_flood_story(
     assert stats.flagged == 2 and stats.flag_rate == 1.0
     estimate_line, spend_at_estimate = seen[0]
     assert "estimate" in estimate_line and "strategy" in seen[1][0]
-    assert spend_at_estimate == ["get_profile", "list_labels"]  # BEFORE scan
+    # US8: the estimate's FIRST spend is labels.list alone — seed follows
+    assert spend_at_estimate == ["list_labels"]  # BEFORE scan and BEFORE seed
     joined = "\n".join(line for line, _ in seen)
     assert "flag-rate 100%" in joined
     assert "from-scratch reload" in joined and "60 units/msg" in joined
     # the flag-rate line itself precedes the metadata spend:
     flag_line = next((calls for line, calls in seen if "flag-rate" in line))
     assert flag_line == [
-        "get_profile",
         "list_labels",
+        "get_profile",
         "list_messages:::L1",
         "list_messages:::L2",
     ]

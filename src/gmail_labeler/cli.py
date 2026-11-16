@@ -677,8 +677,19 @@ def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
     )
     # the flag-rate is the scan's drift signal; on the walk every id
     # is fetched by construction, so quoting a 100% "flag-rate" there
-    # would read as drift that never happened (deepseek review)
-    rate = f" (flag-rate {stats.flag_rate:.0%})" if stats.strategy == "scan" else ""
+    # would read as drift that never happened (deepseek review). Runs
+    # that never finished ENUMERATING (sentinel failures: "<cursor>",
+    # "<labels>", "<label:ID>") stay silent too — a 0% rate from a scan
+    # that never ran reads as measured absence of drift (PR #88
+    # review). A completed scan with per-message failures KEEPS its
+    # rate: it was really measured, and it is the diagnostic a human
+    # reads after a failed run.
+    rate = (
+        f" (flag-rate {stats.flag_rate:.0%})"
+        if stats.strategy == "scan"
+        and not any(key.startswith("<") for key, _reason in stats.failed)
+        else ""
+    )
     typer.echo(
         f"{prefix} strategy={stats.strategy} "
         f"corpus={stats.corpus_messages} "
@@ -708,16 +719,16 @@ def _report_full_resync(stats: FullResyncStats, *, dry_run: bool) -> None:
             typer.echo(
                 f"NOTE: plan includes stepping the Sync Cursor down from "
                 f"{stats.stepped_down_from} to {stats.seed_history_id} "
-                f"(ADR-0008 \u2014 unreachable watermark; ground truth "
-                f"written on completion)."
+                f"(ADR-0008 \u2014 the kept-high cursor would be "
+                f"unreachable; ground truth written on completion)."
             )
         else:
             typer.echo(
                 f"NOTE: Sync Cursor stepped down from "
                 f"{stats.stepped_down_from} to {stats.seed_history_id} \u2014 "
                 f"the mailbox reported below the stored ledger; the kept-high "
-                f"watermark was unreachable and the reconciliation just wrote "
-                f"ground truth (ADR-0008)."
+                f"Sync Cursor was unreachable and the reconciliation just "
+                f"wrote ground truth (ADR-0008)."
             )
 
 

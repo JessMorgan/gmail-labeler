@@ -63,7 +63,7 @@ does not ship releases yet.
   revisions are durable — a reseed, or a birth-when-absent on a
   cursorless corpus with the same ordering; the reseed is
   step-down-permitted when a rolled-back mailbox reports below the
-  stored cursor (a kept-high watermark would be unreachable; replay
+  stored cursor (a kept-high Sync Cursor would be unreachable; replay
   from the lower seed is harmless under ADR-0007) (ADR-0008). ONE `labels.list`
   (per-label `messagesTotal`) plus local resolved-view counts yield the
   cost estimate, printed with the strategy choice before any enumeration
@@ -150,6 +150,18 @@ does not ship releases yet.
   matches the import query — a `messagesDeleted`-touched id that was never
   resident lands in this bucket — so the review-stage name `new_match`
   overstated what the count means.
+- Spec #64 pre-merge fold-in (PR #88 round 2): `--full-resync` now prints
+  the cost estimate and strategy BEFORE reading the profile seed (US8's
+  "before spending any quota beyond one `labels.list` call" order; the
+  seed still precedes all enumeration, and the seed-failed report now
+  names the chosen strategy where it once rendered `strategy=None`, with
+  the flag-rate suppressed only for sentinel-failed runs whose scan
+  never enumerated — a completed scan keeps its measured rate); the
+  Sync Cursor `_Avoid_` list is honored in the step-down NOTEs and the
+  ADR/CHANGELOG prose that said "kept-high watermark"; GLOSSARY gains the
+  report-surfaced **Stale Id** term; and ADR-0008 records that the list
+  response carries no page-level `historyId` in the current wire
+  contract, superseding spec #64's seed-source sentence.
 
 ### Fixed
 

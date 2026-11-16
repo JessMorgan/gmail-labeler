@@ -619,14 +619,17 @@ def _versions(db_path: Path) -> list[int]:
         conn.close()
 
 
-def test_fresh_db_is_v2_with_applications(tmp_path: Path) -> None:
+def test_fresh_db_is_v3_with_daemon_state(tmp_path: Path) -> None:
     db = AppDB(tmp_path / "state.db")
     db.open()
-    assert _versions(db.path) == [SCHEMA_VERSION] == [2]
+    assert _versions(db.path) == [SCHEMA_VERSION] == [3]
     conn = sqlite3.connect(str(db.path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
         assert cols == _APPLICATIONS_COLUMNS
+        # v3 (ticket #25): the daemon_state single-row cursor table
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert state_cols == {"history_cursor"}
         # the corrections/status join (#27): indexes on message_id AND
         # label (the #23 NIT)
         indexes = {
@@ -642,19 +645,22 @@ def test_fresh_db_is_v2_with_applications(tmp_path: Path) -> None:
     db.close()
 
 
-def test_v1_db_migrates_to_a_single_v2_row(tmp_path: Path) -> None:
-    # the migration story (#23's recorded debt): opening a live v1 DB
-    # with the v2 tool CREATES the applications table and RESTAMPS the
-    # version row to 2 — single-row model: UPDATE, never a second row
+def test_v1_db_migrates_to_a_single_v3_row(tmp_path: Path) -> None:
+    # the migration story (#23's recorded debt, carried through v3):
+    # opening a live v1 DB with the v3 tool CREATES the applications and
+    # daemon_state tables and RESTAMPS the version row to 3 — single-row
+    # model: UPDATE, never a second row
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     db = AppDB(db_path)
     db.open()
-    assert _versions(db_path) == [2]  # exactly one row, restamped
+    assert _versions(db_path) == [3]  # exactly one row, restamped
     conn = sqlite3.connect(str(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
         assert cols == _APPLICATIONS_COLUMNS
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert state_cols == {"history_cursor"}
     finally:
         conn.close()
     # the recorded shadow run SURVIVES the migration (the data is the
@@ -662,8 +668,8 @@ def test_v1_db_migrates_to_a_single_v2_row(tmp_path: Path) -> None:
     _run_ts, rows = db.load_run("run-1")
     assert len(rows) == 1
     db.close()
-    # re-opening in-process is v2-clean (the tool that just migrated IS
-    # the v2 tool)
+    # re-opening in-process is v3-clean (the tool that just migrated IS
+    # the v3 tool)
     db2 = AppDB(db_path)
     db2.open()
     db2.close()
@@ -671,9 +677,9 @@ def test_v1_db_migrates_to_a_single_v2_row(tmp_path: Path) -> None:
 
 def test_migrated_db_refused_by_the_v1_gate(tmp_path: Path, monkeypatch) -> None:
     # the OTHER direction of the pin: the SAME migrated file opened by
-    # the version-gate logic as a v1 tool refuses it — {2} != {1},
+    # the version-gate logic as a v1 tool refuses it — {3} != {1},
     # named. The forward-compat story IS the hard gate (documented
-    # honestly: our own v2 is the tool that just migrated it)
+    # honestly: our own v3 is the tool that just migrated it)
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     migrator = AppDB(db_path)
@@ -683,7 +689,7 @@ def test_migrated_db_refused_by_the_v1_gate(tmp_path: Path, monkeypatch) -> None
 
     monkeypatch.setattr(appdb_module, "SCHEMA_VERSION", 1)
     db = AppDB(db_path)
-    with pytest.raises(AppDBError, match=r"schema_version \[2\] != 1"):
+    with pytest.raises(AppDBError, match=r"schema_version \[3\] != 1"):
         db.open()
 
 
@@ -708,11 +714,12 @@ def test_v1_stamp_with_applications_table_is_refused(tmp_path: Path) -> None:
         db.open()
 
 
-def test_v2_stamp_without_applications_self_heals(tmp_path: Path) -> None:
+def test_v2_stamp_without_applications_migrates_to_v3(tmp_path: Path) -> None:
     # {2} stamped but the applications table never created: unreachable
     # by crash since the F1 atomic transition (a tamper or pre-F1
-    # residue) — the next open re-runs the create-all-if-missing
-    # transition and HEALS, no refusal (the self-heal is kept on purpose)
+    # residue) — under v3 this is the MIGRATABLE v2 stamp: the next open
+    # runs the one-transaction transition (create-all-if-missing for
+    # BOTH missing tables + the restamp), no refusal
     db_path = tmp_path / "state.db"
     _v1_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -721,10 +728,13 @@ def test_v2_stamp_without_applications_self_heals(tmp_path: Path) -> None:
     conn.close()
     db = AppDB(db_path)
     db.open()
+    assert _versions(db_path) == [3]  # the migratable v2 stamp restamps
     conn = sqlite3.connect(str(db_path))
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(applications)")}
         assert cols == _APPLICATIONS_COLUMNS
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert state_cols == {"history_cursor"}
     finally:
         conn.close()
     db.close()
@@ -915,7 +925,7 @@ def test_applications_schema_has_no_body_columns(tmp_path: Path) -> None:
     # invariant #5, structural: the table carries the EIGHT metadata
     # columns and nothing else — no body/subject/raw column exists to
     # put a body in (the caplog side of the proof lands with the plan's
-    # id-only warnings in applications.py)
+    # body-free warnings (id + label + score) in applications.py)
     db = AppDB(tmp_path / "state.db")
     db.open()
     conn = sqlite3.connect(str(db.path))
@@ -964,6 +974,462 @@ def test_applications_tampered_applied_at_is_corrupt(tmp_path: Path) -> None:
     db2.close()
 
 
+# -- v3: the daemon_state cursor + the v2->v3 migration (ticket #25) ---------
+
+
+def _v2_db(
+    db_path: Path, *, with_run: bool = True, with_application: bool = True
+) -> None:
+    """A DB exactly as ticket #24 shipped it: schema_version {2} +
+    shadow_results + applications (our shapes), NO daemon_state."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+    conn.execute(
+        "CREATE TABLE shadow_results ("
+        "run_id TEXT NOT NULL, message_id TEXT NOT NULL, label TEXT NOT NULL, "
+        "probability REAL NOT NULL, band TEXT, run_ts TEXT NOT NULL, "
+        "PRIMARY KEY (run_id, message_id, label))"
+    )
+    conn.execute(
+        "CREATE TABLE applications (message_id TEXT NOT NULL, label TEXT NOT NULL, "
+        "label_id TEXT NOT NULL, score REAL NOT NULL, band TEXT NOT NULL, "
+        "tier TEXT NOT NULL, applied_at TEXT NOT NULL, source TEXT NOT NULL "
+        "CHECK (source IN ('daemon', 'apply')))"
+    )
+    if with_run:
+        conn.execute(
+            "INSERT INTO shadow_results VALUES "
+            "('run-1', 'aa', 'Shipping', 0.9, 'high', '2026-11-01T12:00:00+00:00')"
+        )
+    if with_application:
+        conn.execute(
+            "INSERT INTO applications VALUES ('aa', 'Shipping', 'Label_1', 0.9, "
+            "'high', 'ai-high', '2026-11-01T12:00:00+00:00', 'daemon')"
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_v2_db_migrates_to_a_single_v3_row(tmp_path: Path) -> None:
+    # the v2→v3 transition (ticket #25): opening a live v2 DB with the
+    # v3 tool CREATES daemon_state and RESTAMPS {2} → {3} in ONE
+    # explicit transaction (the #24 machinery rides); recorded
+    # applications + shadow rows SURVIVE (the restamp is metadata, the
+    # data is the operator's)
+    db_path = tmp_path / "state.db"
+    _v2_db(db_path)
+    db = AppDB(db_path)
+    db.open()
+    assert _versions(db_path) == [3]  # exactly one row, restamped
+    conn = sqlite3.connect(str(db_path))
+    try:
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert state_cols == {"history_cursor"}
+    finally:
+        conn.close()
+    _run_ts, rows = db.load_run("run-1")
+    assert len(rows) == 1
+    assert len(db.applications_for_message("aa")) == 1
+    assert db.get_history_cursor() is None  # the never-established state
+    db.close()
+
+
+def test_migrated_db_refused_by_the_v2_gate(tmp_path: Path, monkeypatch) -> None:
+    # the OTHER direction, pinned exactly as v1→v2 was: the SAME
+    # migrated file opened by the version-gate logic as a v2 tool
+    # refuses it — {3} != {2}, named (the forward-compat hard gate)
+    db_path = tmp_path / "state.db"
+    _v2_db(db_path)
+    migrator = AppDB(db_path)
+    migrator.open()
+    migrator.close()
+    import gmail_labeler.appdb as appdb_module
+
+    monkeypatch.setattr(appdb_module, "SCHEMA_VERSION", 2)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[3\] != 2"):
+        db.open()
+
+
+def test_v2_stamp_with_daemon_state_table_is_refused(tmp_path: Path) -> None:
+    # the {2}-WITH-state dead-end is TAMPER-ONLY (the crash pin below
+    # proves no crash reaches it — the atomic transition never commits
+    # the table without the restamp): a v2 tool never wrote one
+    db_path = tmp_path / "state.db"
+    _v2_db(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE daemon_state (history_cursor INTEGER NOT NULL)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match=r"schema_version \[2\]") as exc:
+        db.open()
+    assert "UPDATE schema_version SET version = 3" in str(exc.value)
+
+
+def test_v3_stamp_without_daemon_state_self_heals(tmp_path: Path) -> None:
+    # {3} stamped but daemon_state never created (tamper-only since the
+    # atomic transition — the v2-era self-heal's successor): the next
+    # open re-runs create-all-if-missing and HEALS, NO restamp (the
+    # version is already ours)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TABLE daemon_state")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    assert _versions(db_path) == [3]  # healed, not restamped (it never moved)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert state_cols == {"history_cursor"}
+    finally:
+        conn.close()
+    db2.close()
+
+
+def test_wrong_shape_daemon_state_is_refused(tmp_path: Path) -> None:
+    # the ownership gate EXTENDED to the v3 table (the applications
+    # pattern): a same-named daemon_state with the wrong column set is
+    # refused, named
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    conn.execute("CREATE TABLE daemon_state (id INTEGER, note TEXT)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="daemon_state has the wrong shape"):
+        db.open()
+
+
+def test_daemon_state_has_no_body_columns(tmp_path: Path) -> None:
+    # invariant #5, structural: the cursor table carries the ONE
+    # metadata column and nothing else — no body/subject/raw column
+    # exists to put a body in
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    conn = sqlite3.connect(str(db.path))
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(daemon_state)")}
+        assert cols == {"history_cursor"}
+        assert not {"body", "subject", "raw", "snippet"} & cols
+    finally:
+        conn.close()
+    db.close()
+
+
+def test_get_history_cursor_none_when_unset(tmp_path: Path) -> None:
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    assert db.get_history_cursor() is None  # the never-established state
+    db.close()
+
+
+def test_set_history_cursor_roundtrip_is_single_row(tmp_path: Path) -> None:
+    # the single-row model AT THE WRITER: every set UPSERTS rowid 1 —
+    # three sets, one row (the table never grows; a lower value is a
+    # caller decision, the store keeps the last write)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    for cursor in (10, 20, 15):
+        db.set_history_cursor(cursor)
+    assert db.get_history_cursor() == 15
+    conn = sqlite3.connect(str(db.path))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM daemon_state").fetchone() == (1,)
+    finally:
+        conn.close()
+    db.close()
+    # durability across re-open
+    db2 = AppDB(tmp_path / "state.db")
+    db2.open()
+    assert db2.get_history_cursor() == 15
+    db2.close()
+
+
+def test_set_history_cursor_refusals_write_nothing(tmp_path: Path) -> None:
+    # the cursor is an unsigned int64 per the wire doctrine (a negative
+    # historyId must never silently advance anything); a bool is not a
+    # number (the config discipline); refusals land BEFORE any write
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    for bad in (0, -1, True, 1.5, "5", None):
+        with pytest.raises(AppDBError, match="history_cursor"):
+            db.set_history_cursor(bad)  # pyright: ignore[reportArgumentType]
+    assert db.get_history_cursor() is None
+    db.close()
+
+
+def test_daemon_state_multi_row_tamper_is_refused_on_read(tmp_path: Path) -> None:
+    # the single-row model's READ gate: the writer upserts rowid 1, so
+    # a second row is hand-made — refused, named (never silently picked)
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (2, 20)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="single-row") as exc:
+        db.get_history_cursor()
+    # F1 MINOR 3: the module doctrine is recovery in every refusal
+    assert "DELETE FROM daemon_state" in str(exc.value)
+    db.close()
+
+
+def test_daemon_state_tampered_cursor_is_refused_on_read(tmp_path: Path) -> None:
+    # the tamper doctrine (the load_run precedent): a hand-edited
+    # cursor value is refused, named — not served to the poll loop
+    db_path = tmp_path / "state.db"
+    db = AppDB(db_path)
+    db.open()
+    db.set_history_cursor(10)
+    db.close()
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE daemon_state SET history_cursor = 0")
+    conn.commit()
+    conn.close()
+    db2 = AppDB(db_path)
+    db2.open()
+    with pytest.raises(AppDBError, match="history_cursor"):
+        db2.get_history_cursor()
+    db2.close()
+
+
+def test_set_history_cursor_ceiling_refused(tmp_path: Path) -> None:
+    # the wire type (uint64) is wider than SQLite's signed INTEGER: an
+    # unbounded value would escape as a raw OverflowError at bind time,
+    # past every named-error wrapper (review finding) — refused here
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="SQLite INTEGER range"):
+        db.set_history_cursor(2**63)
+    assert db.get_history_cursor() is None
+    # the top of the supported range still lands
+    db.set_history_cursor(2**63 - 1)
+    assert db.get_history_cursor() == 2**63 - 1
+    db.close()
+
+
+def test_daemon_state_off_rowid_tamper_is_refused_on_read(tmp_path: Path) -> None:
+    # the single-row model's rowid gate: the writer only ever touches
+    # rowid 1, so a lone row elsewhere is hand-made (and the next
+    # legitimate write would make the table two rows) — refused,
+    # named, recovery given (review finding)
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    conn.execute("CREATE TABLE daemon_state (history_cursor INTEGER NOT NULL)")
+    conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (7, 42)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    with pytest.raises(AppDBError, match="rowid 7") as exc:
+        db.get_history_cursor()
+    assert "DELETE FROM daemon_state WHERE rowid != 1" in str(exc.value)
+    db.close()
+
+
+def test_commit_page_refuses_mixed_applied_at(tmp_path: Path) -> None:
+    # F1 MINOR 2 (both families): the #24 batch-homogeneity contract is
+    # now a STORE invariant — a commit_page batch carrying >1 distinct
+    # applied_at is refused NAMED before the transaction, so #26's
+    # future caller inherits the guard instead of rediscovering it
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    db.set_history_cursor(10)
+    rows = [
+        _app_row(message_id="a1", applied_at=TS),
+        _app_row(
+            message_id="b2",
+            label="Other",
+            applied_at=datetime(2026, 11, 1, 12, 0, 1, tzinfo=UTC),
+        ),
+    ]
+    with pytest.raises(AppDBError, match="distinct applied_at") as exc:
+        db.commit_page(rows, 20)
+    assert "ONE clock reading" in str(exc.value)
+    assert db.get_history_cursor() == 10  # refused BEFORE the transaction
+    assert db.applications_for_message("a1") == ()
+    db.close()
+
+
+def test_read_path_cursor_tamper_names_recovery(tmp_path: Path) -> None:
+    # F1 MINOR 3: a hand-set invalid cursor value surfacing on the READ
+    # is the operator's to repair — the refusal names the recovery (the
+    # write-path refusals carry none: there the value came from the
+    # caller, not from state damage)
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+    conn.execute("CREATE TABLE daemon_state (history_cursor INTEGER NOT NULL)")
+    conn.execute("INSERT INTO daemon_state (rowid, history_cursor) VALUES (1, 0)")
+    conn.commit()
+    conn.close()
+    db = AppDB(db_path)
+    db.open()
+    with pytest.raises(AppDBError, match="not a valid cursor") as exc:
+        db.get_history_cursor()
+    assert "recovery" in str(exc.value)
+    db.close()
+
+
+def test_unknown_stamp_set_refusal_names_the_honest_diagnosis(tmp_path: Path) -> None:
+    # F1 MINOR 3: the blanket "a newer tool wrote this DB" diagnosed
+    # states NO tool can write as if a tool had. A single FUTURE stamp
+    # keeps the newer-tool wording (the sealed [99] pins hold); an
+    # unwriteable set gets the honest diagnosis + recovery
+    def _stamped(name: str, stamps: list[int]) -> Path:
+        path = tmp_path / name
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.executemany(
+            "INSERT INTO schema_version (version) VALUES (?)", [(v,) for v in stamps]
+        )
+        conn.commit()
+        conn.close()
+        return path
+
+    for stamps in ([2, 3], [0], [-1]):
+        db = AppDB(_stamped("db-" + "-".join(map(str, stamps)) + ".db", stamps))
+        with pytest.raises(AppDBError, match="unknown stamp set"):
+            db.open()
+
+    # the F1 round-2 MAJOR pin: the shape check does not constrain column
+    # TYPES (hostile-affinity doctrine) — a TEXT or NULL stamp must
+    # reach the NAMED refusal, never a raw TypeError out of open() (the
+    # first split compared the stamp to an int and escaped the CLI's
+    # exit-5 mapping)
+    db = AppDB(_stamped("db-future.db", [99]))
+    with pytest.raises(AppDBError, match="a newer tool wrote") as exc:
+        db.open()
+    assert "upgrade this tool" in str(exc.value)
+
+    # non-integer single stamps: honest named refusal, NOT a TypeError
+    path = tmp_path / "db-text.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE schema_version (version)")
+    conn.execute("INSERT INTO schema_version (version) VALUES ('abc')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="unknown stamp set"):
+        AppDB(path).open()
+    path = tmp_path / "db-null.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE schema_version (version)")
+    conn.execute("INSERT INTO schema_version (version) VALUES (NULL)")
+    conn.commit()
+    conn.close()
+    with pytest.raises(AppDBError, match="unknown stamp set"):
+        AppDB(path).open()
+
+
+def test_commit_page_rows_and_cursor_land_together(tmp_path: Path) -> None:
+    # the durable-handling commit point (#25, invariant #3): ONE
+    # transaction carries the delta's Application rows AND the cursor
+    # advance — COMMIT = handled
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    count = db.commit_page(
+        [
+            _app_row("aa"),
+            _app_row("bb", "Money/Bills", "Label_2", 0.7, "med", "ai-med"),
+        ],
+        12345,
+    )
+    assert count == 2
+    assert db.get_history_cursor() == 12345
+    assert len(db.applications_for_message("aa")) == 1
+    assert len(db.applications_for_message("bb")) == 1
+    db.close()
+    db2 = AppDB(tmp_path / "state.db")
+    db2.open()
+    assert db2.get_history_cursor() == 12345  # durability
+    db2.close()
+
+
+def test_commit_page_empty_rows_still_advances_cursor(tmp_path: Path) -> None:
+    # a delta whose messages all composed EMPTY plans (skip-present /
+    # no-band) still advances the cursor — record_applications'
+    # empty-batch refusal is deliberately NOT inherited here: the delta
+    # WAS handled, the cursor must move
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    assert db.commit_page([], 999) == 0
+    assert db.get_history_cursor() == 999
+    db.close()
+
+
+def test_commit_page_rolls_back_rows_and_cursor_together(tmp_path: Path) -> None:
+    # the ATOMICITY pin (the crash matrix's mid-transaction row): the
+    # cursor UPSERT fails AFTER the rows inserted — the ONE transaction
+    # rolls BOTH back. A split-transaction mutant leaves the rows
+    # committed with the cursor stale — the replay then DOUBLE-WRITES
+    # the rows (the exact failure this pin exists to kill)
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+
+    class _FlakyConn:
+        # delegating proxy: the daemon_state UPSERT raises (a simulated
+        # mid-write crash — the _FlakyConn precedent, marker-side)
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        def execute(self, sql: str, *a: object) -> object:
+            if "daemon_state" in sql:
+                raise sqlite3.OperationalError("disk full (simulated)")
+            return self._real.execute(sql, *a)  # pyright: ignore[reportArgumentType]
+
+        def __enter__(self) -> _FlakyConn:
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> object:
+            return self._real.__exit__(*exc)  # type: ignore[arg-type,no-any-return]
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real, name)
+
+    real_conn = db._conn
+    assert real_conn is not None
+    db._conn = _FlakyConn(real_conn)  # type: ignore[assignment]
+    with pytest.raises(AppDBError, match="disk full"):
+        db.commit_page([_app_row("aa")], 12345)
+    db._conn = real_conn
+    assert db.applications_for_message("aa") == ()  # rows rolled back
+    assert db.get_history_cursor() is None  # cursor NOT advanced
+    db.close()
+
+
+def test_commit_page_refusals_write_nothing(tmp_path: Path) -> None:
+    # refusals BEFORE the transaction (the record_applications doctrine
+    # + the cursor refusals): a lying row, a within-batch duplicate, a
+    # bad cursor — nothing lands, the cursor untouched
+    db = AppDB(tmp_path / "state.db")
+    db.open()
+    with pytest.raises(AppDBError, match="hex"):
+        db.commit_page([_app_row(message_id="zz")], 5)
+    with pytest.raises(AppDBError, match="duplicate"):
+        db.commit_page([_app_row("aa"), _app_row("aa", label_id="Label_2")], 5)
+    for bad in (0, -1, True):
+        with pytest.raises(AppDBError, match="history_cursor"):
+            db.commit_page([_app_row("aa")], bad)  # pyright: ignore[reportArgumentType]
+    assert db.applications_for_message("aa") == ()
+    assert db.get_history_cursor() is None
+    db.close()
+
+
 # -- F1: atomic schema transitions (the crash windows closed) ---------------
 
 
@@ -1002,7 +1468,7 @@ def _arm_crash_on(monkeypatch: pytest.MonkeyPatch, marker: str) -> None:
     # point before the schema transition begins writing)
     real_check = AppDB._check_ownership
 
-    def check_then_arm(self: AppDB) -> bool:
+    def check_then_arm(self: AppDB) -> int | None:
         needs = real_check(self)
         assert self._conn is not None
         self._conn = _CrashOn(self._conn, marker)  # type: ignore[assignment]
@@ -1070,10 +1536,46 @@ def test_v1_migration_crash_mid_transition_leaves_clean_v1(
     monkeypatch.undo()  # the crash seam is dead — the retry opens for real
     db2 = AppDB(db_path)
     db2.open()  # the retry sees clean v1 and migrates
-    assert _versions(db_path) == [2]
+    assert _versions(db_path) == [3]
     _run_ts, rows = db2.load_run("run-1")  # shadow history SURVIVES
     assert len(rows) == 1
-    db2.record_applications([_app_row()])  # fully usable v2
+    db2.record_applications([_app_row()])  # fully usable v3
+    db2.close()
+
+
+def test_v2_migration_crash_mid_transition_leaves_clean_v2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the v2→v3 crash pin (the F1 precedent, marker discipline LEARNED
+    # from the v1→v2 round-2 probe): kill on the restamp UPDATE —
+    # daemon_state is the transition's LAST DDL, so a non-transactional
+    # transition (split BEGIN, or the pre-F1 executescript shape) has
+    # ALREADY committed the table here → {2}+daemon_state (the tamper
+    # dead-end above) and the table-set assertion reddens. ONE
+    # transaction: the file stays CLEAN v2 and the retry migrates —
+    # applications + shadow history survive, no delete-recovery, no
+    # manual stamp. (Mutant probe on record: a marker on the
+    # daemon_state CREATE itself SURVIVED the split-BEGIN mutant — the
+    # crash fires before the statement executes, so the table is never
+    # attempted; the UPDATE marker is what discriminates. The v1→v2 pin
+    # needed the INDEX marker for the opposite reason: its new table
+    # was followed by indexes. Both placements are statement-order
+    # facts, executed — not reasoned.)
+    _arm_crash_on(monkeypatch, "UPDATE schema_version SET version")
+    db_path = tmp_path / "state.db"
+    _v2_db(db_path)
+    db = AppDB(db_path)
+    with pytest.raises(AppDBError, match="simulated crash"):
+        db.open()
+    assert _versions(db_path) == [2]  # fully prior-state: the restamp rolled back
+    assert "daemon_state" not in _table_set(db_path)
+    monkeypatch.undo()  # the crash seam is dead — the retry opens for real
+    db2 = AppDB(db_path)
+    db2.open()  # the retry sees clean v2 and migrates
+    assert _versions(db_path) == [3]
+    _run_ts, rows = db2.load_run("run-1")  # shadow history SURVIVES
+    assert len(rows) == 1
+    assert len(db2.applications_for_message("aa")) == 1  # applications SURVIVE
     db2.close()
 
 
@@ -1121,7 +1623,7 @@ def test_tamper_refusals_name_their_recovery(tmp_path: Path) -> None:
     with pytest.raises(AppDBError, match="schema_version is empty") as exc:
         AppDB(db_path).open()
     # the recovery is RUNNABLE SQL, not prose-about-SQL (F2)
-    assert "INSERT INTO schema_version (version) VALUES (2)" in str(exc.value)
+    assert "INSERT INTO schema_version (version) VALUES (3)" in str(exc.value)
     db_path.unlink()
     _v1_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -1133,4 +1635,4 @@ def test_tamper_refusals_name_their_recovery(tmp_path: Path) -> None:
     conn.close()
     with pytest.raises(AppDBError, match=r"schema_version \[1\]") as exc:
         AppDB(db_path).open()
-    assert "UPDATE schema_version SET version = 2" in str(exc.value)
+    assert "UPDATE schema_version SET version = 3" in str(exc.value)

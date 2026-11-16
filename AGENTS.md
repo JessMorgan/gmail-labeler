@@ -99,8 +99,8 @@ versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
 2. **Skip-present**: predicted label already present → not written; no new
    label added → no Application, no Tier Labels. This also makes crash-retry
    idempotent — preserve that property (CODING-STANDARDS).
-3. **Cursor durability**: persist `historyId` only after the page's events are
-   durably handled; replay must be harmless.
+3. **Cursor durability**: persist `historyId` only after the delta's events
+   are durably handled; replay must be harmless.
 4. **Preprocessing integrity**: train and infer share one `preprocess`
    function; any format divergence is the worst class of bug here.
 5. **Bodies stay out**: message bodies never enter logs or the SQLite DB;

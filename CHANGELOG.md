@@ -205,7 +205,10 @@ does not ship releases yet.
   pre-existing contamination stays invisible to the counter; remediation
   is a fresh `corpus.dir` (the corpus store is rooted at exactly that
   path) plus a full re-ingest — a GYB re-import, or a fresh
-  Gmail Import for API-sourced corpora.
+  Gmail Import for API-sourced corpora. The ingest-loop restructure also
+  closed a pre-existing hole: failure paths (unreadable `.eml`, malformed
+  record) previously scanned past `--max-messages`; the bound is now
+  checked once, bottom-of-loop, on every path.
 - `dataset import-gmail` scope (now recorded as Corpus Exclusion) excludes
   DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented

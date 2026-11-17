@@ -26,7 +26,7 @@ and living in one process removes the excuse.
 `GLOSSARY.md` terms are the code's terms: `ManagedLabel`, `TierLabel`,
 `Application`, `Correction`, `Graduation`, `ShadowPass`, `FilterAuthoredLabel`.
 The `_Avoid_` lists apply to identifiers as much as prose. If you need a
-concept the glossary lacks, add it there in the same commit.
+concept the glossary lacks, add it there in the same PR.
 
 ## The application path
 

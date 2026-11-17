@@ -96,7 +96,7 @@ class GybImportStats:
     written: int = 0
     skipped_present: int = 0
     skipped_draft_chat: int = 0  # ingest-layer policy rejections (ticket #32:
-    # mirrors ExportStats — a decision counted, never a defect)
+    # mirrors GmailImportStats — a decision counted, never a defect)
     date_corrected: int = 0  # rows whose stamp was fixed to the folder (<= 1 day)
     folder_unparsed: int = 0  # rows imported with NO UTC anchor (odd filename)
     date_conflict: int = 0  # folder/stamp disagree > 1 day: provenance broken

@@ -201,6 +201,7 @@ nothing ever leaves the store, so records imported before it stay — it
 guards entry, not what is already in.
 _Avoid_: Export Scope (the decision's original name; the policy is
 corpus-wide, not export-only)
+
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`
 (`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB

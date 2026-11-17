@@ -40,6 +40,12 @@ lands.
   `dataset sync-labels --full-resync` recovery command (wired by #74;
   ADR-0008's final wording, never automatic). Sidecar storage + Gmail
   Import birth wired (ticket #72).
+- ADR-0009 the Corpus excludes DRAFT and CHAT and every date states its
+  provenance — documented `-in:draft` query token + the load-bearing
+  ingest-layer raw-wire rejection (no documented chat token exists);
+  `date_provenance` required at construction, legacy lines read explicit
+  `unknown`, split consumers filter `SERVER_AUTHORITATIVE_PROVENANCES`.
+  Wired by #17 (PR #33); GYB row rejection completes the intent in #32.
 
 ## Layout
 

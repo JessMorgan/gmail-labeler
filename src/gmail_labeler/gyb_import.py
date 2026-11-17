@@ -309,6 +309,9 @@ def import_gyb(
                     labels=row.labels,
                     body_hash=body_hash(parsed.body_text),
                     source="gyb",
+                    # the folder-corrected message_internaldate — GYB's own
+                    # source, distinct from the two API provenances
+                    date_provenance="gyb_internaldate",
                     thread_id="",  # msg-db carries no thread map; never guessed
                 )
             except ValueError as e:

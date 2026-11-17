@@ -125,11 +125,26 @@ permanent one-way door. Exclusion is two-layer: the query carries the
 documented `-in:draft` token, and the ingest layer hard-skips any message
 whose raw wire labelIds carry the system label id DRAFT or CHAT (no
 documented chat query token exists, and this layer is load-bearing: an
-explicit `--query` replaces the default wholesale but cannot bypass it).
+explicit `--query` replaces the default wholesale but cannot bypass it);
+already-present messages are answered `skipped_present` from the resume
+id set before the fetch, so the policy never sees them.
 Records already in the corpus are unaffected (append-only). GYB import
-follows whatever the backup holds (tracked by #32). It writes
-`filters.json` and `labels.json` sidecars next to the
-corpus — the offline snapshot `dataset analyze` uses for filter
+applies the same DRAFT/CHAT exclusion at ingest (#32): a backup row whose
+raw label tokens carry the canonical token is never stored. The count is
+new-row-only: a row
+already in the corpus is answered skip-present first and reports
+`skipped_present` without aborting the run; only a not-yet-stored row
+counts `skipped_draft_chat`. Rejection is canonical-exact-token only —
+`--system-labels` (`system_labels_extra`) equivalents are stripped from
+label sets but do not trigger row rejection. A backup storing DRAFT/CHAT
+with case drift imports, and the drifted token survives label filtering
+as a content label (training signal). The containment guard outranks
+the policy for rows not already stored: a DRAFT/CHAT row whose
+backup-index path escapes the backup root aborts the whole run
+(exit 5) instead of being counted; a row already in the corpus
+never reaches the path check (skip-present wins — no abort).
+It writes `filters.json` and `labels.json` sidecars
+next to the corpus — the offline snapshot `dataset analyze` uses for filter
 attribution — and births the `sync-cursor.json` Sync Cursor (ADR-0008)
 when the corpus has none, seeded from the first list page before any
 message is ingested (or warns and leaves the corpus birth-eligible when no

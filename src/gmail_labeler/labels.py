@@ -83,6 +83,22 @@ SYSTEM_LABEL_IDS: frozenset[str] = frozenset(
     }
 )
 
+#: Corpus exclusion pair (maintainer export-scope decision, 2026-11-01,
+#: ticket #17; completed corpus-wide in the GYB importer by ticket #32):
+#: a message carrying either RAW system label id never enters the corpus —
+#: with Additive-only + skip-present (invariants #1/#2) and the append-only
+#: corpus, a wrong inclusion is permanent and unrecoverable, so exclusion
+#: is the safe direction under the one-way door. BOTH ingest layers (API
+#: export, GYB import) import this ONE constant: two ingest layers, one
+#: policy — they must not drift. Exact-case token match, never
+#: case-folded: a user label named "chat" (lowercase) is not chat. In
+#: the GYB NAME space a user label literally named DRAFT/CHAT collides
+#: with the canonical token (the over-inclusion trade-off above) —
+#: accepted, near-zero probability, but the delta is real: _keep_label
+#: dropped only the TOKEN from an imported row; this policy drops the
+#: WHOLE MESSAGE.
+EXCLUDED_CORPUS_LABEL_IDS: frozenset[str] = frozenset({"DRAFT", "CHAT"})
+
 _SEPARATOR = "/"
 _DELETED_PREFIX = "id:"
 

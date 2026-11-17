@@ -182,10 +182,40 @@ does not ship releases yet.
   report-surfaced **Stale Id** term; and ADR-0008 records that the list
   response carries no page-level `historyId` in the current wire
   contract, superseding spec #64's seed-source sentence.
-- `dataset import-gmail` scope excludes DRAFT and CHAT (maintainer decision
+- `dataset import-gyb` rejects DRAFT/CHAT rows at ingest (maintainer decision
+  2026-11-02, ticket #32, completing #17 corpus-wide): a backup row
+  whose raw label tokens carry the canonical token DRAFT or CHAT is
+  counted `skipped_draft_chat` and never stored (a row already in the
+  corpus answers `skipped_present`; a not-yet-stored row whose
+  backup-index path escapes the backup root aborts the run, exit 5,
+  before the rejection is counted) — previously
+  the token was stripped from the row's label set and the
+  contaminated row imported silently. The exclusion pair now has one
+  shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both ingest
+  layers import,
+  so the two layers cannot drift; `dataset import-gyb` reports the
+  count in its summary line.
+  Upgrade consequence: corpora assembled before the pair landed keep
+  their DRAFT/CHAT-contaminated records — anything exported before #17
+  (2026-11-01) may carry it (an explicit `--query` may already have
+  dropped drafts, but chats had no reliable exclusion), anything
+  GYB-imported before #32 may carry it, and the store never deletes in
+  place. Resume runs report those ids as
+  `skipped_present` (skip-present wins), never `skipped_draft_chat`, so
+  pre-existing contamination stays invisible to the counter; remediation
+  is a fresh `corpus.dir` (the corpus store is rooted at exactly that
+  path) plus a full re-ingest — a GYB re-import, or a fresh
+  Gmail Import for API-sourced corpora. The ingest-loop restructure also
+  closed a pre-existing hole: failure paths (unreadable `.eml`, malformed
+  record) previously scanned past `--max-messages`; the bound is now
+  checked once, bottom-of-loop, on every path.
+- `dataset import-gmail` scope (now recorded as Corpus Exclusion) excludes
+  DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message
-  whose raw wire labelIds contain the system label id DRAFT or CHAT —
+  whose raw wire labelIds contain the system label id DRAFT or CHAT
+  (skip-present still wins: an already-present message is answered from
+  the resume id set and never fetched) —
   no documented chat query token exists (is:chat retired; -in:chat
   undocumented, with a word-degradation hazard), so chat exclusion
   lives in code, where an explicit `--query` override cannot bypass

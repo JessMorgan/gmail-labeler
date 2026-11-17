@@ -92,7 +92,7 @@ versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
 - Dedicated worktrees only (global `git-worktree` skill); review gates per
   global `git-management` skill.
 - Keep in sync with every change: README quickstart, `docs/`, `example.toml`,
-  `GLOSSARY.md` (new domain terms land there *in the same commit*), and ADRs —
+  `GLOSSARY.md` (new domain terms land there *in the same PR*), and ADRs —
   overriding a decided shape means superseding its ADR.
 - License is AGPL-3.0-or-later; keep the header policy stated in
   `CODING-STANDARDS.md`.
@@ -120,6 +120,13 @@ versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
    exception: the ~1 h bot installation token in the machine-local gh
    login store); no token values in logs.
 9. **No live API in CI**; the `FakeGmailClient` is the test spine.
+10. **Corpus Exclusion**: DRAFT/CHAT never enter the Corpus from either
+    ingest layer — Gmail Import rejects on raw-wire `labelIds`, GYB import
+    on raw label tokens (canonical tokens, exact case; `system_labels_extra`
+    equivalents never row-reject). Rejection is counted, never a failure
+    (skip-present and the containment guard take precedence — see
+    GLOSSARY); the posture is prospective-only — pre-policy corpora keep
+    contaminated records (GLOSSARY: *Corpus Exclusion*).
 
 ## Domain docs & skills
 

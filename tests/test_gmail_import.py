@@ -13,12 +13,10 @@ from gmail_labeler.corpus_store import CorpusError, CorpusStore
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import GmailPermanentError, classify_status
-from gmail_labeler.gmail_import import (
-    _EXCLUDED_SYSTEM_LABEL_IDS,
-    DEFAULT_QUERY,
-    import_gmail,
-)
-from gmail_labeler.labels import SYSTEM_LABEL_IDS
+from gmail_labeler.gmail_import import DEFAULT_QUERY, import_gmail
+from gmail_labeler.gmail_import import EXCLUDED_CORPUS_LABEL_IDS as _GI_EXCLUDED
+from gmail_labeler.gyb_import import EXCLUDED_CORPUS_LABEL_IDS as _GYB_EXCLUDED
+from gmail_labeler.labels import EXCLUDED_CORPUS_LABEL_IDS, SYSTEM_LABEL_IDS
 from gmail_labeler.sync_cursor import SIDECAR_CURSOR, SyncCursor
 
 
@@ -156,6 +154,10 @@ def test_import_gmail_scope_pins_both_layers(tmp_path: Path) -> None:
         "-in:trash",
         "-in:draft",
     ]
+    # ONE policy, two layers (ticket #32 completion of #17): the exclusion
+    # pair has a single shared home in labels.py that BOTH ingest layers
+    # import — export and GYB import must not drift apart. The pair itself
+    # is pinned by test_excluded_ids_are_exactly_draft_chat_and_real_system_ids.
 
 
 def test_ingest_rejects_draft_and_chat_label_ids(tmp_path: Path) -> None:
@@ -199,12 +201,19 @@ def test_ingest_rejection_is_id_exact_not_name_match(tmp_path: Path) -> None:
 
 def test_excluded_ids_are_exactly_draft_chat_and_real_system_ids() -> None:
     # the two sets are deliberately SEPARATE constants (corpus exclusion
-    # vs vocabulary filtering — gmail_import.py comment records why), but
-    # that comment asserts the ids are real system label ids; this pin
-    # keeps the exclusion set from drifting out of that claim — and the
-    # equality closes over-broadening: the contract is exactly these two
-    assert set(_EXCLUDED_SYSTEM_LABEL_IDS) == {"DRAFT", "CHAT"}
-    assert _EXCLUDED_SYSTEM_LABEL_IDS <= SYSTEM_LABEL_IDS
+    # vs vocabulary filtering — labels.py comments record why), but those
+    # comments assert the ids are real system label ids; this pin keeps
+    # the exclusion set from drifting out of that claim — and the equality
+    # closes over-broadening: the contract is exactly these two. Since
+    # ticket #32 the pair's single home is labels.EXCLUDED_CORPUS_LABEL_IDS,
+    # imported by both ingest layers.
+    assert frozenset({"DRAFT", "CHAT"}) == EXCLUDED_CORPUS_LABEL_IDS
+    assert EXCLUDED_CORPUS_LABEL_IDS <= SYSTEM_LABEL_IDS
+    # the shared home is load-bearing, not convention (mutant-tested on
+    # PR #52: a hardcoded pair at either use site stayed green until
+    # this pin): both ingest layers import THE SAME object
+    assert _GI_EXCLUDED is EXCLUDED_CORPUS_LABEL_IDS
+    assert _GYB_EXCLUDED is EXCLUDED_CORPUS_LABEL_IDS
 
 
 def test_import_gmail_resume_skips_present(tmp_path: Path) -> None:

@@ -182,6 +182,14 @@ does not ship releases yet.
   report-surfaced **Stale Id** term; and ADR-0008 records that the list
   response carries no page-level `historyId` in the current wire
   contract, superseding spec #64's seed-source sentence.
+- `dataset import-gyb` rejects DRAFT/CHAT rows at ingest (ticket #32, completing
+  #17 corpus-wide): a backup row whose raw label tokens carry the
+  canonical id DRAFT or CHAT is counted `skipped_draft_chat` and never
+  stored — previously the token was stripped from the row's label set
+  and the contaminated row imported silently. The exclusion pair now
+  has one shared home (`labels.EXCLUDED_CORPUS_LABEL_IDS`) that both
+  ingest layers import, so the two layers cannot drift; `dataset
+  import-gyb` reports the count in its summary line.
 - `dataset import-gmail` scope excludes DRAFT and CHAT (maintainer decision
   2026-11-01, ticket #17): the default query now carries the documented
   `-in:draft` token only, and the ingest layer hard-skips any message

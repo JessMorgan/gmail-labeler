@@ -218,7 +218,7 @@ today; a `1` means an unhandled crash — that's a bug, please report it.
 - [docs/ROADMAP.md](docs/ROADMAP.md) — phase plan of record
 - [GLOSSARY.md](GLOSSARY.md) — the domain language the code uses verbatim
 - [CODING-STANDARDS.md](CODING-STANDARDS.md) — how this code is written
-- [docs/adr/](docs/adr/) — the eight shape-defining decisions
+- [docs/adr/](docs/adr/) — the nine shape-defining decisions
 
 ## License
 

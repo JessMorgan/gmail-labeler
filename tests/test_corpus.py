@@ -3,16 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import get_args
 
 import pytest
 
 from gmail_labeler.analyze import analyze_corpus
 from gmail_labeler.corpus_record import (
-    _DATE_PROVENANCES,
     SERVER_AUTHORITATIVE_PROVENANCES,
     CorpusRecord,
-    DateProvenance,
     body_hash,
     utc_datetime,
     with_body,
@@ -61,10 +58,6 @@ def test_server_authoritative_provenances_is_the_trust_class() -> None:
         "internal_date",
         "gyb_internaldate",
     }
-    # Literal-vs-tuple drift door (corpus_record.py): the runtime
-    # allow-list must match the compile-time Literal in ORDER (Literal
-    # dedupes, so not multiplicity), not just as a set
-    assert tuple(get_args(DateProvenance)) == _DATE_PROVENANCES
 
 
 def test_date_provenance_line_is_byte_stable() -> None:

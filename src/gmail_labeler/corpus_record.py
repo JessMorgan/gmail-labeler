@@ -21,7 +21,7 @@ import json
 import re
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 Source = Literal["api", "gyb"]
 
@@ -32,10 +32,10 @@ Source = Literal["api", "gyb"]
 # No writer/reader type split: the constructor accepts all four, because
 # the reader side (dataset build) consumes the same type.
 DateProvenance = Literal["internal_date", "mime_date", "gyb_internaldate", "unknown"]
-# KEEP IN SYNC with DateProvenance: the tuple is the runtime allow-list,
-# the Literal is compile-time only — a value added to one without the
-# other silently breaks validation.
-_DATE_PROVENANCES = ("internal_date", "mime_date", "gyb_internaldate", "unknown")
+# The runtime allow-list is DERIVED from the Literal (get_args returns the
+# declared members, in order): one source of truth, no drift door between
+# what the compile-time type admits and what validation accepts.
+_DATE_PROVENANCES: tuple[DateProvenance, ...] = get_args(DateProvenance)
 
 # The server-authoritative trust class (GLOSSARY: Date Provenance) — the
 # split-builder's correct filter; mime_date is sender-claimed, unknown legacy.
@@ -140,7 +140,9 @@ def _opt_date_provenance(payload: dict[str, object]) -> DateProvenance:
         raise ValueError(
             f"field 'date_provenance' must be one of {_DATE_PROVENANCES}, got {value!r}"
         )
-    return value  # narrowed to the Literal by the membership check
+    # membership in the annotated, Literal-derived allow-list narrows
+    # value to the Literal
+    return value
 
 
 def _need_opt_str(payload: dict[str, object], key: str) -> str:

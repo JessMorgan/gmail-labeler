@@ -13,7 +13,12 @@ from gmail_labeler.corpus_store import CorpusError, CorpusStore
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import GmailPermanentError, classify_status
-from gmail_labeler.gmail_import import DEFAULT_QUERY, import_gmail
+from gmail_labeler.gmail_import import (
+    _EXCLUDED_SYSTEM_LABEL_IDS,
+    DEFAULT_QUERY,
+    import_gmail,
+)
+from gmail_labeler.labels import SYSTEM_LABEL_IDS
 from gmail_labeler.sync_cursor import SIDECAR_CURSOR, SyncCursor
 
 
@@ -190,6 +195,16 @@ def test_ingest_rejection_is_id_exact_not_name_match(tmp_path: Path) -> None:
     records = {r.id: r for r in store.iter_records()}
     assert records["aaa"].labels == ("chat",)
     assert records["bbb"].labels == ("Chat/Work",)
+
+
+def test_excluded_ids_are_exactly_draft_chat_and_real_system_ids() -> None:
+    # the two sets are deliberately SEPARATE constants (corpus exclusion
+    # vs vocabulary filtering — gmail_import.py comment records why), but
+    # that comment asserts the ids are real system label ids; this pin
+    # keeps the exclusion set from drifting out of that claim — and the
+    # equality closes over-broadening: the contract is exactly these two
+    assert set(_EXCLUDED_SYSTEM_LABEL_IDS) == {"DRAFT", "CHAT"}
+    assert _EXCLUDED_SYSTEM_LABEL_IDS <= SYSTEM_LABEL_IDS
 
 
 def test_import_gmail_resume_skips_present(tmp_path: Path) -> None:

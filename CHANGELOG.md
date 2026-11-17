@@ -9,8 +9,8 @@ does not ship releases yet.
 ### Added
 
 - Date Provenance on the record contract (`CorpusRecord.date_provenance`):
-  export stamps server `internalDate` vs MIME `Date`-header fallback
-  distinctly, GYB import stamps its own source; pre-existing lines lacking
+  Gmail Import stamps server `internalDate` vs MIME `Date`-header fallback
+  distinctly, GYB Import stamps its own source; pre-existing lines lacking
   the field read as explicit `unknown` (append-only corpus, never rewritten).
   Temporal-split consumers can now filter on the flag (invariant #7).
 

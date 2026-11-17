@@ -13,7 +13,10 @@ from gmail_labeler.corpus_store import CorpusError, CorpusStore
 from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
 from gmail_labeler.gmail_client import LabelInfo
 from gmail_labeler.gmail_errors import GmailPermanentError, classify_status
-from gmail_labeler.gmail_import import import_gmail
+from gmail_labeler.gmail_import import DEFAULT_QUERY, import_gmail
+from gmail_labeler.gmail_import import EXCLUDED_CORPUS_LABEL_IDS as _GI_EXCLUDED
+from gmail_labeler.gyb_import import EXCLUDED_CORPUS_LABEL_IDS as _GYB_EXCLUDED
+from gmail_labeler.labels import EXCLUDED_CORPUS_LABEL_IDS, SYSTEM_LABEL_IDS
 from gmail_labeler.sync_cursor import SIDECAR_CURSOR, SyncCursor
 
 
@@ -60,6 +63,157 @@ def test_import_gmail_writes_records_with_normalized_fields(tmp_path: Path) -> N
     assert two.date.isoformat().startswith("2026-10-30")  # from MIME Date
     body = store.get_body("aaa")
     assert body == "body of One"  # stored body == hashed body
+
+
+def test_date_provenance_stamps_fallback_distinctly_from_internal_date(
+    tmp_path: Path,
+) -> None:
+    # mutation pin (invariant #7): the MIME-Date fallback path must stamp
+    # DIFFERENTLY from the server-internalDate path, and split-boundary
+    # consumers must be able to filter on the flag as round-tripped record
+    # data — not derive it. A forged/future Date header can no longer
+    # silently move a record across the temporal split.
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(
+                id="aaa",
+                eml=_eml("Server"),
+                internal_date_ms=1761818400000,  # authoritative
+            ),
+            FakeMessage(id="bbb", eml=_eml("Header")),  # no internalDate
+        ],
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES)
+    records = {r.id: r for r in store.iter_records()}
+    assert records["aaa"].date_provenance == "internal_date"
+    assert records["bbb"].date_provenance == "mime_date"
+    fallback = [r.id for r in records.values() if r.date_provenance == "mime_date"]
+    assert fallback == ["bbb"]  # the flag is filterable, per-record
+
+
+def test_unconvertible_internal_date_falls_back_to_header_stamp(
+    tmp_path: Path,
+) -> None:
+    # present-but-unconvertible internalDate (epoch overflow): the record
+    # keeps the header date AND stamps mime_date — the stamp follows the
+    # date actually used, not the field that was merely present (mutation
+    # pin: _ms_to_utc's try/except — without it the OverflowError escapes)
+    eml = _eml("Overflow", date="Sun, 30 Oct 2026 10:00:00 +0000")
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=eml, internal_date_ms=10**30)]
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES)
+    rec = next(iter(store.iter_records()))
+    assert rec.date.isoformat().startswith("2026-10-30")  # header date kept
+    assert rec.date_provenance == "mime_date"  # stamped by the actual source
+
+
+def test_forged_future_date_header_cannot_shift_provenance(tmp_path: Path) -> None:
+    # internalDate present + a forged FUTURE Date header: the record keeps
+    # the server date AND stamps internal_date — the header is not even
+    # consulted, so it cannot move the record across the split
+    eml = _eml("Forged", date="Sun, 30 Oct 2099 10:00:00 +0000")
+    fake = FakeGmailClient(
+        messages=[FakeMessage(id="aaa", eml=eml, internal_date_ms=1761818400000)]
+    )
+    store = store_at(tmp_path)
+    import_gmail(fake, store, id_to_name=NAMES)
+    rec = next(iter(store.iter_records()))
+    assert rec.date.isoformat().startswith("2025-10-30")  # server date kept
+    assert rec.date_provenance == "internal_date"
+
+
+def test_import_gmail_scope_pins_both_layers(tmp_path: Path) -> None:
+    # Two layers (maintainer decision 2026-11-01, ticket #17):
+    # QUERY layer — documented tokens only: -in:draft is Google-
+    # documented; NO documented chat token exists (is:chat retired;
+    # -in:chat undocumented + word-degradation hazard), so chat is NOT in
+    # the query. Pinned through the FakeGmailClient's recorded request
+    # params as an EXACT token list (a -in:drafts/-in:chats plural
+    # variant would silently word-degrade), with every page carrying the
+    # same scope.
+    # INGEST layer — raw-wire DRAFT/CHAT labelIds rejection, the
+    # load-bearing layer (see test_ingest_rejects_draft_and_chat_label_ids).
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("A")),
+            FakeMessage(id="bbb", eml=_eml("B")),
+        ],
+        page_size=1,  # two pages: EVERY page must carry the same scope
+    )
+    import_gmail(fake, store_at(tmp_path), id_to_name=NAMES)
+    list_calls = [c for c in fake.calls if c.startswith("list_messages")]
+    assert len(list_calls) == 2  # the two-page claim is self-verifying
+    queries = {c.removeprefix("list_messages:").rsplit(":", 1)[0] for c in list_calls}
+    assert queries == {DEFAULT_QUERY}  # every page carries the same scope
+    assert DEFAULT_QUERY.split() == [
+        "in:anywhere",
+        "-in:spam",
+        "-in:trash",
+        "-in:draft",
+    ]
+    # ONE policy, two layers (ticket #32 completion of #17): the exclusion
+    # pair has a single shared home in labels.py that BOTH ingest layers
+    # import — export and GYB import must not drift apart. The pair itself
+    # is pinned by test_excluded_ids_are_exactly_draft_chat_and_real_system_ids.
+
+
+def test_ingest_rejects_draft_and_chat_label_ids(tmp_path: Path) -> None:
+    # ingest layer (load-bearing): RAW wire labelIds exact-id rejection,
+    # BEFORE labels.py normalization strips System Labels from the record
+    # vocabulary. Skipped messages are COUNTED (no silent vanish), never
+    # stored, and are not failures.
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("D"), label_ids=("INBOX", "DRAFT")),
+            FakeMessage(id="bbb", eml=_eml("C"), label_ids=("CHAT",)),
+            FakeMessage(id="ccc", eml=_eml("Ok"), label_ids=("INBOX",)),
+        ]
+    )
+    store = store_at(tmp_path)
+    stats = import_gmail(fake, store, id_to_name=NAMES)
+    assert [r.id for r in store.iter_records()] == ["ccc"]
+    assert stats.skipped_draft_chat == 2
+    assert stats.written == 1
+    assert not stats.failed  # a policy skip is a decision, not a defect
+
+
+def test_ingest_rejection_is_id_exact_not_name_match(tmp_path: Path) -> None:
+    # a USER label named "chat" (id "L3") and a path "Chat/Work" (id "L4")
+    # must NOT be skipped: the check is exact on the raw wire id — never
+    # name-matched, never path-matched
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=_eml("U1"), label_ids=("L3",)),
+            FakeMessage(id="bbb", eml=_eml("U2"), label_ids=("L4",)),
+        ]
+    )
+    store = store_at(tmp_path)
+    stats = import_gmail(fake, store, id_to_name={"L3": "chat", "L4": "Chat/Work"})
+    assert stats.skipped_draft_chat == 0
+    assert stats.written == 2
+    records = {r.id: r for r in store.iter_records()}
+    assert records["aaa"].labels == ("chat",)
+    assert records["bbb"].labels == ("Chat/Work",)
+
+
+def test_excluded_ids_are_exactly_draft_chat_and_real_system_ids() -> None:
+    # the two sets are deliberately SEPARATE constants (corpus exclusion
+    # vs vocabulary filtering — labels.py comments record why), but those
+    # comments assert the ids are real system label ids; this pin keeps
+    # the exclusion set from drifting out of that claim — and the equality
+    # closes over-broadening: the contract is exactly these two. Since
+    # ticket #32 the pair's single home is labels.EXCLUDED_CORPUS_LABEL_IDS,
+    # imported by both ingest layers.
+    assert frozenset({"DRAFT", "CHAT"}) == EXCLUDED_CORPUS_LABEL_IDS
+    assert EXCLUDED_CORPUS_LABEL_IDS <= SYSTEM_LABEL_IDS
+    # the shared home is load-bearing, not convention (mutant-tested on
+    # PR #52: a hardcoded pair at either use site stayed green until
+    # this pin): both ingest layers import THE SAME object
+    assert _GI_EXCLUDED is EXCLUDED_CORPUS_LABEL_IDS
+    assert _GYB_EXCLUDED is EXCLUDED_CORPUS_LABEL_IDS
 
 
 def test_import_gmail_resume_skips_present(tmp_path: Path) -> None:
@@ -218,6 +372,7 @@ def test_max_messages_bound_holds_on_warm_resume(tmp_path: Path) -> None:
                 labels=("Shipping",),
                 body_hash=body_hash(f"b{i}"),
                 source="api",
+                date_provenance="internal_date",
             ),
             f"b{i}",
         )
@@ -418,6 +573,7 @@ def test_resume_gate_is_case_insensitive(tmp_path: Path) -> None:
             labels=("Shipping",),
             body_hash=body_hash("whatever"),
             source="api",
+            date_provenance="internal_date",
         ),
         "whatever",
     )

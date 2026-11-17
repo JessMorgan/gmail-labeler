@@ -1,0 +1,155 @@
+# ROADMAP — the phase plan of record
+
+What exists today, what comes next, and what is explicitly parked. Phase 0
+(corpus acquisition) has landed; the open remnants below close it
+(#16/#17, plus this document), then Phase 1 starts. This plan is
+extracted from the spec (#13), itself recovered verbatim from the
+2026-10-29 design session; the spec's *Further Notes* records the
+deviations from that session.
+
+## Phase 0 remnants — close before Phase 1 trains
+
+- Finish the open PRs (analyze CLI, docs-sync) and merge them into `main`
+  (#14, maintainer action) — done; #8/#9 landed on `main`, #14 closed.
+- Write `docs/ROADMAP.md` from the spec's phase plan and fix the README's
+  dangling "phase plan in AGENTS.md" pointer (done — this document; the
+  README now links here, #15).
+- Forward-fix the Phase 0 review non-blockers (#10 items 1–3 plus the
+  post-push additions) — comment/wording/test only, zero behavior changes
+  (#16).
+- Corpus Exclusion (maintainer decision recorded in #17,
+  2026-11-01; completed corpus-wide in #32, 2026-11-02): DRAFT and
+  CHAT never enter the Corpus, from this policy onward — one policy
+  across both ingest layers (pre-policy corpora keep their records;
+  the CHANGELOG's upgrade note covers remediation).
+  Gmail Import: the query carries the documented `-in:draft` token, and
+  the ingest layer hard-rejects raw wire labelIds DRAFT/CHAT (the
+  load-bearing layer — chat has no documented query token, and an
+  explicit `--query` cannot bypass it; skip-present wins first here
+  too: an already-stored message answers `skipped_present` before
+  the fetch). GYB import: row-level
+  rejection on raw label tokens (ticket #32) — a matching row is
+  counted `skipped_draft_chat`, never stripped-and-imported, with
+  two boundaries: a row already in the corpus answers
+  `skipped_present` (the path guard and the policy are never asked),
+  and a not-yet-stored row whose backup-index path escapes the backup
+  root aborts the run (exit 5) before the rejection is counted,
+  before any policy decision.
+  Both layers import the one shared home,
+  `labels.EXCLUDED_CORPUS_LABEL_IDS` (exact-case tokens), so the two
+  cannot drift. The rationale: the previous default
+  `in:anywhere -in:spam -in:trash` included both, and under
+  append-only corpus storage + skip-present that was a one-way
+  door. Landed in #17 and #32 — before Phase 1 trains.
+- Date-provenance field on the record contract (#17): a record's date may
+  come from the server's internalDate, a fallback to the MIME `Date`
+  header, or GYB's internal date — the record stamps which. A forged or
+  future `Date` header can shift a fallback-sourced record across
+  the temporal split (invariant #7) undetectably. A schema change —
+  landed in #17 (2026-11-01), before Phase 1 trains.
+
+**Exit:** all remnants closed — #15–#17 and #32 landed; the
+analyze/docs-sync PRs are already on `main` — before Phase 1 trains.
+
+## Phase 1 — train, eval, and the gates (nothing live)
+
+Scope:
+
+- path-aware Label Path vocabulary (maintainer decision): classes are
+  leaf Label Paths; a parent Managed Label's gate may scope its subtree —
+  path-aware from day one;
+- temporal train/test split builder (invariant #7; materialized as a
+  versioned split manifest, recency weighting informed by `dataset
+  analyze`'s windows so the oldest mail doesn't dominate);
+- Filter-Authored exclusion (invariant #6): the builder consumes the
+  filters/labels sidecar bridge and aborts loudly on a missing or
+  bridge-incomplete snapshot, never silently training on filter-authored
+  signal;
+- fine-tune the encoder on the user's machine — CPU smoke, GPU for real —
+  each checkpoint carrying a JSON sidecar the loader validates
+  (label vocabulary hash, thresholds source, corpus fingerprint,
+  train-split manifest hash, encoder identifier);
+- per-label threshold calibration into Threshold Bands (high/medium/none;
+  a score below the threshold earns the glossary's "none" band) —
+  thresholds and the graduation set change only via `train`/`eval`,
+  behind a human-confirmed diff (ADR-0005);
+- per-label Graduation gates (minimum examples + minimum precision on the
+  held-out future window);
+- the `eval` report — per-label precision/recall at candidate thresholds
+  on the temporal split;
+- `shadow run` over the recent Backlog — predictions recorded locally, no
+  Gmail write.
+
+**Exit:** a human reviews the shadow report — diffed against the
+mailbox's actual labels — and chooses the graduates.
+
+## Phase 2 — live application
+
+Scope:
+
+- `daemon`: ~30 s History-API polling, cursor durability (invariant #3),
+  skip-present idempotency (invariant #2), Tier Labels on every
+  Application;
+- Correction capture (manual fixes on applied mail become the next
+  retrain's signal) and `status` (realized precision per graduated label);
+- the deliberate bulk path: `apply --since … --apply` — always
+  human-triggered, never automatic;
+- the `auth` wizard (ADR-0004) — ships in Phase 0's spirit but is
+  scheduled in Phase 2 (it is onboarding polish, not a gate to training).
+
+**Exit:** high-band labels apply silently; the user works the `ai-med`
+queue.
+
+## Phase 3 — deferred (explicitly parked)
+
+Written down, not implied. Each is a future decision, not debt — and a
+parked phase has no exit criteria until a decision unparks it.
+
+- Pub/Sub push — Gmail history-change notification as a trigger. ADR-0003
+  keeps polling as the spine; Pub/Sub is a deferred trigger, not a
+  redesign.
+- Retrain assistance — tooling around the human-gated retraining loop
+  (ADR-0005) as the Corpus grows and Corrections accumulate.
+- PyPI publication — an installable release; today the tool is a source
+  checkout.
+- The community-checkpoint experiment — shared encoder checkpoints as a
+  seed; an experiment, never a substitute for a user's own fine-tune.
+
+## Excluded from all exit criteria
+
+Bulk-fsync group commit (issue #12) is explicitly deprioritized by the
+maintainer: future quality-of-life, not a gate in any phase.
+
+## Never (out of scope)
+
+- Any code path that removes labels (invariant #1; ADR-0005) — including
+  "auto-clean" features.
+- IMAP/app-password fallback (ADR-0004, decided against for v1).
+- Server/multi-user deployments, central accounts, telemetry — one user,
+  one machine, one process (ADR-0002).
+- Retroactive labeling of non-incoming mail except via the deliberate
+  `apply` command.
+- Fine-tuning anything bigger than the encoder class in ADR-0001; generative
+  labeling; per-device/per-account personalization.
+- Live-API tests in CI (invariant #9).
+
+## Cross-references
+
+- [Spec #13](https://github.com/JessMorgan/gmail-labeler/issues/13)
+  (source of record);
+  [#10](https://github.com/JessMorgan/gmail-labeler/issues/10)
+  (Phase 0 follow-ups);
+  [#12](https://github.com/JessMorgan/gmail-labeler/issues/12)
+  (the parked bulk-fsync item);
+  [#14](https://github.com/JessMorgan/gmail-labeler/issues/14)
+  (the P0 gate issue for the merged analyze/docs-sync stack — closed);
+  [#15](https://github.com/JessMorgan/gmail-labeler/issues/15)
+  (this document);
+  [#16](https://github.com/JessMorgan/gmail-labeler/issues/16)
+  (the Phase 0 hygiene forward-fixes);
+  [#17](https://github.com/JessMorgan/gmail-labeler/issues/17)
+  (the record contract: Gmail Import query scope + date provenance);
+  [#32](https://github.com/JessMorgan/gmail-labeler/issues/32)
+  (GYB ingest: the DRAFT/CHAT exclusion completed corpus-wide).
+- [ADRs 0001–0009](adr/), [GLOSSARY.md](../GLOSSARY.md) (normative
+  vocabulary), [CODING-STANDARDS.md](../CODING-STANDARDS.md).

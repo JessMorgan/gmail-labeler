@@ -4,9 +4,11 @@
 fine-tunes a multi-label classifier on the user's own Gmail history and applies
 labels to arriving mail as it lands. Anyone can use it on their own inbox;
 nothing leaves the user's machines; nothing is centralized on the maintainer.
-Docs live where you expect: `GLOSSARY.md`, `CODING-STANDARDS.md`, `docs/adr/`.
-Phase 0 (corpus) has landed; the layout and command sections below mark
-what is wired vs. planned, and each gains detail as its phase lands.
+Docs live where you expect: `GLOSSARY.md`, `CODING-STANDARDS.md`,
+`docs/adr/`, and `docs/ROADMAP.md` (the phase plan of record — phase
+status lives there, not here). The layout and command sections below
+mark what is wired vs. planned, and each gains detail as its phase
+lands.
 
 ## Design spine (read the ADRs before questioning these)
 
@@ -38,6 +40,12 @@ what is wired vs. planned, and each gains detail as its phase lands.
   `dataset sync-labels --full-resync` recovery command (wired by #74;
   ADR-0008's final wording, never automatic). Sidecar storage + Gmail
   Import birth wired (ticket #72).
+- ADR-0009 the Corpus excludes DRAFT and CHAT and every date states its
+  provenance — documented `-in:draft` query token + the load-bearing
+  ingest-layer raw-wire rejection (no documented chat token exists);
+  `date_provenance` required at construction, legacy lines read explicit
+  `unknown`, split consumers filter `SERVER_AUTHORITATIVE_PROVENANCES`.
+  Wired by #17 (PR #33); GYB row rejection completes the intent in #32.
 
 ## Layout
 
@@ -49,7 +57,8 @@ what is wired vs. planned, and each gains detail as its phase lands.
   `eval`) + `model` and `daemon` adapters.
 - `train/` — planned: fine-tune recipe (HF `Trainer`), checkpoint output
   convention.
-- `docs/adr/`, `GLOSSARY.md`, `CODING-STANDARDS.md`, `example.toml`.
+- `docs/adr/`, `docs/ROADMAP.md`, `GLOSSARY.md`, `CODING-STANDARDS.md`,
+  `example.toml`.
 - CLI surface: `auth` (status) + `auth login` and
   `dataset {import-gmail,import-gyb,sync-labels,analyze}` are wired (the
   acquisition pair is pinned by ADR-0006; the old `export` name is a usage
@@ -83,7 +92,7 @@ versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
 - Dedicated worktrees only (global `git-worktree` skill); review gates per
   global `git-management` skill.
 - Keep in sync with every change: README quickstart, `docs/`, `example.toml`,
-  `GLOSSARY.md` (new domain terms land there *in the same commit*), and ADRs —
+  `GLOSSARY.md` (new domain terms land there *in the same PR*), and ADRs —
   overriding a decided shape means superseding its ADR.
 - License is AGPL-3.0-or-later; keep the header policy stated in
   `CODING-STANDARDS.md`.
@@ -111,6 +120,13 @@ versions (3.12/3.15) — a 3.13/3.14 checkout fails it by design;
    exception: the ~1 h bot installation token in the machine-local gh
    login store); no token values in logs.
 9. **No live API in CI**; the `FakeGmailClient` is the test spine.
+10. **Corpus Exclusion**: DRAFT/CHAT never enter the Corpus from either
+    ingest layer — Gmail Import rejects on raw-wire `labelIds`, GYB import
+    on raw label tokens (canonical tokens, exact case; `system_labels_extra`
+    equivalents never row-reject). Rejection is counted, never a failure
+    (skip-present and the containment guard take precedence — see
+    GLOSSARY); the posture is prospective-only — pre-policy corpora keep
+    contaminated records (GLOSSARY: *Corpus Exclusion*).
 
 ## Domain docs & skills
 

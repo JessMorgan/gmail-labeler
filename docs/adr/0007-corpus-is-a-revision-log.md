@@ -28,11 +28,15 @@ envelope fields (`subject`, `sender`, `recipients`, `thread_id`)
 unchanged; only the label set differs. Sync therefore never fetches
 message bodies: per Gmail's sync guidance only a cached message's
 `labelIds` might change, so the retained body stays authoritative. The
-known exception is draft mail: the Gmail Import query does not exclude
-drafts, and a draft keeps its id while its body is edited — neither this
-log nor Label Sync claims body-freshness for drafts. Integrity checking is
-unmoved by this decision too: the
-landed tripwire is `put()`'s write-time hash-vs-record check, and because
+former exception — draft mail, whose body is edited under a stable id —
+no longer applies on the Gmail Import path: drafts are excluded
+(ADR-0009). GYB-sourced drafts — and any draft already stored by an
+earlier import, exclusion being import-time only — were the residual
+body-freshness case until #32 excluded new GYB drafts at the row
+level; what remains is drafts stored before either exclusion landed;
+neither this log nor Label Sync claims body-freshness for
+those. Integrity checking is unmoved by this decision too: the landed
+tripwire is `put()`'s write-time hash-vs-record check, and because
 a revision writes no body, the sync path cannot create body/hash drift;
 deeper read-path verification (`--verify-bodies`) is a named future
 capability, not a promise this design leans on.

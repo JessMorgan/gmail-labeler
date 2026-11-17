@@ -7,7 +7,7 @@ the same property that makes crash-retry harmless — invariant #2's corpus
 twin), so the import can die at any moment and simply be re-run. Retry policy
 is driven by the typed taxonomy only (transient→backoff-retry,
 rate_limited→honored backoff, permanent→record-and-continue: one unreadable
-message must never abort a 394k-message import). Messages whose timestamp
+message must never abort the whole import). Messages whose timestamp
 cannot be established from either source (API internalDate or Date header) are
 FAILED, not fabricated — the temporal split (invariant #7) starts honest.
 """
@@ -24,11 +24,11 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from .attribution import SIDECAR_FILTERS, SIDECAR_LABELS
-from .corpus_record import CorpusRecord, body_hash, utc_datetime
+from .corpus_record import CorpusRecord, DateProvenance, body_hash, utc_datetime
 from .corpus_store import CorpusStore
 from .gmail_client import FilterInfo, GmailClient, MessagePage
 from .gmail_errors import GmailError
-from .labels import normalize_label_names
+from .labels import EXCLUDED_CORPUS_LABEL_IDS, normalize_label_names
 from .mime_extract import decode_gmail_raw, parse_mime
 from .retry import MAX_ATTEMPTS
 from .retry import retrying as _retrying
@@ -36,7 +36,33 @@ from .sync_cursor import SyncCursor
 
 log = logging.getLogger("gmail_labeler.gmail_import")
 
-DEFAULT_QUERY = "in:anywhere -in:spam -in:trash"
+# Export scope decision (maintainer, 2026-11-01; ticket #17 / issue #10
+# item 4): DRAFT and CHAT are EXCLUDED, not just spam/trash. With
+# Additive-only + skip-present (invariants #1/#2) and the append-only
+# corpus, the old implicit inclusion (in:anywhere) would become permanent
+# and unrecoverable — excluding them now is the safe direction under the
+# one-way door.
+#
+# Documented tokens only (provenance standard, labels.py precedent):
+#   -in:draft — Google-documented: "-in:draft means exclude drafts from
+#     the search results" (developers.google.com/workspace/gmail/api/
+#     reference/mcp/tools_list/search_threads, page 2026-07-21). High
+#     confidence as a token; medium for exact REST q composition — the
+#     ingest rejection below covers the gap.
+#   CHAT — NO documented exclusion token: is:chat documented 2014→2021,
+#     gone by 2023-01 (Wayback 7190 lineage); -in:chat is undocumented
+#     and carries a silent word-degradation hazard (an unknown in: value
+#     may be word-degraded and drop legit mail containing the word
+#     "chat"). Chat exclusion therefore lives at INGEST:
+#     labels.EXCLUDED_CORPUS_LABEL_IDS (the shared home in labels.py)
+#     hard-skips raw-wire DRAFT/CHAT labelIds — the load-bearing layer,
+#     which an explicit `--query` override cannot bypass. The GYB importer
+#     imports the SAME constant (ticket #32: two ingest layers, one
+#     policy, no drift).
+# Pinned in test_import_gmail_scope_pins_both_layers (query tokens) and
+# test_excluded_ids_are_exactly_draft_chat_and_real_system_ids (the pair).
+DEFAULT_QUERY = "in:anywhere -in:spam -in:trash -in:draft"
+
 # MAX_ATTEMPTS and the pacing loop are shared with Label Sync via retry.py
 # (ticket #73 generalization); the constant is imported here for the
 # default arguments below — the loop itself no longer lives in this module.
@@ -47,6 +73,7 @@ class GmailImportStats:
     scanned: int = 0
     written: int = 0
     skipped_present: int = 0
+    skipped_draft_chat: int = 0  # ingest-layer policy skips (see above)
     retried: int = 0
     failed: list[tuple[str, str]] = field(default_factory=list)  # (id, reason)
 
@@ -140,6 +167,8 @@ def import_gmail(
                     stats.written += 1
                 elif outcome == "present":
                     stats.skipped_present += 1
+                elif outcome == "policy_skip":
+                    stats.skipped_draft_chat += 1
             # bound checked on EVERY path (deepseek engine pass: continue
             # used to bypass it, scanning past max_messages on resume runs)
             if max_messages is not None and stats.scanned >= max_messages:
@@ -170,7 +199,7 @@ def _birth_cursor(
     non-positive seed is a wire lie the ledger refuses. When no usable seed
     exists the import degrades LOUDLY but not fatally: the cursor is
     additive, the corpus stays birth-eligible, and failing a healthy
-    394k-message import over one bootstrap read would regress the
+    full-corpus import over one bootstrap read would regress the
     acquisition contract. A write failure (CorpusError) propagates like any
     structural store fault — typed exit 5."""
     if store.read_cursor() is not None:
@@ -209,7 +238,7 @@ def _import_one(
     max_attempts: int,
     stats: GmailImportStats,
     sleeper: Callable[[float], None],
-) -> Literal["written", "present", "failed"]:
+) -> Literal["written", "present", "failed", "policy_skip"]:
     msg = _retrying(
         lambda: client.get_message(message_id),
         max_attempts=max_attempts,
@@ -220,6 +249,11 @@ def _import_one(
     if msg is None:
         stats.failed.append((message_id, "fetch failed (permanent/retries)"))
         return "failed"
+    if EXCLUDED_CORPUS_LABEL_IDS.intersection(msg.label_ids):
+        # policy skip on the RAW wire labelIds (before parse/normalize):
+        # counted by the caller, never stored, never a failure — the
+        # exclusion is a decision, not a defect
+        return "policy_skip"
     try:
         parsed = parse_mime(decode_gmail_raw(msg.raw_b64url))
     except ValueError as e:
@@ -227,14 +261,24 @@ def _import_one(
         # binascii.Error and UnicodeEncodeError are ValueError subclasses)
         stats.failed.append((message_id, f"raw decode: {type(e).__name__}"))
         return "failed"
-    # Date provenance: server internalDate when present; the MIME Date
-    # header is SENDER-CLAIMED (a forged/future header can move a message
-    # across the temporal split — a per-record provenance flag is
-    # daemon/eval-phase work, see follow-up). No header => no guess.
-    date = _ms_to_utc(msg.internal_date_ms) or (
-        utc_datetime(parsed.date) if parsed.date is not None else None
-    )
-    if date is None:
+    # Date Provenance (GLOSSARY): the stamp must say where the date ACTUALLY
+    # came from. Server internalDate is authoritative; the MIME Date header
+    # is SENDER-CLAIMED — a forged/future header can move a message across
+    # the temporal split (invariant #7), so the fallback is stamped
+    # "mime_date", never blended. (A present-but-unconvertible internalDate
+    # falls through to the header and is stamped accordingly.) No header =>
+    # no guess.
+    server_date = _ms_to_utc(msg.internal_date_ms)
+    provenance: DateProvenance
+    if server_date is not None:
+        date = server_date
+        provenance = "internal_date"
+    elif parsed.date is not None:
+        date = utc_datetime(parsed.date)
+        provenance = "mime_date"
+    else:
+        # no authoritative timestamp: fail here, never stored — a record's
+        # provenance is always one of the two real sources
         stats.failed.append((message_id, "no authoritative timestamp"))
         return "failed"
     try:
@@ -247,11 +291,12 @@ def _import_one(
             labels=tuple(normalize_label_names(list(msg.label_ids), id_to_name)),
             body_hash=body_hash(parsed.body_text),
             source="api",
+            date_provenance=provenance,
             thread_id=msg.thread_id,
         )
     except ValueError as e:
         # a wire value violating the record contract fails THIS message
-        # only — one impossible id must not abort a 394k import
+        # only — one impossible id must not abort the whole import
         stats.failed.append((message_id, f"record shape: {e}"))
         return "failed"
     # Structural store failures (CorpusError) PROPAGATE and stop the run

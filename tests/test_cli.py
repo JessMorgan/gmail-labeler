@@ -172,6 +172,32 @@ def test_dataset_import_gmail_enforces_modes_on_every_run(
     assert records.stat().st_mode & 0o077 == 0  # only enforce_modes could tighten
 
 
+def test_import_gmail_stats_echo_includes_skipped_draft_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # user-visible stats line: the ingest policy-skip count must not
+    # regress silently (deepseek nit)
+    import gmail_labeler.cli as cli
+    from gmail_labeler.fake_gmail import FakeGmailClient, FakeMessage
+
+    eml = b"Subject: x\r\nDate: Sun, 30 Oct 2026 10:00:00 +0000\r\n\r\nb"
+    fake = FakeGmailClient(
+        messages=[
+            FakeMessage(id="aaa", eml=eml, label_ids=("INBOX",)),
+            FakeMessage(id="bbb", eml=eml, label_ids=("DRAFT",)),
+        ]
+    )
+    monkeypatch.setattr(cli, "_import_gmail_client", lambda cfg: fake)
+    result = runner.invoke(
+        app, ["dataset", "import-gmail", "--config", str(_import_gmail_cfg(tmp_path))]
+    )
+    assert result.exit_code == 0
+    assert (
+        "scanned=2 written=1 skipped_present=0 skipped_draft_chat=1 "
+        "retried=0 failed=0" in result.stdout
+    )
+
+
 def test_dataset_import_gmail_incomplete_exits_5(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -582,6 +608,34 @@ def test_import_gyb_empty_path_flag_is_error(tmp_path: Path) -> None:
     assert "empty" in result.stderr
 
 
+def test_import_gyb_stats_echo_includes_skipped_draft_chat(tmp_path: Path) -> None:
+    # user-visible stats line (ticket #32): the rejection
+    # count must not regress silently — mirrors the export echo pin
+    gyb = _gyb_fixture(tmp_path)
+    import sqlite3
+
+    con = sqlite3.connect(gyb / "msg-db.sqlite")
+    con.execute(
+        "INSERT INTO messages VALUES (2, '2026/7/14/beef.eml', '2026-07-14 10:00:00')"
+    )
+    con.execute("INSERT INTO uids VALUES (2, 'beef')")
+    con.execute("INSERT INTO labels VALUES (2, 'DRAFT')")
+    con.commit()
+    con.close()
+    # NO beef.eml written: rejected rows are answered from the index alone
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        f'[corpus]\ndir = "{tmp_path / "corpus"}"\n[gyb]\npath = "{gyb}"\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["dataset", "import-gyb", "--config", str(cfg)])
+    assert result.exit_code == 0
+    assert (
+        "scanned=2 written=1 skipped_present=0 skipped_draft_chat=1 failed=0"
+        in result.stdout
+    )
+
+
 def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     gyb = _gyb_fixture(tmp_path)
     import sqlite3
@@ -589,6 +643,13 @@ def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     con = sqlite3.connect(gyb / "msg-db.sqlite")
     con.execute("INSERT INTO messages VALUES (2, '2026/7/16/beef.eml', 'garbage-date')")
     con.execute("INSERT INTO uids VALUES (2, 'beef')")
+    # a rejected DRAFT row sorting BEFORE the abort: the aborted-run echo
+    # must account for it too (ticket #32 — never vanish from the totals)
+    con.execute(
+        "INSERT INTO messages VALUES (3, '2026/7/14/draft.eml', '2026-07-14 10:00:00')"
+    )
+    con.execute("INSERT INTO uids VALUES (3, 'dddd')")
+    con.execute("INSERT INTO labels VALUES (3, 'DRAFT')")
     con.commit()
     con.close()
     cfg = tmp_path / "config.toml"
@@ -600,6 +661,7 @@ def test_import_gyb_abort_reports_partial_counts(tmp_path: Path) -> None:
     assert result.exit_code == 5
     # good row (sorts before 'garbage') was durably imported and IS reported
     assert "1 record(s) durably imported so far" in result.stderr
+    assert "skipped_draft_chat=1" in result.stderr  # rejection counted pre-abort
 
 
 def test_import_gyb_help_documents_comma_limit(tmp_path: Path) -> None:
@@ -657,6 +719,7 @@ def _seed_corpus(
             labels=(label,),
             body_hash=body_hash(f"body {base + i}"),
             source="api",
+            date_provenance="internal_date",
         )
         store.put(rec, f"body {base + i}")
     return store.root
@@ -1008,6 +1071,7 @@ def _sync_seed_corpus(
             labels=labels,
             body_hash=body_hash("body a1"),
             source="api",
+            date_provenance="internal_date",
             thread_id="ta1",
         ),
         "body a1",
@@ -2246,7 +2310,7 @@ def test_import_gmail_also_sync_labels_reports_both_passes(
     assert result.exit_code == 0, result.output
     assert (
         "import-gmail: scanned=1 written=1 skipped_present=0 "
-        "retried=0 failed=0" in result.stdout
+        "skipped_draft_chat=0 retried=0 failed=0" in result.stdout
     )
     assert (
         "sync-labels (also): events=1 stale=1 revised=1 deleted_kept=0 "
@@ -2325,7 +2389,7 @@ def test_import_gmail_also_sync_labels_max_messages_bounded_run_still_walks_sync
     # completed durably (no failure sentinel)
     assert (
         "import-gmail: scanned=1 written=1 skipped_present=0 "
-        "retried=0 failed=0" in result.stdout
+        "skipped_draft_chat=0 retried=0 failed=0" in result.stdout
     )
     # the sync pass STILL walked: its appended summary line carries the
     # event it consumed from the birthed seed
@@ -2731,7 +2795,8 @@ def test_import_gmail_composite_body_is_byte_identical_to_standalone(
     assert res_a.exit_code == 0, res_a.output
     assert res_b.exit_code == 0, res_b.output
     assert res_a.stdout == (
-        "import-gmail: scanned=1 written=1 skipped_present=0 retried=0 failed=0\n"
+        "import-gmail: scanned=1 written=1 skipped_present=0 "
+        "skipped_draft_chat=0 retried=0 failed=0\n"
     )
     assert res_b.stdout.startswith(res_a.stdout)  # the import report did not move
     marker = "\nNext: run `dataset analyze`"

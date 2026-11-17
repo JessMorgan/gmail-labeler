@@ -31,9 +31,10 @@ message bodies: per Gmail's sync guidance only a cached message's
 former exception — draft mail, whose body is edited under a stable id —
 no longer applies on the Gmail Import path: drafts are excluded
 (ADR-0009). GYB-sourced drafts — and any draft already stored by an
-earlier import, exclusion being import-time only — are the residual
-body-freshness case until #32 excludes new GYB drafts at the row
-level; neither this log nor Label Sync claims body-freshness for
+earlier import, exclusion being import-time only — were the residual
+body-freshness case until #32 excluded new GYB drafts at the row
+level; what remains is drafts stored before either exclusion landed;
+neither this log nor Label Sync claims body-freshness for
 those. Integrity checking is unmoved by this decision too: the landed
 tripwire is `put()`'s write-time hash-vs-record check, and because
 a revision writes no body, the sync path cannot create body/hash drift;

@@ -176,6 +176,31 @@ load-bearing for correctness (ADR-0007): the last-wins fold is the truth,
 so compaction changes only the fold's cost, never the resolved state.
 _Avoid_: garbage collection, log rotation (both imply the history itself is
 what's managed; the fold already resolves it)
+
+**Corpus Exclusion**:
+DRAFT and CHAT (the exclusion pair) never enter the Corpus, from either
+ingest layer, from this policy onward: Gmail Import rejects messages
+whose raw wire labelIds carry the canonical id (skip-present wins first
+on both layers: an already-stored message is answered `skipped_present`
+from the resume id set before the fetch, and the policy never sees it),
+and GYB import rejects rows whose raw label tokens
+carry the canonical token (exact-case match on the canonical tokens —
+localized `system_labels_extra` equivalents do not trigger rejection;
+a matching GYB row that is not already in the Corpus is counted
+`skipped_draft_chat` — unless its backup-index path escapes the backup
+root, whereupon the fail-closed guard aborts the whole run (exit 5)
+before the rejection is counted — a row already stored is reported
+`skipped_present`, because the store's id set is consulted first).
+One policy, one home — `labels.EXCLUDED_CORPUS_LABEL_IDS`; both layers
+import the same constant so they cannot drift. Rationale: under
+Additive-only and the corpus store's append-only write surface
+(`CorpusStore` has no delete path), a wrong inclusion is permanent
+(a one-way door), and
+exclusion is the safe direction. The policy is prospective only:
+nothing ever leaves the store, so records imported before it stay — it
+guards entry, not what is already in.
+_Avoid_: Export Scope (the decision's original name; the policy is
+corpus-wide, not export-only)
 **Date Provenance**:
 Where a Corpus record's date came from: the server `internalDate`
 (`internal_date`), the MIME `Date` header fallback (`mime_date`), the GYB
